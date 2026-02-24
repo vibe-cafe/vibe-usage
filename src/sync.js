@@ -32,22 +32,31 @@ export async function runSync() {
 
   const apiUrl = config.apiUrl || 'https://vibecafe.ai';
   let totalIngested = 0;
+  const totalBatches = Math.ceil(allBuckets.length / BATCH_SIZE);
+
+  console.log(`Uploading ${allBuckets.length} buckets (${totalBatches} batch${totalBatches > 1 ? 'es' : ''})...`);
 
   try {
     for (let i = 0; i < allBuckets.length; i += BATCH_SIZE) {
       const batch = allBuckets.slice(i, i + BATCH_SIZE);
+      const batchNum = Math.floor(i / BATCH_SIZE) + 1;
+      const uploaded = Math.min(i + BATCH_SIZE, allBuckets.length);
+
+      if (totalBatches > 1) {
+        process.stdout.write(`  [${batchNum}/${totalBatches}] ${uploaded}/${allBuckets.length} buckets...\r`);
+      }
+
       const result = await ingest(apiUrl, config.apiKey, batch);
       totalIngested += result.ingested ?? batch.length;
 
       // Save progress after each successful batch so partial uploads survive interruptions
       config.lastSync = new Date().toISOString();
       saveConfig(config);
-
-      if (allBuckets.length > BATCH_SIZE) {
-        process.stdout.write(`  ${Math.min(i + BATCH_SIZE, allBuckets.length)}/${allBuckets.length} buckets...\r`);
-      }
     }
 
+    if (totalBatches > 1) {
+      process.stdout.write('\n');
+    }
     console.log(`Synced ${totalIngested} buckets.`);
     return totalIngested;
   } catch (err) {
