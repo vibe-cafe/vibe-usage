@@ -39,13 +39,15 @@ export async function runSync() {
       const result = await ingest(apiUrl, config.apiKey, batch);
       totalIngested += result.ingested ?? batch.length;
 
+      // Save progress after each successful batch so partial uploads survive interruptions
+      config.lastSync = new Date().toISOString();
+      saveConfig(config);
+
       if (allBuckets.length > BATCH_SIZE) {
         process.stdout.write(`  ${Math.min(i + BATCH_SIZE, allBuckets.length)}/${allBuckets.length} buckets...\r`);
       }
     }
 
-    config.lastSync = new Date().toISOString();
-    saveConfig(config);
     console.log(`Synced ${totalIngested} buckets.`);
     return totalIngested;
   } catch (err) {
@@ -53,7 +55,12 @@ export async function runSync() {
       console.error('Invalid API key. Run `npx @vibe-cafe/vibe-usage init` to reconfigure.');
       process.exit(1);
     }
-    console.error(`Sync failed: ${err.message}`);
+    // Progress already saved per-batch — report partial success
+    if (totalIngested > 0) {
+      console.error(`Sync partially completed (${totalIngested} buckets uploaded). ${err.message}`);
+    } else {
+      console.error(`Sync failed: ${err.message}`);
+    }
     process.exit(1);
   }
 }

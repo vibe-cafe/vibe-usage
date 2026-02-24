@@ -36,6 +36,9 @@ export async function parse(lastSync) {
       continue;
     }
 
+    // Track previous cumulative totals per model to compute deltas when only total_token_usage is available
+    const prevTotal = new Map();
+
     for (const line of content.split('\n')) {
       if (!line.trim()) continue;
       try {
@@ -54,8 +57,25 @@ export async function parse(lastSync) {
         if (!timestamp || isNaN(timestamp.getTime())) continue;
         if (lastSync && timestamp <= new Date(lastSync)) continue;
 
-
-        const usage = info.last_token_usage || info.total_token_usage;
+        // Prefer incremental per-request usage; compute delta from cumulative total as fallback
+        let usage = info.last_token_usage;
+        if (!usage && info.total_token_usage) {
+          const totalKey = `${info.model || payload.model || ''}`;
+          const prev = prevTotal.get(totalKey);
+          const curr = info.total_token_usage;
+          if (prev) {
+            usage = {
+              input_tokens: (curr.input_tokens || 0) - (prev.input_tokens || 0),
+              output_tokens: (curr.output_tokens || 0) - (prev.output_tokens || 0),
+              cached_input_tokens: (curr.cached_input_tokens || 0) - (prev.cached_input_tokens || 0),
+              reasoning_output_tokens: (curr.reasoning_output_tokens || 0) - (prev.reasoning_output_tokens || 0),
+            };
+          } else {
+            // First cumulative entry — use as-is (it's the first event's total)
+            usage = curr;
+          }
+          prevTotal.set(totalKey, { ...curr });
+        }
         if (!usage) continue;
 
         const model = info.model || payload.model || 'unknown';

@@ -14,7 +14,7 @@ export async function parse(lastSync) {
   const entries = [];
 
   for (const session of sessions) {
-    if (lastSync && session.lastActivity <= lastSync) continue;
+    if (lastSync && new Date(session.lastActivity) <= new Date(lastSync)) continue;
 
     for (const breakdown of session.modelBreakdowns || []) {
       entries.push({

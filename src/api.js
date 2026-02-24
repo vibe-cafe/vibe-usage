@@ -18,6 +18,7 @@ export function ingest(apiUrl, apiKey, buckets) {
 
     const req = mod.request(url, {
       method: 'POST',
+      timeout: 30_000,
       headers: {
         'Content-Type': 'application/json',
         'Authorization': `Bearer ${apiKey}`,
@@ -44,6 +45,10 @@ export function ingest(apiUrl, apiKey, buckets) {
     });
 
     req.on('error', (err) => reject(err));
+    req.on('timeout', () => {
+      req.destroy();
+      reject(new Error('Request timed out (30s)'));
+    });
     req.write(body);
     req.end();
   });

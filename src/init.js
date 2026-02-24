@@ -1,5 +1,5 @@
 import { createInterface } from 'node:readline';
-import { exec } from 'node:child_process';
+import { execFile } from 'node:child_process';
 import { platform } from 'node:os';
 import { existsSync } from 'node:fs';
 import { loadConfig, saveConfig } from './config.js';
@@ -20,7 +20,8 @@ function prompt(question) {
 function openBrowser(url) {
   const cmds = { darwin: 'open', linux: 'xdg-open', win32: 'start' };
   const cmd = cmds[platform()] || cmds.linux;
-  exec(`${cmd} ${url}`, () => {});
+  // Use execFile with args array to avoid shell injection via VIBE_USAGE_API_URL
+  execFile(cmd, [url], () => {});
 }
 
 export async function runInit() {
