@@ -86,7 +86,7 @@ export async function runInit() {
     console.log(`Hooks installed for: ${hooked.join(', ')}`);
   }
   for (const name of manualOnly) {
-    console.log(`${name} detected — use \`npx vibe-usage sync\` to sync manually.`);
+    console.log(`${name} detected — use \`npx @vibe-cafe/vibe-usage sync\` to sync manually.`);
   }
   if (tools.length === 0) {
     console.log('No AI coding tools detected. Install one and re-run init.');
@@ -95,5 +95,5 @@ export async function runInit() {
   console.log('\nRunning initial sync...');
   await runSync();
 
-  console.log('\nSetup complete! Usage data will sync automatically after each session.');
+  console.log(`\nSetup complete! View your dashboard at: ${apiUrl}/usage`);
 }

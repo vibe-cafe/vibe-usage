@@ -2,7 +2,7 @@ import { readFileSync, writeFileSync, existsSync, mkdirSync } from 'node:fs';
 import { join, dirname } from 'node:path';
 import { homedir } from 'node:os';
 
-const SYNC_CMD = 'npx vibe-usage sync 2>/dev/null &';
+const SYNC_CMD = 'npx @vibe-cafe/vibe-usage sync 2>/dev/null &';
 
 function hasVibeUsageHook(hooks) {
   if (!Array.isArray(hooks)) return false;
