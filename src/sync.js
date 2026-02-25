@@ -1,3 +1,4 @@
+import { hostname as osHostname } from 'node:os';
 import { loadConfig, saveConfig } from './config.js';
 import { ingest } from './api.js';
 import { parsers } from './parsers/index.js';
@@ -32,6 +33,12 @@ export async function runSync() {
   if (allBuckets.length === 0) {
     console.log('No new usage data found.');
     return 0;
+  }
+
+  // Tag every bucket with this machine's hostname
+  const host = osHostname().replace(/\.local$/, '');
+  for (const b of allBuckets) {
+    b.hostname = host;
   }
 
   const apiUrl = config.apiUrl || 'https://vibecafe.ai';
