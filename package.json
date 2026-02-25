@@ -4,11 +4,24 @@
   "description": "Track your AI coding tool token usage and sync to vibecafe.ai",
   "type": "module",
   "bin": {
-    "vibe-usage": "./bin/vibe-usage.js"
+    "vibe-usage": "bin/vibe-usage.js"
   },
-  "files": ["bin/", "src/"],
-  "engines": { "node": ">=20" },
-  "keywords": ["ai", "coding", "usage", "tokens", "claude", "codex", "gemini"],
+  "files": [
+    "bin/",
+    "src/"
+  ],
+  "engines": {
+    "node": ">=20"
+  },
+  "keywords": [
+    "ai",
+    "coding",
+    "usage",
+    "tokens",
+    "claude",
+    "codex",
+    "gemini"
+  ],
   "dependencies": {
     "ccusage": "18.0.5"
   },
