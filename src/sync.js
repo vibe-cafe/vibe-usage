@@ -1,10 +1,14 @@
 import { loadConfig, saveConfig } from './config.js';
 import { ingest } from './api.js';
 import { parsers } from './parsers/index.js';
+import { TOOLS } from './hooks.js';
 
 const BATCH_SIZE = 500;
 
 export async function runSync() {
+  // Self-heal: re-inject any missing hooks before syncing
+  ensureHooks();
+
   const config = loadConfig();
   if (!config?.apiKey) {
     console.error('Not configured. Run `npx @vibe-cafe/vibe-usage init` first.');
@@ -71,5 +75,23 @@ export async function runSync() {
       console.error(`Sync failed: ${err.message}`);
     }
     process.exit(1);
+  }
+}
+
+/**
+ * Re-inject hooks for any installed tool whose hook is missing.
+ * Runs silently — meant as a self-healing side effect of sync.
+ */
+function ensureHooks() {
+  for (const tool of TOOLS) {
+    if (!tool.inject) continue;
+    try {
+      const result = tool.inject();
+      if (result.injected) {
+        process.stderr.write(`hook: re-installed ${tool.name} hook\n`);
+      }
+    } catch {
+      // ignore — best effort
+    }
   }
 }

@@ -62,7 +62,7 @@ export async function runInit() {
   const config = {
     apiKey,
     apiUrl,
-    lastSync: null,
+    lastSync: existing?.lastSync || null,
   };
   saveConfig(config);
 
