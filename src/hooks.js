@@ -86,6 +86,8 @@ export function injectCodex() {
   }
 
   if (content.includes('vibe-usage')) {
+    // Fix broken [notify] → [[notify]] from previous versions
+    content = content.replace(/^\[notify\]$/gm, '[[notify]]');
     // Update existing command to use latest
     content = content.replace(
       /npx @vibe-cafe\/vibe-usage(?:@[\d.]+)? sync[^"']*/g,
@@ -95,12 +97,12 @@ export function injectCodex() {
     return { injected: false, reason: 'already installed (updated)' };
   }
 
-  const notifySection = `\n[notify]\ncommand = "${SYNC_CMD}"\n`;
-  const notifyIdx = content.indexOf('[notify]');
+  const notifySection = `\n[[notify]]\ncommand = "${SYNC_CMD}"\n`;
+  const notifyIdx = content.indexOf('[[notify]]');
   if (notifyIdx !== -1) {
     const nextSection = content.indexOf('\n[', notifyIdx + 1);
     const sectionEnd = nextSection === -1 ? content.length : nextSection;
-    content = content.slice(0, notifyIdx) + `[notify]\ncommand = "${SYNC_CMD}"` + content.slice(sectionEnd);
+    content = content.slice(0, notifyIdx) + `[[notify]]\ncommand = "${SYNC_CMD}"` + content.slice(sectionEnd);
   } else {
     content += notifySection;
   }

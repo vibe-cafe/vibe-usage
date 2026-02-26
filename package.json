@@ -1,6 +1,6 @@
 {
   "name": "@vibe-cafe/vibe-usage",
-  "version": "0.2.0",
+  "version": "0.2.1",
   "description": "Track your AI coding tool token usage and sync to vibecafe.ai",
   "type": "module",
   "bin": {
