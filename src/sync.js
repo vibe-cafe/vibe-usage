@@ -1,4 +1,7 @@
 import { hostname as osHostname } from 'node:os';
+import { existsSync, readFileSync, unlinkSync } from 'node:fs';
+import { join } from 'node:path';
+import { homedir } from 'node:os';
 import { loadConfig, saveConfig } from './config.js';
 import { ingest } from './api.js';
 import { parsers } from './parsers/index.js';
@@ -90,6 +93,24 @@ export async function runSync() {
  * Runs silently — meant as a self-healing side effect of sync.
  */
 function ensureHooks() {
+  // Skip hook injection if Vibe Usage Mac app is running
+  const markerPath = join(homedir(), '.vibe-usage', 'mac-app-active');
+  if (existsSync(markerPath)) {
+    try {
+      const marker = JSON.parse(readFileSync(markerPath, 'utf-8'));
+      if (marker.pid) {
+        try {
+          process.kill(marker.pid, 0);
+          return;
+        } catch {
+          try { unlinkSync(markerPath); } catch { /* ignore */ }
+        }
+      }
+    } catch {
+      // Malformed marker file — ignore
+    }
+  }
+
   for (const tool of TOOLS) {
     if (!tool.inject) continue;
     try {

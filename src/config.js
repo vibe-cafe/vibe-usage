@@ -3,7 +3,8 @@ import { join } from 'node:path';
 import { homedir } from 'node:os';
 
 const CONFIG_DIR = join(homedir(), '.vibe-usage');
-const CONFIG_FILE = join(CONFIG_DIR, 'config.json');
+const isDev = process.env.VIBE_USAGE_DEV === '1';
+const CONFIG_FILE = join(CONFIG_DIR, isDev ? 'config.dev.json' : 'config.json');
 
 export function getConfigPath() {
   return CONFIG_FILE;
