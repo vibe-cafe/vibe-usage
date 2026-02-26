@@ -72,6 +72,8 @@ export async function parse(lastSync) {
       } catch { break; }
     }
 
+    // Track model from turn_context events (fallback when token_count lacks model)
+    let turnContextModel = 'unknown';
     // Track previous cumulative totals per model to compute deltas when only total_token_usage is available
     const prevTotal = new Map();
     for (const line of content.split('\n')) {
@@ -83,7 +85,15 @@ export async function parse(lastSync) {
         if (obj.type !== 'event_msg') continue;
 
         const payload = obj.payload;
-        if (!payload || payload.type !== 'token_count') continue;
+        if (!payload) continue;
+
+        // Capture model from turn_context events
+        if (payload.type === 'turn_context' && payload.model) {
+          turnContextModel = payload.model;
+          continue;
+        }
+
+        if (payload.type !== 'token_count') continue;
 
         const info = payload.info;
         if (!info) continue;
@@ -113,7 +123,7 @@ export async function parse(lastSync) {
         }
         if (!usage) continue;
 
-        const model = info.model || payload.model || sessionModel;
+        const model = info.model || payload.model || turnContextModel || sessionModel;
 
         entries.push({
           source: 'codex',

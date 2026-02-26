@@ -85,18 +85,23 @@ export function injectCodex() {
     mkdirSync(dirname(configPath), { recursive: true });
   }
 
-  const notifyLine = `notify = ["sh", "-c", "${SYNC_CMD}"]`;
+  const notifyLine = `notify = "sh -c \\"${SYNC_CMD}\\""`;
 
   if (content.includes('vibe-usage')) {
-    // Migrate broken [[notify]] / [notify] table format from previous versions
-    // to correct inline array format: notify = ["sh", "-c", "..."]
+    // Migrate broken [[notify]] / [notify] table format and array format from previous versions
+    // to correct string format: notify = "sh -c \"...\""
     content = content.replace(
       /^\[\[?notify\]\]?\n(?:command\s*=\s*["'][^"']*["']\n?)?/gm,
       notifyLine + '\n',
     );
-    // Also update existing inline notify = [...] to use latest command
+    // Migrate array format: notify = ["sh", "-c", "..."]
     content = content.replace(
       /^notify\s*=\s*\[.*vibe-usage.*\]$/gm,
+      notifyLine,
+    );
+    // Update existing string format notify = "..." to use latest command
+    content = content.replace(
+      /^notify\s*=\s*".*vibe-usage.*"$/gm,
       notifyLine,
     );
     writeFileSync(configPath, content, 'utf-8');
@@ -106,8 +111,8 @@ export function injectCodex() {
   // Check if any notify line already exists
   const hasNotify = /^notify\s*=/m.test(content);
   if (hasNotify) {
-    // Append our command to existing notify (replace it)
-    content = content.replace(/^notify\s*=\s*\[.*\]$/gm, notifyLine);
+    // Replace existing notify value
+    content = content.replace(/^notify\s*=\s*.+$/gm, notifyLine);
   } else {
     content += `\n${notifyLine}\n`;
   }
