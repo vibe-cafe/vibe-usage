@@ -12,13 +12,14 @@ const INITIAL_DELAY = 1000;
  * @param {string} apiUrl - Base URL (e.g. "https://vibecafe.ai")
  * @param {string} apiKey - Bearer token (vbu_xxx)
  * @param {Array} buckets - Array of usage bucket objects
+ * @param {{onProgress?: (sent: number, total: number) => void}} [opts]
  * @returns {Promise<{ingested: number}>}
  */
-export async function ingest(apiUrl, apiKey, buckets) {
+export async function ingest(apiUrl, apiKey, buckets, opts) {
   let lastError;
   for (let attempt = 0; attempt < MAX_RETRIES; attempt++) {
     try {
-      return await _send(apiUrl, apiKey, buckets);
+      return await _send(apiUrl, apiKey, buckets, opts?.onProgress);
     } catch (err) {
       lastError = err;
       // Don't retry auth errors or client errors
@@ -34,10 +35,11 @@ export async function ingest(apiUrl, apiKey, buckets) {
   throw lastError;
 }
 
-function _send(apiUrl, apiKey, buckets) {
+function _send(apiUrl, apiKey, buckets, onProgress) {
   return new Promise((resolve, reject) => {
     const url = new URL('/api/usage/ingest', apiUrl);
-    const body = JSON.stringify({ buckets });
+    const body = Buffer.from(JSON.stringify({ buckets }));
+    const totalBytes = body.length;
     const mod = url.protocol === 'https:' ? https : http;
 
     const req = mod.request(url, {
@@ -46,7 +48,7 @@ function _send(apiUrl, apiKey, buckets) {
       headers: {
         'Content-Type': 'application/json',
         'Authorization': `Bearer ${apiKey}`,
-        'Content-Length': Buffer.byteLength(body),
+        'Content-Length': totalBytes,
       },
     }, (res) => {
       let data = '';
@@ -75,7 +77,26 @@ function _send(apiUrl, apiKey, buckets) {
       req.destroy();
       reject(new Error('Request timed out (60s)'));
     });
-    req.write(body);
-    req.end();
+
+    // Write body in chunks to report upload progress
+    const CHUNK = 16 * 1024;
+    let sent = 0;
+
+    function writeNext() {
+      let ok = true;
+      while (ok && sent < totalBytes) {
+        const slice = body.subarray(sent, sent + CHUNK);
+        sent += slice.length;
+        if (onProgress) onProgress(sent, totalBytes);
+        ok = req.write(slice);
+      }
+      if (sent < totalBytes) {
+        req.once('drain', writeNext);
+      } else {
+        req.end();
+      }
+    }
+
+    writeNext();
   });
 }

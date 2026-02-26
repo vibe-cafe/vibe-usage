@@ -9,6 +9,12 @@ import { TOOLS } from './hooks.js';
 
 const BATCH_SIZE = 500;
 
+function formatBytes(bytes) {
+  if (bytes < 1024) return `${bytes}B`;
+  if (bytes < 1024 * 1024) return `${(bytes / 1024).toFixed(1)}KB`;
+  return `${(bytes / (1024 * 1024)).toFixed(1)}MB`;
+}
+
 export async function runSync() {
   // Self-heal: re-inject any missing hooks before syncing
   ensureHooks();
@@ -54,13 +60,14 @@ export async function runSync() {
     for (let i = 0; i < allBuckets.length; i += BATCH_SIZE) {
       const batch = allBuckets.slice(i, i + BATCH_SIZE);
       const batchNum = Math.floor(i / BATCH_SIZE) + 1;
-      const uploaded = Math.min(i + BATCH_SIZE, allBuckets.length);
+      const prefix = totalBatches > 1 ? `  [${batchNum}/${totalBatches}] ` : '  ';
 
-      if (totalBatches > 1) {
-        process.stdout.write(`  [${batchNum}/${totalBatches}] ${uploaded}/${allBuckets.length} buckets...\r`);
-      }
-
-      const result = await ingest(apiUrl, config.apiKey, batch);
+      const result = await ingest(apiUrl, config.apiKey, batch, {
+        onProgress(sent, total) {
+          const pct = Math.round((sent / total) * 100);
+          process.stdout.write(`${prefix}${formatBytes(sent)}/${formatBytes(total)} (${pct}%)\r`);
+        },
+      });
       totalIngested += result.ingested ?? batch.length;
 
       // Save progress after each successful batch so partial uploads survive interruptions
@@ -68,7 +75,7 @@ export async function runSync() {
       saveConfig(config);
     }
 
-    if (totalBatches > 1) {
+    if (totalBatches > 1 || allBuckets.length > 0) {
       process.stdout.write('\n');
     }
     console.log(`Synced ${totalIngested} buckets.`);
