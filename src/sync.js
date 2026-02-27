@@ -7,7 +7,7 @@ import { ingest } from './api.js';
 import { parsers } from './parsers/index.js';
 import { TOOLS } from './hooks.js';
 
-const BATCH_SIZE = 500;
+const BATCH_SIZE = 100;
 
 function formatBytes(bytes) {
   if (bytes < 1024) return `${bytes}B`;
