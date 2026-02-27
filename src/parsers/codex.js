@@ -81,17 +81,16 @@ export async function parse(lastSync) {
       try {
         const obj = JSON.parse(line);
 
+        // Capture model from top-level turn_context entries
+        if (obj.type === 'turn_context' && obj.payload?.model) {
+          turnContextModel = obj.payload.model;
+          continue;
+        }
 
         if (obj.type !== 'event_msg') continue;
 
         const payload = obj.payload;
         if (!payload) continue;
-
-        // Capture model from turn_context events
-        if (payload.type === 'turn_context' && payload.model) {
-          turnContextModel = payload.model;
-          continue;
-        }
 
         if (payload.type !== 'token_count') continue;
 
@@ -105,7 +104,7 @@ export async function parse(lastSync) {
         // Prefer incremental per-request usage; compute delta from cumulative total as fallback
         let usage = info.last_token_usage;
         if (!usage && info.total_token_usage) {
-          const totalKey = `${info.model || payload.model || ''}`;
+          const totalKey = `${info.model || payload.model || turnContextModel || ''}`;
           const prev = prevTotal.get(totalKey);
           const curr = info.total_token_usage;
           if (prev) {
