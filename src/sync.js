@@ -18,12 +18,17 @@ export async function runSync() {
     process.exit(1);
   }
 
-  const lastSync = config.lastSync || null;
+  // Migration: remove deprecated lastSync field from config
+  if ('lastSync' in config) {
+    delete config.lastSync;
+    saveConfig(config);
+  }
+
   const allBuckets = [];
 
   for (const [source, parse] of Object.entries(parsers)) {
     try {
-      const buckets = await parse(lastSync);
+      const buckets = await parse();
       if (buckets.length > 0) {
         allBuckets.push(...buckets);
       }
@@ -63,9 +68,7 @@ export async function runSync() {
       });
       totalIngested += result.ingested ?? batch.length;
 
-      // Save progress after each successful batch so partial uploads survive interruptions
-      config.lastSync = new Date().toISOString();
-      saveConfig(config);
+      // State commit happens after ALL batches complete (see postSyncHooks below)
     }
 
 
@@ -86,7 +89,7 @@ export async function runSync() {
       console.error('Invalid API key. Run `npx @vibe-cafe/vibe-usage init` to reconfigure.');
       process.exit(1);
     }
-    // Progress already saved per-batch — report partial success
+    // Report partial success
     if (totalIngested > 0) {
       console.error(`Sync partially completed (${totalIngested} buckets uploaded). ${err.message}`);
     } else {

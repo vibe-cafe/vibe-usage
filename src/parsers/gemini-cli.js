@@ -30,21 +30,13 @@ function findSessionFiles(baseDir) {
   return results;
 }
 
-export async function parse(lastSync) {
+export async function parse() {
   const sessionFiles = findSessionFiles(TMP_DIR);
   if (sessionFiles.length === 0) return [];
 
   const entries = [];
 
   for (const filePath of sessionFiles) {
-    if (lastSync) {
-      try {
-        const stat = statSync(filePath);
-        if (stat.mtime <= new Date(lastSync)) continue;
-      } catch {
-        continue;
-      }
-    }
 
     let data;
     try {
@@ -65,7 +57,6 @@ export async function parse(lastSync) {
       if (!timestamp) continue;
       const ts = new Date(timestamp);
       if (isNaN(ts.getTime())) continue;
-      if (lastSync && ts <= new Date(lastSync)) continue;
 
       if (tokens) {
         // New format: { input, output, cached, thoughts, tool, total }

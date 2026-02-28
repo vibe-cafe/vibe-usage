@@ -35,7 +35,7 @@ export function commitState() {
   }
 }
 
-export async function parse(lastSync) {
+export async function parse() {
   let sessions;
   try {
     sessions = await loadSessionData({ mode: 'display' });
@@ -50,7 +50,6 @@ export async function parse(lastSync) {
   const entries = [];
 
   for (const session of sessions) {
-    if (lastSync && new Date(session.lastActivity) <= new Date(lastSync)) continue;
 
     const project = resolveProject(session);
     const sessionKey = `${session.projectPath}\0${session.sessionId}`;

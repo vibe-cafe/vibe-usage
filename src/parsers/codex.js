@@ -27,21 +27,13 @@ function findJsonlFiles(dir) {
   return results;
 }
 
-export async function parse(lastSync) {
+export async function parse() {
   if (!existsSync(SESSIONS_DIR)) return [];
 
   const entries = [];
   const files = findJsonlFiles(SESSIONS_DIR);
   if (files.length === 0) return [];
   for (const filePath of files) {
-    if (lastSync) {
-      try {
-        const stat = statSync(filePath);
-        if (stat.mtime <= new Date(lastSync)) continue;
-      } catch {
-        continue;
-      }
-    }
 
     let content;
     try {
@@ -99,7 +91,6 @@ export async function parse(lastSync) {
 
         const timestamp = obj.timestamp ? new Date(obj.timestamp) : null;
         if (!timestamp || isNaN(timestamp.getTime())) continue;
-        if (lastSync && timestamp <= new Date(lastSync)) continue;
 
         // Prefer incremental per-request usage; compute delta from cumulative total as fallback
         let usage = info.last_token_usage;

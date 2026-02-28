@@ -20,7 +20,7 @@ function getTokens(usage, ...keys) {
   return 0;
 }
 
-export async function parse(lastSync) {
+export async function parse() {
   const entries = [];
 
   for (const root of POSSIBLE_ROOTS) {
@@ -49,14 +49,6 @@ export async function parse(lastSync) {
 
       for (const file of files) {
         const filePath = join(sessionsDir, file);
-        if (lastSync) {
-          try {
-            const stat = statSync(filePath);
-            if (stat.mtime <= new Date(lastSync)) continue;
-          } catch {
-            continue;
-          }
-        }
 
         let content;
         try {
@@ -82,7 +74,6 @@ export async function parse(lastSync) {
             if (!timestamp) continue;
             const ts = new Date(typeof timestamp === 'number' ? timestamp : timestamp);
             if (isNaN(ts.getTime())) continue;
-            if (lastSync && ts <= new Date(lastSync)) continue;
 
             entries.push({
               source: 'openclaw',

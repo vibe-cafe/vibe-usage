@@ -12,26 +12,22 @@ const MESSAGES_DIR = join(DATA_DIR, 'storage', 'message');
  * Parse opencode usage data.
  * Tries SQLite database first (opencode >= v0.2), falls back to legacy JSON files.
  */
-export async function parse(lastSync) {
+export async function parse() {
   if (existsSync(DB_PATH)) {
     try {
-      return parseFromSqlite(lastSync);
+      return parseFromSqlite();
     } catch (err) {
       process.stderr.write(`warn: opencode sqlite parse failed (${err.message}), trying legacy json...\n`);
     }
   }
-  return parseFromJson(lastSync);
+  return parseFromJson();
 }
 
-function parseFromSqlite(lastSync) {
+function parseFromSqlite() {
   // Build WHERE clause: only messages with token data
   const conditions = [
     "(json_extract(data, '$.tokens.input') > 0 OR json_extract(data, '$.tokens.output') > 0)",
   ];
-  if (lastSync) {
-    const sinceMs = new Date(lastSync).getTime();
-    conditions.push(`time_created > ${sinceMs}`);
-  }
 
   const query = `SELECT data FROM message WHERE ${conditions.join(' AND ')}`;
 
@@ -76,7 +72,6 @@ function parseFromSqlite(lastSync) {
 
     const timestamp = new Date(data.time?.created);
     if (isNaN(timestamp.getTime())) continue;
-    if (lastSync && timestamp <= new Date(lastSync)) continue;
 
     const rootPath = data.path?.root;
     const project = rootPath ? basename(rootPath) : 'unknown';
@@ -97,7 +92,7 @@ function parseFromSqlite(lastSync) {
 }
 
 /** Legacy parser: reads JSON files from storage/message directories. */
-function parseFromJson(lastSync) {
+function parseFromJson() {
   if (!existsSync(MESSAGES_DIR)) return [];
 
   const entries = [];
@@ -120,14 +115,6 @@ function parseFromJson(lastSync) {
 
     for (const file of msgFiles) {
       const filePath = join(sessionPath, file);
-      if (lastSync) {
-        try {
-          const stat = statSync(filePath);
-          if (stat.mtime <= new Date(lastSync)) continue;
-        } catch {
-          continue;
-        }
-      }
 
       let data;
       try {
@@ -144,7 +131,6 @@ function parseFromJson(lastSync) {
 
       const timestamp = new Date(data.time?.created);
       if (isNaN(timestamp.getTime())) continue;
-      if (lastSync && timestamp <= new Date(lastSync)) continue;
 
       const rootPath = data.path?.root;
       const project = rootPath ? basename(rootPath) : 'unknown';

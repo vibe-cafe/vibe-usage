@@ -13,7 +13,6 @@ async function showStatus() {
     console.log(`  Config: ${getConfigPath()}`);
     console.log(`  API key: ${config.apiKey.slice(0, 8)}...`);
     console.log(`  API URL: ${config.apiUrl || 'https://vibecafe.ai'}`);
-    console.log(`  Last sync: ${config.lastSync || 'never'}`);
   }
 
   console.log('\n  Detected tools:');
@@ -35,7 +34,7 @@ async function showStatus() {
   console.log();
 }
 
-const VALID_CONFIG_KEYS = ['apiKey', 'apiUrl', 'lastSync'];
+const VALID_CONFIG_KEYS = ['apiKey', 'apiUrl'];
 
 function handleConfig(args) {
   const sub = args[0];
