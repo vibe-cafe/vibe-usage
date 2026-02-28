@@ -100,3 +100,52 @@ function _send(apiUrl, apiKey, buckets, onProgress) {
     writeNext();
   });
 }
+
+/**
+ * DELETE all usage data for the authenticated user.
+ * @param {string} apiUrl - Base URL (e.g. "https://vibecafe.ai")
+ * @param {string} apiKey - Bearer token (vbu_xxx)
+ * @returns {Promise<{deleted: number}>}
+ */
+export function deleteAllData(apiUrl, apiKey) {
+  return new Promise((resolve, reject) => {
+    const url = new URL('/api/usage/ingest', apiUrl);
+    const mod = url.protocol === 'https:' ? https : http;
+
+    const req = mod.request(url, {
+      method: 'DELETE',
+      timeout: 60_000,
+      headers: {
+        'Authorization': `Bearer ${apiKey}`,
+      },
+    }, (res) => {
+      let data = '';
+      res.on('data', (chunk) => { data += chunk; });
+      res.on('end', () => {
+        if (res.statusCode === 401) {
+          reject(new Error('UNAUTHORIZED'));
+          return;
+        }
+        if (res.statusCode < 200 || res.statusCode >= 300) {
+          const err = new Error(`HTTP ${res.statusCode}: ${data}`);
+          err.statusCode = res.statusCode;
+          reject(err);
+          return;
+        }
+        try {
+          resolve(JSON.parse(data));
+        } catch {
+          reject(new Error(`Invalid JSON response: ${data}`));
+        }
+      });
+    });
+
+    req.on('error', (err) => reject(err));
+    req.on('timeout', () => {
+      req.destroy();
+      reject(new Error('Request timed out (60s)'));
+    });
+
+    req.end();
+  });
+}

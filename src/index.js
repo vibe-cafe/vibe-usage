@@ -22,8 +22,7 @@ async function showStatus() {
     console.log('    (none)\n');
   } else {
     for (const tool of detected) {
-      const hookStatus = tool.inject ? 'auto-sync' : 'manual only';
-      console.log(`    ${tool.name} (${hookStatus})`);
+      console.log(`    ${tool.name}`);
     }
     console.log();
   }
@@ -104,6 +103,11 @@ export async function run(args) {
       await runSync();
       break;
     }
+    case 'reset': {
+      const { runReset } = await import('./reset.js');
+      await runReset();
+      break;
+    }
     case 'config': {
       handleConfig(args.slice(1));
       break;
@@ -120,8 +124,9 @@ export async function run(args) {
 
   Usage:
     npx vibe-usage              Init (first run) or sync
-    npx vibe-usage init         Set up API key and hooks
+    npx vibe-usage init         Set up API key
     npx vibe-usage sync         Manually sync usage data
+    npx vibe-usage reset        Delete all data and re-upload
     npx vibe-usage status       Show config and detected tools
     npx vibe-usage config show  Show full config as JSON
     npx vibe-usage config get <key>   Get a config value

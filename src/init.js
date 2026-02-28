@@ -1,11 +1,10 @@
 import { createInterface } from 'node:readline';
 import { execFile } from 'node:child_process';
 import { platform } from 'node:os';
-import { existsSync } from 'node:fs';
 import { loadConfig, saveConfig } from './config.js';
-import { detectInstalledTools } from './hooks.js';
 import { ingest } from './api.js';
 import { runSync } from './sync.js';
+import { detectInstalledTools } from './hooks.js';
 
 function prompt(question) {
   const rl = createInterface({ input: process.stdin, output: process.stdout });
@@ -67,29 +66,9 @@ export async function runInit() {
   saveConfig(config);
 
   const tools = detectInstalledTools();
-  const hooked = [];
-  const manualOnly = [];
-
-  for (const tool of tools) {
-    if (tool.inject) {
-      try {
-        const result = tool.inject();
-        hooked.push(tool.name + (result.injected ? '' : ' (already installed)'));
-      } catch (err) {
-        console.error(`  warn: Failed to inject hook for ${tool.name}: ${err.message}`);
-      }
-    } else {
-      manualOnly.push(tool.name);
-    }
-  }
-
-  if (hooked.length > 0) {
-    console.log(`Hooks installed for: ${hooked.join(', ')}`);
-  }
-  for (const name of manualOnly) {
-    console.log(`${name} detected — use \`npx @vibe-cafe/vibe-usage sync\` to sync manually.`);
-  }
-  if (tools.length === 0) {
+  if (tools.length > 0) {
+    console.log(`Detected tools: ${tools.map(t => t.name).join(', ')}`);
+  } else {
     console.log('No AI coding tools detected. Install one and re-run init.');
   }
 

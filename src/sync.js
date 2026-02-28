@@ -1,11 +1,7 @@
 import { hostname as osHostname } from 'node:os';
-import { existsSync, readFileSync, unlinkSync } from 'node:fs';
-import { join } from 'node:path';
-import { homedir } from 'node:os';
 import { loadConfig, saveConfig } from './config.js';
 import { ingest } from './api.js';
 import { parsers, postSyncHooks } from './parsers/index.js';
-import { TOOLS } from './hooks.js';
 
 const BATCH_SIZE = 100;
 
@@ -16,9 +12,6 @@ function formatBytes(bytes) {
 }
 
 export async function runSync() {
-  // Self-heal: re-inject any missing hooks before syncing
-  ensureHooks();
-
   const config = loadConfig();
   if (!config?.apiKey) {
     console.error('Not configured. Run `npx @vibe-cafe/vibe-usage init` first.');
@@ -65,7 +58,7 @@ export async function runSync() {
       const result = await ingest(apiUrl, config.apiKey, batch, {
         onProgress(sent, total) {
           const pct = Math.round((sent / total) * 100);
-          process.stdout.write(`${prefix}${formatBytes(sent)}/${formatBytes(total)} (${pct}%)\r`);
+          process.stdout.write(`\r${prefix}${formatBytes(sent)}/${formatBytes(total)} (${pct}%)\x1b[K`);
         },
       });
       totalIngested += result.ingested ?? batch.length;
@@ -100,41 +93,5 @@ export async function runSync() {
       console.error(`Sync failed: ${err.message}`);
     }
     process.exit(1);
-  }
-}
-
-/**
- * Re-inject hooks for any installed tool whose hook is missing.
- * Runs silently — meant as a self-healing side effect of sync.
- */
-function ensureHooks() {
-  // Skip hook injection if Vibe Usage Mac app is running
-  const markerPath = join(homedir(), '.vibe-usage', 'mac-app-active');
-  if (existsSync(markerPath)) {
-    try {
-      const marker = JSON.parse(readFileSync(markerPath, 'utf-8'));
-      if (marker.pid) {
-        try {
-          process.kill(marker.pid, 0);
-          return;
-        } catch {
-          try { unlinkSync(markerPath); } catch { /* ignore */ }
-        }
-      }
-    } catch {
-      // Malformed marker file — ignore
-    }
-  }
-
-  for (const tool of TOOLS) {
-    if (!tool.inject) continue;
-    try {
-      const result = tool.inject();
-      if (result.injected) {
-        process.stderr.write(`hook: re-installed ${tool.name} hook\n`);
-      }
-    } catch {
-      // ignore — best effort
-    }
   }
 }
