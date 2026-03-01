@@ -21,7 +21,7 @@ function prompt(question) {
 }
 
 export async function runReset(args = []) {
-  const hostOnly = args.includes('--host');
+  const hostOnly = args.includes('--local');
   const config = loadConfig();
   if (!config?.apiKey) {
     console.error('Not configured. Run `npx @vibe-cafe/vibe-usage init` first.');
