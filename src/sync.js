@@ -1,7 +1,7 @@
 import { hostname as osHostname } from 'node:os';
 import { loadConfig, saveConfig } from './config.js';
 import { ingest, fetchSettings } from './api.js';
-import { parsers, postSyncHooks } from './parsers/index.js';
+import { parsers } from './parsers/index.js';
 
 const BATCH_SIZE = 100;
 
@@ -81,16 +81,6 @@ export async function runSync({ throws = false, quiet = false } = {}) {
         },
       });
       totalIngested += result.ingested ?? batch.length;
-
-      // State commit happens after ALL batches complete (see postSyncHooks below)
-    }
-
-
-    // Commit parser state now that all data has been uploaded successfully.
-    // State is staged during parse() but only persisted here to prevent
-    // data loss if uploads fail (deltas would be re-computed on retry).
-    for (const hook of postSyncHooks) {
-      try { hook(); } catch { /* best effort */ }
     }
 
     if (totalBatches > 1 || allBuckets.length > 0) {

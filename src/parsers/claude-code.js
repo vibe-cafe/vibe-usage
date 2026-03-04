@@ -1,123 +1,121 @@
-import { loadSessionData } from 'ccusage/data-loader';
-import { aggregateToBuckets } from './index.js';
+import { readdirSync, readFileSync, existsSync } from 'node:fs';
+import { join, basename, sep } from 'node:path';
 import { homedir } from 'node:os';
-import { join } from 'node:path';
-import { readFileSync, writeFileSync, mkdirSync, existsSync } from 'node:fs';
+import { aggregateToBuckets } from './index.js';
 
-const STATE_FILE = join(homedir(), '.vibe-usage', 'claude-code-state.json');
+/**
+ * Stateless Claude Code parser.
+ * Reads ALL *.jsonl files under ~/.claude/projects/ and extracts per-message
+ * token usage from assistant messages. No state file needed — every sync
+ * computes the full bucket totals from raw data, making server-side
+ * ON CONFLICT ... DO UPDATE SET idempotent.
+ */
 
-/** Pending state staged during parse(), committed only after successful upload. */
-let _pendingState = null;
+const CLAUDE_DIR = join(homedir(), '.claude', 'projects');
 
-function loadState() {
+/**
+ * Recursively find all .jsonl files under a directory.
+ * Claude Code stores sessions in two layouts:
+ *   2-layer: projects/{projectPath}/{sessionId}.jsonl
+ *   3-layer: projects/{projectPath}/{sessionId}/subagents/agent-*.jsonl
+ */
+function findJsonlFiles(dir) {
+  const results = [];
+  if (!existsSync(dir)) return results;
   try {
-    return JSON.parse(readFileSync(STATE_FILE, 'utf-8'));
+    for (const entry of readdirSync(dir, { withFileTypes: true })) {
+      const fullPath = join(dir, entry.name);
+      if (entry.isDirectory()) {
+        results.push(...findJsonlFiles(fullPath));
+      } else if (entry.name.endsWith('.jsonl')) {
+        results.push(fullPath);
+      }
+    }
   } catch {
-    return {};
+    // ignore unreadable directories
   }
-}
-
-function saveState(state) {
-  const dir = join(homedir(), '.vibe-usage');
-  if (!existsSync(dir)) mkdirSync(dir, { recursive: true });
-  writeFileSync(STATE_FILE, JSON.stringify(state), 'utf-8');
+  return results;
 }
 
 /**
- * Commit pending state to disk.
- * Called by sync.js AFTER successful upload to ensure we only advance
- * the watermark when data has been safely delivered to the server.
+ * Extract project name from file path.
+ * Path format: ~/.claude/projects/{encodedProjectPath}/{sessionId}.jsonl
+ * The encodedProjectPath uses dashes for separators (e.g. -Users-foo-myproject).
+ * We extract the last path segment as the project name.
  */
-export function commitState() {
-  if (_pendingState) {
-    saveState(_pendingState);
-    _pendingState = null;
-  }
+function extractProject(filePath) {
+  // Get relative path from the projects dir
+  const projectsPrefix = CLAUDE_DIR + sep;
+  if (!filePath.startsWith(projectsPrefix)) return 'unknown';
+  const relative = filePath.slice(projectsPrefix.length);
+  // First segment is the encoded project path
+  const firstSeg = relative.split(sep)[0];
+  if (!firstSeg) return 'unknown';
+  // The encoded path uses dashes: -Users-kalasoo-Projects-myproject
+  // Take the last segment after splitting by dash
+  const parts = firstSeg.split('-').filter(Boolean);
+  return parts.length > 0 ? parts[parts.length - 1] : 'unknown';
 }
 
 export async function parse() {
-  let sessions;
-  try {
-    sessions = await loadSessionData({ mode: 'display' });
-  } catch {
-    return [];
-  }
+  if (!existsSync(CLAUDE_DIR)) return [];
 
-  if (!sessions || sessions.length === 0) return [];
+  const files = findJsonlFiles(CLAUDE_DIR);
+  if (files.length === 0) return [];
 
-  const state = loadState();
-  const nextState = { ...state };
   const entries = [];
+  const seenUuids = new Set();
 
-  for (const session of sessions) {
+  for (const filePath of files) {
+    let content;
+    try {
+      content = readFileSync(filePath, 'utf-8');
+    } catch {
+      continue;
+    }
 
-    const project = resolveProject(session);
-    const sessionKey = `${session.projectPath}\0${session.sessionId}`;
-    const prev = state[sessionKey] || {};
+    const project = extractProject(filePath);
 
-    for (const breakdown of session.modelBreakdowns || []) {
-      const model = breakdown.modelName;
-      const prevModel = prev[model] || { i: 0, o: 0, c: 0 };
+    for (const line of content.split('\n')) {
+      if (!line.trim()) continue;
+      try {
+        const obj = JSON.parse(line);
 
-      const deltaInput = (breakdown.inputTokens || 0) - (prevModel.i || 0);
-      const deltaOutput = (breakdown.outputTokens || 0) - (prevModel.o || 0);
-      const deltaCached = (breakdown.cacheReadTokens || 0) - (prevModel.c || 0);
+        // Only process assistant messages with usage data
+        if (obj.type !== 'assistant') continue;
+        const msg = obj.message;
+        if (!msg || !msg.usage) continue;
 
-      // Always record current cumulative totals for next sync
-      if (!nextState[sessionKey]) nextState[sessionKey] = {};
-      nextState[sessionKey][model] = {
-        i: breakdown.inputTokens || 0,
-        o: breakdown.outputTokens || 0,
-        c: breakdown.cacheReadTokens || 0,
-      };
+        const usage = msg.usage;
+        if (usage.input_tokens == null && usage.output_tokens == null) continue;
 
-      // Only emit entries with positive deltas
-      if (deltaInput <= 0 && deltaOutput <= 0 && deltaCached <= 0) continue;
+        // Deduplicate by UUID across all files
+        const uuid = obj.uuid;
+        if (uuid) {
+          if (seenUuids.has(uuid)) continue;
+          seenUuids.add(uuid);
+        }
 
-      entries.push({
-        source: 'claude-code',
-        model,
-        project,
-        timestamp: new Date(session.lastActivity),
-        inputTokens: Math.max(0, deltaInput),
-        outputTokens: Math.max(0, deltaOutput),
-        cachedInputTokens: Math.max(0, deltaCached),
-        reasoningOutputTokens: 0,
-      });
+        const timestamp = obj.timestamp;
+        if (!timestamp) continue;
+        const ts = new Date(timestamp);
+        if (isNaN(ts.getTime())) continue;
+
+        entries.push({
+          source: 'claude-code',
+          model: msg.model || 'unknown',
+          project,
+          timestamp: ts,
+          inputTokens: usage.input_tokens || 0,
+          outputTokens: usage.output_tokens || 0,
+          cachedInputTokens: usage.cache_read_input_tokens || 0,
+          reasoningOutputTokens: 0,
+        });
+      } catch {
+        continue;
+      }
     }
   }
 
-  // Stage state — only persisted to disk after successful upload
-  _pendingState = nextState;
-
   return aggregateToBuckets(entries);
-}
-
-/**
- * Resolve project name from ccusage session data.
- *
- * ccusage v18 assumes 3-layer: projects/{projectPath}/{sessionId}/{file}.jsonl
- * but Claude Code main sessions are 2-layer: projects/{projectPath}/{sessionId}.jsonl
- *
- * For 2-layer files ccusage incorrectly puts the project dir name into sessionId
- * and sets projectPath to "Unknown Project". We detect and correct this.
- */
-function resolveProject(session) {
-  if (session.projectPath === 'Unknown Project') {
-    // 2-layer: sessionId actually holds the project directory name
-    return cleanProjectDir(session.sessionId);
-  }
-  // 3-layer: projectPath is correct, strip any session UUID suffix
-  return cleanProjectDir(session.projectPath);
-}
-
-/**
- * Clean a raw project directory name from ccusage.
- * Strips session UUID suffix for subagent paths like '-Users-foo-project/77e854f9-...'.
- */
-function cleanProjectDir(raw) {
-  if (!raw || raw === 'unknown' || raw === 'Unknown Project') return 'unknown';
-  const slashIdx = raw.indexOf('/');
-  if (slashIdx !== -1) raw = raw.slice(0, slashIdx);
-  return raw;
 }

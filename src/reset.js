@@ -1,14 +1,11 @@
 import { createInterface } from 'node:readline';
-import { existsSync, unlinkSync } from 'node:fs';
+import { existsSync } from 'node:fs';
 import { join } from 'node:path';
 import { homedir, hostname as getHostname } from 'node:os';
 import { loadConfig, saveConfig } from './config.js';
 import { deleteAllData } from './api.js';
 import { runSync } from './sync.js';
 
-const STATE_FILES = [
-  join(homedir(), '.vibe-usage', 'claude-code-state.json'),
-];
 
 function prompt(question) {
   const rl = createInterface({ input: process.stdin, output: process.stdout });
@@ -73,15 +70,9 @@ export async function runReset(args = []) {
     }
   }
 
-  // 2. Clear local state
+  // 2. Clear local state (legacy — no state files needed for current parsers)
   config.lastSync = null;
   saveConfig(config);
-
-  for (const stateFile of STATE_FILES) {
-    if (existsSync(stateFile)) {
-      unlinkSync(stateFile);
-    }
-  }
   console.log('Cleared local sync state.');
 
   // 3. Re-upload everything

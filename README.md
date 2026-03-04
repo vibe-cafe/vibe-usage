@@ -40,12 +40,12 @@ npx vibe-usage status       # Show config & detected tools
 - Parses local session logs from each AI coding tool
 - Aggregates token usage into 30-minute buckets
 - Uploads to your vibecafe.ai dashboard
-- Only syncs new data since last sync (incremental)
+- Stateless: computes full totals from local logs each sync (idempotent, no state files)
 - For continuous syncing, use `npx vibe-usage daemon` or the [Vibe Usage Mac app](https://github.com/vibe-cafe/vibe-usage-app)
 
 ## Config
 
-Config stored at `~/.vibe-usage/config.json`. Contains your API key and last sync timestamp.
+Config stored at `~/.vibe-usage/config.json`. Contains your API key and server URL.
 
 ## Daemon Mode
 
