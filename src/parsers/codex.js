@@ -115,15 +115,19 @@ export async function parse() {
 
         const model = info.model || payload.model || turnContextModel || sessionModel;
 
+        // OpenAI API: input_tokens INCLUDES cached, output_tokens INCLUDES reasoning.
+        // Normalize to Anthropic-style semantics where each field is non-overlapping.
+        const cachedInput = usage.cached_input_tokens || usage.cache_read_input_tokens || 0;
+        const reasoningOutput = usage.reasoning_output_tokens || 0;
         entries.push({
           source: 'codex',
           model,
           project: sessionProject,
           timestamp,
-          inputTokens: usage.input_tokens || 0,
-          outputTokens: usage.output_tokens || 0,
-          cachedInputTokens: usage.cached_input_tokens || usage.cache_read_input_tokens || 0,
-          reasoningOutputTokens: usage.reasoning_output_tokens || 0,
+          inputTokens: (usage.input_tokens || 0) - cachedInput,
+          outputTokens: (usage.output_tokens || 0) - reasoningOutput,
+          cachedInputTokens: cachedInput,
+          reasoningOutputTokens: reasoningOutput,
         });
       } catch {
         continue;

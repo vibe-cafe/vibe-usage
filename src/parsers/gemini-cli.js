@@ -59,28 +59,32 @@ export async function parse() {
       if (isNaN(ts.getTime())) continue;
 
       if (tokens) {
-        // New format: { input, output, cached, thoughts, tool, total }
+        // Gemini API: input INCLUDES cached, output INCLUDES thoughts. Normalize to non-overlapping.
+        const cached = tokens.cached || 0;
+        const thoughts = tokens.thoughts || 0;
         entries.push({
           source: 'gemini-cli',
           model: msg.model || data.model || 'unknown',
           project: 'unknown',
           timestamp: ts,
-          inputTokens: tokens.input || 0,
-          outputTokens: tokens.output || 0,
-          cachedInputTokens: tokens.cached || 0,
-          reasoningOutputTokens: tokens.thoughts || 0,
+          inputTokens: (tokens.input || 0) - cached,
+          outputTokens: (tokens.output || 0) - thoughts,
+          cachedInputTokens: cached,
+          reasoningOutputTokens: thoughts,
         });
       } else {
-        // Old format: { promptTokenCount, candidatesTokenCount, ... }
+        // Gemini API: promptTokenCount INCLUDES cachedContentTokenCount. Normalize to non-overlapping.
+        const cached = usage.cachedContentTokenCount || 0;
+        const thoughts = usage.thoughtsTokenCount || 0;
         entries.push({
           source: 'gemini-cli',
           model: msg.model || data.model || 'unknown',
           project: 'unknown',
           timestamp: ts,
-          inputTokens: usage.promptTokenCount || usage.input_tokens || 0,
-          outputTokens: usage.candidatesTokenCount || usage.output_tokens || 0,
-          cachedInputTokens: usage.cachedContentTokenCount || 0,
-          reasoningOutputTokens: usage.thoughtsTokenCount || 0,
+          inputTokens: (usage.promptTokenCount || usage.input_tokens || 0) - cached,
+          outputTokens: (usage.candidatesTokenCount || usage.output_tokens || 0) - thoughts,
+          cachedInputTokens: cached,
+          reasoningOutputTokens: thoughts,
         });
       }
     }
