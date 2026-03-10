@@ -1,5 +1,5 @@
 import { loadConfig, saveConfig, getConfigPath } from './config.js';
-import { detectInstalledTools, TOOLS } from './hooks.js';
+import { detectInstalledTools, TOOLS } from './tools.js';
 import { existsSync } from 'node:fs';
 
 async function showStatus() {

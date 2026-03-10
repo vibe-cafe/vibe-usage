@@ -28,6 +28,16 @@ export const TOOLS = [
     id: 'openclaw',
     dataDir: join(homedir(), '.openclaw', 'agents'),
   },
+  {
+    name: 'Qwen Code',
+    id: 'qwen-code',
+    dataDir: join(homedir(), '.qwen', 'tmp'),
+  },
+  {
+    name: 'Kimi Code',
+    id: 'kimi-code',
+    dataDir: join(homedir(), '.kimi', 'sessions'),
+  },
 ];
 
 export function detectInstalledTools() {

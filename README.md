@@ -34,6 +34,8 @@ npx vibe-usage status       # Show config & detected tools
 | Gemini CLI | `~/.gemini/tmp/` |
 | OpenCode | `~/.local/share/opencode/opencode.db` (SQLite) |
 | OpenClaw | `~/.openclaw/agents/` |
+| Qwen Code | `~/.qwen/tmp/` |
+| Kimi Code | `~/.kimi/sessions/` |
 
 ## How It Works
 

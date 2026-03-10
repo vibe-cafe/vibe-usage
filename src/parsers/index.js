@@ -3,6 +3,8 @@ import { parse as parseCodex } from './codex.js';
 import { parse as parseGeminiCli } from './gemini-cli.js';
 import { parse as parseOpencode } from './opencode.js';
 import { parse as parseOpenclaw } from './openclaw.js';
+import { parse as parseQwenCode } from './qwen-code.js';
+import { parse as parseKimiCode } from './kimi-code.js';
 
 export const parsers = {
   'claude-code': parseClaudeCode,
@@ -10,6 +12,8 @@ export const parsers = {
   'gemini-cli': parseGeminiCli,
   'opencode': parseOpencode,
   'openclaw': parseOpenclaw,
+  'qwen-code': parseQwenCode,
+  'kimi-code': parseKimiCode,
 };
 
 

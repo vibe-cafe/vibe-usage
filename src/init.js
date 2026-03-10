@@ -4,7 +4,7 @@ import { platform } from 'node:os';
 import { loadConfig, saveConfig } from './config.js';
 import { ingest } from './api.js';
 import { runSync } from './sync.js';
-import { detectInstalledTools } from './hooks.js';
+import { detectInstalledTools } from './tools.js';
 
 function prompt(question) {
   const rl = createInterface({ input: process.stdin, output: process.stdout });
