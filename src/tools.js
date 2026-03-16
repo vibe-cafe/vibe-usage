@@ -14,6 +14,11 @@ export const TOOLS = [
     dataDir: join(homedir(), '.codex', 'sessions'),
   },
   {
+    name: 'GitHub Copilot CLI',
+    id: 'copilot-cli',
+    dataDir: join(homedir(), '.copilot', 'session-state'),
+  },
+  {
     name: 'Gemini CLI',
     id: 'gemini-cli',
     dataDir: join(homedir(), '.gemini', 'tmp'),
