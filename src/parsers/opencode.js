@@ -24,7 +24,14 @@ export async function parse() {
 }
 
 function parseFromSqlite() {
-  const query = `SELECT data FROM message`;
+  const query = `SELECT
+    session_id as sessionID,
+    json_extract(data, '$.role') as role,
+    json_extract(data, '$.time.created') as created,
+    json_extract(data, '$.modelID') as modelID,
+    json_extract(data, '$.tokens') as tokens,
+    json_extract(data, '$.path.root') as rootPath
+    FROM message`;
 
   let output;
   try {
@@ -53,36 +60,32 @@ function parseFromSqlite() {
   const entries = [];
   const sessionEvents = [];
   for (const row of rows) {
-    let data;
-    try {
-      data = JSON.parse(row.data);
-    } catch {
-      continue;
-    }
-
-    const timestamp = new Date(data.time?.created);
+    const timestamp = new Date(row.created);
     if (isNaN(timestamp.getTime())) continue;
 
-    const rootPath = data.path?.root;
-    const project = rootPath ? basename(rootPath) : 'unknown';
-    const sessionId = data.sessionID || data.session_id || 'unknown';
+    const project = row.rootPath ? basename(row.rootPath) : 'unknown';
+    const sessionId = row.sessionID || 'unknown';
 
     sessionEvents.push({
       sessionId,
       source: 'opencode',
       project,
       timestamp,
-      role: data.role === 'user' ? 'user' : 'assistant',
+      role: row.role === 'user' ? 'user' : 'assistant',
     });
 
-    if (!data.modelID) continue;
-    const tokens = data.tokens;
-    if (!tokens) continue;
-    if (!tokens.input && !tokens.output) continue;
+    if (!row.modelID) continue;
+    let tokens;
+    try {
+      tokens = typeof row.tokens === 'string' ? JSON.parse(row.tokens) : row.tokens;
+    } catch {
+      continue;
+    }
+    if (!tokens || (!tokens.input && !tokens.output)) continue;
 
     entries.push({
       source: 'opencode',
-      model: data.modelID || 'unknown',
+      model: row.modelID || 'unknown',
       project,
       timestamp,
       inputTokens: tokens.input || 0,

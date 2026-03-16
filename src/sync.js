@@ -27,6 +27,7 @@ export async function runSync({ throws = false, quiet = false } = {}) {
 
   const allBuckets = [];
   const allSessions = [];
+  const parserResults = [];
 
   for (const [source, parse] of Object.entries(parsers)) {
     try {
@@ -35,6 +36,9 @@ export async function runSync({ throws = false, quiet = false } = {}) {
       const sessions = Array.isArray(result) ? [] : (result.sessions || []);
       if (buckets.length > 0) allBuckets.push(...buckets);
       if (sessions.length > 0) allSessions.push(...sessions);
+      if (buckets.length > 0 || sessions.length > 0) {
+        parserResults.push({ source, buckets: buckets.length, sessions: sessions.length });
+      }
     } catch (err) {
       process.stderr.write(`warn: ${source} parser failed: ${err.message}\n`);
     }
@@ -43,6 +47,15 @@ export async function runSync({ throws = false, quiet = false } = {}) {
   if (allBuckets.length === 0 && allSessions.length === 0) {
     if (!quiet) console.log('No new usage data found.');
     return 0;
+  }
+
+  if (!quiet && parserResults.length > 0) {
+    for (const p of parserResults) {
+      const parts = [];
+      if (p.buckets > 0) parts.push(`${p.buckets} buckets`);
+      if (p.sessions > 0) parts.push(`${p.sessions} sessions`);
+      console.log(`  ${p.source}: ${parts.join(', ')}`);
+    }
   }
 
   const host = osHostname().replace(/\.local$/, '');
@@ -102,6 +115,20 @@ export async function runSync({ throws = false, quiet = false } = {}) {
     const syncParts = [`${totalIngested} buckets`];
     if (totalSessionsSynced > 0) syncParts.push(`${totalSessionsSynced} sessions`);
     console.log(`Synced ${syncParts.join(' + ')}.`);
+
+    if (!quiet && totalSessionsSynced > 0) {
+      const totalActive = allSessions.reduce((s, x) => s + x.activeSeconds, 0);
+      const totalDuration = allSessions.reduce((s, x) => s + x.durationSeconds, 0);
+      const totalMsgs = allSessions.reduce((s, x) => s + x.messageCount, 0);
+      const fmtTime = (secs) => {
+        if (secs < 60) return `${secs}s`;
+        const h = Math.floor(secs / 3600);
+        const m = Math.floor((secs % 3600) / 60);
+        return h > 0 ? (m > 0 ? `${h}h ${m}m` : `${h}h`) : `${m}m`;
+      };
+      console.log(`  active: ${fmtTime(totalActive)} / total: ${fmtTime(totalDuration)}, ${totalMsgs} messages`);
+    }
+
     return totalIngested;
   } catch (err) {
     if (err.message === 'UNAUTHORIZED') {

@@ -11,7 +11,8 @@ import { aggregateToBuckets, extractSessions } from './index.js';
  * ON CONFLICT ... DO UPDATE SET idempotent.
  */
 
-const CLAUDE_DIR = join(homedir(), '.claude', 'projects');
+const CLAUDE_PROJECTS_DIR = join(homedir(), '.claude', 'projects');
+const CLAUDE_TRANSCRIPTS_DIR = join(homedir(), '.claude', 'transcripts');
 
 /**
  * Recursively find all .jsonl files under a directory.
@@ -44,30 +45,29 @@ function findJsonlFiles(dir) {
  * We extract the last path segment as the project name.
  */
 function extractProject(filePath) {
-  // Get relative path from the projects dir
-  const projectsPrefix = CLAUDE_DIR + sep;
+  const projectsPrefix = CLAUDE_PROJECTS_DIR + sep;
   if (!filePath.startsWith(projectsPrefix)) return 'unknown';
   const relative = filePath.slice(projectsPrefix.length);
-  // First segment is the encoded project path
   const firstSeg = relative.split(sep)[0];
   if (!firstSeg) return 'unknown';
-  // The encoded path uses dashes: -Users-kalasoo-Projects-myproject
-  // Take the last segment after splitting by dash
   const parts = firstSeg.split('-').filter(Boolean);
   return parts.length > 0 ? parts[parts.length - 1] : 'unknown';
 }
 
+function extractSessionId(filePath) {
+  return basename(filePath, '.jsonl');
+}
+
 export async function parse() {
-  if (!existsSync(CLAUDE_DIR)) return { buckets: [], sessions: [] };
-
-  const files = findJsonlFiles(CLAUDE_DIR);
-  if (files.length === 0) return { buckets: [], sessions: [] };
-
   const entries = [];
   const sessionEvents = [];
   const seenUuids = new Set();
+  const seenSessionIds = new Set();
 
-  for (const filePath of files) {
+  // --- projects/ directory: extract BOTH token buckets AND session events ---
+  const projectFiles = findJsonlFiles(CLAUDE_PROJECTS_DIR);
+
+  for (const filePath of projectFiles) {
     let content;
     try {
       content = readFileSync(filePath, 'utf-8');
@@ -76,6 +76,8 @@ export async function parse() {
     }
 
     const project = extractProject(filePath);
+    const sessionId = extractSessionId(filePath);
+    seenSessionIds.add(sessionId);
 
     for (const line of content.split('\n')) {
       if (!line.trim()) continue;
@@ -89,7 +91,7 @@ export async function parse() {
 
         if (obj.type === 'user' || obj.type === 'assistant' || obj.type === 'tool_use' || obj.type === 'tool_result') {
           sessionEvents.push({
-            sessionId: filePath,
+            sessionId,
             source: 'claude-code',
             project,
             timestamp: ts,
@@ -120,6 +122,45 @@ export async function parse() {
           cachedInputTokens: usage.cache_read_input_tokens || 0,
           reasoningOutputTokens: 0,
         });
+      } catch {
+        continue;
+      }
+    }
+  }
+
+  // --- transcripts/ directory: extract session events ONLY (no token data) ---
+  const transcriptFiles = findJsonlFiles(CLAUDE_TRANSCRIPTS_DIR);
+
+  for (const filePath of transcriptFiles) {
+    const sessionId = extractSessionId(filePath);
+    if (seenSessionIds.has(sessionId)) continue;
+
+    let content;
+    try {
+      content = readFileSync(filePath, 'utf-8');
+    } catch {
+      continue;
+    }
+
+    for (const line of content.split('\n')) {
+      if (!line.trim()) continue;
+      try {
+        const obj = JSON.parse(line);
+
+        const timestamp = obj.timestamp;
+        if (!timestamp) continue;
+        const ts = new Date(timestamp);
+        if (isNaN(ts.getTime())) continue;
+
+        if (obj.type === 'user' || obj.type === 'assistant' || obj.type === 'tool_use' || obj.type === 'tool_result') {
+          sessionEvents.push({
+            sessionId,
+            source: 'claude-code',
+            project: 'unknown',
+            timestamp: ts,
+            role: obj.type === 'user' ? 'user' : 'assistant',
+          });
+        }
       } catch {
         continue;
       }
