@@ -1,6 +1,7 @@
 import { createHash } from 'node:crypto';
 import { parse as parseClaudeCode } from './claude-code.js';
 import { parse as parseCodex } from './codex.js';
+import { parse as parseCopilotCli } from './copilot-cli.js';
 import { parse as parseGeminiCli } from './gemini-cli.js';
 import { parse as parseOpencode } from './opencode.js';
 import { parse as parseOpenclaw } from './openclaw.js';
@@ -10,6 +11,7 @@ import { parse as parseKimiCode } from './kimi-code.js';
 export const parsers = {
   'claude-code': parseClaudeCode,
   'codex': parseCodex,
+  'copilot-cli': parseCopilotCli,
   'gemini-cli': parseGeminiCli,
   'opencode': parseOpencode,
   'openclaw': parseOpenclaw,
