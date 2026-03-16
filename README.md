@@ -5,7 +5,7 @@ Track your AI coding tool token usage and sync to [vibecafe.ai](https://vibecafe
 ## Quick Start
 
 ```bash
-npx vibe-usage
+npx @vibe-cafe/vibe-usage
 ```
 
 This will:
@@ -16,13 +16,13 @@ This will:
 ## Commands
 
 ```bash
-npx vibe-usage              # Init (first run) or sync (subsequent runs)
-npx vibe-usage init         # Re-run setup
-npx vibe-usage sync         # Manual sync
-npx vibe-usage daemon       # Continuous sync (every 5 minutes)
-npx vibe-usage reset        # Delete all data and re-upload from local logs
-npx vibe-usage reset --local  # Delete this host's data only and re-upload
-npx vibe-usage status       # Show config & detected tools
+npx @vibe-cafe/vibe-usage              # Init (first run) or sync (subsequent runs)
+npx @vibe-cafe/vibe-usage init         # Re-run setup
+npx @vibe-cafe/vibe-usage sync         # Manual sync
+npx @vibe-cafe/vibe-usage daemon       # Continuous sync (every 5 minutes)
+npx @vibe-cafe/vibe-usage reset        # Delete all data and re-upload from local logs
+npx @vibe-cafe/vibe-usage reset --local  # Delete this host's data only and re-upload
+npx @vibe-cafe/vibe-usage status       # Show config & detected tools
 ```
 
 ## Supported Tools
@@ -45,15 +45,15 @@ npx vibe-usage status       # Show config & detected tools
 - Extracts session metadata from all 8 parsers: active time (sum of turn durations), total duration, message counts
 - Uploads buckets + sessions to your vibecafe.ai dashboard
 - Stateless: computes full totals from local logs each sync (idempotent, no state files)
-- For continuous syncing, use `npx vibe-usage daemon` or the [Vibe Usage Mac app](https://github.com/vibe-cafe/vibe-usage-app)
+- For continuous syncing, use `npx @vibe-cafe/vibe-usage daemon` or the [Vibe Usage Mac app](https://github.com/vibe-cafe/vibe-usage-app)
 
 ## Development
 
 Test against a local vibe-cafe dev server without publishing:
 
 ```bash
-VIBE_USAGE_DEV=1 VIBE_USAGE_API_URL=http://localhost:3000 npx vibe-usage init
-VIBE_USAGE_DEV=1 npx vibe-usage sync
+VIBE_USAGE_DEV=1 VIBE_USAGE_API_URL=http://localhost:3000 npx @vibe-cafe/vibe-usage init
+VIBE_USAGE_DEV=1 npx @vibe-cafe/vibe-usage sync
 ```
 
 `VIBE_USAGE_DEV=1` uses a separate config file (`~/.vibe-usage/config.dev.json`).
@@ -67,10 +67,10 @@ Config stored at `~/.vibe-usage/config.json` (dev: `config.dev.json`). Contains 
 Run continuous syncing in the foreground (every 5 minutes):
 
 ```bash
-npx vibe-usage daemon
+npx @vibe-cafe/vibe-usage daemon
 ```
 
-Press Ctrl+C to stop. For background use: `nohup npx vibe-usage daemon &`
+Press Ctrl+C to stop. For background use: `nohup npx @vibe-cafe/vibe-usage daemon &`
 
 ## License
 
