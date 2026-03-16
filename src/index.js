@@ -8,7 +8,7 @@ async function showStatus() {
 
   if (!config?.apiKey) {
     console.log('  Config: not configured');
-    console.log(`  Run \`npx vibe-usage init\` to set up.\n`);
+    console.log(`  Run \`npx @vibe-cafe/vibe-usage init\` to set up.\n`);
   } else {
     console.log(`  Config: ${getConfigPath()}`);
     console.log(`  API key: ${config.apiKey.slice(0, 8)}...`);
@@ -128,17 +128,17 @@ export async function run(args) {
   vibe-usage - Vibe Usage Tracker by VibeCafé
 
   Usage:
-    npx vibe-usage              Init (first run) or sync
-    npx vibe-usage init         Set up API key
-    npx vibe-usage sync         Manually sync usage data
-    npx vibe-usage daemon       Continuous sync (every 5m)
-    npx vibe-usage reset        Delete all data and re-upload
-    npx vibe-usage reset --local  Delete data for this host only and re-upload
-    npx vibe-usage status       Show config and detected tools
-    npx vibe-usage config show  Show full config as JSON
-    npx vibe-usage config get <key>   Get a config value
-    npx vibe-usage config set <key> <value>  Set a config value
-    npx vibe-usage help         Show this help
+    npx @vibe-cafe/vibe-usage              Init (first run) or sync
+    npx @vibe-cafe/vibe-usage init         Set up API key
+    npx @vibe-cafe/vibe-usage sync         Manually sync usage data
+    npx @vibe-cafe/vibe-usage daemon       Continuous sync (every 5m)
+    npx @vibe-cafe/vibe-usage reset        Delete all data and re-upload
+    npx @vibe-cafe/vibe-usage reset --local  Delete data for this host only and re-upload
+    npx @vibe-cafe/vibe-usage status       Show config and detected tools
+    npx @vibe-cafe/vibe-usage config show  Show full config as JSON
+    npx @vibe-cafe/vibe-usage config get <key>   Get a config value
+    npx @vibe-cafe/vibe-usage config set <key> <value>  Set a config value
+    npx @vibe-cafe/vibe-usage help         Show this help
 `);
       break;
     }

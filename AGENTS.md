@@ -90,4 +90,4 @@ node -e "import('./src/parsers/<tool-id>.js').then(m => m.parse()).then(r => con
 
 - Bump `version` in `package.json` before publishing
 - Published as `@vibe-cafe/vibe-usage` on npm
-- Users run via `npx vibe-usage` (or `npx @vibe-cafe/vibe-usage`)
+- Users run via `npx @vibe-cafe/vibe-usage`
