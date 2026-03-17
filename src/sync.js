@@ -132,6 +132,8 @@ export async function runSync({ throws = false, quiet = false } = {}) {
       console.log(`  active: ${fmtTime(totalActive)} / total: ${fmtTime(totalDuration)}, ${totalMsgs} messages`);
     }
 
+    if (!quiet) console.log(`\nView your dashboard at: ${apiUrl}/usage`);
+
     return totalIngested;
   } catch (err) {
     if (err.message === 'UNAUTHORIZED') {
