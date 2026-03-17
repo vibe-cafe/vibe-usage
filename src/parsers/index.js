@@ -62,8 +62,9 @@ export function aggregateToBuckets(entries) {
  * Extract session metadata from timing events.
  * Each event: { sessionId, source, project, timestamp: Date, role: 'user'|'assistant' }
  *
- * Turn = user prompt → last agent message before next user prompt.
- * activeSeconds = sum(turn durations). durationSeconds = wall clock.
+ * Turn = first AI response → last AI response before next user prompt.
+ * activeSeconds = sum(generation durations), excluding queue/TTFT wait.
+ * durationSeconds = wall clock from first to last message.
  */
 export function extractSessions(events) {
   const groups = new Map();
@@ -83,14 +84,20 @@ export function extractSessions(events) {
     let activeSeconds = 0;
     let turnStart = null;
     let turnEnd = null;
+    let waitingForFirstResponse = false;
 
     for (const event of sessionEvents) {
       if (event.role === 'user') {
         if (turnStart !== null && turnEnd !== null && turnEnd > turnStart) {
           activeSeconds += Math.round((turnEnd - turnStart) / 1000);
         }
+        turnStart = null;
+        turnEnd = null;
+        waitingForFirstResponse = true;
+      } else if (waitingForFirstResponse) {
         turnStart = event.timestamp;
         turnEnd = event.timestamp;
+        waitingForFirstResponse = false;
       } else if (turnStart !== null) {
         turnEnd = event.timestamp;
       }
