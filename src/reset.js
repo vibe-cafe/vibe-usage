@@ -25,7 +25,7 @@ export async function runReset(args = []) {
     process.exit(1);
   }
 
-  const currentHost = getHostname();
+  const currentHost = getHostname().replace(/\.local$/, '');
   const apiUrl = config.apiUrl || 'https://vibecafe.ai';
 
   if (hostOnly) {
