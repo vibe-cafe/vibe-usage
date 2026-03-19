@@ -48,44 +48,94 @@ const ASSISTANT_SOURCES = new Set([
 
 // ── Process discovery (single instance) ──────────────────────────────
 
+const IS_WIN = process.platform === 'win32';
+
 /**
  * Find ONE running language server process with a CSRF token.
  * Returns { pid, csrfToken } or null.
  */
 function findLanguageServer() {
   try {
-    const out = execSync("ps aux | grep 'antigravity/bin/language_server_'", { encoding: 'utf-8', timeout: 5000 });
-    for (const line of out.split('\n')) {
-      if (!line.trim()) continue;
-      if (line.includes('grep')) continue;
-      const parts = line.trim().split(/\s+/);
-      if (parts.length < 2) continue;
-      const pid = parts[1];
-      const csrfMatch = line.match(/--csrf_token\s+([0-9a-f-]+)/);
-      const csrfToken = csrfMatch ? csrfMatch[1] : '';
-      if (csrfToken) return { pid, csrfToken };
-    }
-    return null;
+    return IS_WIN ? findLanguageServerWin() : findLanguageServerUnix();
   } catch {
     return null;
   }
 }
 
+function findLanguageServerUnix() {
+  const out = execSync("ps aux | grep 'antigravity/bin/language_server_'", { encoding: 'utf-8', timeout: 5000 });
+  for (const line of out.split('\n')) {
+    if (!line.trim()) continue;
+    if (line.includes('grep')) continue;
+    const parts = line.trim().split(/\s+/);
+    if (parts.length < 2) continue;
+    const pid = parts[1];
+    const csrfMatch = line.match(/--csrf_token\s+([0-9a-f-]+)/);
+    const csrfToken = csrfMatch ? csrfMatch[1] : '';
+    if (csrfToken) return { pid, csrfToken };
+  }
+  return null;
+}
+
+function findLanguageServerWin() {
+  const out = execSync(
+    'wmic process where "CommandLine like \'%antigravity%language_server%\'" get ProcessId,CommandLine /format:list',
+    { encoding: 'utf-8', timeout: 5000, shell: 'cmd.exe' },
+  );
+  // wmic /format:list outputs lines like "CommandLine=..." and "ProcessId=..."
+  let cmdLine = '';
+  let pid = '';
+  for (const line of out.split('\n')) {
+    const trimmed = line.trim();
+    if (trimmed.startsWith('CommandLine=')) {
+      const val = trimmed.slice('CommandLine='.length);
+      if (/WMIC\.exe/i.test(val)) continue; // skip wmic's own process
+      cmdLine = val;
+    }
+    if (trimmed.startsWith('ProcessId=')) pid = trimmed.slice('ProcessId='.length);
+  }
+  if (!pid || !cmdLine) return null;
+  const csrfMatch = cmdLine.match(/--csrf_token\s+([0-9a-f-]+)/);
+  const csrfToken = csrfMatch ? csrfMatch[1] : '';
+  if (!csrfToken) return null;
+  return { pid, csrfToken };
+}
+
 function findListeningPorts(pid) {
   try {
-    const out = execSync(`lsof -iTCP -sTCP:LISTEN -nP -a -p ${pid}`, {
-      encoding: 'utf-8',
-      timeout: 5000,
-    });
-    const ports = [];
-    for (const line of out.split('\n')) {
-      const match = line.match(/:(\d+)\s+\(LISTEN\)/);
-      if (match) ports.push(parseInt(match[1], 10));
-    }
-    return ports;
+    return IS_WIN ? findListeningPortsWin(pid) : findListeningPortsUnix(pid);
   } catch {
     return [];
   }
+}
+
+function findListeningPortsUnix(pid) {
+  const out = execSync(`lsof -iTCP -sTCP:LISTEN -nP -a -p ${pid}`, {
+    encoding: 'utf-8',
+    timeout: 5000,
+  });
+  const ports = [];
+  for (const line of out.split('\n')) {
+    const match = line.match(/:(\d+)\s+\(LISTEN\)/);
+    if (match) ports.push(parseInt(match[1], 10));
+  }
+  return ports;
+}
+
+function findListeningPortsWin(pid) {
+  // netstat output: TCP  127.0.0.1:49327  0.0.0.0:0  LISTENING  12345
+  const out = execSync('netstat -ano', { encoding: 'utf-8', timeout: 5000 });
+  const ports = [];
+  for (const line of out.split('\n')) {
+    if (!line.includes('LISTENING')) continue;
+    const parts = line.trim().split(/\s+/);
+    // parts: [TCP, local_addr:port, foreign_addr, LISTENING, pid]
+    const linePid = parts[parts.length - 1];
+    if (linePid !== String(pid)) continue;
+    const addrMatch = parts[1]?.match(/:(\d+)$/);
+    if (addrMatch) ports.push(parseInt(addrMatch[1], 10));
+  }
+  return ports;
 }
 
 async function rpcPost(baseUrl, path, body, csrfToken, timeoutMs = 10000) {
