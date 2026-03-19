@@ -54,9 +54,9 @@ const ASSISTANT_SOURCES = new Set([
  */
 function findLanguageServer() {
   try {
-    const out = execSync('ps aux', { encoding: 'utf-8', timeout: 5000 });
+    const out = execSync("ps aux | grep 'antigravity/bin/language_server_'", { encoding: 'utf-8', timeout: 5000 });
     for (const line of out.split('\n')) {
-      if (!line.includes('language_server_macos')) continue;
+      if (!line.trim()) continue;
       if (line.includes('grep')) continue;
       const parts = line.trim().split(/\s+/);
       if (parts.length < 2) continue;
