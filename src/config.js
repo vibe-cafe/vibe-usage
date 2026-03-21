@@ -2,7 +2,7 @@ import { readFileSync, writeFileSync, mkdirSync, existsSync } from 'node:fs';
 import { join } from 'node:path';
 import { homedir } from 'node:os';
 
-export const CONFIG_DIR = join(homedir(), '.vibe-usage');
+const CONFIG_DIR = join(homedir(), '.vibe-usage');
 const isDev = process.env.VIBE_USAGE_DEV === '1';
 const CONFIG_FILE = join(CONFIG_DIR, isDev ? 'config.dev.json' : 'config.json');
 

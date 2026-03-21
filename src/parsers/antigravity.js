@@ -1,35 +1,14 @@
 import { execSync } from 'node:child_process';
-import { readdirSync, statSync, existsSync, readFileSync, writeFileSync, mkdirSync } from 'node:fs';
+import { readdirSync, existsSync } from 'node:fs';
 import { join } from 'node:path';
 import { homedir } from 'node:os';
 import { aggregateToBuckets, extractSessions } from './index.js';
-import { CONFIG_DIR } from '../config.js';
 
-// ── Antigravity sync state ──────────────────────────────────────────
-// Tracks per-cascade file mtime so we only re-parse changed .pb files.
-// Format: { "<cascade-id>": { "mtimeMs": <number> } }
 
-const isDev = process.env.VIBE_USAGE_DEV === '1';
-const ANTIGRAVITY_SYNC_FILE = join(CONFIG_DIR, isDev ? 'antigravity-sync.dev.json' : 'antigravity-sync.json');
-
-export function loadAntigravitySyncState() {
-  if (!existsSync(ANTIGRAVITY_SYNC_FILE)) return {};
-  try {
-    return JSON.parse(readFileSync(ANTIGRAVITY_SYNC_FILE, 'utf-8'));
-  } catch {
-    return {};
-  }
-}
-
-export function saveAntigravitySyncState(state) {
-  mkdirSync(CONFIG_DIR, { recursive: true });
-  writeFileSync(ANTIGRAVITY_SYNC_FILE, JSON.stringify(state, null, 2) + '\n', 'utf-8');
-}
 
 /**
  * Antigravity parser (file-based).
  * Scans .pb files in ~/.gemini/antigravity/conversations/ to discover cascade IDs.
- * Only processes files that are new or modified since last sync.
  * Calls GetCascadeTrajectory via a running language server to extract token usage
  * (from generatorMetadata) and session events (from trajectory steps).
  */
@@ -233,21 +212,15 @@ function projectFromUri(uri) {
 }
 
 /**
- * List .pb files and return [{ cascadeId, mtimeMs }].
+ * List cascade IDs from .pb files in the conversations directory.
  */
-function listCascadeFiles() {
+function listCascades() {
   try {
     const files = readdirSync(CONVERSATIONS_DIR);
     const results = [];
     for (const f of files) {
       if (!f.endsWith('.pb')) continue;
-      const cascadeId = f.slice(0, -3); // strip .pb
-      try {
-        const st = statSync(join(CONVERSATIONS_DIR, f));
-        results.push({ cascadeId, mtimeMs: st.mtimeMs });
-      } catch {
-        // skip unreadable files
-      }
+      results.push(f.slice(0, -3)); // strip .pb → cascadeId
     }
     return results;
   } catch {
@@ -258,17 +231,9 @@ function listCascadeFiles() {
 // ── Main parse ───────────────────────────────────────────────────────
 
 export async function parse() {
-  // Step 1: List cascade .pb files and filter to new/changed
-  const allFiles = listCascadeFiles();
-  if (allFiles.length === 0) return { buckets: [], sessions: [] };
-
-  const syncState = loadAntigravitySyncState();
-  const changedFiles = allFiles.filter((f) => {
-    const prev = syncState[f.cascadeId];
-    return !prev || f.mtimeMs > prev.mtimeMs;
-  });
-
-  if (changedFiles.length === 0) return { buckets: [], sessions: [] };
+  // Step 1: List cascade .pb files
+  const cascadeIds = listCascades();
+  if (cascadeIds.length === 0) return { buckets: [], sessions: [] };
 
   // Step 2: Find a running language server to make RPC calls
   const server = findLanguageServer();
@@ -295,9 +260,7 @@ export async function parse() {
   const seenResponseIds = new Set();
   const unknownModelMetas = [];
 
-  console.log("[antigravity] changed files", changedFiles);
-
-  for (const { cascadeId, mtimeMs } of changedFiles) {
+  for (const cascadeId of cascadeIds) {
     let resp;
     try {
       resp = await rpc('GetCascadeTrajectory', { cascadeId });
@@ -376,12 +339,7 @@ export async function parse() {
       });
     }
 
-    // Mark this cascade as synced
-    syncState[cascadeId] = { mtimeMs };
   }
-
-  // Step 4: Save updated sync state
-  saveAntigravitySyncState(syncState);
 
   return {
     buckets: aggregateToBuckets(entries),
