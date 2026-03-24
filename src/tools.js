@@ -34,6 +34,11 @@ export const TOOLS = [
     dataDir: join(homedir(), '.openclaw', 'agents'),
   },
   {
+    name: 'pi',
+    id: 'pi-coding-agent',
+    dataDir: join(homedir(), '.pi', 'agent', 'sessions'),
+  },
+  {
     name: 'Qwen Code',
     id: 'qwen-code',
     dataDir: join(homedir(), '.qwen', 'tmp'),

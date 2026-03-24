@@ -37,6 +37,7 @@ npx @vibe-cafe/vibe-usage status       # Show config & detected tools
 | Gemini CLI | `~/.gemini/tmp/` |
 | OpenCode | `~/.local/share/opencode/opencode.db` (SQLite, `json_extract` query) |
 | OpenClaw | `~/.openclaw/agents/` |
+| pi | `~/.pi/agent/sessions/` |
 | Qwen Code | `~/.qwen/tmp/` |
 | Kimi Code | `~/.kimi/sessions/` |
 | Amp | `~/.local/share/amp/threads/` |
