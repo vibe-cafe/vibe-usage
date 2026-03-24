@@ -8,7 +8,7 @@ AI agent guidance for the vibe-usage CLI. See [README.md](./README.md) for user-
 vibe-usage/
 ├── bin/vibe-usage.js          # CLI entry point → src/index.js
 ├── src/
-│   ├── index.js               # Command router (init, sync, daemon, reset, status, config)
+│   ├── index.js               # Command router (init, sync, daemon, reset, skill, status, config)
 │   ├── parsers/               # One parser per tool, all export async parse() → { buckets, sessions }
 │   │   ├── index.js           # Parser registry, aggregateToBuckets(), extractSessions()
 │   │   ├── claude-code.js
@@ -18,15 +18,19 @@ vibe-usage/
 │   │   ├── opencode.js        # SQLite via child_process sqlite3, JSON fallback
 │   │   ├── openclaw.js
 │   │   ├── qwen-code.js
-│   │   └── kimi-code.js
+│   │   ├── kimi-code.js
+│   │   ├── amp.js
+│   │   └── droid.js
 │   ├── tools.js               # TOOLS[] registry + detectInstalledTools()
 │   ├── sync.js                # Orchestrator: parse all → batch upload buckets + sessions
 │   ├── api.js                 # HTTP client: ingest(), deleteAllData(), fetchSettings()
 │   ├── config.js              # ~/.vibe-usage/config.json (dev: config.dev.json)
 │   ├── init.js                # Interactive setup (API key, verify, initial sync)
-│   ├── daemon.js              # 5-minute sync loop
-│   └── reset.js               # Delete remote data + re-sync
-├── SKILL.md                   # OpenClaw skill definition
+│   ├── daemon.js              # 5-minute sync loop (foreground)
+│   ├── daemon-service.js      # Background service management (systemd/launchd install/uninstall/status)
+│   ├── reset.js               # Delete remote data + re-sync
+│   └── skill.js               # Install/remove SKILL.md for AI coding tools
+├── SKILL.md                   # Skill definition (also used by `npx skills add`)
 └── package.json               # @vibe-cafe/vibe-usage, ESM, Node >=20, zero dependencies
 ```
 

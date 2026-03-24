@@ -54,4 +54,4 @@ Other available commands:
 
 - Requires initial setup with an API key (run `npx @vibe-cafe/vibe-usage` first)
 - Config is stored at `~/.vibe-usage/config.json`
-- Supports: Claude Code, Codex CLI, Gemini CLI, OpenCode, OpenClaw
+- Supports: Claude Code, Codex CLI, Copilot CLI, Gemini CLI, OpenCode, OpenClaw, Qwen Code, Kimi Code, Amp, Droid

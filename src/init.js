@@ -75,4 +75,8 @@ export async function runInit() {
   await runSync();
 
   console.log(`\nSetup complete! View your dashboard at: ${apiUrl}/usage`);
+
+  if (process.platform === 'linux' || process.platform === 'darwin') {
+    console.log('\nTip: Run `npx @vibe-cafe/vibe-usage daemon install` to sync automatically in the background.');
+  }
 }

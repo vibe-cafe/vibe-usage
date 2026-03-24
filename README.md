@@ -19,9 +19,16 @@ This will:
 npx @vibe-cafe/vibe-usage              # Init (first run) or sync (subsequent runs)
 npx @vibe-cafe/vibe-usage init         # Re-run setup
 npx @vibe-cafe/vibe-usage sync         # Manual sync
-npx @vibe-cafe/vibe-usage daemon       # Continuous sync (every 5 minutes)
+npx @vibe-cafe/vibe-usage daemon       # Continuous sync (every 5m, foreground)
+npx @vibe-cafe/vibe-usage daemon install    # Install background service (systemd/launchd)
+npx @vibe-cafe/vibe-usage daemon uninstall  # Remove background service
+npx @vibe-cafe/vibe-usage daemon status     # Show background service status
+npx @vibe-cafe/vibe-usage daemon stop       # Stop background service
+npx @vibe-cafe/vibe-usage daemon restart    # Restart background service
 npx @vibe-cafe/vibe-usage reset        # Delete all data and re-upload from local logs
 npx @vibe-cafe/vibe-usage reset --local  # Delete this host's data only and re-upload
+npx @vibe-cafe/vibe-usage skill         # Install skill for AI coding assistants
+npx @vibe-cafe/vibe-usage skill --remove  # Remove installed skills
 npx @vibe-cafe/vibe-usage status       # Show config & detected tools
 ```
 
@@ -35,17 +42,40 @@ npx @vibe-cafe/vibe-usage status       # Show config & detected tools
 | Gemini CLI | `~/.gemini/tmp/` |
 | OpenCode | `~/.local/share/opencode/opencode.db` (SQLite, `json_extract` query) |
 | OpenClaw | `~/.openclaw/agents/` |
+| pi | `~/.pi/agent/sessions/` |
 | Qwen Code | `~/.qwen/tmp/` |
 | Kimi Code | `~/.kimi/sessions/` |
+| Amp | `~/.local/share/amp/threads/` |
+| Droid | `~/.factory/sessions/` |
 
 ## How It Works
 
 - Parses local session logs from each AI coding tool
 - Aggregates token usage into 30-minute buckets
-- Extracts session metadata from all 8 parsers: active time (AI generation time, excluding queue/TTFT wait), total duration, message counts
+- Extracts session metadata from all 10 parsers: active time (AI generation time, excluding queue/TTFT wait), total duration, message counts
 - Uploads buckets + sessions to your vibecafe.ai dashboard
 - Stateless: computes full totals from local logs each sync (idempotent, no state files)
 - For continuous syncing, use `npx @vibe-cafe/vibe-usage daemon` or the [Vibe Usage Mac app](https://github.com/vibe-cafe/vibe-usage-app)
+
+## AI Skill
+
+Install vibe-usage as a skill for your AI coding assistant, so it knows how to sync usage data on your behalf:
+
+```bash
+npx @vibe-cafe/vibe-usage skill
+```
+
+This auto-detects installed AI tools (Claude Code, Cursor, Windsurf, Codex CLI) and writes a `SKILL.md` to each tool's global skills directory. To remove:
+
+```bash
+npx @vibe-cafe/vibe-usage skill --remove
+```
+
+You can also install via the [open skills ecosystem](https://github.com/vercel-labs/skills):
+
+```bash
+npx skills add vibe-cafe/vibe-usage
+```
 
 ## Development
 
@@ -64,13 +94,34 @@ Config stored at `~/.vibe-usage/config.json` (dev: `config.dev.json`). Contains 
 
 ## Daemon Mode
 
+### Background service (recommended)
+
+Install as a system service for automatic background syncing:
+
+```bash
+npx @vibe-cafe/vibe-usage daemon install
+```
+
+This creates a user-level service (systemd on Linux, launchd on macOS) that syncs every 5 minutes and starts automatically on login. Manage with:
+
+```bash
+npx @vibe-cafe/vibe-usage daemon status
+npx @vibe-cafe/vibe-usage daemon stop
+npx @vibe-cafe/vibe-usage daemon restart
+npx @vibe-cafe/vibe-usage daemon uninstall
+```
+
+For reliable operation, install globally first: `npm install -g @vibe-cafe/vibe-usage`
+
+### Foreground mode
+
 Run continuous syncing in the foreground (every 5 minutes):
 
 ```bash
 npx @vibe-cafe/vibe-usage daemon
 ```
 
-Press Ctrl+C to stop. For background use: `nohup npx @vibe-cafe/vibe-usage daemon &`
+Press Ctrl+C to stop.
 
 ## License
 
