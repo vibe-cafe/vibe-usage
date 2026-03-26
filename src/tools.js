@@ -4,6 +4,11 @@ import { homedir } from 'node:os';
 
 export const TOOLS = [
   {
+    name: 'Antigravity',
+    id: 'antigravity',
+    dataDir: join(homedir(), '.gemini', 'antigravity'),
+  },
+  {
     name: 'Claude Code',
     id: 'claude-code',
     dataDir: join(homedir(), '.claude', 'projects'),
