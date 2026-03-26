@@ -245,7 +245,6 @@ export async function parse() {
   const baseUrl = await probeHttpPort(ports, server.csrfToken);
   if (!baseUrl) return { buckets: [], sessions: [] };
 
-  console.log("[antigravity] get base url", baseUrl);
   const rpc = (method, body) =>
     rpcPost(
       baseUrl,
@@ -258,7 +257,6 @@ export async function parse() {
   const entries = [];
   const sessionEvents = [];
   const seenResponseIds = new Set();
-  const unknownModelMetas = [];
 
   for (const cascadeId of cascadeIds) {
     let resp;
