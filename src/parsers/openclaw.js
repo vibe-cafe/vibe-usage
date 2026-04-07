@@ -1,16 +1,30 @@
-import { readdirSync, readFileSync, statSync, existsSync } from 'node:fs';
+import { readdirSync, readFileSync, existsSync } from 'node:fs';
 import { join } from 'node:path';
 import { homedir } from 'node:os';
 import { aggregateToBuckets, extractSessions } from './index.js';
 
 // OpenClaw stores data at ~/.openclaw/agents/<agentId>/sessions/*.jsonl
+// Profile deployments use ~/.openclaw-<profile>/agents/...
 // Legacy paths: ~/.clawdbot, ~/.moltbot, ~/.moldbot
-const POSSIBLE_ROOTS = [
-  join(homedir(), '.openclaw'),
-  join(homedir(), '.clawdbot'),
-  join(homedir(), '.moltbot'),
-  join(homedir(), '.moldbot'),
-];
+function getPossibleRoots() {
+  const home = homedir();
+  const roots = [
+    join(home, '.clawdbot'),
+    join(home, '.moltbot'),
+    join(home, '.moldbot'),
+  ];
+  try {
+    for (const entry of readdirSync(home, { withFileTypes: true })) {
+      if (!entry.isDirectory()) continue;
+      if (entry.name === '.openclaw' || /^\.openclaw-.+/.test(entry.name)) {
+        roots.push(join(home, entry.name));
+      }
+    }
+  } catch {
+    // ignore read errors
+  }
+  return roots;
+}
 
 /** Normalize usage fields — OpenClaw supports multiple naming conventions */
 function getTokens(usage, ...keys) {
@@ -24,7 +38,7 @@ export async function parse() {
   const entries = [];
   const sessionEvents = [];
 
-  for (const root of POSSIBLE_ROOTS) {
+  for (const root of getPossibleRoots()) {
     const agentsDir = join(root, 'agents');
     if (!existsSync(agentsDir)) continue;
 

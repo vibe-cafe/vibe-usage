@@ -1,6 +1,24 @@
-import { existsSync } from 'node:fs';
+import { existsSync, readdirSync } from 'node:fs';
 import { join } from 'node:path';
 import { homedir } from 'node:os';
+
+/** Find all OpenClaw data roots: ~/.openclaw and ~/.openclaw-<profile> */
+function findOpenclawDataDirs() {
+  const home = homedir();
+  const dirs = [];
+  try {
+    for (const entry of readdirSync(home, { withFileTypes: true })) {
+      if (!entry.isDirectory()) continue;
+      if (entry.name === '.openclaw' || /^\.openclaw-.+/.test(entry.name)) {
+        const agentsDir = join(home, entry.name, 'agents');
+        if (existsSync(agentsDir)) dirs.push(agentsDir);
+      }
+    }
+  } catch {
+    // ignore read errors
+  }
+  return dirs;
+}
 
 export const TOOLS = [
   {
@@ -37,6 +55,7 @@ export const TOOLS = [
     name: 'OpenClaw',
     id: 'openclaw',
     dataDir: join(homedir(), '.openclaw', 'agents'),
+    detectDataDirs: findOpenclawDataDirs,
   },
   {
     name: 'pi',
@@ -66,5 +85,8 @@ export const TOOLS = [
 ];
 
 export function detectInstalledTools() {
-  return TOOLS.filter(t => existsSync(t.dataDir));
+  return TOOLS.filter(t => {
+    if (t.detectDataDirs) return t.detectDataDirs().length > 0;
+    return existsSync(t.dataDir);
+  });
 }

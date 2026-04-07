@@ -41,7 +41,7 @@ npx @vibe-cafe/vibe-usage status       # Show config & detected tools
 | GitHub Copilot CLI | `~/.copilot/session-state/*/events.jsonl` |
 | Gemini CLI | `~/.gemini/tmp/` |
 | OpenCode | `~/.local/share/opencode/opencode.db` (SQLite, `json_extract` query) |
-| OpenClaw | `~/.openclaw/agents/` |
+| OpenClaw | `~/.openclaw/agents/`, `~/.openclaw-<profile>/agents/` (profile deployments) |
 | pi | `~/.pi/agent/sessions/` |
 | Qwen Code | `~/.qwen/tmp/` |
 | Kimi Code | `~/.kimi/sessions/` |
