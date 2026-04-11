@@ -39,6 +39,7 @@ vibe-usage/
 - **Pure ESM** (`"type": "module"`) — no CommonJS, no build step
 - **Zero dependencies** — only Node built-ins (fs, path, os, crypto, https, readline, child_process)
 - **Stateless sync** — parsers compute full totals from raw logs each run; server upserts idempotently
+- **Stable hostname** — hostname is persisted in config at init; `sync.js` never re-reads `os.hostname()` after first capture. This prevents macOS mDNS hostname drift (e.g., `-2`, `-3` suffixes) from creating duplicate device entries in the DB.
 - **No TypeScript** — plain JavaScript throughout
 
 ## Architecture: Two-Track Data Model

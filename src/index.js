@@ -34,7 +34,7 @@ async function showStatus() {
   console.log();
 }
 
-const VALID_CONFIG_KEYS = ['apiKey', 'apiUrl'];
+const VALID_CONFIG_KEYS = ['apiKey', 'apiUrl', 'hostname'];
 
 function handleConfig(args) {
   const sub = args[0];

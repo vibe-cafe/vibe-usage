@@ -1,6 +1,6 @@
 import { createInterface } from 'node:readline';
 import { execFile } from 'node:child_process';
-import { platform } from 'node:os';
+import { hostname as osHostname, platform } from 'node:os';
 import { loadConfig, saveConfig } from './config.js';
 import { ingest } from './api.js';
 import { runSync } from './sync.js';
@@ -61,6 +61,7 @@ export async function runInit() {
   const config = {
     apiKey,
     apiUrl,
+    hostname: existing?.hostname || osHostname().replace(/\.local$/, ''),
   };
   saveConfig(config);
 

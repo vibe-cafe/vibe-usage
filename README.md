@@ -90,7 +90,19 @@ VIBE_USAGE_DEV=1 npx @vibe-cafe/vibe-usage sync
 
 ## Config
 
-Config stored at `~/.vibe-usage/config.json` (dev: `config.dev.json`). Contains your API key and server URL.
+Config stored at `~/.vibe-usage/config.json` (dev: `config.dev.json`).
+
+| Key | Description |
+|-----|-------------|
+| `apiKey` | Your API key (starts with `vbu_`) |
+| `apiUrl` | Server URL (default: `https://vibecafe.ai`) |
+| `hostname` | Stable device name for usage tracking (set at init, reused across syncs) |
+
+The `hostname` is captured once during `init` and reused for all future syncs. This prevents macOS mDNS hostname changes (e.g., `MacBook-Pro` → `MacBook-Pro-2`) from creating duplicate device entries. To change it manually:
+
+```bash
+npx @vibe-cafe/vibe-usage config set hostname my-device-name
+```
 
 ## Daemon Mode
 

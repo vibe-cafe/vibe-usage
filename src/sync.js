@@ -59,7 +59,12 @@ export async function runSync({ throws = false, quiet = false } = {}) {
     }
   }
 
-  const host = osHostname().replace(/\.local$/, '');
+  let host = config.hostname;
+  if (!host) {
+    host = osHostname().replace(/\.local$/, '');
+    config.hostname = host;
+    saveConfig(config);
+  }
   for (const b of allBuckets) {
     b.hostname = host;
   }
