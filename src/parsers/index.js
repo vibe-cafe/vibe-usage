@@ -10,6 +10,7 @@ import { parse as parseKimiCode } from './kimi-code.js';
 import { parse as parseAmp } from './amp.js';
 import { parse as parseDroid } from './droid.js';
 import { parse as parseAntigravity } from './antigravity.js';
+import { parse as parseHermes } from './hermes.js';
 import { parse as parsePiCodingAgent } from './pi-coding-agent.js';
 
 export const parsers = {
@@ -24,6 +25,7 @@ export const parsers = {
   'amp': parseAmp,
   'droid': parseDroid,
   'antigravity': parseAntigravity,
+  'hermes': parseHermes,
   'pi-coding-agent': parsePiCodingAgent,
 };
 

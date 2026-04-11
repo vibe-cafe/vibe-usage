@@ -82,6 +82,11 @@ export const TOOLS = [
     id: 'droid',
     dataDir: join(homedir(), '.factory', 'sessions'),
   },
+  {
+    name: 'Hermes',
+    id: 'hermes',
+    dataDir: join(homedir(), '.hermes', 'state.db'),
+  },
 ];
 
 export function detectInstalledTools() {

@@ -20,7 +20,8 @@ vibe-usage/
 │   │   ├── qwen-code.js
 │   │   ├── kimi-code.js
 │   │   ├── amp.js
-│   │   └── droid.js
+│   │   ├── droid.js
+│   │   └── hermes.js          # SQLite via child_process sqlite3
 │   ├── tools.js               # TOOLS[] registry + detectInstalledTools()
 │   ├── sync.js                # Orchestrator: parse all → batch upload buckets + sessions
 │   ├── api.js                 # HTTP client: ingest(), deleteAllData(), fetchSettings()
