@@ -13,6 +13,25 @@ import { aggregateToBuckets, extractSessions } from './index.js';
 const KIMI_SESSIONS_DIR = join(homedir(), '.kimi', 'sessions');
 const KIMI_CONFIG = join(homedir(), '.kimi', 'kimi.json');
 
+function parseTimestamp(value) {
+  if (value === null || value === undefined) return null;
+  if (typeof value === 'number') {
+    const ms = value > 1e12 ? value : value * 1000;
+    const date = new Date(ms);
+    return isNaN(date.getTime()) ? null : date;
+  }
+  if (typeof value === 'string') {
+    const asNumber = Number(value);
+    if (!Number.isNaN(asNumber)) {
+      const ms = asNumber > 1e12 ? asNumber : asNumber * 1000;
+      const date = new Date(ms);
+      return isNaN(date.getTime()) ? null : date;
+    }
+  }
+  const date = new Date(value);
+  return isNaN(date.getTime()) ? null : date;
+}
+
 function findWireFiles(baseDir) {
   const results = [];
   if (!existsSync(baseDir)) return results;
@@ -85,32 +104,40 @@ export async function parse() {
       if (!line.trim()) continue;
       try {
         const obj = JSON.parse(line);
-        const type = obj.type;
-        const payload = obj.payload;
-        if (!payload) continue;
+        const message = obj.message && typeof obj.message === 'object' ? obj.message : null;
+        const type = message?.type || obj.type;
+        const payload = message?.payload ?? obj.payload;
+        if (!type || !payload || typeof payload !== 'object') continue;
 
-        if (payload.timestamp) lastTimestamp = payload.timestamp;
+        const eventTimestamp = parseTimestamp(obj.timestamp ?? payload.timestamp);
+        if (eventTimestamp) lastTimestamp = eventTimestamp;
         if (payload.model) currentModel = payload.model;
 
-        if (lastTimestamp) {
-          const evTs = new Date(lastTimestamp);
-          if (!isNaN(evTs.getTime())) {
-            const isUser = type === 'UserMessage' || type === 'user_message' || type === 'Input';
-            sessionEvents.push({
-              sessionId: filePath,
-              source: 'kimi-code',
-              project,
-              timestamp: evTs,
-              role: isUser ? 'user' : 'assistant',
-            });
-          }
+        const sessionTimestamp = eventTimestamp || lastTimestamp;
+        if (sessionTimestamp) {
+          const isUser =
+            type === 'UserMessage' ||
+            type === 'user_message' ||
+            type === 'Input' ||
+            type === 'TurnBegin';
+          sessionEvents.push({
+            sessionId: filePath,
+            source: 'kimi-code',
+            project,
+            timestamp: sessionTimestamp,
+            role: isUser ? 'user' : 'assistant',
+          });
         }
 
         if (type !== 'StatusUpdate') continue;
 
-        const tokenUsage = payload.token_usage;
+        const tokenUsage = payload.token_usage || payload.tokenUsage;
         if (!tokenUsage) continue;
-        if (!tokenUsage.input_other && !tokenUsage.output) continue;
+        const inputOther = tokenUsage.input_other || 0;
+        const output = tokenUsage.output || 0;
+        const cacheRead = tokenUsage.input_cache_read || 0;
+        const cacheCreation = tokenUsage.input_cache_creation || 0;
+        if (!inputOther && !output && !cacheRead && !cacheCreation) continue;
 
         const messageId = payload.message_id;
         if (messageId) {
@@ -118,16 +145,17 @@ export async function parse() {
           seenMessageIds.add(messageId);
         }
 
-        const ts = lastTimestamp ? new Date(lastTimestamp) : new Date();
+        const ts = eventTimestamp || lastTimestamp || new Date();
+        if (isNaN(ts.getTime())) continue;
 
         entries.push({
           source: 'kimi-code',
           model: currentModel,
           project,
           timestamp: ts,
-          inputTokens: tokenUsage.input_other || 0,
-          outputTokens: tokenUsage.output || 0,
-          cachedInputTokens: tokenUsage.input_cache_read || 0,
+          inputTokens: inputOther + cacheCreation,
+          outputTokens: output,
+          cachedInputTokens: cacheRead,
           reasoningOutputTokens: 0,
         });
       } catch {
