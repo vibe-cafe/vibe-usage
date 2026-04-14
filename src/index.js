@@ -142,7 +142,7 @@ export async function run(args) {
     npx @vibe-cafe/vibe-usage              Init (first run) or sync
     npx @vibe-cafe/vibe-usage init         Set up API key
     npx @vibe-cafe/vibe-usage sync         Manually sync usage data
-    npx @vibe-cafe/vibe-usage daemon       Continuous sync (every 5m, foreground)
+    npx @vibe-cafe/vibe-usage daemon       Continuous sync (every 30m, foreground)
     npx @vibe-cafe/vibe-usage daemon install    Install background service (systemd/launchd)
     npx @vibe-cafe/vibe-usage daemon uninstall  Remove background service
     npx @vibe-cafe/vibe-usage daemon status     Show background service status

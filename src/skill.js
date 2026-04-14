@@ -63,7 +63,7 @@ Other available commands:
 |---------|-------------|
 | \`npx @vibe-cafe/vibe-usage sync\` | Sync latest usage data |
 | \`npx @vibe-cafe/vibe-usage status\` | Show config and detected tools |
-| \`npx @vibe-cafe/vibe-usage daemon\` | Continuous sync every 5 minutes |
+| \`npx @vibe-cafe/vibe-usage daemon\` | Continuous sync every 30 minutes |
 | \`npx @vibe-cafe/vibe-usage reset\` | Delete all data and re-upload |
 | \`npx @vibe-cafe/vibe-usage reset --local\` | Delete this host's data and re-upload |
 

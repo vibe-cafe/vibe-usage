@@ -1,7 +1,7 @@
 import { loadConfig } from './config.js';
 import { runSync } from './sync.js';
 
-const INTERVAL = 5 * 60_000; // 5 minutes
+const INTERVAL = 30 * 60_000; // 30 minutes
 
 function log(msg) {
   const ts = new Date().toLocaleTimeString('en-US', { hour12: false });
@@ -19,7 +19,7 @@ export async function runDaemon() {
     process.exit(1);
   }
 
-  log('Daemon started (sync every 5m, Ctrl+C to stop)');
+  log('Daemon started (sync every 30m, Ctrl+C to stop)');
 
   // eslint-disable-next-line no-constant-condition
   while (true) {

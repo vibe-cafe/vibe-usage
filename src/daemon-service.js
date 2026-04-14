@@ -158,7 +158,7 @@ function install() {
     console.log('Service loaded and started.');
   }
 
-  console.log('\nDaemon installed. Usage data will sync automatically every 5 minutes.');
+  console.log('\nDaemon installed. Usage data will sync automatically every 30 minutes.');
   console.log('Run `vibe-usage daemon status` to check.');
 }
 

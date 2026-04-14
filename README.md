@@ -19,7 +19,7 @@ This will:
 npx @vibe-cafe/vibe-usage              # Init (first run) or sync (subsequent runs)
 npx @vibe-cafe/vibe-usage init         # Re-run setup
 npx @vibe-cafe/vibe-usage sync         # Manual sync
-npx @vibe-cafe/vibe-usage daemon       # Continuous sync (every 5m, foreground)
+npx @vibe-cafe/vibe-usage daemon       # Continuous sync (every 30m, foreground)
 npx @vibe-cafe/vibe-usage daemon install    # Install background service (systemd/launchd)
 npx @vibe-cafe/vibe-usage daemon uninstall  # Remove background service
 npx @vibe-cafe/vibe-usage daemon status     # Show background service status
@@ -115,7 +115,7 @@ Install as a system service for automatic background syncing:
 npx @vibe-cafe/vibe-usage daemon install
 ```
 
-This creates a user-level service (systemd on Linux, launchd on macOS) that syncs every 5 minutes and starts automatically on login. Manage with:
+This creates a user-level service (systemd on Linux, launchd on macOS) that syncs every 30 minutes and starts automatically on login. Manage with:
 
 ```bash
 npx @vibe-cafe/vibe-usage daemon status
@@ -128,7 +128,7 @@ For reliable operation, install globally first: `npm install -g @vibe-cafe/vibe-
 
 ### Foreground mode
 
-Run continuous syncing in the foreground (every 5 minutes):
+Run continuous syncing in the foreground (every 30 minutes):
 
 ```bash
 npx @vibe-cafe/vibe-usage daemon
