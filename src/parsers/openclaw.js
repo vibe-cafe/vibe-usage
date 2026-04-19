@@ -106,6 +106,7 @@ export async function parse() {
               inputTokens: getTokens(usage, 'input', 'inputTokens', 'input_tokens', 'promptTokens', 'prompt_tokens'),
               outputTokens: getTokens(usage, 'output', 'outputTokens', 'output_tokens', 'completionTokens', 'completion_tokens'),
               cachedInputTokens: getTokens(usage, 'cacheRead', 'cache_read', 'cache_read_input_tokens'),
+              cacheCreationInputTokens: getTokens(usage, 'cacheCreation', 'cache_creation', 'cache_creation_input_tokens'),
               reasoningOutputTokens: 0,
             });
           } catch {

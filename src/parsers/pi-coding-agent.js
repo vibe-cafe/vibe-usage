@@ -135,6 +135,7 @@ export async function parse() {
         inputTokens: usage.input || 0,
         outputTokens: usage.output || 0,
         cachedInputTokens: usage.cacheRead || 0,
+        cacheCreationInputTokens: usage.cacheWrite || 0,
         reasoningOutputTokens: 0,
       });
     }
