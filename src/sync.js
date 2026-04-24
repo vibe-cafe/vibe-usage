@@ -2,6 +2,7 @@ import { hostname as osHostname } from 'node:os';
 import { loadConfig, saveConfig } from './config.js';
 import { ingest, fetchSettings } from './api.js';
 import { parsers } from './parsers/index.js';
+import { success, failure, arrow, link, dim } from './output.js';
 
 const BATCH_SIZE = 100;
 const SESSION_BATCH_SIZE = 500;
@@ -15,7 +16,7 @@ function formatBytes(bytes) {
 export async function runSync({ throws = false, quiet = false } = {}) {
   const config = loadConfig();
   if (!config?.apiKey) {
-    console.error('Not configured. Run `npx @vibe-cafe/vibe-usage init` first.');
+    console.error(failure('尚未配置，请先运行 `npx @vibe-cafe/vibe-usage init`。'));
     if (throws) throw new Error('NOT_CONFIGURED');
     process.exit(1);
   }
@@ -41,12 +42,13 @@ export async function runSync({ throws = false, quiet = false } = {}) {
         parserResults.push({ source, buckets: buckets.length, sessions: sessions.length });
       }
     } catch (err) {
-      process.stderr.write(`warn: ${source} parser failed: ${err.message}\n`);
+      // Parser errors are non-fatal — pass-through in dim gray (no translation).
+      process.stderr.write(`${dim(`  ${source}: ${err.message}`)}\n`);
     }
   }
 
   if (allBuckets.length === 0 && allSessions.length === 0) {
-    if (!quiet) console.log('No new usage data found.');
+    if (!quiet) console.log(dim('暂无新数据。'));
     return 0;
   }
 
@@ -55,7 +57,7 @@ export async function runSync({ throws = false, quiet = false } = {}) {
       const parts = [];
       if (p.buckets > 0) parts.push(`${p.buckets} buckets`);
       if (p.sessions > 0) parts.push(`${p.sessions} sessions`);
-      console.log(`  ${p.source}: ${parts.join(', ')}`);
+      console.log(`  ${dim(p.source.padEnd(14))}${parts.join(' · ')}`);
     }
   }
 
@@ -65,28 +67,24 @@ export async function runSync({ throws = false, quiet = false } = {}) {
     config.hostname = host;
     saveConfig(config);
   }
-  for (const b of allBuckets) {
-    b.hostname = host;
-  }
-  for (const s of allSessions) {
-    s.hostname = host;
-  }
+  for (const b of allBuckets) b.hostname = host;
+  for (const s of allSessions) s.hostname = host;
 
   // Privacy: check if user allows project name upload
   const apiUrl = config.apiUrl || 'https://vibecafe.ai';
   const settings = await fetchSettings(apiUrl, config.apiKey);
   const uploadProject = settings?.uploadProject === true;
 
-  if (uploadProject) {
-    console.log('📂 项目名: 上传 (可在 vibecafe.ai/usage 设置中关闭)');
-  } else {
-    console.log('🔒 项目名: 已隐藏');
-    for (const b of allBuckets) {
-      b.project = 'unknown';
+  if (!quiet) {
+    if (uploadProject) {
+      console.log(dim('  项目名: 上传（可在 Web 设置中关闭）'));
+    } else {
+      console.log(dim('  项目名: 已隐藏'));
     }
-    for (const s of allSessions) {
-      s.project = 'unknown';
-    }
+  }
+  if (!uploadProject) {
+    for (const b of allBuckets) b.project = 'unknown';
+    for (const s of allSessions) s.project = 'unknown';
   }
 
   let totalIngested = 0;
@@ -95,22 +93,17 @@ export async function runSync({ throws = false, quiet = false } = {}) {
   const sessionBatches = Math.ceil(allSessions.length / SESSION_BATCH_SIZE);
   const totalBatches = Math.max(bucketBatches, sessionBatches, 1);
 
-  const parts = [];
-  if (allBuckets.length > 0) parts.push(`${allBuckets.length} buckets`);
-  if (allSessions.length > 0) parts.push(`${allSessions.length} sessions`);
-  console.log(`Uploading ${parts.join(' + ')} (${totalBatches} batch${totalBatches > 1 ? 'es' : ''})...`);
-
   try {
     for (let batchIdx = 0; batchIdx < totalBatches; batchIdx++) {
       const batch = allBuckets.slice(batchIdx * BATCH_SIZE, (batchIdx + 1) * BATCH_SIZE);
       const batchSessions = allSessions.slice(batchIdx * SESSION_BATCH_SIZE, (batchIdx + 1) * SESSION_BATCH_SIZE);
       const batchNum = batchIdx + 1;
-      const prefix = totalBatches > 1 ? `  [${batchNum}/${totalBatches}] ` : '  ';
+      const prefix = totalBatches > 1 ? `  ${dim(`[${batchNum}/${totalBatches}]`)} 上传中 ` : '  上传中 ';
 
       const result = await ingest(apiUrl, config.apiKey, batch, {
         onProgress(sent, total) {
           const pct = Math.round((sent / total) * 100);
-          process.stdout.write(`\r${prefix}${formatBytes(sent)}/${formatBytes(total)} (${pct}%)\x1b[K`);
+          process.stdout.write(`\r${prefix}${dim(`${formatBytes(sent)}/${formatBytes(total)} (${pct}%)`)}\x1b[K`);
         },
       }, batchSessions.length > 0 ? batchSessions : undefined);
       totalIngested += result.ingested ?? batch.length;
@@ -118,11 +111,11 @@ export async function runSync({ throws = false, quiet = false } = {}) {
     }
 
     if (totalBatches > 1 || allBuckets.length > 0) {
-      process.stdout.write('\n');
+      process.stdout.write('\r\x1b[K');
     }
     const syncParts = [`${totalIngested} buckets`];
     if (totalSessionsSynced > 0) syncParts.push(`${totalSessionsSynced} sessions`);
-    console.log(`Synced ${syncParts.join(' + ')}.`);
+    console.log(success(`已同步 ${syncParts.join(' · ')}`));
 
     if (!quiet && totalSessionsSynced > 0) {
       const totalActive = allSessions.reduce((s, x) => s + x.activeSeconds, 0);
@@ -134,25 +127,28 @@ export async function runSync({ throws = false, quiet = false } = {}) {
         const m = Math.floor((secs % 3600) / 60);
         return h > 0 ? (m > 0 ? `${h}h ${m}m` : `${h}h`) : `${m}m`;
       };
-      console.log(`  active: ${fmtTime(totalActive)} / total: ${fmtTime(totalDuration)}, ${totalMsgs} messages`);
+      console.log(dim(`  活跃 ${fmtTime(totalActive)} / 总时长 ${fmtTime(totalDuration)} · ${totalMsgs} 条消息`));
     }
 
-    if (!quiet) console.log(`\nView your dashboard at: ${apiUrl}/usage`);
+    if (!quiet) {
+      console.log();
+      console.log(`${arrow('前往 Dashboard 查看详情')} ${link(`${apiUrl}/usage`)}`);
+    }
 
     return totalIngested;
   } catch (err) {
     if (err.message === 'UNAUTHORIZED') {
-      console.error('Invalid API key. Run `npx @vibe-cafe/vibe-usage init` to reconfigure.');
+      console.error(failure('API Key 无效，请运行 `npx @vibe-cafe/vibe-usage init` 重新配置。'));
       if (throws) throw err;
       process.exit(1);
     }
-    // Report partial success
     if (totalIngested > 0) {
-      console.error(`Sync partially completed (${totalIngested} buckets uploaded). ${err.message}`);
+      console.error(failure(`部分完成（已上传 ${totalIngested} buckets）: ${err.message}`));
     } else {
-      console.error(`Sync failed: ${err.message}`);
+      console.error(failure(`同步失败: ${err.message}`));
     }
     if (throws) throw err;
     process.exit(1);
   }
 }
+

@@ -3,6 +3,7 @@ import { writeFileSync, unlinkSync, mkdirSync, existsSync } from 'node:fs';
 import { join } from 'node:path';
 import { homedir, platform } from 'node:os';
 import { fileURLToPath } from 'node:url';
+import { success, failure, warn, dim } from './output.js';
 
 const SERVICE_NAME = 'vibe-usage';
 const LAUNCHD_LABEL = 'ai.vibecafe.vibe-usage';
@@ -109,24 +110,23 @@ function run(cmd, args) {
 function install() {
   const plat = detectPlatform();
   if (!plat) {
-    console.log('Daemon install is not supported on this platform.');
-    console.log('Supported: Linux (systemd), macOS (launchd).');
+    console.log(failure('当前平台不支持 daemon。'));
+    console.log(dim('  支持: Linux (systemd) / macOS (launchd)'));
     return;
   }
 
   const { nodePath, binPath, isNpxCache } = resolvePaths();
 
   if (isNpxCache) {
-    console.log('Warning: vibe-usage appears to be running from the npx cache.');
-    console.log('The daemon may break when the cache is cleared.');
-    console.log('For reliable operation, install globally first:');
-    console.log('  npm install -g @vibe-cafe/vibe-usage\n');
+    console.log(warn('检测到从 npx 缓存运行 vibe-usage,缓存清理后 daemon 会失效。'));
+    console.log(dim('  建议先全局安装:  npm install -g @vibe-cafe/vibe-usage'));
+    console.log();
   }
 
   const paths = getServicePaths(plat);
 
   if (existsSync(paths.file)) {
-    console.log('Service is already installed. Run `vibe-usage daemon restart` or `daemon uninstall` first.');
+    console.log(warn('Daemon 已安装，运行 `vibe-usage daemon restart` 或 `uninstall` 先处理。'));
     return;
   }
 
@@ -134,45 +134,46 @@ function install() {
 
   if (plat === 'systemd') {
     writeFileSync(paths.file, generateSystemdUnit(nodePath, binPath), 'utf-8');
-    console.log(`Created ${paths.file}`);
+    console.log(dim(`  已写入 ${paths.file}`));
 
     run('systemctl', ['--user', 'daemon-reload']);
     const result = run('systemctl', ['--user', 'enable', '--now', `${SERVICE_NAME}.service`]);
     if (!result.ok) {
-      console.error(`Failed to start service: ${result.output}`);
+      console.error(failure(`启动服务失败: ${result.output}`));
       return;
     }
-    console.log('Service enabled and started.');
+    console.log(success('服务已启用并启动。'));
   }
 
   if (plat === 'launchd') {
     mkdirSync(join(homedir(), '.vibe-usage'), { recursive: true });
     writeFileSync(paths.file, generateLaunchdPlist(nodePath, binPath), 'utf-8');
-    console.log(`Created ${paths.file}`);
+    console.log(dim(`  已写入 ${paths.file}`));
 
     const result = run('launchctl', ['load', paths.file]);
     if (!result.ok) {
-      console.error(`Failed to load service: ${result.output}`);
+      console.error(failure(`加载服务失败: ${result.output}`));
       return;
     }
-    console.log('Service loaded and started.');
+    console.log(success('服务已加载并启动。'));
   }
 
-  console.log('\nDaemon installed. Usage data will sync automatically every 30 minutes.');
-  console.log('Run `vibe-usage daemon status` to check.');
+  console.log();
+  console.log(success('Daemon 已安装，用量数据将每 30 分钟自动同步。'));
+  console.log(dim('  运行 `vibe-usage daemon status` 查看状态。'));
 }
 
 function uninstall() {
   const plat = detectPlatform();
   if (!plat) {
-    console.log('No supported service platform detected.');
+    console.log(failure('未检测到支持的服务平台。'));
     return;
   }
 
   const paths = getServicePaths(plat);
 
   if (!existsSync(paths.file)) {
-    console.log('No daemon service is installed.');
+    console.log(dim('未安装 daemon 服务。'));
     return;
   }
 
@@ -181,43 +182,43 @@ function uninstall() {
     run('systemctl', ['--user', 'disable', `${SERVICE_NAME}.service`]);
     unlinkSync(paths.file);
     run('systemctl', ['--user', 'daemon-reload']);
-    console.log('Service stopped, disabled, and removed.');
+    console.log(success('服务已停止、禁用并删除。'));
   }
 
   if (plat === 'launchd') {
     run('launchctl', ['unload', paths.file]);
     unlinkSync(paths.file);
-    console.log('Service unloaded and removed.');
+    console.log(success('服务已卸载并删除。'));
   }
 }
 
 function status() {
   const plat = detectPlatform();
   if (!plat) {
-    console.log('No supported service platform detected.');
+    console.log(failure('未检测到支持的服务平台。'));
     return;
   }
 
   const paths = getServicePaths(plat);
 
   if (!existsSync(paths.file)) {
-    console.log('No daemon service is installed.');
-    console.log('Run `vibe-usage daemon install` to set up.');
+    console.log(dim('未安装 daemon 服务。'));
+    console.log(dim('  运行 `vibe-usage daemon install` 安装。'));
     return;
   }
 
   if (plat === 'systemd') {
     const result = run('systemctl', ['--user', 'status', `${SERVICE_NAME}.service`]);
-    console.log(result.output);
+    console.log(dim(result.output));
   }
 
   if (plat === 'launchd') {
     const result = run('launchctl', ['list', LAUNCHD_LABEL]);
     if (result.ok) {
-      console.log(`Service: ${LAUNCHD_LABEL}`);
-      console.log(result.output);
+      console.log(dim(`Service: ${LAUNCHD_LABEL}`));
+      console.log(dim(result.output));
     } else {
-      console.log('Service is installed but not currently running.');
+      console.log(warn('服务已安装但当前未运行。'));
     }
   }
 }
@@ -225,37 +226,37 @@ function status() {
 function stop() {
   const plat = detectPlatform();
   if (!plat) {
-    console.log('No supported service platform detected.');
+    console.log(failure('未检测到支持的服务平台。'));
     return;
   }
 
   if (plat === 'systemd') {
     const result = run('systemctl', ['--user', 'stop', `${SERVICE_NAME}.service`]);
-    console.log(result.ok ? 'Service stopped.' : `Failed: ${result.output}`);
+    console.log(result.ok ? success('服务已停止。') : failure(`停止失败: ${result.output}`));
   }
 
   if (plat === 'launchd') {
     const result = run('launchctl', ['stop', LAUNCHD_LABEL]);
-    console.log(result.ok ? 'Service stopped.' : `Failed: ${result.output}`);
+    console.log(result.ok ? success('服务已停止。') : failure(`停止失败: ${result.output}`));
   }
 }
 
 function restart() {
   const plat = detectPlatform();
   if (!plat) {
-    console.log('No supported service platform detected.');
+    console.log(failure('未检测到支持的服务平台。'));
     return;
   }
 
   if (plat === 'systemd') {
     const result = run('systemctl', ['--user', 'restart', `${SERVICE_NAME}.service`]);
-    console.log(result.ok ? 'Service restarted.' : `Failed: ${result.output}`);
+    console.log(result.ok ? success('服务已重启。') : failure(`重启失败: ${result.output}`));
   }
 
   if (plat === 'launchd') {
     run('launchctl', ['stop', LAUNCHD_LABEL]);
     const result = run('launchctl', ['start', LAUNCHD_LABEL]);
-    console.log(result.ok ? 'Service restarted.' : `Failed: ${result.output}`);
+    console.log(result.ok ? success('服务已重启。') : failure(`重启失败: ${result.output}`));
   }
 }
 
@@ -264,8 +265,8 @@ const SUBCOMMANDS = { install, uninstall, status, stop, restart };
 export async function manageDaemon(subcommand) {
   const fn = SUBCOMMANDS[subcommand];
   if (!fn) {
-    console.error(`Unknown daemon subcommand: ${subcommand}`);
-    console.error('Usage: vibe-usage daemon <install|uninstall|status|stop|restart>');
+    console.error(failure(`未知 daemon 子命令: ${subcommand}`));
+    console.error(dim('  用法: vibe-usage daemon <install|uninstall|status|stop|restart>'));
     process.exit(1);
   }
   fn();

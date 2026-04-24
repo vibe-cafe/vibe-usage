@@ -1,6 +1,7 @@
 import { existsSync, mkdirSync, writeFileSync, unlinkSync, rmdirSync } from 'node:fs';
 import { join } from 'node:path';
 import { homedir } from 'node:os';
+import { success, dim, green, red } from './output.js';
 
 const SKILL_TARGETS = [
   {
@@ -84,19 +85,18 @@ Other available commands:
 export async function runSkill(args = []) {
   const remove = args.includes('--remove');
 
-  console.log('\nvibe-usage skill\n');
-
-  console.log('  AI coding tools:');
+  console.log('  检测到的工具:');
   for (const t of SKILL_TARGETS) {
     const found = existsSync(t.detectDir);
-    console.log(`    ${found ? '\u2713' : '\u2717'} ${t.name}`);
+    const mark = found ? green('✓') : red('✗');
+    console.log(`    ${mark} ${t.name}`);
   }
   console.log();
 
   const detected = SKILL_TARGETS.filter(t => existsSync(t.detectDir));
 
   if (detected.length === 0) {
-    console.log('  No supported tools detected. Nothing to do.\n');
+    console.log(dim('  未检测到支持的工具，无需安装 Skill。'));
     return;
   }
 
@@ -107,14 +107,15 @@ export async function runSkill(args = []) {
       if (existsSync(skillFile)) {
         unlinkSync(skillFile);
         try { rmdirSync(t.skillDir); } catch {}
-        console.log(`  Removed: ${tildePath(skillFile)}`);
+        console.log(dim(`  已移除: ${tildePath(skillFile)}`));
         removed++;
       }
     }
     if (removed === 0) {
-      console.log('  No skills installed to remove.\n');
+      console.log(dim('  没有已安装的 Skill。'));
     } else {
-      console.log(`\n  Removed vibe-usage skill from ${removed} tool${removed > 1 ? 's' : ''}.\n`);
+      console.log();
+      console.log(success(`已从 ${removed} 个工具移除 Skill。`));
     }
     return;
   }
@@ -124,11 +125,11 @@ export async function runSkill(args = []) {
     const skillFile = join(t.skillDir, 'SKILL.md');
     mkdirSync(t.skillDir, { recursive: true });
     writeFileSync(skillFile, SKILL_CONTENT, 'utf-8');
-    console.log(`  Installed: ${tildePath(skillFile)}`);
+    console.log(dim(`  已安装: ${tildePath(skillFile)}`));
     installed++;
   }
 
-  console.log(`\n  Installed vibe-usage skill for ${installed} tool${installed > 1 ? 's' : ''}.\n`);
-  console.log('  Your AI coding assistant now knows how to sync usage data.');
-  console.log('  Try asking: "sync my vibe usage" or "how much have I spent?"\n');
+  console.log();
+  console.log(success(`已为 ${installed} 个工具安装 Skill。`));
+  console.log(dim('  AI 助手现在可以自主帮你同步用量数据。'));
 }

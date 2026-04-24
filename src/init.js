@@ -5,6 +5,7 @@ import { loadConfig, saveConfig } from './config.js';
 import { ingest } from './api.js';
 import { runSync } from './sync.js';
 import { detectInstalledTools } from './tools.js';
+import { bigHeader, success, failure, warn, arrow, link, dim, divider } from './output.js';
 
 function prompt(question) {
   const rl = createInterface({ input: process.stdin, output: process.stdout });
@@ -30,18 +31,19 @@ function isDaemonPlatform() {
 export async function runInit(options = {}) {
   const { apiKey: providedKey } = options;
 
-  console.log('\n  vibe-usage - Vibe Usage Tracker by VibeCaf\u00e9\n');
+  console.log(bigHeader());
 
   const existing = loadConfig();
   if (existing?.apiKey) {
     if (providedKey && existing.apiKey === providedKey) {
-      console.log('Already configured with this key. Running sync...\n');
+      console.log(dim('已配置同一个 Key，直接同步数据。'));
+      console.log();
       await runSync();
       return;
     }
-    const answer = await prompt('Config already exists. Overwrite? (y/N) ');
+    const answer = await prompt('检测到已有配置，是否覆盖? (y/N) ');
     if (answer.toLowerCase() !== 'y') {
-      console.log('Cancelled.');
+      console.log(dim('已取消。'));
       return;
     }
   }
@@ -51,32 +53,32 @@ export async function runInit(options = {}) {
   let apiKey;
   if (providedKey) {
     if (!providedKey.startsWith('vbu_')) {
-      console.error('Invalid API key — must start with "vbu_".');
+      console.error(failure('API Key 无效，必须以 vbu_ 开头。'));
       process.exit(1);
     }
     apiKey = providedKey;
-    console.log(`Using API key ${apiKey.slice(0, 8)}...`);
   } else {
-    console.log(`Get your API key at: ${apiUrl}/usage\n`);
+    console.log(`${arrow('获取 API Key')} ${link(`${apiUrl}/usage`)}`);
+    console.log(dim('  浏览器会自动打开，登录后复制 Key 粘贴到下方。'));
+    console.log();
     openBrowser(`${apiUrl}/usage`);
 
     while (true) {
-      apiKey = await prompt('Paste your API key: ');
+      apiKey = await prompt('粘贴 API Key: ');
       if (apiKey.startsWith('vbu_')) break;
-      console.log('Invalid key — must start with "vbu_". Try again.');
+      console.log(warn('必须以 vbu_ 开头，请重试。'));
     }
   }
 
-  console.log(`\nVerifying key ${apiKey.slice(0, 8)}...`);
   try {
     await ingest(apiUrl, apiKey, []);
-    console.log('Key verified.\n');
+    console.log(success(`验证通过 ${dim(apiKey.slice(0, 12) + '...')}`));
   } catch (err) {
     if (err.message === 'UNAUTHORIZED') {
-      console.error('Invalid API key. Please check and try again.');
+      console.error(failure('API Key 无效，请检查后重试。'));
       process.exit(1);
     }
-    console.log('Could not verify key (network error). Saving anyway.\n');
+    console.log(warn(`网络异常（${err.message}），跳过验证直接保存。`));
   }
 
   const config = {
@@ -88,30 +90,32 @@ export async function runInit(options = {}) {
 
   const tools = detectInstalledTools();
   if (tools.length > 0) {
-    console.log(`Detected tools: ${tools.map(t => t.name).join(', ')}`);
+    console.log(success(`检测到 ${tools.length} 款工具: ${dim(tools.map(t => t.name).join(' · '))}`));
   } else {
-    console.log('No AI coding tools detected. Install one and re-run init.');
+    console.log(warn('未检测到 AI 编码工具，安装后重新运行即可。'));
   }
 
-  console.log('\nRunning initial sync...');
-  await runSync();
+  console.log();
+  console.log(divider());
+  console.log();
 
-  console.log(`\nSetup complete! View your dashboard at: ${apiUrl}/usage`);
+  await runSync();
 
   if (isDaemonPlatform()) {
     if (process.stdin.isTTY) {
-      console.log('');
-      const answer = await prompt('开启后台自动同步？(持续上报用量数据,推荐) [Y/n] ');
+      console.log();
+      const answer = await prompt(`开启后台自动同步？${dim('(推荐)')} [Y/n] `);
       const normalized = answer.toLowerCase();
       if (normalized === '' || normalized === 'y' || normalized === 'yes') {
         const { manageDaemon } = await import('./daemon-service.js');
         await manageDaemon('install');
       } else {
-        console.log('\n可随时运行 `npx @vibe-cafe/vibe-usage daemon install` 开启后台同步。');
+        console.log();
+        console.log(dim('随时运行 `npx @vibe-cafe/vibe-usage daemon install` 开启后台同步。'));
       }
     } else {
-      // Non-interactive shell (CI, pipe) — don't block on prompt
-      console.log('\nTip: Run `npx @vibe-cafe/vibe-usage daemon install` to sync automatically in the background.');
+      console.log();
+      console.log(dim('提示: 运行 `npx @vibe-cafe/vibe-usage daemon install` 开启后台自动同步。'));
     }
   }
 }

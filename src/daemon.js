@@ -1,11 +1,12 @@
 import { loadConfig } from './config.js';
 import { runSync } from './sync.js';
+import { failure, dim } from './output.js';
 
 const INTERVAL = 30 * 60_000; // 30 minutes
 
 function log(msg) {
   const ts = new Date().toLocaleTimeString('en-US', { hour12: false });
-  process.stdout.write(`[${ts}] ${msg}\n`);
+  process.stdout.write(dim(`[${ts}] ${msg}\n`));
 }
 
 function sleep(ms) {
@@ -15,11 +16,11 @@ function sleep(ms) {
 export async function runDaemon() {
   const config = loadConfig();
   if (!config?.apiKey) {
-    console.error('Not configured. Run `npx @vibe-cafe/vibe-usage init` first.');
+    console.error(failure('尚未配置，请先运行 `npx @vibe-cafe/vibe-usage init`。'));
     process.exit(1);
   }
 
-  log('Daemon started (sync every 30m, Ctrl+C to stop)');
+  log('daemon started (sync every 30m, Ctrl+C to stop)');
 
   // eslint-disable-next-line no-constant-condition
   while (true) {
@@ -27,10 +28,10 @@ export async function runDaemon() {
       await runSync({ throws: true, quiet: true });
     } catch (err) {
       if (err.message === 'UNAUTHORIZED') {
-        log('API key invalid. Exiting.');
+        log('API key invalid, exiting.');
         process.exit(1);
       }
-      log(`Sync error: ${err.message}`);
+      log(`sync error: ${err.message}`);
     }
     await sleep(INTERVAL);
   }

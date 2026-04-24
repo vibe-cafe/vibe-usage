@@ -30,7 +30,8 @@ vibe-usage/
 │   ├── daemon.js              # 5-minute sync loop (foreground)
 │   ├── daemon-service.js      # Background service management (systemd/launchd install/uninstall/status)
 │   ├── reset.js               # Delete remote data + re-sync
-│   └── skill.js               # Install/remove SKILL.md for AI coding tools
+│   ├── skill.js               # Install/remove SKILL.md for AI coding tools
+│   └── output.js              # Terminal output helpers: colors, OSC 8 links, big/small headers
 ├── SKILL.md                   # Skill definition (also used by `npx skills add`)
 └── package.json               # @vibe-cafe/vibe-usage, ESM, Node >=20, zero dependencies
 ```
@@ -42,6 +43,7 @@ vibe-usage/
 - **Stateless sync** — parsers compute full totals from raw logs each run; server upserts idempotently
 - **Stable hostname** — hostname is persisted in config at init; `sync.js` never re-reads `os.hostname()` after first capture. This prevents macOS mDNS hostname drift (e.g., `-2`, `-3` suffixes) from creating duplicate device entries in the DB.
 - **No TypeScript** — plain JavaScript throughout
+- **Output style** — user-facing text is Chinese (colored via `output.js` helpers: `success` / `failure` / `warn` / `arrow` / `link`). Dashboard URLs use OSC 8 hyperlinks so terminals that support it (iTerm2, Warp, VSCode, Kitty, Terminal.app 14+) render them as clickable. Raw pass-through from external tools (parser errors, `systemctl` / `launchctl` output, daemon loop timestamps) is kept in English and dimmed so it's visually de-emphasized. `init` prints a big ASCII logo; other commands print a compact one-line header (`bigHeader()` / `smallHeader()` from `output.js`).
 
 ## Architecture: Two-Track Data Model
 

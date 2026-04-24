@@ -1,6 +1,13 @@
 import { loadConfig, saveConfig, getConfigPath } from './config.js';
 import { detectInstalledTools, TOOLS } from './tools.js';
 import { existsSync } from 'node:fs';
+import { smallHeader } from './output.js';
+
+function printSmallHeader() {
+  console.log();
+  console.log(smallHeader());
+  console.log();
+}
 
 async function showStatus() {
   const config = loadConfig();
@@ -111,11 +118,13 @@ export async function run(rawArgs) {
       break;
     }
     case 'sync': {
+      printSmallHeader();
       const { runSync } = await import('./sync.js');
       await runSync();
       break;
     }
     case 'reset': {
+      printSmallHeader();
       const { runReset } = await import('./reset.js');
       await runReset(args.slice(1));
       break;
@@ -124,15 +133,18 @@ export async function run(rawArgs) {
     case '--daemon': {
       const sub = args[1];
       if (sub && ['install', 'uninstall', 'status', 'stop', 'restart'].includes(sub)) {
+        printSmallHeader();
         const { manageDaemon } = await import('./daemon-service.js');
         await manageDaemon(sub);
       } else {
+        // Foreground daemon loop — no header, just start syncing
         const { runDaemon } = await import('./daemon.js');
         await runDaemon();
       }
       break;
     }
     case 'skill': {
+      printSmallHeader();
       const { runSkill } = await import('./skill.js');
       await runSkill(args.slice(1));
       break;
@@ -178,10 +190,12 @@ export async function run(rawArgs) {
     default: {
       const config = loadConfig();
       if (!config?.apiKey || apiKey) {
-        // First run OR user passed --key for a one-shot setup
+        // First run OR user passed --key for a one-shot setup — init.js prints the big header
         const { runInit } = await import('./init.js');
         await runInit({ apiKey });
       } else {
+        // Already configured: small header + sync
+        printSmallHeader();
         const { runSync } = await import('./sync.js');
         await runSync();
       }
