@@ -26,7 +26,7 @@ vibe-usage/
 │   ├── sync.js                # Orchestrator: parse all → batch upload buckets + sessions
 │   ├── api.js                 # HTTP client: ingest(), deleteAllData(), fetchSettings()
 │   ├── config.js              # ~/.vibe-usage/config.json (dev: config.dev.json)
-│   ├── init.js                # Interactive setup (API key, verify, initial sync)
+│   ├── init.js                # Setup flow (API key via prompt or --key flag, verify, initial sync, daemon install prompt)
 │   ├── daemon.js              # 5-minute sync loop (foreground)
 │   ├── daemon-service.js      # Background service management (systemd/launchd install/uninstall/status)
 │   ├── reset.js               # Delete remote data + re-sync

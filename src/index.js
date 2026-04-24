@@ -88,13 +88,26 @@ function handleConfig(args) {
   }
 }
 
-export async function run(args) {
+function extractOption(args, name) {
+  const flag = `--${name}`;
+  const idx = args.findIndex(a => a === flag);
+  if (idx === -1) return { args, value: undefined };
+  const value = args[idx + 1];
+  if (value === undefined || value.startsWith('--')) {
+    console.error(`Option ${flag} requires a value.`);
+    process.exit(1);
+  }
+  return { args: [...args.slice(0, idx), ...args.slice(idx + 2)], value };
+}
+
+export async function run(rawArgs) {
+  const { args, value: apiKey } = extractOption(rawArgs, 'key');
   const command = args[0];
 
   switch (command) {
     case 'init': {
       const { runInit } = await import('./init.js');
-      await runInit();
+      await runInit({ apiKey });
       break;
     }
     case 'sync': {
@@ -140,7 +153,9 @@ export async function run(args) {
 
   Usage:
     npx @vibe-cafe/vibe-usage              Init (first run) or sync
-    npx @vibe-cafe/vibe-usage init         Set up API key
+    npx @vibe-cafe/vibe-usage --key <vbu_...>   One-shot init with a pre-copied key
+    npx @vibe-cafe/vibe-usage init         Set up API key (interactive)
+    npx @vibe-cafe/vibe-usage init --key <vbu_...>   Init with key, skip paste prompt
     npx @vibe-cafe/vibe-usage sync         Manually sync usage data
     npx @vibe-cafe/vibe-usage daemon       Continuous sync (every 30m, foreground)
     npx @vibe-cafe/vibe-usage daemon install    Install background service (systemd/launchd)
@@ -162,9 +177,10 @@ export async function run(args) {
     }
     default: {
       const config = loadConfig();
-      if (!config?.apiKey) {
+      if (!config?.apiKey || apiKey) {
+        // First run OR user passed --key for a one-shot setup
         const { runInit } = await import('./init.js');
-        await runInit();
+        await runInit({ apiKey });
       } else {
         const { runSync } = await import('./sync.js');
         await runSync();

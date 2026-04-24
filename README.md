@@ -4,19 +4,29 @@ Track your AI coding tool token usage and sync to [vibecafe.ai](https://vibecafe
 
 ## Quick Start
 
+Get your API key at [vibecafe.ai/usage](https://vibecafe.ai/usage), then copy the one-liner shown there:
+
+```bash
+npx @vibe-cafe/vibe-usage --key vbu_xxxxxxxxxxxx
+```
+
+Or run without a key and paste it interactively:
+
 ```bash
 npx @vibe-cafe/vibe-usage
 ```
 
-This will:
-1. Ask for your API key (get one at https://vibecafe.ai/usage/setup)
+Either path will:
+1. Save your API key to `~/.vibe-usage/config.json`
 2. Detect installed AI coding tools
 3. Run an initial sync of your usage data
+4. Prompt you to enable the background daemon for continuous syncing (recommended)
 
 ## Commands
 
 ```bash
 npx @vibe-cafe/vibe-usage              # Init (first run) or sync (subsequent runs)
+npx @vibe-cafe/vibe-usage --key <vbu_...>   # One-shot init with a pre-copied key
 npx @vibe-cafe/vibe-usage init         # Re-run setup
 npx @vibe-cafe/vibe-usage sync         # Manual sync
 npx @vibe-cafe/vibe-usage daemon       # Continuous sync (every 30m, foreground)
