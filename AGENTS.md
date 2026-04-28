@@ -24,7 +24,7 @@ vibe-usage/
 │   │   └── hermes.js          # SQLite via child_process sqlite3
 │   ├── tools.js               # TOOLS[] registry + detectInstalledTools()
 │   ├── sync.js                # Orchestrator: parse all → batch upload buckets + sessions
-│   ├── api.js                 # HTTP client: ingest(), deleteAllData(), fetchSettings()
+│   ├── api.js                 # HTTP client: ingest() (gzip if ≥1KB), deleteAllData(), fetchSettings()
 │   ├── config.js              # ~/.vibe-usage/config.json (dev: config.dev.json)
 │   ├── init.js                # Setup flow (API key via prompt or --key flag, verify, initial sync, daemon install prompt)
 │   ├── daemon.js              # 5-minute sync loop (foreground)
@@ -39,7 +39,7 @@ vibe-usage/
 ## Key Conventions
 
 - **Pure ESM** (`"type": "module"`) — no CommonJS, no build step
-- **Zero dependencies** — only Node built-ins (fs, path, os, crypto, https, readline, child_process)
+- **Zero dependencies** — only Node built-ins (fs, path, os, crypto, https, readline, child_process, zlib)
 - **Stateless sync** — parsers compute full totals from raw logs each run; server upserts idempotently
 - **Stable hostname** — hostname is persisted in config at init; `sync.js` never re-reads `os.hostname()` after first capture. This prevents macOS mDNS hostname drift (e.g., `-2`, `-3` suffixes) from creating duplicate device entries in the DB.
 - **No TypeScript** — plain JavaScript throughout
