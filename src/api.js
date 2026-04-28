@@ -1,9 +1,11 @@
 import https from 'node:https';
 import http from 'node:http';
 import { URL } from 'node:url';
+import { gzipSync } from 'node:zlib';
 
 const MAX_RETRIES = 3;
 const INITIAL_DELAY = 1000;
+const GZIP_MIN_BYTES = 1024;
 
 export async function ingest(apiUrl, apiKey, buckets, opts, sessions) {
   let lastError;
@@ -30,18 +32,23 @@ function _send(apiUrl, apiKey, buckets, onProgress, sessions) {
     const url = new URL('/api/usage/ingest', apiUrl);
     const payload = { buckets };
     if (sessions && sessions.length > 0) payload.sessions = sessions;
-    const body = Buffer.from(JSON.stringify(payload));
+    const raw = Buffer.from(JSON.stringify(payload));
+    const useGzip = raw.length >= GZIP_MIN_BYTES;
+    const body = useGzip ? gzipSync(raw) : raw;
     const totalBytes = body.length;
     const mod = url.protocol === 'https:' ? https : http;
+
+    const headers = {
+      'Content-Type': 'application/json',
+      'Authorization': `Bearer ${apiKey}`,
+      'Content-Length': totalBytes,
+    };
+    if (useGzip) headers['Content-Encoding'] = 'gzip';
 
     const req = mod.request(url, {
       method: 'POST',
       timeout: 60_000,
-      headers: {
-        'Content-Type': 'application/json',
-        'Authorization': `Bearer ${apiKey}`,
-        'Content-Length': totalBytes,
-      },
+      headers,
     }, (res) => {
       let data = '';
       res.on('data', (chunk) => { data += chunk; });
