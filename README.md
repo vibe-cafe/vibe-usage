@@ -57,7 +57,7 @@ npx @vibe-cafe/vibe-usage status       # Show config & detected tools
 | Kimi Code | `~/.kimi/sessions/` |
 | Amp | `~/.local/share/amp/threads/` |
 | Droid | `~/.factory/sessions/` |
-| Hermes | `~/.hermes/state.db` (SQLite) |
+| Hermes | `~/.hermes/state.db` + `~/.hermes/profiles/<name>/state.db` (SQLite, multi-profile) |
 
 ## How It Works
 
