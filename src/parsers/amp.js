@@ -83,6 +83,7 @@ export async function parse() {
 
         const toMessage = Number.isInteger(event.toMessageId) ? messages[event.toMessageId] : null;
         const cacheReadInputTokens = toMessage?.usage?.cacheReadInputTokens || 0;
+        const cacheCreationInputTokens = toMessage?.usage?.cacheCreationInputTokens || 0;
 
         entries.push({
           source: 'amp',
@@ -92,6 +93,7 @@ export async function parse() {
           inputTokens,
           outputTokens,
           cachedInputTokens: cacheReadInputTokens,
+          cacheCreationInputTokens,
           reasoningOutputTokens: 0,
         });
       }
@@ -115,6 +117,7 @@ export async function parse() {
           inputTokens,
           outputTokens,
           cachedInputTokens: usage.cacheReadInputTokens || 0,
+          cacheCreationInputTokens: usage.cacheCreationInputTokens || 0,
           reasoningOutputTokens: 0,
         });
       }

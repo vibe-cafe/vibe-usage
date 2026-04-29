@@ -52,6 +52,7 @@ export function aggregateToBuckets(entries) {
         inputTokens: 0,
         outputTokens: 0,
         cachedInputTokens: 0,
+        cacheCreationInputTokens: 0,
         reasoningOutputTokens: 0,
         totalTokens: 0,
       });
@@ -61,6 +62,7 @@ export function aggregateToBuckets(entries) {
     b.inputTokens += e.inputTokens || 0;
     b.outputTokens += e.outputTokens || 0;
     b.cachedInputTokens += e.cachedInputTokens || 0;
+    b.cacheCreationInputTokens += e.cacheCreationInputTokens || 0;
     b.reasoningOutputTokens += e.reasoningOutputTokens || 0;
     b.totalTokens += (e.inputTokens || 0) + (e.outputTokens || 0) + (e.reasoningOutputTokens || 0);
   }
