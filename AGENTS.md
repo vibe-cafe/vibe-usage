@@ -14,6 +14,7 @@ vibe-usage/
 │   │   ├── claude-code.js
 │   │   ├── codex.js
 │   │   ├── copilot-cli.js
+│   │   ├── cursor.js          # SQLite (read auth token) + cursor.com CSV export
 │   │   ├── gemini-cli.js
 │   │   ├── opencode.js        # SQLite via child_process sqlite3, JSON fallback
 │   │   ├── openclaw.js
@@ -75,13 +76,18 @@ Timing events fed to `extractSessions()` for interaction metadata.
 2. Register in `src/parsers/index.js` — import + add to `parsers` object
 3. Add tool entry in `src/tools.js` — `{ name, id, dataDir }` (alphabetical by id)
 4. Update `README.md` supported tools table
-5. **Backend**: add tool id to `VALID_SOURCES` in `vibe-cafe/apps/web/src/app/api/usage/ingest/route.ts`
+5. **Backend**: append the source to `USAGE_SOURCES` in `vibe-cafe/apps/web/src/lib/usage-sources.ts` (ingest validator and `/usage` chip list both derive from it).
 
 Parser pattern:
 - Read local log files from the tool's data directory
 - Extract per-message token entries → `aggregateToBuckets(entries)`
 - Extract user/assistant timing events → `extractSessions(events)`
 - Handle missing/corrupt files gracefully (try/catch, skip bad lines)
+
+Network-fetch parsers (the Cursor exception):
+- Cursor stores no usage locally — only an auth token in `state.vscdb`. The parser reads the token via the system `sqlite3` CLI, then GETs a CSV from `cursor.com`.
+- Always wrap network calls with `AbortSignal.timeout(...)` so a single hung host can't stall the whole sync (sync.js catches throws per-parser but cannot interrupt a hanging await).
+- Mark transient/network errors with `err.skip = true` so the parser silently returns empty (avoids noisy daemon logs every 5 min). Only auth/permanent errors should bubble up.
 
 ## Development & Testing
 

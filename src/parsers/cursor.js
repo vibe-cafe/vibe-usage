@@ -97,6 +97,8 @@ function decodeJwtSub(token) {
   }
 }
 
+const FETCH_TIMEOUT_MS = 10_000;
+
 async function fetchUsageCsv(token) {
   const url = `${(process.env.CURSOR_WEB_BASE_URL?.trim() || 'https://cursor.com').replace(/\/+$/, '')}/api/dashboard/export-usage-events-csv?strategy=tokens`;
   const sub = decodeJwtSub(token);
@@ -112,15 +114,23 @@ async function fetchUsageCsv(token) {
   for (const headers of attempts) {
     let resp;
     try {
-      resp = await fetch(url, { headers: { Accept: 'text/csv,*/*;q=0.8', ...headers } });
+      resp = await fetch(url, {
+        headers: { Accept: 'text/csv,*/*;q=0.8', ...headers },
+        signal: AbortSignal.timeout(FETCH_TIMEOUT_MS),
+      });
     } catch (e) {
-      failures.push(`network: ${e.message}`);
-      continue;
+      // Hard-fail on network/timeout: stop trying further headers (won't fix
+      // a downed host) and signal a soft skip to the caller.
+      const reason = e.name === 'TimeoutError' ? 'timeout' : `network: ${e.message}`;
+      const err = new Error(`Cursor usage export skipped (${reason})`);
+      err.skip = true;
+      throw err;
     }
     if (resp.ok) return await resp.text();
     failures.push(`${resp.status} ${resp.statusText}`);
   }
-  throw new Error(`Cursor usage export failed (${failures.join('; ')})`);
+  // All auth combos rejected — token is likely expired. Surface to user.
+  throw new Error(`Cursor usage export auth failed (${failures.join('; ')})`);
 }
 
 function parseCsv(text) {
@@ -178,7 +188,15 @@ export async function parse() {
   }
   if (!token) return { buckets: [], sessions: [] };
 
-  const csv = await fetchUsageCsv(token);
+  let csv;
+  try {
+    csv = await fetchUsageCsv(token);
+  } catch (err) {
+    // Network/timeout → silent skip (avoid noisy daemon logs every 5 min).
+    // Auth failure → bubble up so user sees they need to re-login in Cursor.
+    if (err && err.skip) return { buckets: [], sessions: [] };
+    throw err;
+  }
   const rows = parseCsv(csv);
   if (rows.length < 2) return { buckets: [], sessions: [] };
 
