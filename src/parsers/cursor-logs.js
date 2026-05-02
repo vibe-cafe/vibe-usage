@@ -116,8 +116,6 @@ async function parseLogFiles(logDir) {
         continue;
       }
 
-      if (raw.status !== 'completed') continue;
-
       const prompt = n(raw.input_tokens ?? raw.prompt_tokens);
       const output = n(raw.output_tokens ?? raw.completion_tokens);
       const cacheRead = n(raw.cache_read_tokens ?? raw.cache_read_input_tokens);
