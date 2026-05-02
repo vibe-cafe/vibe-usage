@@ -199,7 +199,7 @@ export async function parse() {
     throw err;
   }
   const rows = parseCsv(csv);
-  if (rows.length < 2) return { buckets: [], sessions: [] };
+  if (rows.length < 2) return parseCursorLogs();
 
   const header = rows[0].map(h => h.trim());
   const idx = (name) => header.indexOf(name);
@@ -210,7 +210,7 @@ export async function parse() {
   const cacheReadIdx = idx('Cache Read');
   const outputIdx = idx('Output Tokens');
 
-  if (dateIdx < 0 || modelIdx < 0) return { buckets: [], sessions: [] };
+  if (dateIdx < 0 || modelIdx < 0) return parseCursorLogs();
 
   const entries = [];
   for (let r = 1; r < rows.length; r++) {
@@ -238,6 +238,8 @@ export async function parse() {
       reasoningOutputTokens: 0,
     });
   }
+
+  if (entries.length === 0) return parseCursorLogs();
 
   return { buckets: aggregateToBuckets(entries), sessions: [] };
 }
