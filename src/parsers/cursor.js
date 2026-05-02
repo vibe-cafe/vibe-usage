@@ -3,6 +3,7 @@ import { copyFileSync, existsSync, mkdtempSync, rmSync } from 'node:fs';
 import { join, resolve } from 'node:path';
 import { homedir, tmpdir } from 'node:os';
 import { aggregateToBuckets } from './index.js';
+import { parse as parseCursorLogs } from './cursor-logs.js';
 
 const STATE_DB_RELATIVE = join('User', 'globalStorage', 'state.vscdb');
 const ACCESS_TOKEN_KEY = 'cursorAuth/accessToken';
@@ -175,7 +176,7 @@ function parseInt0(value) {
 
 export async function parse() {
   const dbPath = getCursorStateDbPath();
-  if (!dbPath) return { buckets: [], sessions: [] };
+  if (!dbPath) return parseCursorLogs();
 
   let token;
   try {
@@ -186,7 +187,7 @@ export async function parse() {
     }
     throw err;
   }
-  if (!token) return { buckets: [], sessions: [] };
+  if (!token) return parseCursorLogs();
 
   let csv;
   try {

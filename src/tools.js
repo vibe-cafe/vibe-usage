@@ -58,6 +58,7 @@ export const TOOLS = [
     name: 'Cursor',
     id: 'cursor',
     dataDir: getCursorStateDbPath(),
+    note: 'Uses cursor.com API when authenticated, falls back to local hook logs (~/.config/Cursor/logs)',
   },
   {
     name: 'Gemini CLI',
