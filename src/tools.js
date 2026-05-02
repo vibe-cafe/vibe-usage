@@ -2,6 +2,19 @@ import { existsSync, readdirSync } from 'node:fs';
 import { join } from 'node:path';
 import { homedir } from 'node:os';
 
+function getCursorStateDbPath() {
+  const rel = join('User', 'globalStorage', 'state.vscdb');
+  if (process.platform === 'darwin') {
+    return join(homedir(), 'Library', 'Application Support', 'Cursor', rel);
+  }
+  if (process.platform === 'win32') {
+    const appData = process.env.APPDATA?.trim() || join(homedir(), 'AppData', 'Roaming');
+    return join(appData, 'Cursor', rel);
+  }
+  const xdgConfigHome = process.env.XDG_CONFIG_HOME?.trim() || join(homedir(), '.config');
+  return join(xdgConfigHome, 'Cursor', rel);
+}
+
 /** Find all OpenClaw data roots: ~/.openclaw and ~/.openclaw-<profile> */
 function findOpenclawDataDirs() {
   const home = homedir();
@@ -40,6 +53,11 @@ export const TOOLS = [
     name: 'GitHub Copilot CLI',
     id: 'copilot-cli',
     dataDir: join(homedir(), '.copilot', 'session-state'),
+  },
+  {
+    name: 'Cursor',
+    id: 'cursor',
+    dataDir: getCursorStateDbPath(),
   },
   {
     name: 'Gemini CLI',

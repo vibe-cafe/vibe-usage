@@ -49,6 +49,7 @@ npx @vibe-cafe/vibe-usage status       # Show config & detected tools
 | Claude Code | `~/.claude/projects/` (tokens + sessions), `~/.claude/transcripts/` (sessions only) |
 | Codex CLI | `~/.codex/sessions/` |
 | GitHub Copilot CLI | `~/.copilot/session-state/*/events.jsonl` |
+| Cursor | `state.vscdb` (SQLite, reads `cursorAuth/accessToken`, fetches CSV from `cursor.com`) |
 | Gemini CLI | `~/.gemini/tmp/` |
 | OpenCode | `~/.local/share/opencode/opencode.db` (SQLite, `json_extract` query) |
 | OpenClaw | `~/.openclaw/agents/`, `~/.openclaw-<profile>/agents/` (profile deployments) |
