@@ -1,4 +1,4 @@
-import { existsSync, readdirSync } from 'node:fs';
+import { existsSync, readdirSync, statSync } from 'node:fs';
 import { join } from 'node:path';
 import { homedir } from 'node:os';
 
@@ -14,6 +14,53 @@ function getCursorStateDbPath() {
   const xdgConfigHome = process.env.XDG_CONFIG_HOME?.trim() || join(homedir(), '.config');
   return join(xdgConfigHome, 'Cursor', rel);
 }
+
+function getKiroAgentPath() {
+  const rel = join('User', 'globalStorage', 'kiro.kiroagent');
+  if (process.platform === 'darwin') {
+    return join(homedir(), 'Library', 'Application Support', 'Kiro', rel);
+  }
+  if (process.platform === 'win32') {
+    const appData = process.env.APPDATA?.trim() || join(homedir(), 'AppData', 'Roaming');
+    return join(appData, 'Kiro', rel);
+  }
+  const xdgConfigHome = process.env.XDG_CONFIG_HOME?.trim() || join(homedir(), '.config');
+  return join(xdgConfigHome, 'Kiro', rel);
+}
+
+// VSCode-fork host directories where extensions like Cline / Roo Code live.
+const VSCODE_HOSTS = ['Code', 'Cursor', 'Windsurf', 'VSCodium', 'Code - Insiders', 'Trae', 'Trae CN'];
+
+function getVscodeHostRoots() {
+  const out = [];
+  if (process.platform === 'darwin') {
+    const base = join(homedir(), 'Library', 'Application Support');
+    for (const h of VSCODE_HOSTS) out.push(join(base, h));
+  } else if (process.platform === 'win32') {
+    const appData = process.env.APPDATA?.trim() || join(homedir(), 'AppData', 'Roaming');
+    for (const h of VSCODE_HOSTS) out.push(join(appData, h));
+  } else {
+    const xdg = process.env.XDG_CONFIG_HOME?.trim() || join(homedir(), '.config');
+    for (const h of VSCODE_HOSTS) out.push(join(xdg, h));
+  }
+  return out;
+}
+
+function findExtensionDirs(extensionId) {
+  const dirs = [];
+  for (const root of getVscodeHostRoots()) {
+    const ext = join(root, 'User', 'globalStorage', extensionId);
+    try {
+      if (statSync(ext).isDirectory()) dirs.push(ext);
+    } catch {
+      // not present in this host
+    }
+  }
+  return dirs;
+}
+
+const findClineDataDirs = () => findExtensionDirs('saoudrizwan.claude-dev');
+const findRooCodeDataDirs = () => findExtensionDirs('rooveterinaryinc.roo-cline');
 
 /** Find all OpenClaw data roots: ~/.openclaw and ~/.openclaw-<profile> */
 function findOpenclawDataDirs() {
@@ -43,6 +90,12 @@ export const TOOLS = [
     name: 'Claude Code',
     id: 'claude-code',
     dataDir: join(homedir(), '.claude', 'projects'),
+  },
+  {
+    name: 'Cline',
+    id: 'cline',
+    dataDir: join(homedir(), 'Library', 'Application Support', 'Code', 'User', 'globalStorage', 'saoudrizwan.claude-dev'),
+    detectDataDirs: findClineDataDirs,
   },
   {
     name: 'Codex CLI',
@@ -104,6 +157,17 @@ export const TOOLS = [
     name: 'Hermes',
     id: 'hermes',
     dataDir: join(homedir(), '.hermes', 'state.db'),
+  },
+  {
+    name: 'Kiro',
+    id: 'kiro',
+    dataDir: getKiroAgentPath(),
+  },
+  {
+    name: 'Roo Code',
+    id: 'roo-code',
+    dataDir: join(homedir(), 'Library', 'Application Support', 'Code', 'User', 'globalStorage', 'rooveterinaryinc.roo-cline'),
+    detectDataDirs: findRooCodeDataDirs,
   },
 ];
 

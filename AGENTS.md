@@ -76,7 +76,7 @@ Timing events fed to `extractSessions()` for interaction metadata.
 2. Register in `src/parsers/index.js` — import + add to `parsers` object
 3. Add tool entry in `src/tools.js` — `{ name, id, dataDir }` (alphabetical by id)
 4. Update `README.md` supported tools table
-5. **Backend**: append the source to `USAGE_SOURCES` in `vibe-cafe/apps/web/src/lib/usage-sources.ts` (ingest validator and `/usage` chip list both derive from it).
+5. **Backend**: append the source to `USAGE_SOURCES` in `vibe-cafe/apps/web/src/lib/usage-sources.ts` (ingest filter and `/usage` chip list both derive from it). Release ordering between vibe-usage publish and vibe-cafe deploy is no longer load-bearing — the ingest endpoint **soft-drops** unknown sources (returns them in `dropped: { buckets, unknownSources }` instead of 400ing the batch) so other parsers' data still lands. Until the source is registered server-side, `sync.js` prints a dim "X buckets dropped (服务端未收录的 source: …)" line.
 
 Parser pattern:
 - Read local log files from the tool's data directory

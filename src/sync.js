@@ -89,6 +89,8 @@ export async function runSync({ throws = false, quiet = false } = {}) {
 
   let totalIngested = 0;
   let totalSessionsSynced = 0;
+  let totalDroppedBuckets = 0;
+  const droppedSources = new Set();
   const bucketBatches = Math.ceil(allBuckets.length / BATCH_SIZE);
   const sessionBatches = Math.ceil(allSessions.length / SESSION_BATCH_SIZE);
   const totalBatches = Math.max(bucketBatches, sessionBatches, 1);
@@ -108,6 +110,10 @@ export async function runSync({ throws = false, quiet = false } = {}) {
       }, batchSessions.length > 0 ? batchSessions : undefined);
       totalIngested += result.ingested ?? batch.length;
       totalSessionsSynced += result.sessions ?? 0;
+      if (result.dropped) {
+        totalDroppedBuckets += Number(result.dropped.buckets) || 0;
+        for (const s of result.dropped.unknownSources || []) droppedSources.add(s);
+      }
     }
 
     if (totalBatches > 1 || allBuckets.length > 0) {
@@ -116,6 +122,14 @@ export async function runSync({ throws = false, quiet = false } = {}) {
     const syncParts = [`${totalIngested} buckets`];
     if (totalSessionsSynced > 0) syncParts.push(`${totalSessionsSynced} sessions`);
     console.log(success(`已同步 ${syncParts.join(' · ')}`));
+
+    if (totalDroppedBuckets > 0) {
+      // Server doesn't (yet) recognize these source IDs — usually means the
+      // CLI is newer than the deployed vibe-cafe. Surface so the user knows
+      // the data wasn't lost on their end, just not stored upstream.
+      const sourcesList = Array.from(droppedSources).sort().join(', ');
+      console.log(dim(`  ${totalDroppedBuckets} buckets dropped (服务端未收录的 source: ${sourcesList})`));
+    }
 
     if (!quiet && totalSessionsSynced > 0) {
       const totalActive = allSessions.reduce((s, x) => s + x.activeSeconds, 0);

@@ -59,6 +59,9 @@ npx @vibe-cafe/vibe-usage status       # Show config & detected tools
 | Amp | `~/.local/share/amp/threads/` |
 | Droid | `~/.factory/sessions/` |
 | Hermes | `~/.hermes/state.db` + `~/.hermes/profiles/<name>/state.db` (SQLite, multi-profile) |
+| Kiro | `~/Library/Application Support/Kiro/User/globalStorage/kiro.kiroagent/dev_data/devdata.sqlite` (SQLite, JSONL fallback; model name resolved from `.chat` timeline) |
+| Cline | `<host>/User/globalStorage/saoudrizwan.claude-dev/{state/taskHistory.json,tasks/<id>/ui_messages.json}` (walks all VSCode-fork hosts: Code, Cursor, Windsurf, VSCodium, Trae, ...) |
+| Roo Code | `<host>/User/globalStorage/rooveterinaryinc.roo-cline/{tasks/_index.json,tasks/<id>/{history_item,ui_messages}.json}` (walks all VSCode-fork hosts) |
 
 ## How It Works
 
