@@ -4,7 +4,7 @@ import { ingest, fetchSettings } from './api.js';
 import { parsers } from './parsers/index.js';
 import { success, failure, arrow, link, dim } from './output.js';
 
-const BATCH_SIZE = 100;
+const BATCH_SIZE = 10;
 const SESSION_BATCH_SIZE = 500;
 
 function formatBytes(bytes) {
