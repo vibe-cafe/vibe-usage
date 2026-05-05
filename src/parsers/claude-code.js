@@ -120,6 +120,7 @@ export async function parse() {
           inputTokens: usage.input_tokens || 0,
           outputTokens: usage.output_tokens || 0,
           cachedInputTokens: usage.cache_read_input_tokens || 0,
+          cacheCreationInputTokens: usage.cache_creation_input_tokens || 0,
           reasoningOutputTokens: 0,
         });
       } catch {

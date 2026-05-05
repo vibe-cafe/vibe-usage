@@ -107,11 +107,10 @@ export async function parse() {
             model,
             project: currentProject,
             timestamp,
-            // Copilot reports cache reads separately, but cache writes are part of
-            // regular input for this schema because buckets don't have a dedicated field.
-            inputTokens: Math.max(0, totalInput - cachedRead),
+            inputTokens: Math.max(0, totalInput - cachedRead - cacheWrite),
             outputTokens: output,
             cachedInputTokens: cachedRead,
+            cacheCreationInputTokens: cacheWrite,
             reasoningOutputTokens: 0,
           });
         }

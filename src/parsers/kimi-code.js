@@ -128,6 +128,7 @@ export async function parse() {
           inputTokens: tokenUsage.input_other || 0,
           outputTokens: tokenUsage.output || 0,
           cachedInputTokens: tokenUsage.input_cache_read || 0,
+          cacheCreationInputTokens: tokenUsage.input_cache_creation || 0,
           reasoningOutputTokens: 0,
         });
       } catch {
