@@ -55,7 +55,7 @@ npx @vibe-cafe/vibe-usage status       # Show config & detected tools
 | OpenClaw | `~/.openclaw/agents/`, `~/.openclaw-<profile>/agents/` (profile deployments) |
 | pi | `~/.pi/agent/sessions/` |
 | Qwen Code | `~/.qwen/tmp/` |
-| Kimi Code | `~/.kimi/sessions/` |
+| Kimi Code | `~/.kimi/sessions/<md5(workdir)>/<session-id>/wire.jsonl` (wire protocol 1.9, model from `~/.kimi/config.toml`, project from `~/.kimi/kimi.json`) |
 | Amp | `~/.local/share/amp/threads/` |
 | Droid | `~/.factory/sessions/` |
 | Hermes | `~/.hermes/state.db` + `~/.hermes/profiles/<name>/state.db` (SQLite, multi-profile) |
