@@ -12,6 +12,7 @@ import { aggregateToBuckets, extractSessions } from './index.js';
 
 const KIMI_SESSIONS_DIR = join(homedir(), '.kimi', 'sessions');
 const KIMI_CONFIG = join(homedir(), '.kimi', 'kimi.json');
+const KIMI_CONFIG_TOML = join(homedir(), '.kimi', 'config.toml');
 
 function findWireFiles(baseDir) {
   const results = [];
@@ -60,11 +61,31 @@ function loadProjectMap() {
   return map;
 }
 
+function loadModelFromConfig() {
+  if (!existsSync(KIMI_CONFIG_TOML)) return 'unknown';
+
+  try {
+    const content = readFileSync(KIMI_CONFIG_TOML, 'utf-8');
+    // Try default_model first
+    const defaultMatch = content.match(/default_model\s*=\s*["']([^"']+)["']/);
+    if (defaultMatch) return defaultMatch[1];
+
+    // Fall back to first model section name
+    const sectionMatch = content.match(/\[models\."([^"]+)"\]/);
+    if (sectionMatch) return sectionMatch[1];
+
+    return 'unknown';
+  } catch {
+    return 'unknown';
+  }
+}
+
 export async function parse() {
   const wireFiles = findWireFiles(KIMI_SESSIONS_DIR);
   if (wireFiles.length === 0) return { buckets: [], sessions: [] };
 
   const projectMap = loadProjectMap();
+  const defaultModel = loadModelFromConfig();
   const entries = [];
   const sessionEvents = [];
   const seenMessageIds = new Set();
@@ -78,18 +99,23 @@ export async function parse() {
     }
 
     const project = projectMap.get(workDirHash) || workDirHash;
-    let currentModel = 'unknown';
+    let currentModel = defaultModel;
     let lastTimestamp = null;
 
     for (const line of content.split('\n')) {
       if (!line.trim()) continue;
       try {
         const obj = JSON.parse(line);
-        const type = obj.type;
-        const payload = obj.payload;
+        // Bug 1: Handle wire protocol 1.9 message wrapper
+        const message = obj.message || obj;
+        const type = message.type || obj.type;
+        const payload = message.payload || obj.payload;
         if (!payload) continue;
 
-        if (payload.timestamp) lastTimestamp = payload.timestamp;
+        // Bug 2: Kimi CLI uses Unix seconds, convert to ms for Date()
+        if (obj.timestamp) lastTimestamp = obj.timestamp * 1000;
+        else if (payload.timestamp) lastTimestamp = payload.timestamp * 1000;
+
         if (payload.model) currentModel = payload.model;
 
         if (lastTimestamp) {
