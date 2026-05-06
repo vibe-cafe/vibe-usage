@@ -3,6 +3,7 @@ import { copyFileSync, existsSync, mkdtempSync, rmSync } from 'node:fs';
 import { join, resolve } from 'node:path';
 import { homedir, tmpdir } from 'node:os';
 import { aggregateToBuckets } from './index.js';
+import { parse as parseCursorLogs } from './cursor-logs.js';
 
 const STATE_DB_RELATIVE = join('User', 'globalStorage', 'state.vscdb');
 const ACCESS_TOKEN_KEY = 'cursorAuth/accessToken';
@@ -175,7 +176,7 @@ function parseInt0(value) {
 
 export async function parse() {
   const dbPath = getCursorStateDbPath();
-  if (!dbPath) return { buckets: [], sessions: [] };
+  if (!dbPath) return parseCursorLogs();
 
   let token;
   try {
@@ -186,7 +187,7 @@ export async function parse() {
     }
     throw err;
   }
-  if (!token) return { buckets: [], sessions: [] };
+  if (!token) return parseCursorLogs();
 
   let csv;
   try {
@@ -198,7 +199,7 @@ export async function parse() {
     throw err;
   }
   const rows = parseCsv(csv);
-  if (rows.length < 2) return { buckets: [], sessions: [] };
+  if (rows.length < 2) return parseCursorLogs();
 
   const header = rows[0].map(h => h.trim());
   const idx = (name) => header.indexOf(name);
@@ -209,7 +210,7 @@ export async function parse() {
   const cacheReadIdx = idx('Cache Read');
   const outputIdx = idx('Output Tokens');
 
-  if (dateIdx < 0 || modelIdx < 0) return { buckets: [], sessions: [] };
+  if (dateIdx < 0 || modelIdx < 0) return parseCursorLogs();
 
   const entries = [];
   for (let r = 1; r < rows.length; r++) {
@@ -237,6 +238,8 @@ export async function parse() {
       reasoningOutputTokens: 0,
     });
   }
+
+  if (entries.length === 0) return parseCursorLogs();
 
   return { buckets: aggregateToBuckets(entries), sessions: [] };
 }

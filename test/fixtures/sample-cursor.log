@@ -1,0 +1,42 @@
+[2026-04-30T08:00:50.683Z] Hook step requested: stop
+INPUT:
+{
+  "conversation_id": "32676ff8-cd67-45c6-af79-5510adaf6c95",
+  "generation_id": "2035c6d5-1e19-4831-b62e-b34ef36f4877",
+  "model": "gpt-5.4",
+  "status": "completed",
+  "input_tokens": 325659,
+  "output_tokens": 1032,
+  "cache_read_tokens": 325120,
+  "session_id": "32676ff8-cd67-45c6-af79-5510adaf6c95",
+  "workspace_roots": ["/tmp/demo"]
+}
+OUTPUT:
+(empty)
+[2026-04-30T08:04:34.891Z] Hook step requested: stop
+INPUT:
+{
+  "conversation_id": "93688faf-02b3-4b43-95a4-4179b0dee37e",
+  "generation_id": "621c35c8-58ac-4857-bd87-8bb58b19c293",
+  "model": "gpt-5.5",
+  "status": "aborted",
+  "input_tokens": 1000,
+  "output_tokens": 200,
+  "cache_read_tokens": 900,
+  "session_id": "93688faf-02b3-4b43-95a4-4179b0dee37e",
+  "workspace_roots": ["/tmp/demo"]
+}
+OUTPUT:
+(empty)
+[2026-04-30T09:05:00.000Z] Hook step requested: stop
+INPUT:
+{
+  "conversation_id": "no-tokens-1234-5678-90ab-cdef12345678",
+  "generation_id": "no-tokens-8765-4321-10fe-dcba87654321",
+  "model": "gpt-5.4",
+  "status": "completed",
+  "session_id": "no-tokens-1234-5678-90ab-cdef12345678",
+  "workspace_roots": []
+}
+OUTPUT:
+(empty)
