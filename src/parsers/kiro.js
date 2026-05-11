@@ -1,4 +1,3 @@
-import { execFileSync } from 'node:child_process';
 import {
   copyFileSync,
   existsSync,
@@ -11,6 +10,7 @@ import {
 import { join, resolve } from 'node:path';
 import { homedir, tmpdir } from 'node:os';
 import { aggregateToBuckets } from './index.js';
+import { queryDbJson } from './sqlite.js';
 
 const KIROAGENT_RELATIVE = join('User', 'globalStorage', 'kiro.kiroagent');
 
@@ -41,14 +41,7 @@ function isLockError(err) {
 }
 
 function queryDb(dbPath, sql) {
-  const out = execFileSync('sqlite3', ['-json', dbPath, sql], {
-    encoding: 'utf-8',
-    maxBuffer: 100 * 1024 * 1024,
-    timeout: 30000,
-  });
-  const trimmed = out.trim();
-  if (!trimmed || trimmed === '[]') return [];
-  return JSON.parse(trimmed);
+  return queryDbJson(dbPath, sql);
 }
 
 const TOKENS_SQL =
@@ -195,7 +188,7 @@ export async function parse() {
     }
   } catch (err) {
     if (err && typeof err.message === 'string' && err.message.includes('ENOENT')) {
-      throw new Error('sqlite3 CLI not found. Install sqlite3 to sync Kiro data.');
+      throw new Error('sqlite3 CLI not found. Install sqlite3 (or use Node >= 22.5) to sync Kiro data.');
     }
     throw err;
   }

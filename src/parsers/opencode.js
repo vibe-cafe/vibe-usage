@@ -1,8 +1,8 @@
-import { execFileSync } from 'node:child_process';
-import { readdirSync, readFileSync, statSync, existsSync } from 'node:fs';
+import { readdirSync, readFileSync, existsSync } from 'node:fs';
 import { join, basename } from 'node:path';
 import { homedir } from 'node:os';
 import { aggregateToBuckets, extractSessions } from './index.js';
+import { queryDbJson } from './sqlite.js';
 
 const DATA_DIR = join(homedir(), '.local', 'share', 'opencode');
 const DB_PATH = join(DATA_DIR, 'opencode.db');
@@ -33,29 +33,16 @@ function parseFromSqlite() {
     json_extract(data, '$.path.root') as rootPath
     FROM message`;
 
-  let output;
+  let rows;
   try {
-    output = execFileSync('sqlite3', [
-      '-json',
-      DB_PATH,
-      query,
-    ], { encoding: 'utf-8', maxBuffer: 100 * 1024 * 1024, timeout: 30000 });
+    rows = queryDbJson(DB_PATH, query);
   } catch (err) {
     if (err.status === 127 || (err.message && err.message.includes('ENOENT'))) {
-      throw new Error('sqlite3 CLI not found. Install sqlite3 to sync opencode data.');
+      throw new Error('sqlite3 CLI not found. Install sqlite3 (or use Node >= 22.5) to sync opencode data.');
     }
     throw err;
   }
-
-  output = output.trim();
-  if (!output || output === '[]') return { buckets: [], sessions: [] };
-
-  let rows;
-  try {
-    rows = JSON.parse(output);
-  } catch {
-    throw new Error('Failed to parse sqlite3 JSON output');
-  }
+  if (!rows.length) return { buckets: [], sessions: [] };
 
   const entries = [];
   const sessionEvents = [];

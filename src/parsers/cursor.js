@@ -1,8 +1,8 @@
-import { execFileSync } from 'node:child_process';
 import { copyFileSync, existsSync, mkdtempSync, rmSync } from 'node:fs';
 import { join, resolve } from 'node:path';
 import { homedir, tmpdir } from 'node:os';
 import { aggregateToBuckets } from './index.js';
+import { queryDbJson } from './sqlite.js';
 
 const STATE_DB_RELATIVE = join('User', 'globalStorage', 'state.vscdb');
 const ACCESS_TOKEN_KEY = 'cursorAuth/accessToken';
@@ -66,14 +66,7 @@ function readAccessToken(dbPath) {
 
 function queryAccessToken(dbPath) {
   const sql = `SELECT value FROM ItemTable WHERE key = '${ACCESS_TOKEN_KEY}' LIMIT 1`;
-  const out = execFileSync('sqlite3', ['-json', dbPath, sql], {
-    encoding: 'utf-8',
-    maxBuffer: 4 * 1024 * 1024,
-    timeout: 15000,
-  });
-  const trimmed = out.trim();
-  if (!trimmed || trimmed === '[]') return null;
-  const rows = JSON.parse(trimmed);
+  const rows = queryDbJson(dbPath, sql, { maxBuffer: 4 * 1024 * 1024, timeout: 15000 });
   const value = rows[0]?.value;
   if (typeof value !== 'string') return null;
   const t = value.trim();
@@ -182,7 +175,7 @@ export async function parse() {
     token = readAccessToken(dbPath);
   } catch (err) {
     if (err && typeof err.message === 'string' && err.message.includes('ENOENT')) {
-      throw new Error('sqlite3 CLI not found. Install sqlite3 to sync Cursor data.');
+      throw new Error('sqlite3 CLI not found. Install sqlite3 (or use Node >= 22.5) to sync Cursor data.');
     }
     throw err;
   }

@@ -1,8 +1,8 @@
-import { execFileSync } from 'node:child_process';
 import { existsSync, readdirSync, statSync } from 'node:fs';
 import { join } from 'node:path';
 import { homedir } from 'node:os';
 import { aggregateToBuckets, extractSessions } from './index.js';
+import { queryDbJson } from './sqlite.js';
 
 const HERMES_HOME = process.env.HERMES_HOME || join(homedir(), '.hermes');
 
@@ -38,7 +38,7 @@ export async function parse() {
         WHERE input_tokens > 0 OR output_tokens > 0`);
     } catch (err) {
       if (err.message && err.message.includes('ENOENT')) {
-        throw new Error('sqlite3 CLI not found. Install sqlite3 to sync Hermes data.');
+        throw new Error('sqlite3 CLI not found. Install sqlite3 (or use Node >= 22.5) to sync Hermes data.');
       }
       throw err;
     }
@@ -121,14 +121,5 @@ function discoverDbPaths(home) {
 }
 
 function queryDb(dbPath, sql) {
-  const output = execFileSync('sqlite3', [
-    '-json',
-    dbPath,
-    sql,
-  ], { encoding: 'utf-8', maxBuffer: 100 * 1024 * 1024, timeout: 30000 });
-
-  const trimmed = output.trim();
-  if (!trimmed || trimmed === '[]') return [];
-
-  return JSON.parse(trimmed);
+  return queryDbJson(dbPath, sql);
 }

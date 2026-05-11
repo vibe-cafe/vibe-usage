@@ -70,6 +70,7 @@ npx @vibe-cafe/vibe-usage status       # Show config & detected tools
 - Extracts session metadata from all parsers: active time (AI generation time, excluding queue/TTFT wait), total duration, message counts
 - Uploads buckets + sessions to your vibecafe.ai dashboard (gzip-compressed when ≥ 1 KB, ~94% smaller)
 - Stateless: computes full totals from local logs each sync (idempotent, no state files)
+- SQLite-backed tools (Cursor, OpenCode, Kiro, Hermes) are read via Node's built-in `node:sqlite` on Node ≥ 22.5 — no `sqlite3` binary needed (works on Windows out of the box); on older Node it falls back to the system `sqlite3` CLI
 - For continuous syncing, use `npx @vibe-cafe/vibe-usage daemon` or the [Vibe Usage Mac app](https://github.com/vibe-cafe/vibe-usage-app)
 
 ## AI Skill

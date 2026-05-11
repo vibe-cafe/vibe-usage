@@ -14,15 +14,17 @@ vibe-usage/
 │   │   ├── claude-code.js
 │   │   ├── codex.js
 │   │   ├── copilot-cli.js
+│   │   ├── sqlite.js          # queryDbJson() — node:sqlite (Node ≥22.5), falls back to sqlite3 CLI
 │   │   ├── cursor.js          # SQLite (read auth token) + cursor.com CSV export
 │   │   ├── gemini-cli.js
-│   │   ├── opencode.js        # SQLite via child_process sqlite3, JSON fallback
+│   │   ├── opencode.js        # SQLite (via sqlite.js), legacy JSON fallback
 │   │   ├── openclaw.js
 │   │   ├── qwen-code.js
 │   │   ├── kimi-code.js
 │   │   ├── amp.js
 │   │   ├── droid.js
-│   │   └── hermes.js          # SQLite via child_process sqlite3
+│   │   ├── kiro.js            # SQLite (via sqlite.js), JSONL fallback
+│   │   └── hermes.js          # SQLite (via sqlite.js), multi-profile
 │   ├── tools.js               # TOOLS[] registry + detectInstalledTools()
 │   ├── sync.js                # Orchestrator: parse all → batch upload buckets + sessions
 │   ├── api.js                 # HTTP client: ingest() (gzip if ≥1KB), deleteAllData(), fetchSettings()
@@ -34,13 +36,13 @@ vibe-usage/
 │   ├── skill.js               # Install/remove SKILL.md for AI coding tools
 │   └── output.js              # Terminal output helpers: colors, OSC 8 links, big/small headers
 ├── SKILL.md                   # Skill definition (also used by `npx skills add`)
-└── package.json               # @vibe-cafe/vibe-usage, ESM, Node >=20, zero dependencies
+└── package.json               # @vibe-cafe/vibe-usage, ESM, Node >=20 (≥22.5 enables built-in node:sqlite), zero dependencies
 ```
 
 ## Key Conventions
 
 - **Pure ESM** (`"type": "module"`) — no CommonJS, no build step
-- **Zero dependencies** — only Node built-ins (fs, path, os, crypto, https, readline, child_process, zlib)
+- **Zero dependencies** — only Node built-ins (fs, path, os, crypto, https, readline, child_process, zlib, `node:sqlite`)
 - **Stateless sync** — parsers compute full totals from raw logs each run; server upserts idempotently
 - **Stable hostname** — hostname is persisted in config at init; `sync.js` never re-reads `os.hostname()` after first capture. This prevents macOS mDNS hostname drift (e.g., `-2`, `-3` suffixes) from creating duplicate device entries in the DB.
 - **No TypeScript** — plain JavaScript throughout
@@ -84,8 +86,14 @@ Parser pattern:
 - Extract user/assistant timing events → `extractSessions(events)`
 - Handle missing/corrupt files gracefully (try/catch, skip bad lines)
 
+SQLite-backed parsers (cursor, opencode, kiro, hermes):
+- Use `queryDbJson(dbPath, sql)` from `src/parsers/sqlite.js` — never shell out to `sqlite3` directly. It prefers Node's built-in `node:sqlite` (`DatabaseSync`, opened read-only; Node ≥ 22.5, works on Windows with no extra binary) and falls back to the `sqlite3` CLI on older Node.
+- Rows come back as plain objects (`{ column: value }`), same shape as `sqlite3 -json` — INTEGER → number, TEXT → string, JSON via `json_extract` → string.
+- If neither `node:sqlite` nor the CLI is available the helper throws an `ENOENT`-flavored error; catch it and rethrow `'sqlite3 CLI not found. Install sqlite3 (or use Node >= 22.5) to sync X data.'` so the user gets a hint.
+- For DBs the source app holds a write lock on (Cursor, Kiro): catch `/database is locked/i`, copy the DB (+ `-wal`/`-shm`) to a temp dir, and re-query the snapshot.
+
 Network-fetch parsers (the Cursor exception):
-- Cursor stores no usage locally — only an auth token in `state.vscdb`. The parser reads the token via the system `sqlite3` CLI, then GETs a CSV from `cursor.com`.
+- Cursor stores no usage locally — only an auth token in `state.vscdb`. The parser reads the token via `queryDbJson()`, then GETs a CSV from `cursor.com`.
 - Always wrap network calls with `AbortSignal.timeout(...)` so a single hung host can't stall the whole sync (sync.js catches throws per-parser but cannot interrupt a hanging await).
 - Mark transient/network errors with `err.skip = true` so the parser silently returns empty (avoids noisy daemon logs every 5 min). Only auth/permanent errors should bubble up.
 
