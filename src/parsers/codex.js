@@ -4,6 +4,7 @@ import { homedir } from 'node:os';
 import { aggregateToBuckets, extractSessions } from './index.js';
 
 const SESSIONS_DIR = join(homedir(), '.codex', 'sessions');
+const FORK_REPLAY_WINDOW_MS = 5_000;
 
 /**
  * Recursively find all .jsonl files under a directory.
@@ -27,12 +28,12 @@ function findJsonlFiles(dir) {
   return results;
 }
 
-export async function parse() {
-  if (!existsSync(SESSIONS_DIR)) return { buckets: [], sessions: [] };
+export async function parse({ sessionsDir = SESSIONS_DIR } = {}) {
+  if (!existsSync(sessionsDir)) return { buckets: [], sessions: [] };
 
   const entries = [];
   const sessionEvents = [];
-  const files = findJsonlFiles(SESSIONS_DIR);
+  const files = findJsonlFiles(sessionsDir);
   if (files.length === 0) return { buckets: [], sessions: [] };
   for (const filePath of files) {
 
@@ -43,15 +44,22 @@ export async function parse() {
       continue;
     }
 
-    // Extract project name and model from session_meta line
+    // Extract project name, model, and fork metadata from session_meta lines.
     let sessionProject = 'unknown';
     let sessionModel = 'unknown';
+    let forkReplayUntil = null;
     for (const line of content.split('\n')) {
       if (!line.trim()) continue;
       try {
         const obj = JSON.parse(line);
         if (obj.type === 'session_meta' && obj.payload) {
           const meta = obj.payload;
+          if (meta.forked_from_id && obj.timestamp) {
+            const forkStart = new Date(obj.timestamp);
+            if (!isNaN(forkStart.getTime())) {
+              forkReplayUntil = new Date(forkStart.getTime() + FORK_REPLAY_WINDOW_MS);
+            }
+          }
           if (meta.cwd) {
             sessionProject = meta.cwd.split('/').pop() || 'unknown';
           }
@@ -75,14 +83,16 @@ export async function parse() {
         if (obj.timestamp) {
           const evTs = new Date(obj.timestamp);
           if (!isNaN(evTs.getTime())) {
-            const isUserTurn = obj.type === 'turn_context' || obj.type === 'session_meta';
-            sessionEvents.push({
-              sessionId: filePath,
-              source: 'codex',
-              project: sessionProject,
-              timestamp: evTs,
-              role: isUserTurn ? 'user' : 'assistant',
-            });
+            if (!forkReplayUntil || evTs > forkReplayUntil) {
+              const isUserTurn = obj.type === 'turn_context' || obj.type === 'session_meta';
+              sessionEvents.push({
+                sessionId: filePath,
+                source: 'codex',
+                project: sessionProject,
+                timestamp: evTs,
+                role: isUserTurn ? 'user' : 'assistant',
+              });
+            }
           }
         }
 
@@ -103,6 +113,7 @@ export async function parse() {
 
         const timestamp = obj.timestamp ? new Date(obj.timestamp) : null;
         if (!timestamp || isNaN(timestamp.getTime())) continue;
+        if (forkReplayUntil && timestamp <= forkReplayUntil) continue;
 
         // Prefer incremental per-request usage; compute delta from cumulative total as fallback
         let usage = info.last_token_usage;
