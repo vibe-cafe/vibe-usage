@@ -27,6 +27,26 @@ function findJsonlFiles(dir) {
   return results;
 }
 
+/**
+ * Count the leading `event_msg/token_count` records in a session file.
+ * Used to size the replayed-history block of a forked session: a fork
+ * copies the original conversation verbatim, so it begins with exactly as
+ * many token_count records as the original session has in total.
+ */
+function countTokenCountRecords(content) {
+  let n = 0;
+  for (const line of content.split('\n')) {
+    if (!line.trim()) continue;
+    try {
+      const obj = JSON.parse(line);
+      if (obj.type === 'event_msg' && obj.payload?.type === 'token_count') n++;
+    } catch {
+      continue;
+    }
+  }
+  return n;
+}
+
 export async function parse() {
   if (!existsSync(SESSIONS_DIR)) return { buckets: [], sessions: [] };
 
@@ -34,19 +54,72 @@ export async function parse() {
   const sessionEvents = [];
   const files = findJsonlFiles(SESSIONS_DIR);
   if (files.length === 0) return { buckets: [], sessions: [] };
-  for (const filePath of files) {
 
+  // Pass 1: index every session by its UUID and count its token_count
+  // records. A forked session (session_meta.payload.forked_from_id) starts
+  // with the original conversation replayed verbatim — including every
+  // token_count, all timestamped in a burst at the fork instant. Those
+  // tokens are already counted from the original session's own file, so
+  // re-counting them here double-counts usage and produces a spurious
+  // token/cost spike at the fork time. Timestamps cannot distinguish the
+  // replay from new activity (the replay burst is stamped at/after the fork
+  // instant, within the same 1–3s window), so we instead skip exactly the
+  // original session's token_count count from the start of each fork.
+  const tokenCountById = new Map(); // sessionId → number of token_count records
+  const fileMeta = new Map(); // filePath → { content, forkedFromId }
+  for (const filePath of files) {
     let content;
     try {
       content = readFileSync(filePath, 'utf-8');
     } catch {
       continue;
     }
+    let sessionId = null;
+    let forkedFromId = null;
+    for (const line of content.split('\n')) {
+      if (!line.trim()) continue;
+      try {
+        const obj = JSON.parse(line);
+        if (obj.type === 'session_meta' && obj.payload) {
+          sessionId = obj.payload.id || null;
+          forkedFromId = obj.payload.forked_from_id || null;
+        }
+      } catch { /* ignore */ }
+      break; // session_meta is always the first line
+    }
+    fileMeta.set(filePath, { content, forkedFromId });
+    if (sessionId) {
+      tokenCountById.set(sessionId, countTokenCountRecords(content));
+    }
+  }
 
-    // Extract project name and model from session_meta line
+  // Pass 2: parse usage, skipping each fork's replayed-history token_counts.
+  for (const filePath of files) {
+    const fm = fileMeta.get(filePath);
+    if (!fm) continue;
+    const { content, forkedFromId } = fm;
+
+    const lines = content.split('\n');
+
+    // How many leading token_count records are copied history. A fork's file
+    // begins with the *entire* source file replayed verbatim, so the count
+    // to skip is the source's total token_count count. This is correct even
+    // for chained forks: a fork-of-a-fork replays the parent fork's whole
+    // file (which itself already contains the grandparent's replay), so
+    // skipping the parent's full count skips exactly the duplicated region.
+    // If the source file is missing (rotated/deleted) we cannot locate the
+    // boundary; skip nothing so incomplete data over-counts rather than
+    // silently dropping real usage.
+    let replayTokenCountToSkip = 0;
+    if (forkedFromId != null) {
+      replayTokenCountToSkip = tokenCountById.get(forkedFromId) ?? 0;
+    }
+    let tokenCountSeen = 0;
+
+    // Extract project name from session_meta.
     let sessionProject = 'unknown';
     let sessionModel = 'unknown';
-    for (const line of content.split('\n')) {
+    for (const line of lines) {
       if (!line.trim()) continue;
       try {
         const obj = JSON.parse(line);
@@ -60,29 +133,44 @@ export async function parse() {
             const match = meta.git.repository_url.match(/([^/]+\/[^/]+?)(?:\.git)?$/);
             if (match) sessionProject = match[1];
           }
-          break;
         }
-      } catch { break; }
+      } catch { /* ignore */ }
+      break; // session_meta is always the first line
     }
 
     let turnContextModel = 'unknown';
     const prevTotal = new Map();
-    for (const line of content.split('\n')) {
+    for (const line of lines) {
       if (!line.trim()) continue;
       try {
         const obj = JSON.parse(line);
 
+        // A fork's replayed-history block is the run from the start of the
+        // file up to and including the Nth token_count, where N is the source
+        // session's total token_count count. We are still inside that block
+        // until we have *passed* the Nth token_count. (token_count is the
+        // last event of each turn, so the boundary lands cleanly at a turn
+        // edge — the new conversation's events come strictly after it.)
+        const inReplayBlock = tokenCountSeen < replayTokenCountToSkip;
+
         if (obj.timestamp) {
           const evTs = new Date(obj.timestamp);
           if (!isNaN(evTs.getTime())) {
-            const isUserTurn = obj.type === 'turn_context' || obj.type === 'session_meta';
-            sessionEvents.push({
-              sessionId: filePath,
-              source: 'codex',
-              project: sessionProject,
-              timestamp: evTs,
-              role: isUserTurn ? 'user' : 'assistant',
-            });
+            // Skip replayed history events so a forked session's
+            // duration/active-time/message counts reflect only the new
+            // conversation, not the copied original. session_meta itself is
+            // kept: it marks when the fork actually started.
+            const isReplay = inReplayBlock && obj.type !== 'session_meta';
+            if (!isReplay) {
+              const isUserTurn = obj.type === 'turn_context' || obj.type === 'session_meta';
+              sessionEvents.push({
+                sessionId: filePath,
+                source: 'codex',
+                project: sessionProject,
+                timestamp: evTs,
+                role: isUserTurn ? 'user' : 'assistant',
+              });
+            }
           }
         }
 
@@ -104,6 +192,14 @@ export async function parse() {
         const timestamp = obj.timestamp ? new Date(obj.timestamp) : null;
         if (!timestamp || isNaN(timestamp.getTime())) continue;
 
+        // This is the (tokenCountSeen+1)-th token_count in the file. If it
+        // falls inside the fork's replay block it's an exact copy of a record
+        // already counted from the source session's own file — skip it (but
+        // still advance the cumulative-total baseline below so the first real
+        // post-fork delta is measured correctly).
+        const isReplayedHistory = tokenCountSeen < replayTokenCountToSkip;
+        tokenCountSeen++;
+
         // Prefer incremental per-request usage; compute delta from cumulative total as fallback
         let usage = info.last_token_usage;
         if (!usage && info.total_token_usage) {
@@ -121,9 +217,13 @@ export async function parse() {
             // First cumulative entry — use as-is (it's the first event's total)
             usage = curr;
           }
+          // Always advance the cumulative baseline, even for replayed history,
+          // so the first real post-fork delta is measured against the last
+          // replayed total instead of being mistaken for a fresh "first entry".
           prevTotal.set(totalKey, { ...curr });
         }
         if (!usage) continue;
+        if (isReplayedHistory) continue;
 
         const model = info.model || payload.model || turnContextModel || sessionModel;
 
