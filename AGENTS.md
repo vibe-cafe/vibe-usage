@@ -102,6 +102,10 @@ Codex forked sessions (`codex.js`):
 - Timestamps **cannot** discriminate the replay (Codex stamps it at/after the fork's `session_meta` time, not before). The parser instead does two passes: pass 1 indexes every file by `session_meta.payload.id` and counts its `token_count` records; pass 2 skips exactly that many leading `token_count`s in any file whose `session_meta.payload.forked_from_id` points at it. A fork copies the source file verbatim, so the skip count == source's total count — this is also correct for chained forks (fork-of-a-fork replays the parent's whole file). If the source file is missing, skip nothing (over-count on incomplete data beats silently dropping real usage).
 - Both passes **stream** each rollout file line-by-line (`node:readline` over a `createReadStream`), never `readFileSync` into memory. Large `~/.codex/sessions` histories (hundreds of files, some >100 MB) otherwise OOM the V8 heap during `JSON.parse`. The trade-off is reading each file twice (pass 1 indexes id/fork/project/token_count count via `indexSessionFile`; pass 2 re-streams for usage extraction) — bounded memory beats a single-pass read that retains gigabytes of transcript text.
 
+Codex archived sessions (`codex.js`, `tools.js`):
+- Codex moves a "completed" session's rollout file from `~/.codex/sessions/` to `~/.codex/archived_sessions/`. The parser scans **both** dirs in one pass (`SESSIONS_DIRS`); scanning only the live dir permanently lost any session archived between two syncs. Re-reading an already-synced archived file is idempotent (stateless parser, server dedups), and indexing both dirs together keeps fork replay-skip correct when a fork and its parent are split across them.
+- Session timing events are grouped by the real `session_meta.payload.id`, not the file path — the same session can momentarily exist in both dirs, and path-keying would emit two `sessionHash`es and double-count its stats. `findCodexDataDirs` in `tools.js` likewise treats either dir as "Codex installed".
+
 ## Development & Testing
 
 ```bash

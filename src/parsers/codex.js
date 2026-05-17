@@ -4,7 +4,18 @@ import { homedir } from 'node:os';
 import { createInterface } from 'node:readline';
 import { aggregateToBuckets, extractSessions } from './index.js';
 
-const SESSIONS_DIR = join(homedir(), '.codex', 'sessions');
+// Codex stores live sessions in ~/.codex/sessions and, once a session is
+// "completed", moves its rollout file verbatim into ~/.codex/archived_sessions.
+// A session can be archived between two syncs, so scanning only the live dir
+// loses that session's usage forever. We scan both: the parser is stateless
+// and the server dedups on (source, sessionHash/bucket), so re-reading an
+// archived file that was already synced from sessions/ is idempotent. Indexing
+// both together also keeps fork replay-skip correct when a fork and its parent
+// end up split across the two directories.
+const SESSIONS_DIRS = [
+  join(homedir(), '.codex', 'sessions'),
+  join(homedir(), '.codex', 'archived_sessions'),
+];
 
 /**
  * Recursively find all .jsonl files under a directory.
@@ -80,11 +91,11 @@ async function indexSessionFile(filePath) {
 }
 
 export async function parse() {
-  if (!existsSync(SESSIONS_DIR)) return { buckets: [], sessions: [] };
+  if (!SESSIONS_DIRS.some(existsSync)) return { buckets: [], sessions: [] };
 
   const entries = [];
   const sessionEvents = [];
-  const files = findJsonlFiles(SESSIONS_DIR);
+  const files = SESSIONS_DIRS.flatMap(findJsonlFiles);
   if (files.length === 0) return { buckets: [], sessions: [] };
 
   // Pass 1: index every session by its UUID and count its token_count
@@ -134,6 +145,12 @@ export async function parse() {
     let tokenCountSeen = 0;
 
     const sessionProject = fm.sessionProject;
+    // Group timing events by the real Codex session id, not the file path: the
+    // same session can briefly exist in both sessions/ and archived_sessions/
+    // (mid-archive, or a re-synced archive). Path-keyed grouping would emit it
+    // as two different sessionHashes and double-count its session stats. Fall
+    // back to the path only when the id is unknown (corrupt/missing meta).
+    const sessionKey = fm.sessionId || filePath;
 
     let turnContextModel = 'unknown';
     const prevTotal = new Map();
@@ -161,7 +178,7 @@ export async function parse() {
             if (!isReplay) {
               const isUserTurn = obj.type === 'turn_context' || obj.type === 'session_meta';
               sessionEvents.push({
-                sessionId: filePath,
+                sessionId: sessionKey,
                 source: 'codex',
                 project: sessionProject,
                 timestamp: evTs,

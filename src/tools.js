@@ -80,6 +80,16 @@ function findOpenclawDataDirs() {
   return dirs;
 }
 
+// Codex keeps live sessions in ~/.codex/sessions and moves completed ones to
+// ~/.codex/archived_sessions. Detect Codex if either dir exists, so a user
+// whose sessions have all been archived is still recognized.
+function findCodexDataDirs() {
+  return [
+    join(homedir(), '.codex', 'sessions'),
+    join(homedir(), '.codex', 'archived_sessions'),
+  ].filter(existsSync);
+}
+
 export const TOOLS = [
   {
     name: 'Antigravity',
@@ -101,6 +111,7 @@ export const TOOLS = [
     name: 'Codex CLI',
     id: 'codex',
     dataDir: join(homedir(), '.codex', 'sessions'),
+    detectDataDirs: findCodexDataDirs,
   },
   {
     name: 'GitHub Copilot CLI',
