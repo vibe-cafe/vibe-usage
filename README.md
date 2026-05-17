@@ -73,6 +73,28 @@ npx @vibe-cafe/vibe-usage status       # Show config & detected tools
 - SQLite-backed tools (Cursor, OpenCode, Kiro, Hermes) are read via Node's built-in `node:sqlite` on Node ≥ 22.5 — no `sqlite3` binary needed (works on Windows out of the box); on older Node it falls back to the system `sqlite3` CLI
 - For continuous syncing, use `npx @vibe-cafe/vibe-usage daemon` or the [Vibe Usage Mac app](https://github.com/vibe-cafe/vibe-usage-app)
 
+## Trust Model
+
+vibe-usage parses **local tool logs and local application state** on a machine the user fully controls. The reported data is self-reported telemetry — local logs, parsers, and upload requests can all be modified by the user.
+
+**Good for visibility, not sufficient for settlement.**
+
+Suitable for:
+
+- personal analytics and efficiency review
+- team-internal AI coding adoption visibility
+- token usage trends across tools, models, and projects
+- rough cost estimation and anomaly detection
+
+Not sufficient for:
+
+- financial settlement or team expense reimbursement
+- user rewards, credits, token, or airdrop allocation
+- agent contribution scoring or marketplace revenue sharing
+- proof-of-work / proof-of-usage or contractual billing
+
+In short: this solves the *visibility* problem, not the *verifiability* problem. High-trust use cases need additional, independently verifiable metering layers.
+
 ## AI Skill
 
 Install vibe-usage as a skill for your AI coding assistant, so it knows how to sync usage data on your behalf:
