@@ -37,7 +37,7 @@ function readLines(filePath) {
 
 function extractProject(meta) {
   if (meta.git?.repository_url) {
-    // e.g. https://github.com/org/repo.git -> org/repo
+    // e.g. https://github.com/org/repo.git → org/repo
     const match = meta.git.repository_url.match(/([^/]+\/[^/]+?)(?:\.git)?$/);
     if (match) return match[1];
   }
@@ -46,10 +46,12 @@ function extractProject(meta) {
 }
 
 /**
- * Count the leading `event_msg/token_count` records in a session file.
- * Used to size the replayed-history block of a forked session: a fork
- * copies the original conversation verbatim, so it begins with exactly as
- * many token_count records as the original session has in total.
+ * Stream a session file once and extract its index metadata: the session
+ * id, the forked-from id, the project name, and the total count of
+ * `event_msg/token_count` records. The token_count total is used to size
+ * the replayed-history block of a forked session — a fork copies the
+ * original conversation verbatim, so it begins with exactly as many
+ * token_count records as the source session has in total.
  */
 async function indexSessionFile(filePath) {
   let sessionId = null;
