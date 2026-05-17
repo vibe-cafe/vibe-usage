@@ -1,6 +1,7 @@
-import { readdirSync, readFileSync, statSync, existsSync } from 'node:fs';
+import { createReadStream, readdirSync, existsSync } from 'node:fs';
 import { join } from 'node:path';
 import { homedir } from 'node:os';
+import { createInterface } from 'node:readline';
 import { aggregateToBuckets, extractSessions } from './index.js';
 
 const SESSIONS_DIR = join(homedir(), '.codex', 'sessions');
@@ -27,24 +28,55 @@ function findJsonlFiles(dir) {
   return results;
 }
 
+function readLines(filePath) {
+  return createInterface({
+    input: createReadStream(filePath, { encoding: 'utf-8' }),
+    crlfDelay: Infinity,
+  });
+}
+
+function extractProject(meta) {
+  if (meta.git?.repository_url) {
+    // e.g. https://github.com/org/repo.git → org/repo
+    const match = meta.git.repository_url.match(/([^/]+\/[^/]+?)(?:\.git)?$/);
+    if (match) return match[1];
+  }
+  if (meta.cwd) return meta.cwd.split('/').pop() || 'unknown';
+  return 'unknown';
+}
+
 /**
- * Count the leading `event_msg/token_count` records in a session file.
- * Used to size the replayed-history block of a forked session: a fork
- * copies the original conversation verbatim, so it begins with exactly as
- * many token_count records as the original session has in total.
+ * Stream a session file once and extract its index metadata: the session
+ * id, the forked-from id, the project name, and the total count of
+ * `event_msg/token_count` records. The token_count total is used to size
+ * the replayed-history block of a forked session — a fork copies the
+ * original conversation verbatim, so it begins with exactly as many
+ * token_count records as the source session has in total.
  */
-function countTokenCountRecords(content) {
-  let n = 0;
-  for (const line of content.split('\n')) {
+async function indexSessionFile(filePath) {
+  let sessionId = null;
+  let forkedFromId = null;
+  let sessionProject = 'unknown';
+  let tokenCountRecords = 0;
+
+  for await (const line of readLines(filePath)) {
     if (!line.trim()) continue;
     try {
       const obj = JSON.parse(line);
-      if (obj.type === 'event_msg' && obj.payload?.type === 'token_count') n++;
+      if (obj.type === 'session_meta' && obj.payload) {
+        const meta = obj.payload;
+        sessionId = meta.id || sessionId;
+        forkedFromId = meta.forked_from_id || null;
+        sessionProject = extractProject(meta);
+      } else if (obj.type === 'event_msg' && obj.payload?.type === 'token_count') {
+        tokenCountRecords++;
+      }
     } catch {
       continue;
     }
   }
-  return n;
+
+  return { sessionId, forkedFromId, sessionProject, tokenCountRecords };
 }
 
 export async function parse() {
@@ -66,30 +98,17 @@ export async function parse() {
   // instant, within the same 1–3s window), so we instead skip exactly the
   // original session's token_count count from the start of each fork.
   const tokenCountById = new Map(); // sessionId → number of token_count records
-  const fileMeta = new Map(); // filePath → { content, forkedFromId }
+  const fileMeta = new Map(); // filePath -> { forkedFromId, sessionProject }
   for (const filePath of files) {
-    let content;
+    let meta;
     try {
-      content = readFileSync(filePath, 'utf-8');
+      meta = await indexSessionFile(filePath);
     } catch {
       continue;
     }
-    let sessionId = null;
-    let forkedFromId = null;
-    for (const line of content.split('\n')) {
-      if (!line.trim()) continue;
-      try {
-        const obj = JSON.parse(line);
-        if (obj.type === 'session_meta' && obj.payload) {
-          sessionId = obj.payload.id || null;
-          forkedFromId = obj.payload.forked_from_id || null;
-        }
-      } catch { /* ignore */ }
-      break; // session_meta is always the first line
-    }
-    fileMeta.set(filePath, { content, forkedFromId });
-    if (sessionId) {
-      tokenCountById.set(sessionId, countTokenCountRecords(content));
+    fileMeta.set(filePath, meta);
+    if (meta.sessionId) {
+      tokenCountById.set(meta.sessionId, meta.tokenCountRecords);
     }
   }
 
@@ -97,9 +116,7 @@ export async function parse() {
   for (const filePath of files) {
     const fm = fileMeta.get(filePath);
     if (!fm) continue;
-    const { content, forkedFromId } = fm;
-
-    const lines = content.split('\n');
+    const { forkedFromId } = fm;
 
     // How many leading token_count records are copied history. A fork's file
     // begins with the *entire* source file replayed verbatim, so the count
@@ -116,31 +133,11 @@ export async function parse() {
     }
     let tokenCountSeen = 0;
 
-    // Extract project name from session_meta.
-    let sessionProject = 'unknown';
-    let sessionModel = 'unknown';
-    for (const line of lines) {
-      if (!line.trim()) continue;
-      try {
-        const obj = JSON.parse(line);
-        if (obj.type === 'session_meta' && obj.payload) {
-          const meta = obj.payload;
-          if (meta.cwd) {
-            sessionProject = meta.cwd.split('/').pop() || 'unknown';
-          }
-          if (meta.git?.repository_url) {
-            // e.g. https://github.com/org/repo.git → org/repo
-            const match = meta.git.repository_url.match(/([^/]+\/[^/]+?)(?:\.git)?$/);
-            if (match) sessionProject = match[1];
-          }
-        }
-      } catch { /* ignore */ }
-      break; // session_meta is always the first line
-    }
+    const sessionProject = fm.sessionProject;
 
     let turnContextModel = 'unknown';
     const prevTotal = new Map();
-    for (const line of lines) {
+    for await (const line of readLines(filePath)) {
       if (!line.trim()) continue;
       try {
         const obj = JSON.parse(line);
@@ -225,7 +222,7 @@ export async function parse() {
         if (!usage) continue;
         if (isReplayedHistory) continue;
 
-        const model = info.model || payload.model || turnContextModel || sessionModel;
+        const model = info.model || payload.model || turnContextModel || 'unknown';
 
         // OpenAI API: input_tokens INCLUDES cached, output_tokens INCLUDES reasoning.
         // Normalize to Anthropic-style semantics where each field is non-overlapping.
