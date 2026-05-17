@@ -5,7 +5,10 @@ import { gzipSync } from 'node:zlib';
 
 const MAX_RETRIES = 3;
 const INITIAL_DELAY = 1000;
-const GZIP_MIN_BYTES = 1024;
+// Always gzip: ingest bodies are repetitive JSON that compresses ~10:1, and
+// the few-byte gzip header overhead on a tiny body is irrelevant next to
+// guaranteeing no uncompressed request ever leaves the client.
+const GZIP_MIN_BYTES = 0;
 
 export async function ingest(apiUrl, apiKey, buckets, opts, sessions) {
   let lastError;

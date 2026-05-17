@@ -26,11 +26,12 @@ vibe-usage/
 │   │   ├── kiro.js            # SQLite (via sqlite.js), JSONL fallback
 │   │   └── hermes.js          # SQLite (via sqlite.js), multi-profile
 │   ├── tools.js               # TOOLS[] registry + detectInstalledTools()
-│   ├── sync.js                # Orchestrator: parse all → batch upload buckets + sessions
-│   ├── api.js                 # HTTP client: ingest() (gzip if ≥1KB), deleteAllData(), fetchSettings()
+│   ├── sync.js                # Orchestrator: parse all → diff vs state → batch upload only new/changed
+│   ├── state.js               # ~/.vibe-usage/state.json: key→hash of uploaded items (incremental sync)
+│   ├── api.js                 # HTTP client: ingest() (always gzip), deleteAllData(), fetchSettings()
 │   ├── config.js              # ~/.vibe-usage/config.json (dev: config.dev.json)
 │   ├── init.js                # Setup flow (API key via prompt or --key flag, verify, initial sync, daemon install prompt)
-│   ├── daemon.js              # 5-minute sync loop (foreground)
+│   ├── daemon.js              # 30-minute sync loop (foreground)
 │   ├── daemon-service.js      # Background service management (systemd/launchd install/uninstall/status)
 │   ├── reset.js               # Delete remote data + re-sync
 │   ├── skill.js               # Install/remove SKILL.md for AI coding tools
@@ -43,7 +44,7 @@ vibe-usage/
 
 - **Pure ESM** (`"type": "module"`) — no CommonJS, no build step
 - **Zero dependencies** — only Node built-ins (fs, path, os, crypto, https, readline, child_process, zlib, `node:sqlite`)
-- **Stateless sync** — parsers compute full totals from raw logs each run; server upserts idempotently
+- **Incremental sync** — parsers stay stateless (compute full totals from raw logs each run, server upserts idempotently), but `sync.js` diffs each item's content-hash against `~/.vibe-usage/state.json` and uploads only new/changed buckets/sessions — a quiet machine sends zero bytes. State is committed per-batch only after that batch's upload succeeds (failed batch re-sends next run); prune of dead keys (logs the parsers no longer emit) persists unconditionally and is bounded by liveness, never by age. Deleting `state.json` triggers a one-time full re-upload.
 - **Stable hostname** — hostname is persisted in config at init; `sync.js` never re-reads `os.hostname()` after first capture. This prevents macOS mDNS hostname drift (e.g., `-2`, `-3` suffixes) from creating duplicate device entries in the DB.
 - **No TypeScript** — plain JavaScript throughout
 - **Output style** — user-facing text is Chinese (colored via `output.js` helpers: `success` / `failure` / `warn` / `arrow` / `link`). Dashboard URLs use OSC 8 hyperlinks so terminals that support it (iTerm2, Warp, VSCode, Kitty, Terminal.app 14+) render them as clickable. Raw pass-through from external tools (parser errors, `systemctl` / `launchctl` output, daemon loop timestamps) is kept in English and dimmed so it's visually de-emphasized. `init` prints a big ASCII logo; other commands print a compact one-line header (`bigHeader()` / `smallHeader()` from `output.js`).

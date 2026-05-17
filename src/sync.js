@@ -1,5 +1,9 @@
 import { hostname as osHostname } from 'node:os';
 import { loadConfig, saveConfig } from './config.js';
+import {
+  loadState, saveState, pruneState,
+  bucketKey, bucketHash, sessionKey, sessionHash,
+} from './state.js';
 import { ingest, fetchSettings } from './api.js';
 import { parsers } from './parsers/index.js';
 import { success, failure, arrow, link, dim } from './output.js';
@@ -87,18 +91,72 @@ export async function runSync({ throws = false, quiet = false } = {}) {
     for (const s of allSessions) s.project = 'unknown';
   }
 
+  // Incremental diff: parsers above always read the full local history (cheap,
+  // local-only). Here we drop anything whose content matches what we already
+  // uploaded, so only new/changed items go over the network. A quiet machine
+  // sends zero bytes; an active one sends just the current 30-min bucket.
+  // Missing/corrupt state.json => empty maps => one-time full upload, then
+  // incremental forever after.
+  const state = loadState();
+  const changedBuckets = [];
+  const changedSessions = [];
+  const liveBucketKeys = new Set();
+  const liveSessionKeys = new Set();
+  // key -> hash, committed to state only after the owning batch's upload
+  // succeeds (a failed batch re-sends next sync — no silent gap).
+  const pendingBucketState = new Map();
+  const pendingSessionState = new Map();
+
+  for (const b of allBuckets) {
+    const key = bucketKey(b);
+    const h = bucketHash(b);
+    liveBucketKeys.add(key);
+    if (state.buckets[key] === h) continue;
+    changedBuckets.push(b);
+    pendingBucketState.set(key, h);
+  }
+  for (const s of allSessions) {
+    const key = sessionKey(s);
+    const h = sessionHash(s);
+    liveSessionKeys.add(key);
+    if (state.sessions[key] === h) continue;
+    changedSessions.push(s);
+    pendingSessionState.set(key, h);
+  }
+
+  // Drop entries the parsers no longer emit (deleted logs) so state.json can't
+  // grow forever. Done by liveness, never by age — an old bucket's hash never
+  // changes, so keeping it is exactly what prevents re-uploading it.
+  //
+  // Persist the pruned state unconditionally and immediately: removing dead
+  // keys is independent of whether anything uploads, so it must NOT be coupled
+  // to upload success. If we deferred this to the batch loop, a first-batch
+  // failure would throw before any saveState and the prune would be lost.
+  const before = Object.keys(state.buckets).length + Object.keys(state.sessions).length;
+  pruneState(state, liveBucketKeys, liveSessionKeys);
+  const pruned = before - (Object.keys(state.buckets).length + Object.keys(state.sessions).length);
+  if (pruned > 0) saveState(state);
+
+  if (changedBuckets.length === 0 && changedSessions.length === 0) {
+    if (!quiet) console.log(dim('无新增数据。'));
+    return 0;
+  }
+
+  const allBucketsToSend = changedBuckets;
+  const allSessionsToSend = changedSessions;
+
   let totalIngested = 0;
   let totalSessionsSynced = 0;
   let totalDroppedBuckets = 0;
   const droppedSources = new Set();
-  const bucketBatches = Math.ceil(allBuckets.length / BATCH_SIZE);
-  const sessionBatches = Math.ceil(allSessions.length / SESSION_BATCH_SIZE);
+  const bucketBatches = Math.ceil(allBucketsToSend.length / BATCH_SIZE);
+  const sessionBatches = Math.ceil(allSessionsToSend.length / SESSION_BATCH_SIZE);
   const totalBatches = Math.max(bucketBatches, sessionBatches, 1);
 
   try {
     for (let batchIdx = 0; batchIdx < totalBatches; batchIdx++) {
-      const batch = allBuckets.slice(batchIdx * BATCH_SIZE, (batchIdx + 1) * BATCH_SIZE);
-      const batchSessions = allSessions.slice(batchIdx * SESSION_BATCH_SIZE, (batchIdx + 1) * SESSION_BATCH_SIZE);
+      const batch = allBucketsToSend.slice(batchIdx * BATCH_SIZE, (batchIdx + 1) * BATCH_SIZE);
+      const batchSessions = allSessionsToSend.slice(batchIdx * SESSION_BATCH_SIZE, (batchIdx + 1) * SESSION_BATCH_SIZE);
       const batchNum = batchIdx + 1;
       const prefix = totalBatches > 1 ? `  ${dim(`[${batchNum}/${totalBatches}]`)} 上传中 ` : '  上传中 ';
 
@@ -114,9 +172,25 @@ export async function runSync({ throws = false, quiet = false } = {}) {
         totalDroppedBuckets += Number(result.dropped.buckets) || 0;
         for (const s of result.dropped.unknownSources || []) droppedSources.add(s);
       }
+
+      // Commit only this batch's hashes, only after it uploaded successfully.
+      // A batch that throws aborts the loop with its keys still absent from
+      // state, so the next sync re-sends exactly those items — no data loss,
+      // no silent gaps.
+      for (const b of batch) {
+        const key = bucketKey(b);
+        const entry = pendingBucketState.get(key);
+        if (entry) state.buckets[key] = entry;
+      }
+      for (const s of batchSessions) {
+        const key = sessionKey(s);
+        const entry = pendingSessionState.get(key);
+        if (entry) state.sessions[key] = entry;
+      }
+      saveState(state);
     }
 
-    if (totalBatches > 1 || allBuckets.length > 0) {
+    if (totalBatches > 1 || allBucketsToSend.length > 0) {
       process.stdout.write('\r\x1b[K');
     }
     const syncParts = [`${totalIngested} buckets`];
@@ -132,9 +206,9 @@ export async function runSync({ throws = false, quiet = false } = {}) {
     }
 
     if (!quiet && totalSessionsSynced > 0) {
-      const totalActive = allSessions.reduce((s, x) => s + x.activeSeconds, 0);
-      const totalDuration = allSessions.reduce((s, x) => s + x.durationSeconds, 0);
-      const totalMsgs = allSessions.reduce((s, x) => s + x.messageCount, 0);
+      const totalActive = allSessionsToSend.reduce((s, x) => s + x.activeSeconds, 0);
+      const totalDuration = allSessionsToSend.reduce((s, x) => s + x.durationSeconds, 0);
+      const totalMsgs = allSessionsToSend.reduce((s, x) => s + x.messageCount, 0);
       const fmtTime = (secs) => {
         if (secs < 60) return `${secs}s`;
         const h = Math.floor(secs / 3600);
