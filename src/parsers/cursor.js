@@ -223,6 +223,10 @@ export async function parse() {
       source: 'cursor',
       model,
       project: 'unknown',
+      // Cursor usage is pulled from the cloud API — it reflects the same account
+      // data on every machine. Use a fixed sentinel so all machines share one row
+      // per (model, bucket_start) rather than duplicating per hostname.
+      hostname: 'cursor-cloud',
       timestamp,
       inputTokens: inputCacheWrite + inputNoCache,
       outputTokens: output,

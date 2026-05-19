@@ -71,8 +71,10 @@ export async function runSync({ throws = false, quiet = false } = {}) {
     config.hostname = host;
     saveConfig(config);
   }
-  for (const b of allBuckets) b.hostname = host;
-  for (const s of allSessions) s.hostname = host;
+  // Cloud-sourced parsers (e.g. cursor) pre-set their own hostname sentinel so
+  // the same account data isn't stored as separate rows per machine.
+  for (const b of allBuckets) if (!b.hostname) b.hostname = host;
+  for (const s of allSessions) if (!s.hostname) s.hostname = host;
 
   // Privacy: check if user allows project name upload
   const apiUrl = config.apiUrl || 'https://vibecafe.ai';
