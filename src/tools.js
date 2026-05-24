@@ -80,6 +80,20 @@ function findOpenclawDataDirs() {
   return dirs;
 }
 
+// Claude Code lives in ~/.claude/projects, but $CLAUDE_CONFIG_DIR relocates its
+// whole tree. Detect either so a user who only set CLAUDE_CONFIG_DIR is still
+// recognized (the parser scans both roots; see parsers/claude-code.js).
+function findClaudeCodeDataDirs() {
+  const dirs = [join(homedir(), '.claude', 'projects')];
+  const cfg = process.env.CLAUDE_CONFIG_DIR?.trim();
+  if (cfg) {
+    let custom = cfg.startsWith('~') ? join(homedir(), cfg.slice(1)) : cfg;
+    custom = custom.replace(/[/\\]+$/, '') || custom;
+    dirs.push(join(custom, 'projects'));
+  }
+  return dirs.filter(existsSync);
+}
+
 // Codex keeps live sessions in ~/.codex/sessions and moves completed ones to
 // ~/.codex/archived_sessions. Detect Codex if either dir exists, so a user
 // whose sessions have all been archived is still recognized.
@@ -100,6 +114,7 @@ export const TOOLS = [
     name: 'Claude Code',
     id: 'claude-code',
     dataDir: join(homedir(), '.claude', 'projects'),
+    detectDataDirs: findClaudeCodeDataDirs,
   },
   {
     name: 'Cline',

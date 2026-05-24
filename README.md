@@ -46,7 +46,7 @@ npx @vibe-cafe/vibe-usage status       # Show config & detected tools
 
 | Tool | Data Location |
 |------|---------------|
-| Claude Code | `~/.claude/projects/` (tokens + sessions), `~/.claude/transcripts/` (sessions only) |
+| Claude Code | `~/.claude/projects/` (tokens + sessions), `~/.claude/transcripts/` (sessions only); also scans `$CLAUDE_CONFIG_DIR` when set (deduped), so relocated configs and GUI/CLI env mismatches are both covered |
 | Codex CLI | `~/.codex/sessions/` and `~/.codex/archived_sessions/` |
 | GitHub Copilot CLI | `~/.copilot/session-state/*/events.jsonl` |
 | Cursor | `state.vscdb` (SQLite, reads `cursorAuth/accessToken`, fetches CSV from `cursor.com`); cloud data is stamped with a fixed `cursor-cloud` hostname so multi-machine setups don't double-count |

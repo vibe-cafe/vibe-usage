@@ -1,18 +1,54 @@
-import { readdirSync, readFileSync, existsSync } from 'node:fs';
+import { readdirSync, readFileSync, existsSync, realpathSync } from 'node:fs';
 import { join, basename, sep } from 'node:path';
 import { homedir } from 'node:os';
 import { aggregateToBuckets, extractSessions } from './index.js';
 
 /**
  * Stateless Claude Code parser.
- * Reads ALL *.jsonl files under ~/.claude/projects/ and extracts per-message
+ * Reads ALL *.jsonl files under <root>/projects/ and extracts per-message
  * token usage from assistant messages. No state file needed — every sync
  * computes the full bucket totals from raw data, making server-side
  * ON CONFLICT ... DO UPDATE SET idempotent.
+ *
+ * Roots: always ~/.claude, plus $CLAUDE_CONFIG_DIR when set to a different
+ * path. Claude Code itself relocates its whole tree (incl. projects/) to
+ * $CLAUDE_CONFIG_DIR and uses only that dir — but a GUI launched from the
+ * Dock may not inherit the shell's env, so usage can be split across both
+ * roots. We scan both and dedup so neither source is missed or double-counted.
  */
 
-const CLAUDE_PROJECTS_DIR = join(homedir(), '.claude', 'projects');
-const CLAUDE_TRANSCRIPTS_DIR = join(homedir(), '.claude', 'transcripts');
+/**
+ * Resolve the set of Claude config roots to scan.
+ * Always includes ~/.claude; adds $CLAUDE_CONFIG_DIR when set and it resolves
+ * to a different real path. Deduped by canonical path.
+ */
+function getClaudeRoots() {
+  const roots = [join(homedir(), '.claude')];
+
+  const cfg = process.env.CLAUDE_CONFIG_DIR?.trim();
+  if (cfg) {
+    let custom = cfg;
+    if (custom.startsWith('~')) custom = join(homedir(), custom.slice(1));
+    custom = custom.replace(/[/\\]+$/, '') || custom;
+    roots.push(custom);
+  }
+
+  // Dedup by canonical path (realpath when the dir exists, else the raw string).
+  const seen = new Set();
+  const unique = [];
+  for (const r of roots) {
+    let key = r;
+    try {
+      key = realpathSync(r);
+    } catch {
+      // dir may not exist yet — fall back to the literal path
+    }
+    if (seen.has(key)) continue;
+    seen.add(key);
+    unique.push(r);
+  }
+  return unique;
+}
 
 /**
  * Recursively find all .jsonl files under a directory.
@@ -39,15 +75,22 @@ function findJsonlFiles(dir) {
 }
 
 /**
- * Extract project name from file path.
- * Path format: ~/.claude/projects/{encodedProjectPath}/{sessionId}.jsonl
- * The encodedProjectPath uses dashes for separators (e.g. -Users-foo-myproject).
- * We extract the last path segment as the project name.
+ * Path of a project file relative to its root's projects/ dir, e.g.
+ * "<root>/projects/-Users-foo-app/abc.jsonl" → "-Users-foo-app/abc.jsonl".
+ * Used both for project-name extraction and cross-root dedup.
  */
-function extractProject(filePath) {
-  const projectsPrefix = CLAUDE_PROJECTS_DIR + sep;
-  if (!filePath.startsWith(projectsPrefix)) return 'unknown';
-  const relative = filePath.slice(projectsPrefix.length);
+function projectRelativePath(filePath, projectsDir) {
+  const prefix = projectsDir + sep;
+  return filePath.startsWith(prefix) ? filePath.slice(prefix.length) : null;
+}
+
+/**
+ * Extract project name from a projects-relative path.
+ * The first segment is the dash-encoded project path (e.g. -Users-foo-myproject);
+ * we take its last component as the project name.
+ */
+function extractProject(relative) {
+  if (!relative) return 'unknown';
   const firstSeg = relative.split(sep)[0];
   if (!firstSeg) return 'unknown';
   const parts = firstSeg.split('-').filter(Boolean);
@@ -58,16 +101,21 @@ function extractSessionId(filePath) {
   return basename(filePath, '.jsonl');
 }
 
-export async function parse() {
-  const entries = [];
-  const sessionEvents = [];
-  const seenUuids = new Set();
-  const seenSessionIds = new Set();
+/**
+ * Scan one root's projects/ dir → token entries + session events (mutates ctx).
+ */
+function scanProjectsRoot(root, ctx) {
+  const projectsDir = join(root, 'projects');
 
-  // --- projects/ directory: extract BOTH token buckets AND session events ---
-  const projectFiles = findJsonlFiles(CLAUDE_PROJECTS_DIR);
+  for (const filePath of findJsonlFiles(projectsDir)) {
+    const relative = projectRelativePath(filePath, projectsDir);
+    // Same session present under two roots (e.g. data copied between them):
+    // process it once so session message counts aren't inflated.
+    if (relative !== null) {
+      if (ctx.seenProjectFiles.has(relative)) continue;
+      ctx.seenProjectFiles.add(relative);
+    }
 
-  for (const filePath of projectFiles) {
     let content;
     try {
       content = readFileSync(filePath, 'utf-8');
@@ -75,9 +123,9 @@ export async function parse() {
       continue;
     }
 
-    const project = extractProject(filePath);
+    const project = extractProject(relative);
     const sessionId = extractSessionId(filePath);
-    seenSessionIds.add(sessionId);
+    ctx.seenSessionIds.add(sessionId);
 
     for (const line of content.split('\n')) {
       if (!line.trim()) continue;
@@ -90,7 +138,7 @@ export async function parse() {
         if (isNaN(ts.getTime())) continue;
 
         if (obj.type === 'user' || obj.type === 'assistant' || obj.type === 'tool_use' || obj.type === 'tool_result') {
-          sessionEvents.push({
+          ctx.sessionEvents.push({
             sessionId,
             source: 'claude-code',
             project,
@@ -108,11 +156,11 @@ export async function parse() {
 
         const uuid = obj.uuid;
         if (uuid) {
-          if (seenUuids.has(uuid)) continue;
-          seenUuids.add(uuid);
+          if (ctx.seenUuids.has(uuid)) continue;
+          ctx.seenUuids.add(uuid);
         }
 
-        entries.push({
+        ctx.entries.push({
           source: 'claude-code',
           model: msg.model || 'unknown',
           project,
@@ -127,13 +175,17 @@ export async function parse() {
       }
     }
   }
+}
 
-  // --- transcripts/ directory: extract session events ONLY (no token data) ---
-  const transcriptFiles = findJsonlFiles(CLAUDE_TRANSCRIPTS_DIR);
-
-  for (const filePath of transcriptFiles) {
+/**
+ * Scan one root's transcripts/ dir → session events only (no token data).
+ * Skips sessions already covered by a projects/ or transcripts/ scan.
+ */
+function scanTranscriptsRoot(root, ctx) {
+  for (const filePath of findJsonlFiles(join(root, 'transcripts'))) {
     const sessionId = extractSessionId(filePath);
-    if (seenSessionIds.has(sessionId)) continue;
+    if (ctx.seenSessionIds.has(sessionId)) continue;
+    ctx.seenSessionIds.add(sessionId);
 
     let content;
     try {
@@ -153,7 +205,7 @@ export async function parse() {
         if (isNaN(ts.getTime())) continue;
 
         if (obj.type === 'user' || obj.type === 'assistant' || obj.type === 'tool_use' || obj.type === 'tool_result') {
-          sessionEvents.push({
+          ctx.sessionEvents.push({
             sessionId,
             source: 'claude-code',
             project: 'unknown',
@@ -166,6 +218,26 @@ export async function parse() {
       }
     }
   }
+}
 
-  return { buckets: aggregateToBuckets(entries), sessions: extractSessions(sessionEvents) };
+export async function parse() {
+  const ctx = {
+    entries: [],
+    sessionEvents: [],
+    seenUuids: new Set(),
+    seenSessionIds: new Set(),
+    seenProjectFiles: new Set(), // projects-relative path → dedup same session across roots
+  };
+
+  const roots = getClaudeRoots();
+
+  // projects/ yields BOTH token buckets and session events.
+  for (const root of roots) scanProjectsRoot(root, ctx);
+  // transcripts/ yields session events only, for sessions not already covered.
+  for (const root of roots) scanTranscriptsRoot(root, ctx);
+
+  return {
+    buckets: aggregateToBuckets(ctx.entries),
+    sessions: extractSessions(ctx.sessionEvents),
+  };
 }
