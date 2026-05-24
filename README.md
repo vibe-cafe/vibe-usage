@@ -4,7 +4,7 @@ Track your AI coding tool token usage and sync to [vibecafe.ai](https://vibecafe
 
 ## Quick Start
 
-Get your API key at [vibecafe.ai/usage](https://vibecafe.ai/usage), then copy the one-liner shown there:
+Get your API key at [vibecafe.ai/usage/setup](https://vibecafe.ai/usage/setup), then copy the one-liner shown there:
 
 ```bash
 npx @vibe-cafe/vibe-usage --key vbu_xxxxxxxxxxxx

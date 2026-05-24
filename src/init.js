@@ -58,10 +58,10 @@ export async function runInit(options = {}) {
     }
     apiKey = providedKey;
   } else {
-    console.log(`${arrow('获取 API Key')} ${link(`${apiUrl}/usage`)}`);
-    console.log(dim('  浏览器会自动打开，登录后复制 Key 粘贴到下方。'));
+    console.log(`${arrow('获取 API Key')} ${link(`${apiUrl}/usage/setup`)}`);
+    console.log(dim('  浏览器会自动打开，登录后在「API Keys」处生成并复制 Key（vbu_ 开头），粘贴到下方。'));
     console.log();
-    openBrowser(`${apiUrl}/usage`);
+    openBrowser(`${apiUrl}/usage/setup`);
 
     while (true) {
       apiKey = await prompt('粘贴 API Key: ');
