@@ -132,6 +132,11 @@ export async function run(rawArgs) {
       await runSync();
       break;
     }
+    case 'summary': {
+      const { runSummary } = await import('./summary.js');
+      await runSummary(args.slice(1));
+      break;
+    }
     case 'reset': {
       printSmallHeader();
       const { runReset } = await import('./reset.js');
@@ -177,6 +182,8 @@ export async function run(rawArgs) {
     npx @vibe-cafe/vibe-usage init         Set up via browser login (default)
     npx @vibe-cafe/vibe-usage init --manual-key <vbu_...>   Skip browser, use a pre-issued key (CI/headless)
     npx @vibe-cafe/vibe-usage sync         Manually sync usage data
+    npx @vibe-cafe/vibe-usage summary       Print last 7 days as markdown (cost/tokens/model/project)
+    npx @vibe-cafe/vibe-usage summary --days N   Same, but over the last N days (1-90)
     npx @vibe-cafe/vibe-usage daemon       Continuous sync (every 30m, foreground)
     npx @vibe-cafe/vibe-usage daemon install    Install background service (systemd/launchd)
     npx @vibe-cafe/vibe-usage daemon uninstall  Remove background service
