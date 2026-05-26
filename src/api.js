@@ -155,6 +155,64 @@ export function deleteAllData(apiUrl, apiKey, opts) {
 }
 
 /**
+ * Start a device authorization flow.
+ * Returns the deviceCode (for polling) + userCode + URLs (for the user).
+ */
+export function requestDeviceCode(apiUrl, { clientName, hostname }) {
+  return _jsonRequest(apiUrl, '/api/usage/device/code', 'POST', { clientName, hostname }, 10_000);
+}
+
+/**
+ * One poll iteration. Resolves with one of:
+ *   { apiKey, apiUrl }                 — approved, key delivered
+ *   { error: 'authorization_pending' } — keep polling
+ *   { error: 'access_denied' }         — user pressed deny
+ *   { error: 'expired_token' }         — code expired or already consumed
+ *   { error: 'invalid_grant' | ... }   — unrecoverable
+ * Rejects only on network/server errors.
+ */
+export function pollDeviceCode(apiUrl, deviceCode) {
+  return _jsonRequest(apiUrl, '/api/usage/device/poll', 'POST', { deviceCode }, 15_000);
+}
+
+function _jsonRequest(apiUrl, path, method, body, timeoutMs) {
+  return new Promise((resolve, reject) => {
+    const url = new URL(path, apiUrl);
+    const mod = url.protocol === 'https:' ? https : http;
+    const raw = Buffer.from(JSON.stringify(body));
+
+    const req = mod.request(url, {
+      method,
+      timeout: timeoutMs,
+      headers: {
+        'Content-Type': 'application/json',
+        'Content-Length': raw.length,
+      },
+    }, (res) => {
+      let data = '';
+      res.on('data', (chunk) => { data += chunk; });
+      res.on('end', () => {
+        if (res.statusCode < 200 || res.statusCode >= 300) {
+          const err = new Error(`HTTP ${res.statusCode}: ${data}`);
+          err.statusCode = res.statusCode;
+          reject(err);
+          return;
+        }
+        try {
+          resolve(JSON.parse(data));
+        } catch {
+          reject(new Error(`Invalid JSON response: ${data}`));
+        }
+      });
+    });
+    req.on('error', reject);
+    req.on('timeout', () => { req.destroy(); reject(new Error(`Request timed out (${timeoutMs}ms)`)); });
+    req.write(raw);
+    req.end();
+  });
+}
+
+/**
  * GET user settings from the vibecafe API.
  * Returns null on any failure (network, auth, timeout) — caller should fail-safe.
  * @param {string} apiUrl

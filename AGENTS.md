@@ -28,9 +28,9 @@ vibe-usage/
 │   ├── tools.js               # TOOLS[] registry + detectInstalledTools()
 │   ├── sync.js                # Orchestrator: parse all → diff vs state → batch upload only new/changed
 │   ├── state.js               # ~/.vibe-usage/state.json: key→hash of uploaded items (incremental sync)
-│   ├── api.js                 # HTTP client: ingest() (always gzip), deleteAllData(), fetchSettings()
+│   ├── api.js                 # HTTP client: ingest() (always gzip), requestDeviceCode()/pollDeviceCode() (device flow), deleteAllData(), fetchSettings()
 │   ├── config.js              # ~/.vibe-usage/config.json (dev: config.dev.json)
-│   ├── init.js                # Setup flow (API key via prompt or --key flag, verify, initial sync, daemon install prompt)
+│   ├── init.js                # Setup flow (device-flow browser login by default; --manual-key for CI/headless, verify, initial sync, daemon install prompt)
 │   ├── daemon.js              # 30-minute sync loop (foreground)
 │   ├── daemon-service.js      # Background service management (systemd/launchd install/uninstall/status)
 │   ├── reset.js               # Delete remote data + re-sync

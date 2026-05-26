@@ -2,10 +2,12 @@ import { createInterface } from 'node:readline';
 import { execFile } from 'node:child_process';
 import { hostname as osHostname, platform } from 'node:os';
 import { loadConfig, saveConfig } from './config.js';
-import { ingest } from './api.js';
+import { ingest, requestDeviceCode, pollDeviceCode } from './api.js';
 import { runSync } from './sync.js';
 import { detectInstalledTools } from './tools.js';
 import { bigHeader, success, failure, warn, arrow, link, dim, divider } from './output.js';
+
+const CLIENT_NAME = 'vibe-usage CLI';
 
 function prompt(question) {
   const rl = createInterface({ input: process.stdin, output: process.stdout });
@@ -49,6 +51,7 @@ export async function runInit(options = {}) {
   }
 
   const apiUrl = process.env.VIBE_USAGE_API_URL || 'https://vibecafe.ai';
+  const host = existing?.hostname || osHostname().replace(/\.local$/, '');
 
   let apiKey;
   if (providedKey) {
@@ -58,16 +61,8 @@ export async function runInit(options = {}) {
     }
     apiKey = providedKey;
   } else {
-    console.log(`${arrow('获取 API Key')} ${link(`${apiUrl}/usage/setup`)}`);
-    console.log(dim('  浏览器会自动打开，登录后在「API Keys」处生成并复制 Key（vbu_ 开头），粘贴到下方。'));
-    console.log();
-    openBrowser(`${apiUrl}/usage/setup`);
-
-    while (true) {
-      apiKey = await prompt('粘贴 API Key: ');
-      if (apiKey.startsWith('vbu_')) break;
-      console.log(warn('必须以 vbu_ 开头，请重试。'));
-    }
+    apiKey = await runDeviceFlow(apiUrl, host);
+    if (!apiKey) process.exit(1);
   }
 
   try {
@@ -84,7 +79,7 @@ export async function runInit(options = {}) {
   const config = {
     apiKey,
     apiUrl,
-    hostname: existing?.hostname || osHostname().replace(/\.local$/, ''),
+    hostname: host,
   };
   saveConfig(config);
 
@@ -118,4 +113,77 @@ export async function runInit(options = {}) {
       console.log(dim('提示: 运行 `npx @vibe-cafe/vibe-usage daemon install` 开启后台自动同步。'));
     }
   }
+}
+
+async function runDeviceFlow(apiUrl, hostname) {
+  let device;
+  try {
+    device = await requestDeviceCode(apiUrl, { clientName: CLIENT_NAME, hostname });
+  } catch (err) {
+    console.error(failure(`无法连接 ${apiUrl}：${err.message}`));
+    return null;
+  }
+
+  console.log(`${arrow('登录确认')} ${link(device.verificationUriComplete)}`);
+  console.log(`  验证码: ${device.userCode}`);
+  console.log(dim('  浏览器会自动打开；如果没反应，请手动复制上方链接。'));
+  console.log();
+  openBrowser(device.verificationUriComplete);
+
+  const intervalMs = (device.interval || 5) * 1000;
+  const deadline = Date.now() + (device.expiresIn || 900) * 1000;
+
+  process.stdout.write(dim('等待审批…'));
+  const aborter = new AbortController();
+  const onSigint = () => { aborter.abort(); };
+  process.on('SIGINT', onSigint);
+  try {
+    while (Date.now() < deadline) {
+      if (aborter.signal.aborted) {
+        process.stdout.write('\n');
+        console.log(warn('已取消。'));
+        return null;
+      }
+      await sleep(intervalMs);
+      let res;
+      try {
+        res = await pollDeviceCode(apiUrl, device.deviceCode);
+      } catch (err) {
+        // Transient network blip — keep polling until deadline.
+        process.stdout.write(dim('.'));
+        continue;
+      }
+      if (res.apiKey) {
+        process.stdout.write('\n');
+        console.log(success('已批准，获取到 API Key。'));
+        return res.apiKey;
+      }
+      if (res.error === 'authorization_pending') {
+        process.stdout.write(dim('.'));
+        continue;
+      }
+      if (res.error === 'access_denied') {
+        process.stdout.write('\n');
+        console.error(failure('请求被拒绝。'));
+        return null;
+      }
+      if (res.error === 'expired_token') {
+        process.stdout.write('\n');
+        console.error(failure('验证码已过期，请重跑 init。'));
+        return null;
+      }
+      process.stdout.write('\n');
+      console.error(failure(`服务端返回未知错误：${res.error}`));
+      return null;
+    }
+    process.stdout.write('\n');
+    console.error(failure('验证码已过期，请重跑 init。'));
+    return null;
+  } finally {
+    process.removeListener('SIGINT', onSigint);
+  }
+}
+
+function sleep(ms) {
+  return new Promise((resolve) => setTimeout(resolve, ms));
 }

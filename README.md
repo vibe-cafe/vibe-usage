@@ -4,30 +4,32 @@ Track your AI coding tool token usage and sync to [vibecafe.ai](https://vibecafe
 
 ## Quick Start
 
-Get your API key at [vibecafe.ai/usage/setup](https://vibecafe.ai/usage/setup), then copy the one-liner shown there:
-
-```bash
-npx @vibe-cafe/vibe-usage --key vbu_xxxxxxxxxxxx
-```
-
-Or run without a key and paste it interactively:
-
 ```bash
 npx @vibe-cafe/vibe-usage
 ```
 
-Either path will:
+That's it. The CLI opens [vibecafe.ai/usage/device](https://vibecafe.ai/usage/device) in your browser; sign in, confirm the verification code shown in your terminal, click 「确认链接」, and the CLI receives an API key automatically.
+
+After approval, it will:
 1. Save your API key to `~/.vibe-usage/config.json`
 2. Detect installed AI coding tools
 3. Run an initial sync of your usage data
 4. Prompt you to enable the background daemon for continuous syncing (recommended)
 
+### CI / Headless
+
+If you don't have a local browser (CI, remote SSH session, container), pre-issue a key at [vibecafe.ai/usage/setup](https://vibecafe.ai/usage/setup) and pass it on the command line:
+
+```bash
+npx @vibe-cafe/vibe-usage init --manual-key vbu_xxxxxxxxxxxx
+```
+
 ## Commands
 
 ```bash
-npx @vibe-cafe/vibe-usage              # Init (first run) or sync (subsequent runs)
-npx @vibe-cafe/vibe-usage --key <vbu_...>   # One-shot init with a pre-copied key
-npx @vibe-cafe/vibe-usage init         # Re-run setup
+npx @vibe-cafe/vibe-usage              # Init (first run, browser login) or sync (subsequent runs)
+npx @vibe-cafe/vibe-usage init         # Re-run setup via browser login
+npx @vibe-cafe/vibe-usage init --manual-key <vbu_...>   # Skip browser, use pre-issued key (CI/headless)
 npx @vibe-cafe/vibe-usage sync         # Manual sync
 npx @vibe-cafe/vibe-usage daemon       # Continuous sync (every 30m, foreground)
 npx @vibe-cafe/vibe-usage daemon install    # Install background service (systemd/launchd)

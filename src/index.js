@@ -108,7 +108,16 @@ function extractOption(args, name) {
 }
 
 export async function run(rawArgs) {
-  const { args, value: apiKey } = extractOption(rawArgs, 'key');
+  // --key and --manual-key both mean "skip device flow, take this vbu_ key".
+  // --manual-key is the documented name; --key is kept as a legacy alias so
+  // existing scripts/docs don't break when device flow becomes the default.
+  let stripped;
+  let apiKey;
+  ({ args: stripped, value: apiKey } = extractOption(rawArgs, 'manual-key'));
+  if (apiKey === undefined) {
+    ({ args: stripped, value: apiKey } = extractOption(stripped, 'key'));
+  }
+  const args = stripped;
   const command = args[0];
 
   switch (command) {
@@ -164,10 +173,9 @@ export async function run(rawArgs) {
   vibe-usage - Vibe Usage Tracker by VibeCafé
 
   Usage:
-    npx @vibe-cafe/vibe-usage              Init (first run) or sync
-    npx @vibe-cafe/vibe-usage --key <vbu_...>   One-shot init with a pre-copied key
-    npx @vibe-cafe/vibe-usage init         Set up API key (interactive)
-    npx @vibe-cafe/vibe-usage init --key <vbu_...>   Init with key, skip paste prompt
+    npx @vibe-cafe/vibe-usage              Init (first run, browser login) or sync
+    npx @vibe-cafe/vibe-usage init         Set up via browser login (default)
+    npx @vibe-cafe/vibe-usage init --manual-key <vbu_...>   Skip browser, use a pre-issued key (CI/headless)
     npx @vibe-cafe/vibe-usage sync         Manually sync usage data
     npx @vibe-cafe/vibe-usage daemon       Continuous sync (every 30m, foreground)
     npx @vibe-cafe/vibe-usage daemon install    Install background service (systemd/launchd)
