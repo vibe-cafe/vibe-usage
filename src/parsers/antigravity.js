@@ -1,5 +1,5 @@
 import { execSync } from 'node:child_process';
-import { readdirSync, existsSync } from 'node:fs';
+import { readdirSync } from 'node:fs';
 import { join } from 'node:path';
 import { homedir } from 'node:os';
 import { aggregateToBuckets, extractSessions } from './index.js';
@@ -57,27 +57,89 @@ function findLanguageServerUnix() {
 }
 
 function findLanguageServerWin() {
-  const out = execSync(
-    'wmic process where "CommandLine like \'%antigravity%language_server%\'" get ProcessId,CommandLine /format:list',
-    { encoding: 'utf-8', timeout: 5000, shell: 'cmd.exe' },
-  );
-  // wmic /format:list outputs lines like "CommandLine=..." and "ProcessId=..."
-  let cmdLine = '';
+  // Prefer PowerShell/CIM: wmic is disabled by default on Windows 11 23H2+
+  // and removed entirely from 25H2 onward. Fall back to wmic for old/stripped
+  // environments without PowerShell. Each probe is independently time-boxed and
+  // failures are swallowed, so a missing/hung tool never blocks the next one or
+  // the parsers that run after antigravity.
+  const out = queryProcessesWinPowerShell() ?? queryProcessesWinWmic();
+  if (!out) return null;
+  return parseWinProcessList(out);
+}
+
+/**
+ * Query language_server processes via PowerShell + CIM.
+ * Emits "ProcessId=..." / "CommandLine=..." lines (wmic /format:list shape)
+ * so parseWinProcessList handles either source. Returns null on failure.
+ */
+function queryProcessesWinPowerShell() {
+  // Filter is applied in PowerShell so the LIKE wildcards stay server-side.
+  // A "---" separator before each process's ProcessId/CommandLine lines keeps
+  // fields grouped even when multiple processes match.
+  const script =
+    "Get-CimInstance Win32_Process -Filter \"CommandLine LIKE '%antigravity%language_server%'\" | " +
+    'ForEach-Object { "---"; "ProcessId=" + $_.ProcessId; "CommandLine=" + $_.CommandLine }';
+  for (const exe of ['powershell.exe', 'pwsh.exe']) {
+    try {
+      const out = execSync(
+        `${exe} -NoProfile -NonInteractive -Command "${script.replace(/"/g, '\\"')}"`,
+        { encoding: 'utf-8', timeout: 4000, windowsHide: true },
+      );
+      if (out && out.trim()) return out;
+      // Empty (no matching process) — no point trying another shell.
+      return null;
+    } catch {
+      // Try next shell (pwsh on systems without legacy powershell.exe).
+    }
+  }
+  return null;
+}
+
+/** Legacy fallback: wmic /format:list. Returns null on failure. */
+function queryProcessesWinWmic() {
+  try {
+    return execSync(
+      'wmic process where "CommandLine like \'%antigravity%language_server%\'" get ProcessId,CommandLine /format:list',
+      { encoding: 'utf-8', timeout: 4000, shell: 'cmd.exe' },
+    );
+  } catch {
+    return null;
+  }
+}
+
+/**
+ * Parse "ProcessId=..." / "CommandLine=..." records (from either PowerShell or
+ * wmic /format:list) and return the first language_server that carries a
+ * --csrf_token, or null. PowerShell emits an explicit "---" separator per
+ * process; wmic does not and may emit the two fields in either order, so a
+ * record also ends whenever a field we've already captured reappears.
+ */
+function parseWinProcessList(out) {
   let pid = '';
+  let cmdLine = '';
+  const finish = () => {
+    if (pid && cmdLine && !/WMIC\.exe|powershell\.exe|pwsh\.exe/i.test(cmdLine)) {
+      const csrfMatch = cmdLine.match(/--csrf_token\s+([0-9a-f-]+)/);
+      if (csrfMatch) return { pid, csrfToken: csrfMatch[1] };
+    }
+    return null;
+  };
+  const reset = () => { pid = ''; cmdLine = ''; };
   for (const line of out.split('\n')) {
     const trimmed = line.trim();
-    if (trimmed.startsWith('CommandLine=')) {
-      const val = trimmed.slice('CommandLine='.length);
-      if (/WMIC\.exe/i.test(val)) continue; // skip wmic's own process
-      cmdLine = val;
+    const isPid = trimmed.startsWith('ProcessId=');
+    const isCmd = trimmed.startsWith('CommandLine=');
+    // Record boundary: explicit "---", or a field that would overwrite one we
+    // already hold (next process began without a separator, e.g. wmic output).
+    if (trimmed === '---' || (isPid && pid) || (isCmd && cmdLine)) {
+      const found = finish();
+      if (found) return found;
+      reset();
     }
-    if (trimmed.startsWith('ProcessId=')) pid = trimmed.slice('ProcessId='.length);
+    if (isPid) pid = trimmed.slice('ProcessId='.length);
+    else if (isCmd) cmdLine = trimmed.slice('CommandLine='.length);
   }
-  if (!pid || !cmdLine) return null;
-  const csrfMatch = cmdLine.match(/--csrf_token\s+([0-9a-f-]+)/);
-  const csrfToken = csrfMatch ? csrfMatch[1] : '';
-  if (!csrfToken) return null;
-  return { pid, csrfToken };
+  return finish();
 }
 
 function findListeningPorts(pid) {
