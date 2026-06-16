@@ -195,6 +195,11 @@ export const TOOLS = [
     dataDir: join(homedir(), 'Library', 'Application Support', 'Code', 'User', 'globalStorage', 'rooveterinaryinc.roo-cline'),
     detectDataDirs: findRooCodeDataDirs,
   },
+  {
+    name: 'ZCode',
+    id: 'zcode',
+    dataDir: join(homedir(), '.zcode', 'cli', 'db', 'db.sqlite'),
+  },
 ];
 
 export function detectInstalledTools() {

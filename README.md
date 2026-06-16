@@ -67,6 +67,7 @@ npx @vibe-cafe/vibe-usage status       # Show config & detected tools
 | Cline | `<host>/User/globalStorage/saoudrizwan.claude-dev/{state/taskHistory.json,tasks/<id>/ui_messages.json}` (walks all VSCode-fork hosts: Code, Cursor, Windsurf, VSCodium, Trae, ...) |
 | Roo Code | `<host>/User/globalStorage/rooveterinaryinc.roo-cline/{tasks/_index.json,tasks/<id>/{history_item,ui_messages}.json}` (walks all VSCode-fork hosts) |
 | Antigravity | `~/.gemini/antigravity/conversations/*.pb` to discover cascades, then reads token usage + sessions from the running language server via Connect RPC (process discovered with `ps`/`lsof` on macOS/Linux, PowerShell CIM with a `wmic` fallback on Windows) |
+| ZCode | `~/.zcode/cli/db/db.sqlite` (SQLite; reads the `message` table for per-message tokens, model, and project `cwd`/`root`, joined to `session.directory`) |
 
 ## How It Works
 
