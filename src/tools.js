@@ -104,6 +104,39 @@ function findCodexDataDirs() {
   ].filter(existsSync);
 }
 
+// TRAE IDE (VS Code fork by ByteDance) stores AI chat sessions under
+// workspaceStorage/<ws>/chatSessions/*.jsonl and globalStorage/emptyWindowChatSessions/*.jsonl
+function findTraeChatSessionDirs() {
+  const hosts = ['Trae CN', 'Trae', 'TRAE SOLO CN'];
+  const dirs = [];
+  if (process.platform === 'darwin') {
+    const base = join(homedir(), 'Library', 'Application Support');
+    for (const h of hosts) {
+      const wsDir = join(base, h, 'User', 'workspaceStorage');
+      if (existsSync(wsDir)) dirs.push(wsDir);
+      const ewDir = join(base, h, 'User', 'globalStorage', 'emptyWindowChatSessions');
+      if (existsSync(ewDir)) dirs.push(ewDir);
+    }
+  } else if (process.platform === 'win32') {
+    const appData = process.env.APPDATA?.trim() || join(homedir(), 'AppData', 'Roaming');
+    for (const h of hosts) {
+      const wsDir = join(appData, h, 'User', 'workspaceStorage');
+      if (existsSync(wsDir)) dirs.push(wsDir);
+      const ewDir = join(appData, h, 'User', 'globalStorage', 'emptyWindowChatSessions');
+      if (existsSync(ewDir)) dirs.push(ewDir);
+    }
+  } else {
+    const xdg = process.env.XDG_CONFIG_HOME?.trim() || join(homedir(), '.config');
+    for (const h of hosts) {
+      const wsDir = join(xdg, h, 'User', 'workspaceStorage');
+      if (existsSync(wsDir)) dirs.push(wsDir);
+      const ewDir = join(xdg, h, 'User', 'globalStorage', 'emptyWindowChatSessions');
+      if (existsSync(ewDir)) dirs.push(ewDir);
+    }
+  }
+  return dirs;
+}
+
 export const TOOLS = [
   {
     name: 'Antigravity',
@@ -199,6 +232,12 @@ export const TOOLS = [
     name: 'ZCode',
     id: 'zcode',
     dataDir: join(homedir(), '.zcode', 'cli', 'db', 'db.sqlite'),
+  },
+  {
+    name: 'TRAE',
+    id: 'trae',
+    dataDir: join(homedir(), 'Library', 'Application Support', 'Trae CN', 'User', 'workspaceStorage'),
+    detectDataDirs: findTraeChatSessionDirs,
   },
 ];
 
