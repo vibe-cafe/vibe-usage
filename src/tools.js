@@ -104,6 +104,15 @@ function findCodexDataDirs() {
   ].filter(existsSync);
 }
 
+// Kimi Code moved its store from ~/.kimi to ~/.kimi-code; recognize either so
+// users on either version are detected. The parser prefers ~/.kimi-code.
+function findKimiCodeDataDirs() {
+  return [
+    join(homedir(), '.kimi-code', 'sessions'),
+    join(homedir(), '.kimi', 'sessions'),
+  ].filter(existsSync);
+}
+
 export const TOOLS = [
   {
     name: 'Antigravity',
@@ -167,7 +176,10 @@ export const TOOLS = [
   {
     name: 'Kimi Code',
     id: 'kimi-code',
-    dataDir: join(homedir(), '.kimi', 'sessions'),
+    // Current layout is ~/.kimi-code/sessions; ~/.kimi/sessions is the legacy
+    // path. The parser reads whichever exists (preferring ~/.kimi-code).
+    dataDir: join(homedir(), '.kimi-code', 'sessions'),
+    detectDataDirs: findKimiCodeDataDirs,
   },
   {
     name: 'Amp',
