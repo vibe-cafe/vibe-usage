@@ -17,6 +17,8 @@ import { queryDbJson } from './sqlite.js';
 const KIRO_AGENT_RELATIVE = join('User', 'globalStorage', 'kiro.kiroagent');
 const KIRO_USER_RELATIVE = 'User';
 const CREDIT_MODEL = 'kiro-credits';
+const ESTIMATE_MODEL = 'kiro-token-estimate';
+const CHARS_PER_TOKEN = 4;
 
 function getDefaultAppPath() {
   if (process.platform === 'darwin') {
@@ -62,12 +64,70 @@ export function getKiroUserPath() {
   return existsSync(def) ? def : null;
 }
 
+export function getKiroCliDbPath() {
+  const explicit = process.env.KIRO_CLI_DB_PATH?.trim();
+  if (explicit) {
+    const r = resolve(explicit);
+    return existsSync(r) ? r : null;
+  }
+  let def;
+  if (process.platform === 'darwin') {
+    def = join(homedir(), 'Library', 'Application Support', 'kiro-cli', 'data.sqlite3');
+  } else if (process.platform === 'win32') {
+    const appData = process.env.APPDATA?.trim() || join(homedir(), 'AppData', 'Roaming');
+    def = join(appData, 'kiro-cli', 'data.sqlite3');
+  } else {
+    def = join(homedir(), '.local', 'share', 'kiro-cli', 'data.sqlite3');
+  }
+  return existsSync(def) ? def : null;
+}
+
+export function getKiroSessionsDir() {
+  const explicit = process.env.KIRO_SESSIONS_DIR?.trim();
+  if (explicit) {
+    const r = resolve(explicit);
+    return existsSync(r) ? r : null;
+  }
+  const def = join(homedir(), '.kiro_sessions');
+  return existsSync(def) ? def : null;
+}
+
 function isLockError(err) {
   return err && typeof err.message === 'string' && /database is locked/i.test(err.message);
 }
 
 function queryDb(dbPath, sql) {
   return queryDbJson(dbPath, sql);
+}
+
+function queryDbSnapshotOnLock(dbPath, sql) {
+  try {
+    return queryDb(dbPath, sql);
+  } catch (err) {
+    if (!isLockError(err)) throw err;
+    const snapshotDir = mkdtempSync(join(tmpdir(), 'vibe-usage-kiro-'));
+    const queryPath = join(snapshotDir, 'data.sqlite3');
+    copyFileSync(dbPath, queryPath);
+    for (const suffix of ['-shm', '-wal']) {
+      const companion = `${dbPath}${suffix}`;
+      if (existsSync(companion)) copyFileSync(companion, `${queryPath}${suffix}`);
+    }
+    try {
+      return queryDb(queryPath, sql);
+    } finally {
+      rmSync(snapshotDir, { recursive: true, force: true });
+    }
+  }
+}
+
+function queryOptionalDb(dbPath, sql) {
+  try {
+    return queryDbSnapshotOnLock(dbPath, sql);
+  } catch (err) {
+    const msg = err && typeof err.message === 'string' ? err.message : '';
+    if (/no such table|no such column/i.test(msg)) return [];
+    throw err;
+  }
 }
 
 const TOKENS_SQL =
@@ -77,23 +137,7 @@ const TOKENS_SQL =
   'ORDER BY id ASC';
 
 function readLegacyDb(dbPath) {
-  try {
-    return queryDb(dbPath, TOKENS_SQL);
-  } catch (err) {
-    if (!isLockError(err)) throw err;
-    const snapshotDir = mkdtempSync(join(tmpdir(), 'vibe-usage-kiro-'));
-    const queryPath = join(snapshotDir, 'devdata.sqlite');
-    copyFileSync(dbPath, queryPath);
-    for (const suffix of ['-shm', '-wal']) {
-      const companion = `${dbPath}${suffix}`;
-      if (existsSync(companion)) copyFileSync(companion, `${queryPath}${suffix}`);
-    }
-    try {
-      return queryDb(queryPath, TOKENS_SQL);
-    } finally {
-      rmSync(snapshotDir, { recursive: true, force: true });
-    }
-  }
+  return queryDbSnapshotOnLock(dbPath, TOKENS_SQL);
 }
 
 // Legacy Kiro dev telemetry fallback. This is opt-in because recent Kiro builds
@@ -113,7 +157,7 @@ function readLegacyJsonl(jsonlPath) {
       const obj = JSON.parse(lines[i]);
       rows.push({
         id: i + 1,
-        model: obj.model || 'kiro-token-estimate',
+        model: obj.model || ESTIMATE_MODEL,
         tokens_prompt: obj.promptTokens || 0,
         tokens_generated: obj.generatedTokens || 0,
         timestamp: ts,
@@ -135,13 +179,13 @@ function parseDbTimestamp(value) {
 
 function normalizeLegacyModel(raw) {
   const model = typeof raw === 'string' ? raw.trim() : '';
-  if (!model || model.toLowerCase() === 'agent') return 'kiro-token-estimate';
+  if (!model || model.toLowerCase() === 'agent') return ESTIMATE_MODEL;
   if (model === model.toLowerCase() && model.includes('-')) return model;
   return model
     .replace(/_\d{8}_V\d+_\d+$/i, '')
     .replace(/_V\d+$/i, '')
     .toLowerCase()
-    .replace(/_/g, '-') || 'kiro-token-estimate';
+    .replace(/_/g, '-') || ESTIMATE_MODEL;
 }
 
 function rowsToLegacyEntries(rows) {
@@ -164,6 +208,196 @@ function rowsToLegacyEntries(rows) {
     });
   }
   return entries;
+}
+
+function textLength(field) {
+  if (!field) return 0;
+  if (typeof field !== 'object' || Array.isArray(field)) return String(field).length;
+  let len = 0;
+  for (const [key, value] of Object.entries(field)) {
+    if (key === 'images') continue;
+    len += String(value ?? '').length;
+  }
+  return len;
+}
+
+function imageTokens(field) {
+  if (!field || typeof field !== 'object' || Array.isArray(field)) return 0;
+  const images = field.images;
+  if (!Array.isArray(images)) return 0;
+  let total = 0;
+  for (const image of images) {
+    const source = image && typeof image === 'object' ? image.source || {} : {};
+    const rawData = source.Bytes;
+    try {
+      let buf;
+      if (Array.isArray(rawData)) {
+        buf = Buffer.from(rawData);
+      } else if (typeof rawData === 'string') {
+        buf = Buffer.from(rawData, 'base64');
+      }
+      if (buf?.length >= 24 && buf.subarray(0, 4).equals(Buffer.from([0x89, 0x50, 0x4e, 0x47]))) {
+        total += Math.floor((buf.readUInt32BE(16) * buf.readUInt32BE(20)) / 750);
+        continue;
+      }
+    } catch {
+      // fall back below
+    }
+    total += 1600;
+  }
+  return total;
+}
+
+function estimateTextTokens(field) {
+  return Math.floor(textLength(field) / CHARS_PER_TOKEN);
+}
+
+function normalizeCliModel(raw) {
+  const model = typeof raw === 'string' ? raw.trim() : '';
+  return model || ESTIMATE_MODEL;
+}
+
+function parseMsTimestamp(value) {
+  const n = Number(value);
+  if (!Number.isFinite(n) || n <= 0) return null;
+  const d = new Date(n);
+  return isNaN(d.getTime()) ? null : d;
+}
+
+function extractConversationTimes(data) {
+  const turns = Array.isArray(data?.history) ? data.history : [];
+  const first = turns[0]?.request_metadata?.request_start_timestamp_ms;
+  const last = turns[turns.length - 1]?.request_metadata?.request_start_timestamp_ms;
+  return {
+    createdAt: Number(first) || 0,
+    updatedAt: Number(last) || Number(first) || 0,
+  };
+}
+
+function conversationToEntries(conversation) {
+  const data = conversation?.value;
+  const turns = Array.isArray(data?.history) ? data.history : [];
+  const summary = data?.latest_summary || [];
+  const summaryTokens = summary ? Math.floor(String(summary).length / CHARS_PER_TOKEN) : 0;
+  let cumulative = summaryTokens;
+  let prevAssistantTokens = 0;
+  const entries = [];
+
+  for (let i = 0; i < turns.length; i++) {
+    const turn = turns[i] || {};
+    const meta = turn.request_metadata || {};
+    const timestamp = parseMsTimestamp(meta.request_start_timestamp_ms);
+    if (!timestamp) continue;
+
+    const userTokens = estimateTextTokens(turn.user) + imageTokens(turn.user);
+    const assistantTokens = estimateTextTokens(turn.assistant);
+    const outputTokens = Array.isArray(meta.time_between_chunks) ? meta.time_between_chunks.length : 0;
+    const cachedInputTokens = i > 0 ? cumulative : 0;
+    const inputTokens = userTokens + (i > 0 ? prevAssistantTokens : 0);
+
+    cumulative += userTokens + assistantTokens;
+    prevAssistantTokens = assistantTokens;
+
+    if (inputTokens === 0 && outputTokens === 0 && cachedInputTokens === 0) continue;
+    entries.push({
+      source: 'kiro',
+      model: normalizeCliModel(meta.model_id),
+      project: conversation.cwd || 'unknown',
+      timestamp,
+      inputTokens,
+      outputTokens,
+      cachedInputTokens,
+      reasoningOutputTokens: 0,
+    });
+  }
+
+  return entries;
+}
+
+export function conversationsToEstimateEntries(conversations) {
+  const entries = [];
+  const byId = new Map();
+  for (const conversation of conversations) {
+    const id = conversation?.conversation_id;
+    if (!id) continue;
+    const updatedAt = Number(conversation.updated_at) || 0;
+    const existing = byId.get(id);
+    if (!existing || updatedAt >= (Number(existing.updated_at) || 0)) {
+      byId.set(id, conversation);
+    }
+  }
+  for (const conversation of byId.values()) {
+    entries.push(...conversationToEntries(conversation));
+  }
+  return entries;
+}
+
+function readArchivedConversations(sessionsDir) {
+  if (!sessionsDir) return [];
+  let files;
+  try {
+    files = readdirSync(sessionsDir).filter(f => f.endsWith('.json'));
+  } catch {
+    return [];
+  }
+  const conversations = [];
+  for (const file of files) {
+    try {
+      const obj = JSON.parse(readFileSync(join(sessionsDir, file), 'utf-8'));
+      if (obj?.conversation_id && obj?.value) conversations.push(obj);
+    } catch {
+      // skip malformed archives
+    }
+  }
+  return conversations;
+}
+
+function readCliDbConversations(dbPath) {
+  if (!dbPath) return [];
+  const conversations = [];
+  for (const row of queryOptionalDb(
+    dbPath,
+    'SELECT conversation_id, key as cwd, created_at, updated_at, value FROM conversations_v2',
+  )) {
+    try {
+      conversations.push({
+        conversation_id: row.conversation_id,
+        cwd: row.cwd || 'unknown',
+        created_at: Number(row.created_at) || 0,
+        updated_at: Number(row.updated_at) || 0,
+        value: JSON.parse(row.value),
+      });
+    } catch {
+      // skip malformed conversations
+    }
+  }
+
+  for (const row of queryOptionalDb(dbPath, 'SELECT key as cwd, value FROM conversations')) {
+    try {
+      const data = JSON.parse(row.value);
+      const conversationId = data?.conversation_id;
+      if (!conversationId) continue;
+      const { createdAt, updatedAt } = extractConversationTimes(data);
+      conversations.push({
+        conversation_id: conversationId,
+        cwd: row.cwd || 'unknown',
+        created_at: createdAt,
+        updated_at: updatedAt,
+        value: data,
+      });
+    } catch {
+      // skip malformed conversations
+    }
+  }
+  return conversations;
+}
+
+function readCliEstimateEntries() {
+  const conversations = [
+    ...readArchivedConversations(getKiroSessionsDir()),
+    ...readCliDbConversations(getKiroCliDbPath()),
+  ];
+  return conversationsToEstimateEntries(conversations);
 }
 
 function parseLogTimestamp(raw) {
@@ -340,6 +574,18 @@ function parseLegacyTokens(base) {
 }
 
 export async function parse() {
+  try {
+    const estimateEntries = readCliEstimateEntries();
+    if (estimateEntries.length > 0) {
+      return { buckets: aggregateToBuckets(estimateEntries), sessions: [] };
+    }
+  } catch (err) {
+    if (err && typeof err.message === 'string' && err.message.includes('ENOENT')) {
+      throw new Error('sqlite3 CLI not found. Install sqlite3 (or use Node >= 22.5) to sync Kiro CLI data.');
+    }
+    throw err;
+  }
+
   const userPath = getKiroUserPath();
   if (!userPath) return { buckets: [], sessions: [] };
 
