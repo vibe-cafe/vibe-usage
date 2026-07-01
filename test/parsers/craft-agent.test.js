@@ -62,3 +62,40 @@ test('craft-agent parser reads pi-compatible JSONL usage', async () => {
     rmSync(root, { recursive: true, force: true });
   }
 });
+
+test('craft-agent parser falls back to session directory when cwd is missing', async () => {
+  const root = mkdtempSync(join(tmpdir(), 'vibe-usage-craft-agent-'));
+  const oldEnv = process.env.CRAFT_AGENT_DIR;
+
+  try {
+    process.env.CRAFT_AGENT_DIR = root;
+
+    const sessionDir = join(root, 'workspaces', 'code-space', 'sessions', 'fresh-branch', '.pi-sessions');
+    mkdirSync(sessionDir, { recursive: true });
+
+    writeFileSync(join(sessionDir, 'session.jsonl'), [
+      JSON.stringify({ type: 'session', id: 'session-1', timestamp: '2026-06-30T15:00:00.000Z' }),
+      JSON.stringify({
+        type: 'message',
+        id: 'a1',
+        timestamp: '2026-06-30T15:01:20.000Z',
+        message: {
+          role: 'assistant',
+          model: 'gpt-test',
+          content: [],
+          usage: { input: 100, output: 20, cacheRead: 30 },
+        },
+      }),
+      '',
+    ].join('\n'));
+
+    const result = await parseCraftAgent();
+
+    assert.equal(result.buckets.length, 1);
+    assert.equal(result.buckets[0].project, 'fresh-branch');
+  } finally {
+    if (oldEnv == null) delete process.env.CRAFT_AGENT_DIR;
+    else process.env.CRAFT_AGENT_DIR = oldEnv;
+    rmSync(root, { recursive: true, force: true });
+  }
+});

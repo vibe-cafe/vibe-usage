@@ -29,7 +29,8 @@ function isPiSessionFile(filePath) {
 function projectFromCraftPath(filePath) {
   const parts = filePath.replace(/\\/g, '/').split('/');
   const sessionsIndex = parts.lastIndexOf('sessions');
-  if (sessionsIndex > 0 && parts[sessionsIndex - 1]) return parts[sessionsIndex - 1];
+  const sessionName = parts[sessionsIndex + 1];
+  if (sessionsIndex >= 0 && sessionName) return sessionName;
   return 'unknown';
 }
 
