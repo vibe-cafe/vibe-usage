@@ -1,0 +1,164 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Kiro CLI token estimation — design note</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=Noto+Sans+SC:wght@400;500;700&family=Noto+Serif+SC:wght@400;700&display=swap" rel="stylesheet">
+<style>
+:root{--klein:#002FA7;--lemon:#FFED00;--orange:#FF6B00;--ink:#111;--mute:#666;--bg:#fafaf7;--card:#fff;--code-bg:#efefe9}
+*{box-sizing:border-box;margin:0;padding:0}
+body{font-family:"Noto Sans SC","Helvetica Neue","Inter",-apple-system,BlinkMacSystemFont,"PingFang SC","Microsoft YaHei",sans-serif;font-size:15px;line-height:1.55;color:var(--ink);background:var(--bg);-webkit-font-smoothing:antialiased}
+code,kbd{font-family:"SF Mono","JetBrains Mono",Menlo,Consolas,"PingFang SC","Source Han Sans SC",monospace;font-size:.86em;background:var(--code-bg);padding:1px 5px;border-radius:2px}
+.wrap{max-width:1080px;margin:0 auto;padding:0 6vw}
+.eyebrow{font-size:11px;letter-spacing:.18em;text-transform:uppercase;color:var(--mute);margin-bottom:14px}
+header{padding:60px 0 38px;border-bottom:1px solid var(--ink)}
+h1.title{font-size:clamp(32px,5vw,60px);font-weight:900;line-height:1.03;letter-spacing:-.02em}
+h1.title em{font-style:italic;color:var(--klein)}
+.sub{margin-top:16px;font-size:17px;max-width:64ch;color:#222}
+nav.jump{position:sticky;top:0;z-index:10;background:var(--bg);border-bottom:1px solid var(--ink);display:flex;flex-wrap:wrap;gap:6px;padding:12px 6vw}
+nav.jump a{font-size:12px;text-decoration:none;color:var(--ink);border:1px solid var(--ink);padding:5px 11px;background:var(--card)}
+nav.jump a:hover,nav.jump a.on{background:var(--klein);color:#fff}
+section{padding:46px 0;border-bottom:1px solid var(--ink)}
+.shead{display:grid;grid-template-columns:64px 1fr;gap:18px;align-items:start;margin-bottom:24px}
+.snum{font-size:44px;font-weight:900;color:var(--klein);letter-spacing:-.04em;line-height:1}
+.stitle{font-size:25px;font-weight:800;letter-spacing:-.01em;padding-top:4px}
+.tldr{display:grid;grid-template-columns:96px 1fr;gap:22px;padding:22px;background:var(--lemon);border:2px solid var(--ink);margin-top:28px}
+.tldr .label{font-size:11px;letter-spacing:.2em;font-weight:700;text-transform:uppercase}
+.tldr .body{font-size:16px;line-height:1.5}
+.tldr .body b{background:var(--ink);color:var(--lemon);padding:2px 7px}
+table{width:100%;border-collapse:collapse;margin:8px 0;font-size:14px}
+th,td{text-align:left;padding:8px 10px;border-bottom:1px solid #ddd;vertical-align:top}
+td.n,th.n{text-align:right;font-variant-numeric:tabular-nums}
+thead th{border-bottom:2px solid var(--ink);font-size:12px;text-transform:uppercase;letter-spacing:.04em}
+tr.big td{background:#fff7cc;font-weight:700}
+.card{background:var(--card);border:1px solid var(--ink);padding:18px 20px;margin:14px 0}
+.card.klein{border:2px solid var(--klein)}
+.grid2{display:grid;grid-template-columns:1fr 1fr;gap:16px}
+@media(max-width:720px){.grid2{grid-template-columns:1fr}.shead{grid-template-columns:44px 1fr}}
+h3{font-size:16px;margin:18px 0 8px;font-weight:800}
+p{margin:10px 0}ul{margin:10px 0 10px 20px}li{margin:5px 0}
+pre{background:var(--code-bg);border:1px solid #ddd;padding:14px 16px;overflow-x:auto;font-size:13px;line-height:1.5;margin:12px 0}
+pre code{background:none;padding:0}
+.kv{color:var(--mute);font-size:13px}
+.warn{border-left:4px solid var(--orange);background:#fff2e8;padding:14px 16px;margin:14px 0}
+.warn .t{font-weight:800;color:var(--orange);text-transform:uppercase;font-size:12px;letter-spacing:.08em}
+footer{padding:28px 0 60px;color:var(--mute);font-size:13px}
+</style>
+</head>
+<body>
+<div class="wrap">
+<header>
+  <div class="eyebrow">VIBE-USAGE · KIRO CLI · DESIGN NOTE</div>
+  <h1 class="title">Kiro CLI token estimation<br><em>read the native event stream</em></h1>
+  <p class="sub">The shipping Kiro CLI records conversations as a <code>{version, kind, data}</code> event stream — not in <code>conversations_v2</code>. This note documents the new parser, the estimation model, two reviewer decision points, and how the numbers were cross-validated.</p>
+</header>
+</div>
+
+<nav class="jump" id="nav">
+  <a href="#why">① Why the DB path is empty</a>
+  <a href="#format">② Native format</a>
+  <a href="#est">③ Estimation</a>
+  <a href="#valid">④ Validation</a>
+  <a href="#decide">⑤ Decision points</a>
+</nav>
+
+<div class="wrap">
+
+<div class="tldr">
+  <div class="label">TL;DR</div>
+  <div class="body">
+    Adds <code>~/.kiro/sessions/cli/*.jsonl</code> as the <b>first</b> Kiro source; estimates in/out/thinking/cache from text (<code>chars/4</code>); falls back to the existing credit / legacy paths.
+    Cross-validated — input reconciles to <b>99.5%</b>. Key trap handled: <b>thinking-block signatures must be excluded</b> from token counts (~1.5M tokens of noise, would inflate output &gt;100%).
+  </div>
+</div>
+
+<section id="why">
+  <div class="shead"><div class="snum">01</div><div class="stitle">Why the current CLI path finds nothing</div></div>
+  <p>Commit <code>858336b</code> reads <code>conversations_v2</code> / <code>conversations</code> from <code>data.sqlite3</code>, plus <code>~/.kiro_sessions/*.json</code> archives. On a real, heavily-used install:</p>
+  <table>
+    <thead><tr><th>Source the current path reads</th><th class="n">Rows on the test machine</th></tr></thead>
+    <tbody>
+      <tr><td><code>data.sqlite3</code> → <code>conversations_v2</code></td><td class="n">0</td></tr>
+      <tr><td><code>data.sqlite3</code> → <code>conversations</code></td><td class="n">0</td></tr>
+      <tr><td><code>~/.kiro_sessions/*.json</code></td><td class="n">absent</td></tr>
+    </tbody>
+  </table>
+  <p>The real data lives in <code>~/.kiro/sessions/cli/*.jsonl</code> (116 files touched in 2 days on the test machine), in an event-stream format — not the <code>history[]</code> shape the DB path expects.</p>
+</section>
+
+<section id="format">
+  <div class="shead"><div class="snum">02</div><div class="stitle">The native format</div></div>
+  <p><code>&lt;uuid&gt;.jsonl</code> — one event per line, <code>{version, kind, data}</code>:</p>
+  <table>
+    <thead><tr><th>kind</th><th>payload</th><th>maps to</th></tr></thead>
+    <tbody>
+      <tr><td><code>Prompt</code></td><td><code>content[]</code> (text/image); <code>meta.timestamp</code> = epoch <b>seconds</b></td><td>fresh input · only timestamp</td></tr>
+      <tr><td><code>AssistantMessage</code></td><td><code>content[]</code>: text · thinking (text + modelId + crypto signature) · toolUse (name + input)</td><td>output / reasoning · model id</td></tr>
+      <tr><td><code>ToolResults</code></td><td><code>content[]</code> tool output</td><td>fresh input to next turn</td></tr>
+      <tr><td><code>Compaction</code></td><td><code>summary</code></td><td>resets running context</td></tr>
+    </tbody>
+  </table>
+  <p class="kv">Companion <code>&lt;uuid&gt;.json</code>: <code>cwd</code> → project; <code>session_state.rts_model_state.model_info.model_id</code> → model fallback.</p>
+</section>
+
+<section id="est">
+  <div class="shead"><div class="snum">03</div><div class="stitle">Estimation</div></div>
+  <p><code>token = string-leaf-chars / 4</code>, walking only string leaves and <b>skipping non-linguistic keys</b> (<code>signature, redactedContent, toolUseId, modelId, message_id, format, id</code>). Per assistant turn:</p>
+  <pre><code>outputTokens          = assistant text + toolUse(name/input)
+reasoningOutputTokens = thinking.text            (signature excluded)
+inputTokens           = prompt + preceding ToolResults (+~1600/image)
+cachedInputTokens     = running context (re-sent each turn) + system overhead
+model    = thinking.modelId -> session model_id -> 'kiro-token-estimate'
+timestamp = enclosing Prompt timestamp (turns inherit it)</code></pre>
+  <div class="warn">
+    <div class="t">Correctness trap · exclude signatures</div>
+    <p>Extended-thinking blocks carry a ~500-char crypto <code>signature</code>. On the test machine that is ~<b>1.48M tokens</b> of non-linguistic bytes. Counting the raw JSON (or "all string values") inflates output by <b>&gt;100%</b>. Output is estimated from assistant <b>text</b>, which is also more faithful than a chunk count (<code>time_between_chunks</code> is not present in this native format).</p>
+  </div>
+</section>
+
+<section id="valid">
+  <div class="shead"><div class="snum">04</div><div class="stitle">How the numbers were validated</div></div>
+  <p>Two independently-written counters over the same logs: the estimator (stateful turn walker, selective extraction) vs. a dead-simple single pass summing every string leaf (no turn logic, no cache, no key-skipping).</p>
+  <ul>
+    <li><b>Caught a real bug</b>: an early version extracted tool results via <code>JSON.stringify</code> → structural overhead → <b>6×</b> inflation (14.8M vs 2.5M input). Only independent implementations surface that.</li>
+    <li><b>Converged</b>: after the fix, input reconciles to <b>99.5%</b> (2,532,691 vs 2,544,964).</li>
+    <li><b>Gap fully explained</b>: the output-side difference equalled a third, separate measurement of signature volume (~1.48M) — a deliberate exclusion, not a bug.</li>
+  </ul>
+  <p class="kv">Scope: validates parsing correctness &amp; consistency — not the <code>chars/4</code> ratio or that the cache model matches provider billing (Kiro exposes no ground truth; it meters in Credits / <code>INVOCATIONS</code>, non-linear in tokens).</p>
+  <p class="kv">For reference, the parser on the contributor's machine: fresh (in+out+think) ≈ <b>3.67M</b>, cacheRead ≈ 662M, dominant model <code>claude-opus-4.8</code>.</p>
+</section>
+
+<section id="decide">
+  <div class="shead"><div class="snum">05</div><div class="stitle">Two "re-sent every turn" terms — your call</div></div>
+  <div class="grid2">
+    <div class="card klein">
+      <h3>(A) Thinking signatures in cache</h3>
+      <p>Thinking blocks (incl. signature) are re-sent on every later request, so the signature is added to the running <b>context</b> (never to output). Counted at <code>chars/4</code> — a conservative floor (base64 tokenizes worse).</p>
+    </div>
+    <div class="card klein">
+      <h3>(B) System prompt + tool schemas</h3>
+      <p>Injected on every request but never logged, so the stream counts none of them. Modeled as a per-turn constant <code>KIRO_CLI_SYSTEM_OVERHEAD_TOKENS</code> (default <b>20000</b>). Set to <code>0</code> to count only logged text. Happy to tune/remove.</p>
+    </div>
+  </div>
+  <h3>Tests</h3>
+  <ul>
+    <li><code>cliEventsToEntries</code> — estimation, signature excluded from output but kept in cache, structure-not-inflated counting, prompt-timestamp inheritance.</li>
+    <li><code>parse</code> — reads a native <code>*.jsonl</code> fixture end-to-end. All existing Kiro tests still pass.</li>
+  </ul>
+</section>
+
+<footer>Design note for the <code>kiro.js</code> native event-stream parser · numbers cross-validated on a real Kiro CLI install · system-overhead term is a tunable assumption.</footer>
+
+</div>
+<script>
+const links=[...document.querySelectorAll('nav.jump a')];
+const map=links.map(a=>({a,sec:document.querySelector(a.getAttribute('href'))}));
+function spy(){let cur=map[0];const y=window.scrollY+120;for(const m of map){if(m.sec&&m.sec.offsetTop<=y)cur=m;}links.forEach(l=>l.classList.remove('on'));if(cur)cur.a.classList.add('on');}
+document.addEventListener('scroll',spy,{passive:true});spy();
+links.forEach(l=>l.addEventListener('click',e=>{e.preventDefault();document.querySelector(l.getAttribute('href')).scrollIntoView({behavior:'smooth'});}));
+</script>
+</body>
+</html>

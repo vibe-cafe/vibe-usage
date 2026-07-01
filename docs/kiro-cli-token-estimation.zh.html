@@ -1,0 +1,163 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Kiro CLI Token 估算 — 设计说明</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=Noto+Sans+SC:wght@400;500;700&family=Noto+Serif+SC:wght@400;700&display=swap" rel="stylesheet">
+<style>
+:root{--klein:#002FA7;--lemon:#FFED00;--orange:#FF6B00;--ink:#111;--mute:#666;--bg:#fafaf7;--card:#fff;--code-bg:#efefe9}
+*{box-sizing:border-box;margin:0;padding:0}
+body{font-family:"Noto Sans SC","Helvetica Neue","Inter",-apple-system,BlinkMacSystemFont,"PingFang SC","Microsoft YaHei",sans-serif;font-size:15px;line-height:1.6;color:var(--ink);background:var(--bg);-webkit-font-smoothing:antialiased}
+code,kbd{font-family:"SF Mono","JetBrains Mono",Menlo,Consolas,"PingFang SC","Source Han Sans SC",monospace;font-size:.86em;background:var(--code-bg);padding:1px 5px;border-radius:2px}
+.wrap{max-width:1080px;margin:0 auto;padding:0 6vw}
+.eyebrow{font-size:11px;letter-spacing:.18em;text-transform:uppercase;color:var(--mute);margin-bottom:14px}
+header{padding:60px 0 38px;border-bottom:1px solid var(--ink)}
+h1.title{font-size:clamp(30px,5vw,56px);font-weight:900;line-height:1.08;letter-spacing:-.02em}
+h1.title em{font-style:italic;color:var(--klein)}
+.sub{margin-top:16px;font-size:17px;max-width:60ch;color:#222}
+nav.jump{position:sticky;top:0;z-index:10;background:var(--bg);border-bottom:1px solid var(--ink);display:flex;flex-wrap:wrap;gap:6px;padding:12px 6vw}
+nav.jump a{font-size:12px;text-decoration:none;color:var(--ink);border:1px solid var(--ink);padding:5px 11px;background:var(--card)}
+nav.jump a:hover,nav.jump a.on{background:var(--klein);color:#fff}
+section{padding:46px 0;border-bottom:1px solid var(--ink)}
+.shead{display:grid;grid-template-columns:64px 1fr;gap:18px;align-items:start;margin-bottom:24px}
+.snum{font-size:44px;font-weight:900;color:var(--klein);letter-spacing:-.04em;line-height:1}
+.stitle{font-size:24px;font-weight:800;letter-spacing:-.01em;padding-top:6px}
+.tldr{display:grid;grid-template-columns:96px 1fr;gap:22px;padding:22px;background:var(--lemon);border:2px solid var(--ink);margin-top:28px}
+.tldr .label{font-size:11px;letter-spacing:.2em;font-weight:700;text-transform:uppercase}
+.tldr .body{font-size:16px;line-height:1.6}
+.tldr .body b{background:var(--ink);color:var(--lemon);padding:2px 7px}
+table{width:100%;border-collapse:collapse;margin:8px 0;font-size:14px}
+th,td{text-align:left;padding:8px 10px;border-bottom:1px solid #ddd;vertical-align:top}
+td.n,th.n{text-align:right;font-variant-numeric:tabular-nums}
+thead th{border-bottom:2px solid var(--ink);font-size:12px;letter-spacing:.04em}
+.card{background:var(--card);border:1px solid var(--ink);padding:18px 20px;margin:14px 0}
+.card.klein{border:2px solid var(--klein)}
+.grid2{display:grid;grid-template-columns:1fr 1fr;gap:16px}
+@media(max-width:720px){.grid2{grid-template-columns:1fr}.shead{grid-template-columns:44px 1fr}}
+h3{font-size:16px;margin:18px 0 8px;font-weight:800}
+p{margin:10px 0}ul{margin:10px 0 10px 20px}li{margin:6px 0}
+pre{background:var(--code-bg);border:1px solid #ddd;padding:14px 16px;overflow-x:auto;font-size:13px;line-height:1.6;margin:12px 0}
+pre code{background:none;padding:0}
+.kv{color:var(--mute);font-size:13px}
+.warn{border-left:4px solid var(--orange);background:#fff2e8;padding:14px 16px;margin:14px 0}
+.warn .t{font-weight:800;color:var(--orange);text-transform:uppercase;font-size:12px;letter-spacing:.08em}
+footer{padding:28px 0 60px;color:var(--mute);font-size:13px}
+</style>
+</head>
+<body>
+<div class="wrap">
+<header>
+  <div class="eyebrow">VIBE-USAGE · KIRO CLI · 设计说明</div>
+  <h1 class="title">Kiro CLI Token 估算<br><em>读原生事件流就好</em></h1>
+  <p class="sub">正式版 Kiro CLI 把会话存成 <code>{version, kind, data}</code> 事件流,而不是 <code>conversations_v2</code>。本文说明新解析器、估算模型、两个需你定夺的点,以及数字是怎么交叉验证的。</p>
+</header>
+</div>
+
+<nav class="jump" id="nav">
+  <a href="#why">① 为什么 DB 路径是空的</a>
+  <a href="#format">② 原生格式</a>
+  <a href="#est">③ 估算</a>
+  <a href="#valid">④ 验证</a>
+  <a href="#decide">⑤ 需定夺的点</a>
+</nav>
+
+<div class="wrap">
+
+<div class="tldr">
+  <div class="label">TL;DR</div>
+  <div class="body">
+    把 <code>~/.kiro/sessions/cli/*.jsonl</code> 作为 Kiro 的<b>第一数据源</b>;从文本按 <code>chars/4</code> 估 in/out/thinking/cache;读不到再回退到既有 credit / legacy 路径。
+    已交叉验证——输入侧对账 <b>99.5%</b>。已处理的关键陷阱:<b>thinking 块签名必须从 token 计数排除</b>(约 148 万 token 噪音,否则 output 虚高 &gt;100%)。
+  </div>
+</div>
+
+<section id="why">
+  <div class="shead"><div class="snum">01</div><div class="stitle">为什么现有 CLI 路径读不到东西</div></div>
+  <p>提交 <code>858336b</code> 读 <code>data.sqlite3</code> 里的 <code>conversations_v2</code> / <code>conversations</code>,外加 <code>~/.kiro_sessions/*.json</code> 归档。在一台真实、重度使用的机器上:</p>
+  <table>
+    <thead><tr><th>现有路径读取的位置</th><th class="n">测试机行数</th></tr></thead>
+    <tbody>
+      <tr><td><code>data.sqlite3</code> → <code>conversations_v2</code></td><td class="n">0</td></tr>
+      <tr><td><code>data.sqlite3</code> → <code>conversations</code></td><td class="n">0</td></tr>
+      <tr><td><code>~/.kiro_sessions/*.json</code></td><td class="n">目录不存在</td></tr>
+    </tbody>
+  </table>
+  <p>真实数据在 <code>~/.kiro/sessions/cli/*.jsonl</code>(测试机两天内 116 个文件被改),是事件流格式,而非 DB 路径期待的 <code>history[]</code> 结构。</p>
+</section>
+
+<section id="format">
+  <div class="shead"><div class="snum">02</div><div class="stitle">原生格式</div></div>
+  <p><code>&lt;uuid&gt;.jsonl</code> — 每行一个事件 <code>{version, kind, data}</code>:</p>
+  <table>
+    <thead><tr><th>kind</th><th>载荷</th><th>对应</th></tr></thead>
+    <tbody>
+      <tr><td><code>Prompt</code></td><td><code>content[]</code>(text/image);<code>meta.timestamp</code> = epoch <b>秒</b></td><td>新增输入 · 唯一时间戳</td></tr>
+      <tr><td><code>AssistantMessage</code></td><td><code>content[]</code>:text · thinking(text + modelId + 加密 signature)· toolUse(name + input)</td><td>输出 / 推理 · 模型 id</td></tr>
+      <tr><td><code>ToolResults</code></td><td><code>content[]</code> 工具输出</td><td>下一轮的新增输入</td></tr>
+      <tr><td><code>Compaction</code></td><td><code>summary</code></td><td>重置累计上下文</td></tr>
+    </tbody>
+  </table>
+  <p class="kv">同名 <code>&lt;uuid&gt;.json</code>:<code>cwd</code> → 项目;<code>session_state.rts_model_state.model_info.model_id</code> → 模型回退。</p>
+</section>
+
+<section id="est">
+  <div class="shead"><div class="snum">03</div><div class="stitle">估算</div></div>
+  <p><code>token = 字符串叶子字符数 / 4</code>,只遍历字符串叶子,并<b>跳过非语言键</b>(<code>signature, redactedContent, toolUseId, modelId, message_id, format, id</code>)。每个 assistant 轮次:</p>
+  <pre><code>outputTokens          = assistant text + toolUse(name/input)
+reasoningOutputTokens = thinking.text            (排除签名)
+inputTokens           = prompt + 之前的 ToolResults (每图 +~1600)
+cachedInputTokens     = 累计上下文(每轮重发) + 系统提示开销
+model    = thinking.modelId -> 会话 model_id -> 'kiro-token-estimate'
+timestamp = 所在 Prompt 的时间戳(同轮继承)</code></pre>
+  <div class="warn">
+    <div class="t">正确性陷阱 · 排除签名</div>
+    <p>扩展思考块带一段 ~500 字符的加密 <code>signature</code>。在测试机上约为 <b>148 万 token</b> 的非语言字节。数整段 JSON(或"所有字符串值")会让 output 虚高 <b>&gt;100%</b>。输出用 assistant <b>文本</b> 估算,也比数 chunk 更贴近真实(此原生格式里没有 <code>time_between_chunks</code>)。</p>
+  </div>
+</section>
+
+<section id="valid">
+  <div class="shead"><div class="snum">04</div><div class="stitle">数字是怎么验证的</div></div>
+  <p>两份独立编写的计数器跑同一批日志:估算器(有状态轮次遍历 + 选择性提取) vs. 单遍暴力累加所有字符串叶子(无轮次、无 cache、不跳字段)。</p>
+  <ul>
+    <li><b>抓到真 bug</b>:早期版本用 <code>JSON.stringify</code> 提取工具结果 → 结构开销 → <b>6 倍</b>虚高(输入 1480万 vs 250万)。只有独立实现才暴露得出。</li>
+    <li><b>收敛</b>:修复后输入对账到 <b>99.5%</b>(2,532,691 vs 2,544,964)。</li>
+    <li><b>差异可解释</b>:输出侧差值恰等于第三次独立测得的签名量(~148万)—— 刻意排除,非 bug。</li>
+  </ul>
+  <p class="kv">范围:验证解析正确性与一致性,<b>不</b>验证 <code>chars/4</code> 比例、也不验证 cache 模型是否等于厂商计费(Kiro 不暴露 ground truth,按 Credits / <code>INVOCATIONS</code> 计量,与 token 非线性)。</p>
+  <p class="kv">参考:该解析器在贡献者机器上跑出——新增(in+out+think)≈ <b>3.67M</b>,cacheRead ≈ 662M,主力模型 <code>claude-opus-4.8</code>。</p>
+</section>
+
+<section id="decide">
+  <div class="shead"><div class="snum">05</div><div class="stitle">两个"每轮重发"项 — 你定夺</div></div>
+  <div class="grid2">
+    <div class="card klein">
+      <h3>(A) thinking 签名进 cache</h3>
+      <p>thinking 块(含签名)后续每轮都会被重发,所以签名加进累计<b>上下文</b>(不计入 output)。按 <code>chars/4</code> 计,是保守下限(base64 分词更差)。</p>
+    </div>
+    <div class="card klein">
+      <h3>(B) 系统提示 + 工具 schema</h3>
+      <p>每次请求注入但从不写日志,所以事件流一个都数不到。建模为每轮常量 <code>KIRO_CLI_SYSTEM_OVERHEAD_TOKENS</code>(默认 <b>20000</b>)。设为 <code>0</code> 即只数日志内文本。随你改 / 删。</p>
+    </div>
+  </div>
+  <h3>测试</h3>
+  <ul>
+    <li><code>cliEventsToEntries</code> — 估算、签名从 output 排除但保留在 cache、碎结构不被撑大、prompt 时间戳继承。</li>
+    <li><code>parse</code> — 端到端读取原生 <code>*.jsonl</code> fixture。既有 Kiro 测试全部通过。</li>
+  </ul>
+</section>
+
+<footer><code>kiro.js</code> 原生事件流解析器设计说明 · 数字在真实 Kiro CLI 机器上交叉验证 · 系统开销项是可调假设。</footer>
+
+</div>
+<script>
+const links=[...document.querySelectorAll('nav.jump a')];
+const map=links.map(a=>({a,sec:document.querySelector(a.getAttribute('href'))}));
+function spy(){let cur=map[0];const y=window.scrollY+120;for(const m of map){if(m.sec&&m.sec.offsetTop<=y)cur=m;}links.forEach(l=>l.classList.remove('on'));if(cur)cur.a.classList.add('on');}
+document.addEventListener('scroll',spy,{passive:true});spy();
+links.forEach(l=>l.addEventListener('click',e=>{e.preventDefault();document.querySelector(l.getAttribute('href')).scrollIntoView({behavior:'smooth'});}));
+</script>
+</body>
+</html>

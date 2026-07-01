@@ -19,6 +19,25 @@ const KIRO_USER_RELATIVE = 'User';
 const CREDIT_MODEL = 'kiro-credits';
 const ESTIMATE_MODEL = 'kiro-token-estimate';
 const CHARS_PER_TOKEN = 4;
+const IMAGE_TOKENS = 1600;
+
+// The official Kiro CLI persists each conversation as a `{version, kind, data}`
+// event stream under ~/.kiro/sessions/cli/<uuid>.jsonl (companion <uuid>.json
+// holds cwd + model). It carries NO token counts, so tokens are estimated from
+// text length (chars/CHARS_PER_TOKEN), the same heuristic used elsewhere here.
+//
+// String values that are NOT linguistic tokens are excluded from the count.
+// The big one is `signature`: extended-thinking blocks carry a ~500-char crypto
+// signature; counting it as text inflates "output" by well over 100%.
+const NON_TEXT_KEYS = new Set([
+  'signature', 'redactedContent', 'toolUseId', 'modelId', 'message_id', 'format', 'id',
+]);
+
+// System prompt + tool JSON schemas are injected on every request but never
+// written to the session log, so the stream alone counts none of them. They are
+// a near-constant per-call overhead (a cache read after the first call). This is
+// an assumption, applied per assistant turn; set to 0 to count only logged text.
+const KIRO_CLI_SYSTEM_OVERHEAD_TOKENS = 20000;
 
 function getDefaultAppPath() {
   if (process.platform === 'darwin') {
@@ -89,6 +108,17 @@ export function getKiroSessionsDir() {
     return existsSync(r) ? r : null;
   }
   const def = join(homedir(), '.kiro_sessions');
+  return existsSync(def) ? def : null;
+}
+
+// Native Kiro CLI session event streams: ~/.kiro/sessions/cli/*.jsonl
+export function getKiroCliSessionsDir() {
+  const explicit = process.env.KIRO_CLI_SESSIONS_DIR?.trim();
+  if (explicit) {
+    const r = resolve(explicit);
+    return existsSync(r) ? r : null;
+  }
+  const def = join(homedir(), '.kiro', 'sessions', 'cli');
   return existsSync(def) ? def : null;
 }
 
@@ -400,6 +430,165 @@ function readCliEstimateEntries() {
   return conversationsToEstimateEntries(conversations);
 }
 
+// ---------------------------------------------------------------------------
+// Native Kiro CLI event-stream sessions: ~/.kiro/sessions/cli/<uuid>.jsonl
+// Each line is a {version, kind, data} event. Relevant kinds:
+//   Prompt           user turn; data.content[] (text/image); data.meta.timestamp
+//                    is the ONLY timestamp (epoch SECONDS).
+//   AssistantMessage data.content[] items: text (reply), thinking (reasoning +
+//                    modelId + crypto signature), toolUse (name + input).
+//   ToolResults      tool output fed back as context for the next turn.
+//   Compaction       context was summarized; resets the running context size.
+// ---------------------------------------------------------------------------
+
+// Sum of string-leaf character lengths, skipping non-linguistic keys.
+function textLeafChars(value) {
+  if (typeof value === 'string') return value.length;
+  if (Array.isArray(value)) {
+    let n = 0;
+    for (const v of value) n += textLeafChars(v);
+    return n;
+  }
+  if (value && typeof value === 'object') {
+    let n = 0;
+    for (const [k, v] of Object.entries(value)) {
+      if (NON_TEXT_KEYS.has(k)) continue;
+      n += textLeafChars(v);
+    }
+    return n;
+  }
+  return 0;
+}
+
+function estTokens(value) {
+  return Math.floor(textLeafChars(value) / CHARS_PER_TOKEN);
+}
+
+function loadCliSessionMeta(sessionsDir, sessionId) {
+  try {
+    const d = JSON.parse(readFileSync(join(sessionsDir, `${sessionId}.json`), 'utf-8'));
+    return {
+      cwd: (d && typeof d.cwd === 'string' && d.cwd) || 'unknown',
+      model: d?.session_state?.rts_model_state?.model_info?.model_id || null,
+    };
+  } catch {
+    return { cwd: 'unknown', model: null };
+  }
+}
+
+async function readCliSessionEntries(sessionsDir, fileName) {
+  const sessionId = fileName.replace(/\.jsonl$/, '');
+  const { cwd, model: metaModel } = loadCliSessionMeta(sessionsDir, sessionId);
+  const filePath = join(sessionsDir, fileName);
+
+  let mtime;
+  try { mtime = statSync(filePath).mtime; } catch { mtime = new Date(); }
+
+  const events = [];
+  const rl = createInterface({
+    input: createReadStream(filePath, { encoding: 'utf-8' }),
+    crlfDelay: Infinity,
+  });
+  for await (const raw of rl) {
+    const line = raw.trim();
+    if (!line) continue;
+    try { events.push(JSON.parse(line)); } catch { /* skip malformed line */ }
+  }
+
+  return cliEventsToEntries(events, { cwd, model: metaModel, fallbackTimestamp: mtime });
+}
+
+// Pure state machine over a Kiro CLI session's ordered events. Exposed for tests.
+export function cliEventsToEntries(events, { cwd = 'unknown', model = null, fallbackTimestamp = null } = {}) {
+  const entries = [];
+  let curTs = null;      // Date from the enclosing Prompt (epoch seconds)
+  let cumulative = 0;    // running conversation context, re-sent every turn
+  let pendingInput = 0;  // fresh input accumulated since the last assistant turn
+  let curModel = model;
+
+  for (const ev of events) {
+    const data = ev?.data;
+    if (!data || typeof data !== 'object') continue;
+    const content = Array.isArray(data.content) ? data.content : [];
+
+    if (ev.kind === 'Prompt') {
+      const ts = data.meta?.timestamp;
+      if (typeof ts === 'number' && ts > 0) curTs = new Date(ts * 1000);
+      for (const item of content) {
+        pendingInput += item?.kind === 'image' ? IMAGE_TOKENS : estTokens(item?.data);
+      }
+    } else if (ev.kind === 'ToolResults') {
+      for (const item of content) pendingInput += estTokens(item?.data);
+    } else if (ev.kind === 'AssistantMessage') {
+      let output = 0;
+      let reasoning = 0;
+      let signatureTokens = 0;
+      for (const item of content) {
+        const cd = item?.data;
+        if (cd && typeof cd === 'object' && typeof cd.modelId === 'string' && cd.modelId) {
+          curModel = cd.modelId;
+        }
+        if (item?.kind === 'thinking' && cd && typeof cd === 'object') {
+          reasoning += Math.floor(String(cd.text ?? '').length / CHARS_PER_TOKEN);
+          // Signature persists in history and is re-sent as context on every
+          // later turn, but it is NOT model output — keep it out of output.
+          signatureTokens += Math.floor(String(cd.signature ?? '').length / CHARS_PER_TOKEN);
+        } else {
+          output += estTokens(cd);
+        }
+      }
+
+      const inputTokens = pendingInput;
+      // Each request re-sends the whole prior conversation (cache read) plus the
+      // per-call system-prompt/tool-schema overhead.
+      const cachedInputTokens = cumulative + KIRO_CLI_SYSTEM_OVERHEAD_TOKENS;
+
+      if (inputTokens > 0 || output > 0 || reasoning > 0) {
+        entries.push({
+          source: 'kiro',
+          model: curModel || ESTIMATE_MODEL,
+          project: cwd,
+          timestamp: curTs || fallbackTimestamp || new Date(),
+          inputTokens,
+          outputTokens: output,
+          cachedInputTokens,
+          reasoningOutputTokens: reasoning,
+        });
+      }
+
+      // Grow the running context: fresh input + everything generated this turn,
+      // including the thinking signature (it persists in history and is re-sent).
+      cumulative += inputTokens + output + reasoning + signatureTokens;
+      pendingInput = 0;
+    } else if (ev.kind === 'Compaction') {
+      cumulative = estTokens(data.summary);
+      pendingInput = 0;
+    }
+  }
+
+  return entries;
+}
+
+async function readCliSessionStreamEntries() {
+  const dir = getKiroCliSessionsDir();
+  if (!dir) return [];
+  let files;
+  try {
+    files = readdirSync(dir).filter(f => f.endsWith('.jsonl'));
+  } catch {
+    return [];
+  }
+  const entries = [];
+  for (const file of files) {
+    try {
+      entries.push(...await readCliSessionEntries(dir, file));
+    } catch {
+      // skip unreadable / concurrently rotated session
+    }
+  }
+  return entries;
+}
+
 function parseLogTimestamp(raw) {
   const d = new Date(String(raw).replace(' ', 'T'));
   return isNaN(d.getTime()) ? null : d;
@@ -574,6 +763,15 @@ function parseLegacyTokens(base) {
 }
 
 export async function parse() {
+  // 1. Official Kiro CLI native event streams (~/.kiro/sessions/cli/*.jsonl).
+  //    This is where the shipping CLI actually records conversations; the
+  //    conversations_v2 DB path below is empty on those installs.
+  const streamEntries = await readCliSessionStreamEntries();
+  if (streamEntries.length > 0) {
+    return { buckets: aggregateToBuckets(streamEntries), sessions: [] };
+  }
+
+  // 2. Kiro CLI conversations DB / archived snapshots (other CLI variants).
   try {
     const estimateEntries = readCliEstimateEntries();
     if (estimateEntries.length > 0) {
