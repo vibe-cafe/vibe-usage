@@ -9,6 +9,9 @@
   "bin": {
     "vibe-usage": "bin/vibe-usage.js"
   },
+  "scripts": {
+    "test": "node --test"
+  },
   "files": [
     "bin/",
     "src/"

@@ -104,6 +104,12 @@ function findCodexDataDirs() {
   ].filter(existsSync);
 }
 
+function findCraftAgentDataDirs() {
+  const envDir = process.env.CRAFT_AGENT_DIR || process.env.CRAFTAGENT_DIR;
+  const root = envDir ? join(envDir, 'workspaces') : join(homedir(), '.craft-agent', 'workspaces');
+  return existsSync(root) ? [root] : [];
+}
+
 // Kimi Code moved its store from ~/.kimi to ~/.kimi-code; recognize either so
 // users on either version are detected. The parser prefers ~/.kimi-code.
 function findKimiCodeDataDirs() {
@@ -136,6 +142,12 @@ export const TOOLS = [
     id: 'codex',
     dataDir: join(homedir(), '.codex', 'sessions'),
     detectDataDirs: findCodexDataDirs,
+  },
+  {
+    name: 'CraftAgent',
+    id: 'craft-agent',
+    dataDir: join(homedir(), '.craft-agent', 'workspaces'),
+    detectDataDirs: findCraftAgentDataDirs,
   },
   {
     name: 'GitHub Copilot CLI',
