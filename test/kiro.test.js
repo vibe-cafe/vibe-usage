@@ -3,7 +3,7 @@ import assert from 'node:assert/strict';
 import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from 'node:fs';
 import { join } from 'node:path';
 import { tmpdir } from 'node:os';
-import { conversationsToEstimateEntries, parse, snapshotsToCreditEntries } from '../src/parsers/kiro.js';
+import { cliEventsToEntries, conversationsToEstimateEntries, parse, snapshotsToCreditEntries } from '../src/parsers/kiro.js';
 
 test('snapshotsToCreditEntries emits positive credit deltas only', () => {
   const entries = snapshotsToCreditEntries([
@@ -50,10 +50,12 @@ test('parse reads q-client logs and aggregates Kiro credits without model guessi
   const prevUserPath = process.env.KIRO_USER_PATH;
   const prevSessionsDir = process.env.KIRO_SESSIONS_DIR;
   const prevCliDbPath = process.env.KIRO_CLI_DB_PATH;
+  const prevCliSessionsDir = process.env.KIRO_CLI_SESSIONS_DIR;
   const prevLegacy = process.env.VIBE_USAGE_KIRO_LEGACY_TOKENS;
   process.env.KIRO_USER_PATH = userPath;
   process.env.KIRO_SESSIONS_DIR = sessionsDir;
   process.env.KIRO_CLI_DB_PATH = join(root, 'missing.sqlite3');
+  process.env.KIRO_CLI_SESSIONS_DIR = sessionsDir;
   delete process.env.VIBE_USAGE_KIRO_LEGACY_TOKENS;
   try {
     const result = await parse();
@@ -71,6 +73,7 @@ test('parse reads q-client logs and aggregates Kiro credits without model guessi
     restoreEnv('KIRO_USER_PATH', prevUserPath);
     restoreEnv('KIRO_SESSIONS_DIR', prevSessionsDir);
     restoreEnv('KIRO_CLI_DB_PATH', prevCliDbPath);
+    restoreEnv('KIRO_CLI_SESSIONS_DIR', prevCliSessionsDir);
     restoreEnv('VIBE_USAGE_KIRO_LEGACY_TOKENS', prevLegacy);
     rmSync(root, { recursive: true, force: true });
   }
@@ -168,9 +171,11 @@ test('parse prefers archived Kiro CLI token estimates over q-client credits', as
   const prevUserPath = process.env.KIRO_USER_PATH;
   const prevSessionsDir = process.env.KIRO_SESSIONS_DIR;
   const prevCliDbPath = process.env.KIRO_CLI_DB_PATH;
+  const prevCliSessionsDir = process.env.KIRO_CLI_SESSIONS_DIR;
   process.env.KIRO_USER_PATH = userPath;
   process.env.KIRO_SESSIONS_DIR = sessionsDir;
   process.env.KIRO_CLI_DB_PATH = join(root, 'missing.sqlite3');
+  process.env.KIRO_CLI_SESSIONS_DIR = join(root, 'missing-cli-sessions');
   try {
     const result = await parse();
     assert.deepEqual(result.buckets.map(b => ({
@@ -190,6 +195,109 @@ test('parse prefers archived Kiro CLI token estimates over q-client credits', as
     restoreEnv('KIRO_USER_PATH', prevUserPath);
     restoreEnv('KIRO_SESSIONS_DIR', prevSessionsDir);
     restoreEnv('KIRO_CLI_DB_PATH', prevCliDbPath);
+    restoreEnv('KIRO_CLI_SESSIONS_DIR', prevCliSessionsDir);
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test('cliEventsToEntries estimates in/out/think, excludes signatures from output, keeps them in cache, and inherits the prompt timestamp', () => {
+  const events = [
+    { version: 'v1', kind: 'Prompt', data: {
+      content: [{ kind: 'text', data: 'a'.repeat(40) }],   // 40/4 = 10 input
+      meta: { timestamp: 1782720000 },                      // epoch SECONDS
+    } },
+    { version: 'v1', kind: 'AssistantMessage', data: { content: [
+      { kind: 'thinking', data: {
+        text: 'T'.repeat(20),          // 20/4 = 5 reasoning
+        signature: 'S'.repeat(400),    // 400/4 = 100 — excluded from output/reasoning
+        modelId: 'claude-opus-4.8',
+      } },
+      { kind: 'text', data: 'O'.repeat(24) },               // 24/4 = 6 output
+      { kind: 'toolUse', data: { toolUseId: 'x'.repeat(30), name: 'read', input: { path: '/p' } } }, // 'read'+'/p' = 6 chars -> 1
+    ] } },
+    { version: 'v1', kind: 'ToolResults', data: { content: [
+      { kind: 'toolResult', data: { toolUseId: 'y'.repeat(30), content: [{ text: 'R'.repeat(40) }] } }, // 40/4 = 10 input
+    ] } },
+    { version: 'v1', kind: 'AssistantMessage', data: { content: [
+      { kind: 'text', data: 'Z'.repeat(16) },               // 16/4 = 4 output, no new Prompt -> same ts
+    ] } },
+  ];
+
+  const entries = cliEventsToEntries(events, { cwd: '/x', model: null });
+
+  assert.deepEqual(entries.map(e => ({
+    model: e.model,
+    project: e.project,
+    inputTokens: e.inputTokens,
+    outputTokens: e.outputTokens,
+    reasoningOutputTokens: e.reasoningOutputTokens,
+    cachedInputTokens: e.cachedInputTokens,
+    ms: e.timestamp.getTime(),
+  })), [
+    // turn 1: cache = 0 (nothing prior); system overhead is opt-in.
+    { model: 'claude-opus-4.8', project: '/x', inputTokens: 10, outputTokens: 7, reasoningOutputTokens: 5, cachedInputTokens: 0, ms: 1782720000 * 1000 },
+    // turn 2: cache = prior context (10+7+5+100 signature = 122); ts inherited
+    { model: 'claude-opus-4.8', project: '/x', inputTokens: 10, outputTokens: 4, reasoningOutputTokens: 0, cachedInputTokens: 122, ms: 1782720000 * 1000 },
+  ]);
+});
+
+test('cliEventsToEntries can opt into Kiro CLI system overhead via env', () => {
+  const prev = process.env.KIRO_CLI_SYSTEM_OVERHEAD_TOKENS;
+  process.env.KIRO_CLI_SYSTEM_OVERHEAD_TOKENS = '20000';
+  try {
+    const entries = cliEventsToEntries([
+      { version: 'v1', kind: 'Prompt', data: {
+        content: [{ kind: 'text', data: 'a'.repeat(40) }],
+        meta: { timestamp: 1782720000 },
+      } },
+      { version: 'v1', kind: 'AssistantMessage', data: { content: [
+        { kind: 'text', data: 'O'.repeat(24) },
+      ] } },
+    ], { cwd: '/x', model: 'claude-sonnet-4.5' });
+
+    assert.equal(entries[0].cachedInputTokens, 20000);
+  } finally {
+    restoreEnv('KIRO_CLI_SYSTEM_OVERHEAD_TOKENS', prev);
+  }
+});
+
+test('parse reads native ~/.kiro/sessions/cli/*.jsonl event streams', async () => {
+  const root = mkdtempSync(join(tmpdir(), 'vibe-usage-kiro-stream-'));
+  const cliDir = join(root, 'cli');
+  mkdirSync(cliDir, { recursive: true });
+  writeFileSync(join(cliDir, 'sess.json'), JSON.stringify({ cwd: '/repo/x' }));
+  writeFileSync(join(cliDir, 'sess.jsonl'), [
+    JSON.stringify({ version: 'v1', kind: 'Prompt', data: { content: [{ kind: 'text', data: 'a'.repeat(40) }], meta: { timestamp: 1782720000 } } }),
+    JSON.stringify({ version: 'v1', kind: 'AssistantMessage', data: { content: [
+      { kind: 'thinking', data: { text: 'T'.repeat(20), signature: 'S'.repeat(400), modelId: 'claude-opus-4.8' } },
+      { kind: 'text', data: 'O'.repeat(24) },
+    ] } }),
+  ].join('\n') + '\n');
+
+  const prevCliSessionsDir = process.env.KIRO_CLI_SESSIONS_DIR;
+  process.env.KIRO_CLI_SESSIONS_DIR = cliDir;
+  try {
+    const result = await parse();
+    assert.equal(result.sessions.length, 0);
+    assert.deepEqual(result.buckets.map(b => ({
+      model: b.model,
+      project: b.project,
+      inputTokens: b.inputTokens,
+      outputTokens: b.outputTokens,
+      reasoningOutputTokens: b.reasoningOutputTokens,
+      cachedInputTokens: b.cachedInputTokens,
+      totalTokens: b.totalTokens,
+    })), [{
+      model: 'claude-opus-4.8',
+      project: '/repo/x',
+      inputTokens: 10,
+      outputTokens: 6,
+      reasoningOutputTokens: 5,
+      cachedInputTokens: 0,
+      totalTokens: 21,   // 10 + 6 + 5
+    }]);
+  } finally {
+    restoreEnv('KIRO_CLI_SESSIONS_DIR', prevCliSessionsDir);
     rmSync(root, { recursive: true, force: true });
   }
 });
