@@ -46,24 +46,43 @@ export function roundToHalfHour(date) {
   return d;
 }
 
+// Server column limits (usage_buckets: model varchar(100), project varchar(200)).
+// Anything longer aborts the whole INSERT chunk with 22001, so clamp here.
+const MODEL_MAX_LENGTH = 100;
+const PROJECT_MAX_LENGTH = 200;
+
+// Server token columns are bigint — a single fractional/NaN value aborts the
+// whole INSERT chunk with 22P02, taking every other tool's rows in the batch
+// down with it.
+function toTokenCount(value) {
+  const n = Number(value);
+  if (!Number.isFinite(n) || n <= 0) return 0;
+  return Math.round(n);
+}
+
 export function aggregateToBuckets(entries) {
   const map = new Map();
 
   for (const e of entries) {
+    const model = String(e.model || 'unknown').slice(0, MODEL_MAX_LENGTH);
+    const project = String(e.project || 'unknown').slice(0, PROJECT_MAX_LENGTH);
     const bucketStart = roundToHalfHour(e.timestamp).toISOString();
-    const key = `${e.source}|${e.model}|${e.project}|${bucketStart}`;
+    const key = `${e.source}|${model}|${project}|${e.hostname || ''}|${bucketStart}`;
 
     if (!map.has(key)) {
       map.set(key, {
         source: e.source,
-        model: e.model,
-        project: e.project,
+        model,
+        project,
+        // Cloud-sourced parsers (cursor) pre-set a fixed hostname sentinel; it
+        // must survive aggregation, or sync.js stamps the machine hostname and
+        // every machine gets its own duplicate row server-side.
+        ...(e.hostname ? { hostname: e.hostname } : {}),
         bucketStart,
         inputTokens: 0,
         outputTokens: 0,
         cachedInputTokens: 0,
         reasoningOutputTokens: 0,
-        totalTokens: 0,
       });
     }
 
@@ -72,10 +91,24 @@ export function aggregateToBuckets(entries) {
     b.outputTokens += e.outputTokens || 0;
     b.cachedInputTokens += e.cachedInputTokens || 0;
     b.reasoningOutputTokens += e.reasoningOutputTokens || 0;
-    b.totalTokens += (e.inputTokens || 0) + (e.outputTokens || 0) + (e.reasoningOutputTokens || 0);
   }
 
-  return Array.from(map.values());
+  // Clamp after summation, not per entry — rounding each entry first would
+  // discard sub-integer values instead of letting them accumulate.
+  return Array.from(map.values()).map((b) => {
+    const inputTokens = toTokenCount(b.inputTokens);
+    const outputTokens = toTokenCount(b.outputTokens);
+    const cachedInputTokens = toTokenCount(b.cachedInputTokens);
+    const reasoningOutputTokens = toTokenCount(b.reasoningOutputTokens);
+    return {
+      ...b,
+      inputTokens,
+      outputTokens,
+      cachedInputTokens,
+      reasoningOutputTokens,
+      totalTokens: inputTokens + outputTokens + reasoningOutputTokens,
+    };
+  });
 }
 
 /**

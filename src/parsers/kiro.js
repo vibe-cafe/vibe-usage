@@ -736,7 +736,12 @@ export function snapshotsToCreditEntries(snapshots) {
       continue;
     }
 
-    const delta = Number((snapshot.currentUsage - prev.currentUsage).toFixed(4));
+    // The server's token columns are bigint, so fractional credit deltas
+    // cannot be uploaded as-is. Diff floored cumulative values instead of
+    // rounding each delta: the diffs telescope, so sub-integer usage is never
+    // lost or double-counted — it surfaces on whichever snapshot crosses the
+    // next whole-credit boundary.
+    const delta = Math.floor(snapshot.currentUsage) - Math.floor(prev.currentUsage);
     if (delta > 0) {
       entries.push({
         source: 'kiro',

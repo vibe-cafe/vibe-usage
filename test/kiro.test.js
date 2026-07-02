@@ -5,7 +5,7 @@ import { join } from 'node:path';
 import { tmpdir } from 'node:os';
 import { cliEventsToEntries, conversationsToEstimateEntries, parse, snapshotsToCreditEntries } from '../src/parsers/kiro.js';
 
-test('snapshotsToCreditEntries emits positive credit deltas only', () => {
+test('snapshotsToCreditEntries emits positive whole-credit deltas only', () => {
   const entries = snapshotsToCreditEntries([
     snapshot('2026-06-25T00:00:00Z', 0, '2026-07-01T00:00:00Z'),
     snapshot('2026-06-29T12:00:00Z', 10.25, '2026-07-01T00:00:00Z'),
@@ -18,8 +18,24 @@ test('snapshotsToCreditEntries emits positive credit deltas only', () => {
     outputTokens: e.outputTokens,
     iso: e.timestamp.toISOString(),
   })), [
-    { model: 'kiro-credits', outputTokens: 10.25, iso: '2026-06-29T12:00:00.000Z' },
-    { model: 'kiro-credits', outputTokens: 2.75, iso: '2026-06-29T13:00:00.000Z' },
+    { model: 'kiro-credits', outputTokens: 10, iso: '2026-06-29T12:00:00.000Z' },
+    { model: 'kiro-credits', outputTokens: 3, iso: '2026-06-29T13:00:00.000Z' },
+  ]);
+});
+
+test('snapshotsToCreditEntries accumulates sub-credit deltas until a whole boundary is crossed', () => {
+  const entries = snapshotsToCreditEntries([
+    snapshot('2026-06-29T12:00:00Z', 0, '2026-07-01T00:00:00Z'),
+    snapshot('2026-06-29T12:10:00Z', 0.4, '2026-07-01T00:00:00Z'),
+    snapshot('2026-06-29T12:20:00Z', 0.9, '2026-07-01T00:00:00Z'),
+    snapshot('2026-06-29T12:30:00Z', 1.2, '2026-07-01T00:00:00Z'),
+  ]);
+
+  assert.deepEqual(entries.map(e => ({
+    outputTokens: e.outputTokens,
+    iso: e.timestamp.toISOString(),
+  })), [
+    { outputTokens: 1, iso: '2026-06-29T12:30:00.000Z' },
   ]);
 });
 
@@ -66,8 +82,8 @@ test('parse reads q-client logs and aggregates Kiro credits without model guessi
       outputTokens: b.outputTokens,
       totalTokens: b.totalTokens,
     })), [
-      { model: 'kiro-credits', inputTokens: 0, outputTokens: 25.5, totalTokens: 25.5 },
-      { model: 'kiro-credits', inputTokens: 0, outputTokens: 4.5, totalTokens: 4.5 },
+      { model: 'kiro-credits', inputTokens: 0, outputTokens: 25, totalTokens: 25 },
+      { model: 'kiro-credits', inputTokens: 0, outputTokens: 5, totalTokens: 5 },
     ]);
   } finally {
     restoreEnv('KIRO_USER_PATH', prevUserPath);
