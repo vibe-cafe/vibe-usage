@@ -95,20 +95,34 @@ const FETCH_TIMEOUT_MS = 10_000;
 async function fetchUsageCsv(token) {
   const url = `${(process.env.CURSOR_WEB_BASE_URL?.trim() || 'https://cursor.com').replace(/\/+$/, '')}/api/dashboard/export-usage-events-csv?strategy=tokens`;
   const sub = decodeJwtSub(token);
-  const cookieValues = sub ? [token, `${sub}::${token}`] : [token];
+  // The dashboard API authenticates via the WorkosCursorSessionToken cookie in
+  // `{sub}%3A%3A{jwt}` form (what the browser sends). Bearer and bare-token
+  // cookies now return 401, so they're kept only as last-resort fallbacks.
+  const userId = sub?.includes('|') ? sub.split('|').pop() : null;
+  const cookieValues = [
+    ...(sub ? [`${sub}%3A%3A${token}`] : []),
+    ...(userId ? [`${userId}%3A%3A${token}`] : []),
+    token,
+  ];
 
-  const attempts = [{ Authorization: `Bearer ${token}` }];
-  for (const cv of cookieValues) {
-    attempts.push({ Cookie: `${SESSION_COOKIE}=${cv}` });
-    attempts.push({ Authorization: `Bearer ${token}`, Cookie: `${SESSION_COOKIE}=${cv}` });
-  }
+  // Browser-mimicking headers, matching what the dashboard sends (and what
+  // cursor-stats / cursor-price-tracking send) — Node's default UA is a
+  // common target for intermittent WAF blocks on cursor.com.
+  const baseHeaders = {
+    Accept: 'text/csv,*/*;q=0.8',
+    Origin: 'https://cursor.com',
+    Referer: 'https://cursor.com/dashboard?tab=usage',
+    'User-Agent': 'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36',
+  };
+  const attempts = cookieValues.map(cv => ({ Cookie: `${SESSION_COOKIE}=${cv}` }));
+  attempts.push({ Authorization: `Bearer ${token}` });
 
   const failures = [];
   for (const headers of attempts) {
     let resp;
     try {
       resp = await fetch(url, {
-        headers: { Accept: 'text/csv,*/*;q=0.8', ...headers },
+        headers: { ...baseHeaders, ...headers },
         signal: AbortSignal.timeout(FETCH_TIMEOUT_MS),
       });
     } catch (e) {
@@ -121,9 +135,18 @@ async function fetchUsageCsv(token) {
     }
     if (resp.ok) return await resp.text();
     failures.push(`${resp.status} ${resp.statusText}`);
+    // Only auth rejections are worth retrying with different credentials.
+    // 429/5xx are transient server-side states — soft-skip like network errors
+    // instead of surfacing them as auth failures every daemon cycle.
+    if (resp.status !== 401 && resp.status !== 403) {
+      const err = new Error(`Cursor usage export skipped (HTTP ${resp.status} ${resp.statusText})`);
+      err.skip = true;
+      throw err;
+    }
   }
-  // All auth combos rejected — token is likely expired. Surface to user.
-  throw new Error(`Cursor usage export auth failed (${failures.join('; ')})`);
+  // Every auth combo rejected — the stored token no longer works. Surface an
+  // actionable message: re-signing in inside Cursor rewrites the token.
+  throw new Error(`Cursor session rejected (${failures.join('; ')}). Open Cursor and sign in again (Cursor Settings → Account), then re-run sync.`);
 }
 
 function parseCsv(text) {
