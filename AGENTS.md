@@ -11,8 +11,10 @@ vibe-usage/
 │   ├── index.js               # Command router (init, sync, daemon, reset, skill, status, config)
 │   ├── parsers/               # One parser per tool, all export async parse() → { buckets, sessions }
 │   │   ├── index.js           # Parser registry, aggregateToBuckets(), extractSessions()
+│   │   ├── pi-session-jsonl.js # Shared JSONL reader for Pi-compatible session logs
 │   │   ├── claude-code.js
 │   │   ├── codex.js
+│   │   ├── craft-agent.js     # CraftAgent ~/.craft-agent/workspaces/*/sessions/*/.pi-sessions/*.jsonl
 │   │   ├── copilot-cli.js
 │   │   ├── sqlite.js          # queryDbJson() — node:sqlite (Node ≥22.5), falls back to sqlite3 CLI
 │   │   ├── cursor.js          # SQLite (read auth token) + cursor.com CSV export
@@ -89,6 +91,11 @@ Parser pattern:
 - Extract user/assistant timing events → `extractSessions(events)`
 - Handle missing/corrupt files gracefully (try/catch, skip bad lines)
 
+Pi-compatible JSONL parsers (`pi-coding-agent.js`, `craft-agent.js`):
+- Use `parsePiSessionJsonl()` from `src/parsers/pi-session-jsonl.js` instead of duplicating recursive file walking and message/usage extraction.
+- The helper only counts assistant messages with `message.usage`; user/toolResult messages are timing events only.
+- Project comes from the session header `cwd` when present; parser-specific path heuristics are only fallbacks.
+
 SQLite-backed parsers (cursor, opencode, kiro, hermes):
 - Use `queryDbJson(dbPath, sql)` from `src/parsers/sqlite.js` — never shell out to `sqlite3` directly. It prefers Node's built-in `node:sqlite` (`DatabaseSync`, opened read-only; Node ≥ 22.5, works on Windows with no extra binary) and falls back to the `sqlite3` CLI on older Node.
 - Rows come back as plain objects (`{ column: value }`), same shape as `sqlite3 -json` — INTEGER → number, TEXT → string, JSON via `json_extract` → string.
@@ -112,6 +119,8 @@ Codex archived sessions (`codex.js`, `tools.js`):
 ## Development & Testing
 
 ```bash
+npm test
+
 # Dev mode (separate config, custom API URL)
 VIBE_USAGE_DEV=1 VIBE_USAGE_API_URL=http://localhost:3000 node ./bin/vibe-usage.js init
 VIBE_USAGE_DEV=1 node ./bin/vibe-usage.js sync
