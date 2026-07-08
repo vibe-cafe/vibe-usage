@@ -3,18 +3,25 @@ import { readdirSync } from 'node:fs';
 import { join } from 'node:path';
 import { homedir } from 'node:os';
 import { aggregateToBuckets, extractSessions } from './index.js';
+import { listDbCascades, readDbUsageRecords, readDbWorkspaceUri, readDbSessionEvents } from './antigravity-db.js';
 
 
 
 /**
- * Antigravity parser (file-based).
- * Scans .pb/.db files in ~/.gemini/antigravity/conversations/ to discover cascade IDs.
- * Calls GetCascadeTrajectory via a running language server to extract token usage
- * (from generatorMetadata) and session events (from trajectory steps).
+ * Antigravity parser.
+ *
+ * Two conversation stores, two read paths:
+ *  - `.db` cascades (App 2.0 + `agy` CLI): plain-protobuf SQLite, parsed offline
+ *    from disk — no running process required (see antigravity-db.js).
+ *  - `.pb` cascades (legacy App history): encrypted/opaque, only decodable via a
+ *    running language server's GetCascadeTrajectory RPC (fallback below).
+ * A cascade backed by a `.db` never uses RPC, so the two paths never double-count.
  */
 
 const SOURCE = 'antigravity';
 const CONVERSATIONS_DIR = join(homedir(), '.gemini', 'antigravity', 'conversations');
+// `agy` CLI stores conversations in a separate, App-independent directory.
+const CLI_CONVERSATIONS_DIR = join(homedir(), '.gemini', 'antigravity-cli', 'conversations');
 
 // User sources → role 'user'; Model source → role 'assistant'; System sources → skip
 const USER_SOURCES = new Set([
@@ -221,12 +228,14 @@ async function probeHttpPort(ports, csrfToken) {
 /**
  * Normalize model names to canonical forms.
  */
+// Normalize model names to canonical forms. NOTE: only legacy .pb data (which
+// exposes bare slugs via responseModel) reaches this; .db data uses the
+// human-readable modelDisplayName verbatim (e.g. "Gemini 3.5 Flash (High)"),
+// which is never normalized. Flash reasoning tiers (-a/-b/-c) are intentionally
+// NOT merged: each tier is a distinct choice and left as-is ("as it is").
 const MODEL_NORMALIZE_MAP = {
   'claude-opus-4-6-thinking': 'claude-opus-4-6',
   'claude-sonnet-4-6-thinking': 'claude-sonnet-4-6',
-  'gemini-3-flash-a': 'gemini-3-flash',
-  'gemini-3-flash-b': 'gemini-3-flash',
-  'gemini-3-flash-c': 'gemini-3-flash',
   "gemini-3.1-pro-high": "gemini-3.1-pro",
   "gemini-3.1-pro-low": "gemini-3.1-pro",
   "gemini-3-pro-high": "gemini-3-pro",
@@ -244,10 +253,6 @@ const PLACEHOLDER_MODEL_MAP = {
   'MODEL_PLACEHOLDER_M35': 'claude-sonnet-4-6',
   'MODEL_PLACEHOLDER_M26': 'claude-opus-4-6',
   'MODEL_OPENAI_GPT_OSS_120B_MEDIUM': 'gpt-oss-120b',
-  // Antigravity 2.0+ standalone app placeholders (verified via responseModel)
-  'MODEL_PLACEHOLDER_M132': 'gemini-3-flash',
-  'MODEL_PLACEHOLDER_M133': 'gemini-3-flash',
-  'MODEL_PLACEHOLDER_M20': 'gemini-3-flash',
 };
 
 function normalizeModel(raw) {
@@ -255,9 +260,16 @@ function normalizeModel(raw) {
 }
 
 /**
- * Resolve model name: prefer responseModel, fall back to placeholder map.
+ * Resolve a display model name from a chatModel-like object.
+ * Priority: modelDisplayName (real name, e.g. "Gemini 3.5 Flash (High)") →
+ * responseModel slug (normalized) → placeholder map → "unknown".
+ *
+ * modelDisplayName is present on .db data (App 2.0 + CLI) and is authoritative;
+ * it is used verbatim (carries the reasoning tier). Legacy .pb data has no
+ * display name, so it falls back to the responseModel slug.
  */
 function resolveModel(chatModel) {
+  if (chatModel.modelDisplayName) return chatModel.modelDisplayName;
   if (chatModel.responseModel) return normalizeModel(chatModel.responseModel);
   const placeholder = chatModel.model || '';
   if (PLACEHOLDER_MODEL_MAP[placeholder]) return PLACEHOLDER_MODEL_MAP[placeholder];
@@ -280,21 +292,16 @@ function projectFromUri(uri) {
 }
 
 /**
- * List cascade IDs from .pb and .db files in the conversations directory.
- * Antigravity 2.0+ stores new conversations as SQLite .db files instead of .pb.
+ * List cascade IDs backed by a legacy `.pb` file (App history). `.db` cascades
+ * are handled separately via offline parsing.
  */
-function listCascades() {
+function listPbCascades() {
   try {
-    const files = readdirSync(CONVERSATIONS_DIR);
-    const seen = new Set();
-    for (const f of files) {
-      // SQLite auxiliaries (foo.db-wal / foo.db-shm) don't end with .db, so no
-      // extra filtering is needed here.
-      if (f.endsWith('.pb') || f.endsWith('.db')) {
-        seen.add(f.slice(0, -3));
-      }
+    const out = [];
+    for (const f of readdirSync(CONVERSATIONS_DIR)) {
+      if (f.endsWith('.pb')) out.push(f.slice(0, -3));
     }
-    return [...seen];
+    return out;
   } catch {
     return [];
   }
@@ -302,113 +309,133 @@ function listCascades() {
 
 // ── Main parse ───────────────────────────────────────────────────────
 
+/** Model name for an offline .db record: real display name → slug → unknown. */
+function modelFromRecord(rec) {
+  if (rec.displayName) return rec.displayName;
+  if (rec.responseModel) return normalizeModel(rec.responseModel);
+  return 'unknown';
+}
+
 export async function parse() {
-  // Step 1: List cascade conversation files (.pb / .db)
-  const cascadeIds = listCascades();
-  if (cascadeIds.length === 0) return { buckets: [], sessions: [] };
-
-  // Step 2: Find a running language server to make RPC calls
-  const server = findLanguageServer();
-  if (!server) return { buckets: [], sessions: [] };
-
-  const ports = findListeningPorts(server.pid);
-  if (ports.length === 0) return { buckets: [], sessions: [] };
-
-  const baseUrl = await probeHttpPort(ports, server.csrfToken);
-  if (!baseUrl) return { buckets: [], sessions: [] };
-
-  const rpc = (method, body) =>
-    rpcPost(
-      baseUrl,
-      `/exa.language_server_pb.LanguageServerService/${method}`,
-      body,
-      server.csrfToken,
-    );
-
-  // Step 3: Fetch trajectory for each changed cascade
   const entries = [];
   const sessionEvents = [];
   const seenResponseIds = new Set();
 
-  for (const cascadeId of cascadeIds) {
-    let resp;
-    try {
-      resp = await rpc('GetCascadeTrajectory', { cascadeId });
-    } catch {
-      continue; // skip this cascade if RPC fails
-    }
+  // ── Path 1: offline .db parsing (App 2.0 + agy CLI, no process needed) ──
+  const dbHandled = new Set();
+  for (const dir of [CONVERSATIONS_DIR, CLI_CONVERSATIONS_DIR]) {
+    for (const cascadeId of listDbCascades(dir)) {
+      const records = readDbUsageRecords(dir, cascadeId);
+      const project = projectFromUri(readDbWorkspaceUri(dir, cascadeId)) || 'unknown';
 
-    const trajectory = resp?.trajectory;
-    if (!trajectory) continue;
+      if (records.length > 0) {
+        dbHandled.add(cascadeId);
+        for (const rec of records) {
+          if (rec.responseId && seenResponseIds.has(rec.responseId)) continue;
+          if (rec.responseId) seenResponseIds.add(rec.responseId);
+          if (!rec.timestamp || isNaN(rec.timestamp.getTime())) continue;
+          entries.push({
+            source: SOURCE,
+            model: modelFromRecord(rec),
+            project,
+            timestamp: rec.timestamp,
+            inputTokens: toSafeNumber(rec.inputTokens),
+            outputTokens: toSafeNumber(rec.outputTokens),
+            cachedInputTokens: toSafeNumber(rec.cacheReadTokens),
+            reasoningOutputTokens: toSafeNumber(rec.thinkingOutputTokens),
+          });
+        }
+      }
 
-    const steps = trajectory.steps || [];
-    const metadataList = trajectory.generatorMetadata || [];
-
-
-    // Extract project from trajectory metadata workspaces
-    let project = 'unknown';
-    const workspaces = trajectory.metadata?.workspaces || [];
-    if (workspaces.length > 0) {
-      project = workspaces[0].repository?.computedName || projectFromUri(workspaces[0].workspaceFolderAbsoluteUri) || 'unknown';
-    }
-
-    // ── Token entries from generatorMetadata ──
-    for (const meta of metadataList) {
-      const chatModel = meta?.chatModel;
-      if (!chatModel) continue;
-
-      const responseModel = resolveModel(chatModel);
-      const createdAt = chatModel?.chatStartMetadata?.createdAt;
-      const ts = createdAt ? new Date(createdAt) : null;
-      if (!ts || isNaN(ts.getTime())) continue;
-
-      const retryInfos = chatModel.retryInfos || [];
-      for (const retry of retryInfos) {
-        const usage = retry.usage;
-        if (!usage) continue;
-
-        const responseId = usage.responseId || '';
-        if (responseId && seenResponseIds.has(responseId)) continue;
-        if (responseId) seenResponseIds.add(responseId);
-
-        entries.push({
+      // Session timing from steps (independent of token usage presence).
+      for (const ev of readDbSessionEvents(dir, cascadeId)) {
+        sessionEvents.push({
+          sessionId: cascadeId,
           source: SOURCE,
-          model: responseModel,
           project,
-          timestamp: ts,
-          inputTokens: toSafeNumber(usage.inputTokens),
-          outputTokens: toSafeNumber(usage.outputTokens),
-          cachedInputTokens: toSafeNumber(usage.cacheReadTokens),
-          reasoningOutputTokens: toSafeNumber(usage.thinkingOutputTokens),
+          timestamp: ev.timestamp,
+          role: ev.role,
         });
       }
     }
+  }
 
-    // ── Session events from trajectory steps ──
-    for (const step of steps) {
-      const stepSource = step?.metadata?.source || '';
-      let role;
-      if (USER_SOURCES.has(stepSource)) {
-        role = 'user';
-      } else if (ASSISTANT_SOURCES.has(stepSource)) {
-        role = 'assistant';
-      } else {
-        continue; // skip SYSTEM / SYSTEM_SDK / UNSPECIFIED
+  // ── Path 2: RPC fallback, only for legacy .pb cascades not already parsed ──
+  const pbCascades = listPbCascades().filter((id) => !dbHandled.has(id));
+  if (pbCascades.length > 0) {
+    const server = findLanguageServer();
+    const ports = server ? findListeningPorts(server.pid) : [];
+    const baseUrl = ports.length > 0 ? await probeHttpPort(ports, server.csrfToken) : null;
+    if (baseUrl) {
+      const rpc = (method, body) =>
+        rpcPost(
+          baseUrl,
+          `/exa.language_server_pb.LanguageServerService/${method}`,
+          body,
+          server.csrfToken,
+        );
+
+      for (const cascadeId of pbCascades) {
+        let resp;
+        try {
+          resp = await rpc('GetCascadeTrajectory', { cascadeId });
+        } catch {
+          continue;
+        }
+        const trajectory = resp?.trajectory;
+        if (!trajectory) continue;
+
+        const steps = trajectory.steps || [];
+        const metadataList = trajectory.generatorMetadata || [];
+
+        let project = 'unknown';
+        const workspaces = trajectory.metadata?.workspaces || [];
+        if (workspaces.length > 0) {
+          project = workspaces[0].repository?.computedName
+            || projectFromUri(workspaces[0].workspaceFolderAbsoluteUri)
+            || 'unknown';
+        }
+
+        for (const meta of metadataList) {
+          const chatModel = meta?.chatModel;
+          if (!chatModel) continue;
+          const model = resolveModel(chatModel);
+          const createdAt = chatModel?.chatStartMetadata?.createdAt;
+          const ts = createdAt ? new Date(createdAt) : null;
+          if (!ts || isNaN(ts.getTime())) continue;
+
+          for (const retry of (chatModel.retryInfos || [])) {
+            const usage = retry.usage;
+            if (!usage) continue;
+            const responseId = usage.responseId || '';
+            if (responseId && seenResponseIds.has(responseId)) continue;
+            if (responseId) seenResponseIds.add(responseId);
+            entries.push({
+              source: SOURCE,
+              model,
+              project,
+              timestamp: ts,
+              inputTokens: toSafeNumber(usage.inputTokens),
+              outputTokens: toSafeNumber(usage.outputTokens),
+              cachedInputTokens: toSafeNumber(usage.cacheReadTokens),
+              reasoningOutputTokens: toSafeNumber(usage.thinkingOutputTokens),
+            });
+          }
+        }
+
+        for (const step of steps) {
+          const stepSource = step?.metadata?.source || '';
+          let role;
+          if (USER_SOURCES.has(stepSource)) role = 'user';
+          else if (ASSISTANT_SOURCES.has(stepSource)) role = 'assistant';
+          else continue;
+          const createdAt = step?.metadata?.createdAt;
+          const ts = createdAt ? new Date(createdAt) : null;
+          if (!ts || isNaN(ts.getTime())) continue;
+          sessionEvents.push({ sessionId: cascadeId, source: SOURCE, project, timestamp: ts, role });
+        }
       }
-
-      const createdAt = step?.metadata?.createdAt;
-      const ts = createdAt ? new Date(createdAt) : null;
-      if (!ts || isNaN(ts.getTime())) continue;
-
-      sessionEvents.push({
-        sessionId: cascadeId,
-        source: SOURCE,
-        project,
-        timestamp: ts,
-        role,
-      });
     }
-
   }
 
   return {
