@@ -224,6 +224,8 @@ async function probeHttpPort(ports, csrfToken) {
 const MODEL_NORMALIZE_MAP = {
   'claude-opus-4-6-thinking': 'claude-opus-4-6',
   'claude-sonnet-4-6-thinking': 'claude-sonnet-4-6',
+  'gemini-3-flash-a': 'gemini-3-flash',
+  'gemini-3-flash-b': 'gemini-3-flash',
   'gemini-3-flash-c': 'gemini-3-flash',
   "gemini-3.1-pro-high": "gemini-3.1-pro",
   "gemini-3.1-pro-low": "gemini-3.1-pro",
@@ -242,10 +244,10 @@ const PLACEHOLDER_MODEL_MAP = {
   'MODEL_PLACEHOLDER_M35': 'claude-sonnet-4-6',
   'MODEL_PLACEHOLDER_M26': 'claude-opus-4-6',
   'MODEL_OPENAI_GPT_OSS_120B_MEDIUM': 'gpt-oss-120b',
-  // Antigravity 2.0+ standalone app placeholders
+  // Antigravity 2.0+ standalone app placeholders (verified via responseModel)
   'MODEL_PLACEHOLDER_M132': 'gemini-3-flash',
   'MODEL_PLACEHOLDER_M133': 'gemini-3-flash',
-  'MODEL_PLACEHOLDER_M20': 'gemini-2.5-pro',
+  'MODEL_PLACEHOLDER_M20': 'gemini-3-flash',
 };
 
 function normalizeModel(raw) {
