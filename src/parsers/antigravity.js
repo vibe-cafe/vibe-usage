@@ -8,7 +8,7 @@ import { aggregateToBuckets, extractSessions } from './index.js';
 
 /**
  * Antigravity parser (file-based).
- * Scans .pb files in ~/.gemini/antigravity/conversations/ to discover cascade IDs.
+ * Scans .pb/.db files in ~/.gemini/antigravity/conversations/ to discover cascade IDs.
  * Calls GetCascadeTrajectory via a running language server to extract token usage
  * (from generatorMetadata) and session events (from trajectory steps).
  */
@@ -288,9 +288,9 @@ function listCascades() {
     const files = readdirSync(CONVERSATIONS_DIR);
     const seen = new Set();
     for (const f of files) {
-      if (f.endsWith('.pb')) {
-        seen.add(f.slice(0, -3));
-      } else if (f.endsWith('.db') && !f.endsWith('-shm') && !f.endsWith('-wal') && f !== 'db.sqlite') {
+      // SQLite auxiliaries (foo.db-wal / foo.db-shm) don't end with .db, so no
+      // extra filtering is needed here.
+      if (f.endsWith('.pb') || f.endsWith('.db')) {
         seen.add(f.slice(0, -3));
       }
     }
@@ -303,7 +303,7 @@ function listCascades() {
 // ── Main parse ───────────────────────────────────────────────────────
 
 export async function parse() {
-  // Step 1: List cascade .pb files
+  // Step 1: List cascade conversation files (.pb / .db)
   const cascadeIds = listCascades();
   if (cascadeIds.length === 0) return { buckets: [], sessions: [] };
 
