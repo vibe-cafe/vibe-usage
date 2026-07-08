@@ -113,7 +113,29 @@ function findKimiCodeDataDirs() {
   ].filter(existsSync);
 }
 
+export function findTraeCliDataDirs() {
+  const envDir = process.env.VIBE_USAGE_TRAE_CLI_SESSIONS?.trim();
+  if (envDir) {
+    return [envDir].filter(existsSync);
+  }
+  if (process.platform === 'darwin') {
+    return [join(homedir(), 'Library', 'Caches', 'trae-cli', 'sessions')].filter(existsSync);
+  }
+  if (process.platform === 'win32') {
+    const localAppData = process.env.LOCALAPPDATA?.trim() || join(homedir(), 'AppData', 'Local');
+    return [join(localAppData, 'trae-cli', 'cache', 'sessions')].filter(existsSync);
+  }
+  const xdgCacheHome = process.env.XDG_CACHE_HOME?.trim() || join(homedir(), '.cache');
+  return [join(xdgCacheHome, 'trae-cli', 'sessions')].filter(existsSync);
+}
+
 export const TOOLS = [
+  {
+    name: 'Trae CLI',
+    id: 'trae-cli',
+    dataDir: join(homedir(), 'Library', 'Caches', 'trae-cli', 'sessions'),
+    detectDataDirs: findTraeCliDataDirs,
+  },
   {
     name: 'Antigravity',
     id: 'antigravity',
