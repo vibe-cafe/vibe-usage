@@ -42,7 +42,7 @@ function findLanguageServer() {
 }
 
 function findLanguageServerUnix() {
-  const out = execSync("ps aux | grep 'antigravity/bin/language_server_'", { encoding: 'utf-8', timeout: 5000 });
+  const out = execSync("ps aux | grep -i 'antigravity.*language_server'", { encoding: 'utf-8', timeout: 5000 });
   for (const line of out.split('\n')) {
     if (!line.trim()) continue;
     if (line.includes('grep')) continue;
@@ -224,6 +224,8 @@ async function probeHttpPort(ports, csrfToken) {
 const MODEL_NORMALIZE_MAP = {
   'claude-opus-4-6-thinking': 'claude-opus-4-6',
   'claude-sonnet-4-6-thinking': 'claude-sonnet-4-6',
+  'gemini-3-flash-a': 'gemini-3-flash',
+  'gemini-3-flash-b': 'gemini-3-flash',
   'gemini-3-flash-c': 'gemini-3-flash',
   "gemini-3.1-pro-high": "gemini-3.1-pro",
   "gemini-3.1-pro-low": "gemini-3.1-pro",
@@ -242,6 +244,10 @@ const PLACEHOLDER_MODEL_MAP = {
   'MODEL_PLACEHOLDER_M35': 'claude-sonnet-4-6',
   'MODEL_PLACEHOLDER_M26': 'claude-opus-4-6',
   'MODEL_OPENAI_GPT_OSS_120B_MEDIUM': 'gpt-oss-120b',
+  // Antigravity 2.0+ standalone app placeholders (verified via responseModel)
+  'MODEL_PLACEHOLDER_M132': 'gemini-3-flash',
+  'MODEL_PLACEHOLDER_M133': 'gemini-3-flash',
+  'MODEL_PLACEHOLDER_M20': 'gemini-3-flash',
 };
 
 function normalizeModel(raw) {
@@ -274,17 +280,21 @@ function projectFromUri(uri) {
 }
 
 /**
- * List cascade IDs from .pb files in the conversations directory.
+ * List cascade IDs from .pb and .db files in the conversations directory.
+ * Antigravity 2.0+ stores new conversations as SQLite .db files instead of .pb.
  */
 function listCascades() {
   try {
     const files = readdirSync(CONVERSATIONS_DIR);
-    const results = [];
+    const seen = new Set();
     for (const f of files) {
-      if (!f.endsWith('.pb')) continue;
-      results.push(f.slice(0, -3)); // strip .pb → cascadeId
+      if (f.endsWith('.pb')) {
+        seen.add(f.slice(0, -3));
+      } else if (f.endsWith('.db') && !f.endsWith('-shm') && !f.endsWith('-wal') && f !== 'db.sqlite') {
+        seen.add(f.slice(0, -3));
+      }
     }
-    return results;
+    return [...seen];
   } catch {
     return [];
   }
