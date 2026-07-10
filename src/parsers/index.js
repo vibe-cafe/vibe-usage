@@ -17,6 +17,7 @@ import { parse as parseHermes } from './hermes.js';
 import { parse as parseKiro } from './kiro.js';
 import { parse as parsePiCodingAgent } from './pi-coding-agent.js';
 import { parse as parseZcode } from './zcode.js';
+import { parse as parseTraeCli } from './trae-cli.js';
 
 export const parsers = {
   'claude-code': parseClaudeCode,
@@ -37,6 +38,7 @@ export const parsers = {
   'kiro': parseKiro,
   'pi-coding-agent': parsePiCodingAgent,
   'zcode': parseZcode,
+  'trae-cli': parseTraeCli,
 };
 
 
