@@ -4,18 +4,22 @@ import { homedir } from 'node:os';
 import { createInterface } from 'node:readline';
 import { aggregateToBuckets, extractSessions } from './index.js';
 
-// Codex stores live sessions in ~/.codex/sessions and, once a session is
-// "completed", moves its rollout file verbatim into ~/.codex/archived_sessions.
-// A session can be archived between two syncs, so scanning only the live dir
-// loses that session's usage forever. We scan both: the parser is stateless
-// and the server dedups on (source, sessionHash/bucket), so re-reading an
-// archived file that was already synced from sessions/ is idempotent. Indexing
-// both together also keeps fork replay-skip correct when a fork and its parent
-// end up split across the two directories.
-const SESSIONS_DIRS = [
-  join(homedir(), '.codex', 'sessions'),
-  join(homedir(), '.codex', 'archived_sessions'),
-];
+// Codex stores live sessions in $CODEX_HOME/sessions (default ~/.codex) and,
+// once a session is "completed", moves its rollout file verbatim into
+// $CODEX_HOME/archived_sessions. A session can be archived between two syncs,
+// so scanning only the live dir loses that session's usage forever. We scan
+// both: the parser is stateless and the server dedups on
+// (source, sessionHash/bucket), so re-reading an archived file that was
+// already synced from sessions/ is idempotent. Indexing both together also
+// keeps fork replay-skip correct when a fork and its parent end up split
+// across the two directories.
+function sessionsDirs() {
+  const codexHome = process.env.CODEX_HOME?.trim() || join(homedir(), '.codex');
+  return [
+    join(codexHome, 'sessions'),
+    join(codexHome, 'archived_sessions'),
+  ];
+}
 
 /**
  * Recursively find all .jsonl files under a directory.
@@ -57,8 +61,23 @@ function extractProject(meta) {
 }
 
 /**
+ * A sub-agent rollout (spawned thread / guardian / collab agent). Depending
+ * on the Codex version the marker is `thread_source: "subagent"`, a
+ * `source: { subagent: {...} }` object, or just a `parent_thread_id` — check
+ * all three so no version's sub-agents slip through as normal sessions.
+ */
+function isSubagentMeta(meta) {
+  if (meta.thread_source === 'subagent') return true;
+  const src = meta.source;
+  if (src === 'subagent') return true;
+  if (src && typeof src === 'object' && 'subagent' in src) return true;
+  return meta.parent_thread_id != null;
+}
+
+/**
  * Stream a session file once and extract its index metadata: the session
- * id, the forked-from id, the project name, and the total count of
+ * id, the forked-from id, the project name, whether it is a sub-agent
+ * rollout (and contains a task_started boundary), and the total count of
  * `event_msg/token_count` records. The token_count total is used to size
  * the replayed-history block of a forked session — a fork copies the
  * original conversation verbatim, so it begins with exactly as many
@@ -69,6 +88,8 @@ async function indexSessionFile(filePath) {
   let forkedFromId = null;
   let sessionProject = 'unknown';
   let tokenCountRecords = 0;
+  let isSubagent = false;
+  let hasTaskStarted = false;
 
   for await (const line of readLines(filePath)) {
     if (!line.trim()) continue;
@@ -78,24 +99,28 @@ async function indexSessionFile(filePath) {
         const meta = obj.payload;
         sessionId = meta.id || sessionId;
         forkedFromId = meta.forked_from_id || null;
+        isSubagent = isSubagentMeta(meta);
         sessionProject = extractProject(meta);
       } else if (obj.type === 'event_msg' && obj.payload?.type === 'token_count') {
         tokenCountRecords++;
+      } else if (obj.type === 'event_msg' && obj.payload?.type === 'task_started') {
+        hasTaskStarted = true;
       }
     } catch {
       continue;
     }
   }
 
-  return { sessionId, forkedFromId, sessionProject, tokenCountRecords };
+  return { sessionId, forkedFromId, sessionProject, tokenCountRecords, isSubagent, hasTaskStarted };
 }
 
 export async function parse() {
-  if (!SESSIONS_DIRS.some(existsSync)) return { buckets: [], sessions: [] };
+  const dirs = sessionsDirs();
+  if (!dirs.some(existsSync)) return { buckets: [], sessions: [] };
 
   const entries = [];
   const sessionEvents = [];
-  const files = SESSIONS_DIRS.flatMap(findJsonlFiles);
+  const files = dirs.flatMap(findJsonlFiles);
   if (files.length === 0) return { buckets: [], sessions: [] };
 
   // Pass 1: index every session by its UUID and count its token_count
@@ -144,6 +169,19 @@ export async function parse() {
     }
     let tokenCountSeen = 0;
 
+    // Sub-agent rollouts can begin with the parent session's history copied
+    // in — including its token_count records — all re-stamped at the spawn
+    // instant. Those tokens are already counted from the parent's own file,
+    // so re-counting them here double-counts usage and produces a huge
+    // spurious spike at spawn time (observed 20×+). Unlike forks there is no
+    // forked_from_id/count to size the block by, but the copied history ends
+    // at the sub-agent's own first task_started event, so skip everything
+    // before it. If the file has no task_started at all (unknown/legacy
+    // format) we can't locate the boundary; skip nothing so incomplete data
+    // over-counts rather than silently dropping real usage.
+    const skipUntilTaskStarted = fm.isSubagent && fm.hasTaskStarted;
+    let taskStartedSeen = false;
+
     const sessionProject = fm.sessionProject;
     // Group timing events by the real Codex session id, not the file path: the
     // same session can briefly exist in both sessions/ and archived_sessions/
@@ -154,6 +192,7 @@ export async function parse() {
 
     let turnContextModel = 'unknown';
     const prevTotal = new Map();
+    let prevCumulativeTotal = null;
     for await (const line of readLines(filePath)) {
       if (!line.trim()) continue;
       try {
@@ -167,14 +206,23 @@ export async function parse() {
         // edge — the new conversation's events come strictly after it.)
         const inReplayBlock = tokenCountSeen < replayTokenCountToSkip;
 
+        // The task_started event itself belongs to the sub-agent — it marks
+        // the start of its own first turn — so flip the flag before deciding
+        // whether this record is inherited.
+        if (skipUntilTaskStarted && !taskStartedSeen
+            && obj.type === 'event_msg' && obj.payload?.type === 'task_started') {
+          taskStartedSeen = true;
+        }
+        const inInheritedBlock = skipUntilTaskStarted && !taskStartedSeen;
+
         if (obj.timestamp) {
           const evTs = new Date(obj.timestamp);
           if (!isNaN(evTs.getTime())) {
-            // Skip replayed history events so a forked session's
-            // duration/active-time/message counts reflect only the new
-            // conversation, not the copied original. session_meta itself is
-            // kept: it marks when the fork actually started.
-            const isReplay = inReplayBlock && obj.type !== 'session_meta';
+            // Skip replayed/inherited history events so a forked or sub-agent
+            // session's duration/active-time/message counts reflect only the
+            // new conversation, not the copied original. session_meta itself
+            // is kept: it marks when the fork/sub-agent actually started.
+            const isReplay = (inReplayBlock || inInheritedBlock) && obj.type !== 'session_meta';
             if (!isReplay) {
               const isUserTurn = obj.type === 'turn_context' || obj.type === 'session_meta';
               sessionEvents.push({
@@ -207,12 +255,26 @@ export async function parse() {
         if (!timestamp || isNaN(timestamp.getTime())) continue;
 
         // This is the (tokenCountSeen+1)-th token_count in the file. If it
-        // falls inside the fork's replay block it's an exact copy of a record
-        // already counted from the source session's own file — skip it (but
-        // still advance the cumulative-total baseline below so the first real
-        // post-fork delta is measured correctly).
-        const isReplayedHistory = tokenCountSeen < replayTokenCountToSkip;
+        // falls inside the fork's replay block or a sub-agent's inherited
+        // block it's an exact copy of a record already counted from the
+        // source session's own file — skip it (but still advance the
+        // cumulative-total baselines below so the first real delta after the
+        // copied history is measured correctly).
+        const isReplayedHistory = tokenCountSeen < replayTokenCountToSkip || inInheritedBlock;
         tokenCountSeen++;
+
+        // Codex sometimes writes the same token_count twice back-to-back:
+        // identical last_token_usage with an unchanged cumulative total. A
+        // real API call always advances the cumulative counter (its input
+        // tokens alone are non-zero), so an unchanged positive total marks a
+        // duplicate emission — or a zero-usage bookkeeping event such as
+        // compaction — and must count as zero, not a second copy of
+        // last_token_usage. Guarded to positive totals so builds that leave
+        // total_token_usage all-zero can't suppress real usage.
+        const cumulativeTotal = info.total_token_usage?.total_tokens;
+        const isDuplicateEmission = typeof cumulativeTotal === 'number'
+          && cumulativeTotal > 0 && cumulativeTotal === prevCumulativeTotal;
+        if (typeof cumulativeTotal === 'number') prevCumulativeTotal = cumulativeTotal;
 
         // Prefer incremental per-request usage; compute delta from cumulative total as fallback
         let usage = info.last_token_usage;
@@ -237,7 +299,7 @@ export async function parse() {
           prevTotal.set(totalKey, { ...curr });
         }
         if (!usage) continue;
-        if (isReplayedHistory) continue;
+        if (isReplayedHistory || isDuplicateEmission) continue;
 
         const model = info.model || payload.model || turnContextModel || 'unknown';
 

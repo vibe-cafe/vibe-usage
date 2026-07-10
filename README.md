@@ -51,7 +51,7 @@ npx @vibe-cafe/vibe-usage status       # Show config & detected tools
 | Tool | Data Location |
 |------|---------------|
 | Claude Code | `~/.claude/projects/` (tokens + sessions), `~/.claude/transcripts/` (sessions only); also scans `$CLAUDE_CONFIG_DIR` when set (deduped), so relocated configs and GUI/CLI env mismatches are both covered |
-| Codex CLI | `~/.codex/sessions/` and `~/.codex/archived_sessions/` |
+| Codex CLI | `$CODEX_HOME/sessions/` and `$CODEX_HOME/archived_sessions/` (default `~/.codex`); forked and sub-agent rollouts replay the parent conversation's `token_count` records at spawn time — those are skipped (fork: by source session's record count; sub-agent: everything before its own first `task_started`), and duplicate `token_count` emissions with an unchanged cumulative total count once |
 | GitHub Copilot CLI | `~/.copilot/session-state/*/events.jsonl` |
 | Cursor | `state.vscdb` (SQLite, reads `cursorAuth/accessToken`, fetches CSV from `cursor.com`); cloud data is stamped with a fixed `cursor-cloud` hostname so multi-machine setups don't double-count |
 | Gemini CLI | `~/.gemini/tmp/<project_hash>/chats/session-*.jsonl` (current line-delimited format) and legacy `session-*.json`; recurses into nested subagent sessions |
