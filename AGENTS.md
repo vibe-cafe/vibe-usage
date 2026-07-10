@@ -25,6 +25,7 @@ vibe-usage/
 │   │   ├── droid.js
 │   │   ├── kiro.js            # SQLite (via sqlite.js), JSONL fallback
 │   │   ├── hermes.js          # SQLite (via sqlite.js), multi-profile
+│   │   ├── trae-cli.js        # Trae CLI JSONL telemetry (not Trae IDE/Work)
 │   │   └── zcode.js           # SQLite (via sqlite.js), reads message table
 │   ├── tools.js               # TOOLS[] registry + detectInstalledTools()
 │   ├── sync.js                # Orchestrator: parse all → diff vs state → batch upload only new/changed
