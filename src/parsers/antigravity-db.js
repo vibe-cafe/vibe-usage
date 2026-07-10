@@ -1,4 +1,5 @@
-import { readdirSync } from 'node:fs';
+import { copyFileSync, existsSync, mkdtempSync, readdirSync, rmSync } from 'node:fs';
+import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { queryDbJson } from './sqlite.js';
 
@@ -148,6 +149,41 @@ export function parseGenMetadataBlob(buf) {
 
 // ── SQLite store reading ──────────────────────────────────────────────
 
+function isLockError(err) {
+  return err && typeof err.message === 'string' && /database is locked/i.test(err.message);
+}
+
+function isSqliteUnavailableError(err) {
+  return err && typeof err.message === 'string' && /ENOENT|sqlite3.*not found/i.test(err.message);
+}
+
+function queryCascadeDb(conversationsDir, cascadeId, sql) {
+  const dbPath = join(conversationsDir, `${cascadeId}.db`);
+  try {
+    return queryDbJson(dbPath, sql);
+  } catch (err) {
+    if (isSqliteUnavailableError(err)) {
+      throw new Error('sqlite3 CLI not found. Install sqlite3 (or use Node >= 22.5) to sync Antigravity data.');
+    }
+    if (!isLockError(err)) throw err;
+
+    // The App can hold the live DB open. Query a WAL-consistent snapshot so
+    // one active cascade does not make the whole Antigravity parser go empty.
+    const snapshotDir = mkdtempSync(join(tmpdir(), 'vibe-usage-antigravity-'));
+    const snapshotPath = join(snapshotDir, `${cascadeId}.db`);
+    try {
+      copyFileSync(dbPath, snapshotPath);
+      for (const suffix of ['-shm', '-wal']) {
+        const companion = `${dbPath}${suffix}`;
+        if (existsSync(companion)) copyFileSync(companion, `${snapshotPath}${suffix}`);
+      }
+      return queryDbJson(snapshotPath, sql);
+    } finally {
+      rmSync(snapshotDir, { recursive: true, force: true });
+    }
+  }
+}
+
 /** List cascade IDs backed by a `.db` file in a conversations directory. */
 export function listDbCascades(conversationsDir) {
   try {
@@ -167,11 +203,11 @@ export function listDbCascades(conversationsDir) {
  * node:sqlite and sqlite3-CLI backends uniformly.
  */
 export function readDbUsageRecords(conversationsDir, cascadeId) {
-  const dbPath = join(conversationsDir, `${cascadeId}.db`);
   let rows;
   try {
-    rows = queryDbJson(dbPath, 'SELECT hex(data) AS h FROM gen_metadata ORDER BY idx');
-  } catch {
+    rows = queryCascadeDb(conversationsDir, cascadeId, 'SELECT hex(data) AS h FROM gen_metadata ORDER BY idx');
+  } catch (err) {
+    if (isSqliteUnavailableError(err)) throw err;
     return [];
   }
   const records = [];
@@ -194,11 +230,11 @@ export function readDbUsageRecords(conversationsDir, cascadeId) {
  * Returns the raw file:// URI, or null.
  */
 export function readDbWorkspaceUri(conversationsDir, cascadeId) {
-  const dbPath = join(conversationsDir, `${cascadeId}.db`);
   let rows;
   try {
-    rows = queryDbJson(dbPath, 'SELECT hex(data) AS h FROM trajectory_metadata_blob LIMIT 1');
-  } catch {
+    rows = queryCascadeDb(conversationsDir, cascadeId, 'SELECT hex(data) AS h FROM trajectory_metadata_blob LIMIT 1');
+  } catch (err) {
+    if (isSqliteUnavailableError(err)) throw err;
     return null;
   }
   if (!rows.length || !rows[0].h) return null;
@@ -245,14 +281,15 @@ export function parseStepMetadata(buf) {
  * steps table, chronological by idx.
  */
 export function readDbSessionEvents(conversationsDir, cascadeId) {
-  const dbPath = join(conversationsDir, `${cascadeId}.db`);
   let rows;
   try {
-    rows = queryDbJson(
-      dbPath,
+    rows = queryCascadeDb(
+      conversationsDir,
+      cascadeId,
       'SELECT hex(metadata) AS h FROM steps WHERE metadata IS NOT NULL ORDER BY idx',
     );
-  } catch {
+  } catch (err) {
+    if (isSqliteUnavailableError(err)) throw err;
     return [];
   }
   const events = [];

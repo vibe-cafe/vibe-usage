@@ -67,7 +67,7 @@ npx @vibe-cafe/vibe-usage status       # Show config & detected tools
 | Cline | `<host>/User/globalStorage/saoudrizwan.claude-dev/{state/taskHistory.json,tasks/<id>/ui_messages.json}` (walks all VSCode-fork hosts: Code, Cursor, Windsurf, VSCodium, Trae, ...) |
 | Roo Code | `<host>/User/globalStorage/rooveterinaryinc.roo-cline/{tasks/_index.json,tasks/<id>/{history_item,ui_messages}.json}` (walks all VSCode-fork hosts) |
 | Trae CLI | macOS: `~/Library/Caches/trae-cli/sessions/`; Windows: `%LOCALAPPDATA%/trae-cli/cache/sessions/`; Linux: `~/.cache/trae-cli/sessions/` (CLI telemetry only; Trae IDE/Trae Work chats are not supported) |
-| Antigravity | `~/.gemini/antigravity/conversations/*.pb` / `*.db` to discover cascades, then reads token usage + sessions from the running language server via Connect RPC (process discovered with `ps`/`lsof` on macOS/Linux, PowerShell CIM with a `wmic` fallback on Windows) |
+| Antigravity | App 2.0 `~/.gemini/antigravity/conversations/*.db` and `agy` CLI `~/.gemini/antigravity-cli/conversations/*.db` are parsed offline (tokens, real model display name, project, sessions); legacy App `.pb` history falls back to Connect RPC while the language server is running |
 | ZCode | `~/.zcode/cli/db/db.sqlite` (SQLite; reads the `message` table for per-message tokens, model, and project `cwd`/`root`, joined to `session.directory`) |
 
 ## How It Works

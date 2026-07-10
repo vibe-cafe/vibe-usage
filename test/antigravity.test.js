@@ -1,6 +1,16 @@
 import { test } from 'node:test';
 import assert from 'node:assert';
-import { parseGenMetadataBlob, parseStepMetadata } from '../src/parsers/antigravity-db.js';
+import { mkdirSync, mkdtempSync, rmSync } from 'node:fs';
+import { tmpdir } from 'node:os';
+import { join } from 'node:path';
+import {
+  listDbCascades,
+  parseGenMetadataBlob,
+  parseStepMetadata,
+  readDbSessionEvents,
+  readDbUsageRecords,
+  readDbWorkspaceUri,
+} from '../src/parsers/antigravity-db.js';
 
 // ── Minimal protobuf encoder (mirrors the wire format the decoder reads) ──
 function varint(n) {
@@ -106,4 +116,51 @@ test('parseStepMetadata maps source=2 to an assistant turn', () => {
 test('parseStepMetadata skips non-user/model sources (system/tool)', () => {
   assert.equal(parseStepMetadata(buildStep({ source: 5, seconds: 1783508701 })), null);
   assert.equal(parseStepMetadata(buildStep({ seconds: 1783508701 })), null); // no source
+});
+
+test('offline DB reader loads usage, workspace, and session events', async (t) => {
+  let DatabaseSync;
+  try {
+    ({ DatabaseSync } = await import('node:sqlite'));
+  } catch {
+    t.skip('node:sqlite is unavailable on this Node version');
+    return;
+  }
+
+  const root = mkdtempSync(join(tmpdir(), 'vibe-usage-antigravity-test-'));
+  const conversationsDir = join(root, 'conversations');
+  mkdirSync(conversationsDir, { recursive: true });
+  const cascadeId = 'cascade-1';
+  const db = new DatabaseSync(join(conversationsDir, `${cascadeId}.db`));
+  try {
+    db.exec(`
+      CREATE TABLE gen_metadata (idx INTEGER, data BLOB);
+      CREATE TABLE trajectory_metadata_blob (data BLOB);
+      CREATE TABLE steps (idx INTEGER, metadata BLOB);
+    `);
+    const usageBlob = buildBlob({
+      input: 1000, output: 50, cache: 400, thinking: 25,
+      responseId: 'RESP_DB', seconds: 1783484000,
+      responseModel: 'gemini-default', displayName: 'Gemini 3.5 Flash (Medium)',
+    });
+    const workspaceBlob = lfield(1, sfield(1, 'file:///Users/example/project-one'));
+    db.prepare('INSERT INTO gen_metadata (idx, data) VALUES (?, ?)').run(1, usageBlob);
+    db.prepare('INSERT INTO trajectory_metadata_blob (data) VALUES (?)').run(workspaceBlob);
+    db.prepare('INSERT INTO steps (idx, metadata) VALUES (?, ?)').run(1, buildStep({ source: 4, seconds: 1783484001 }));
+    db.prepare('INSERT INTO steps (idx, metadata) VALUES (?, ?)').run(2, buildStep({ source: 2, seconds: 1783484003 }));
+  } finally {
+    db.close();
+  }
+
+  try {
+    assert.deepEqual(listDbCascades(conversationsDir), [cascadeId]);
+    const records = readDbUsageRecords(conversationsDir, cascadeId);
+    assert.equal(records.length, 1);
+    assert.equal(records[0].displayName, 'Gemini 3.5 Flash (Medium)');
+    assert.equal(records[0].thinkingOutputTokens, 25);
+    assert.equal(readDbWorkspaceUri(conversationsDir, cascadeId), 'file:///Users/example/project-one');
+    assert.deepEqual(readDbSessionEvents(conversationsDir, cascadeId).map((event) => event.role), ['user', 'assistant']);
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
 });

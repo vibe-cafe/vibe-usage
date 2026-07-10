@@ -113,6 +113,13 @@ function findKimiCodeDataDirs() {
   ].filter(existsSync);
 }
 
+function findAntigravityDataDirs() {
+  return [
+    join(homedir(), '.gemini', 'antigravity'),
+    join(homedir(), '.gemini', 'antigravity-cli'),
+  ].filter(existsSync);
+}
+
 export function findTraeCliDataDirs() {
   const envDir = process.env.VIBE_USAGE_TRAE_CLI_SESSIONS?.trim();
   if (envDir) {
@@ -140,6 +147,7 @@ export const TOOLS = [
     name: 'Antigravity',
     id: 'antigravity',
     dataDir: join(homedir(), '.gemini', 'antigravity'),
+    detectDataDirs: findAntigravityDataDirs,
   },
   {
     name: 'Claude Code',
