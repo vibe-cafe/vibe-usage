@@ -56,6 +56,13 @@ test('parse reads Trae CLI session cache logs and aggregates tokens', async () =
         { key: 'usage.cache_read_tokens', type: 'int64', value: 5944 },
         { key: 'usage.reasoning_tokens', type: 'int64', value: 0 }
       ]
+    }),
+    JSON.stringify({
+      traceID: 'invalid-time',
+      startTime: 'not-a-timestamp',
+      tags: [
+        { key: 'usage.input_tokens', type: 'int64', value: 999 }
+      ]
     })
   ].join('\n') + '\n');
 
@@ -72,6 +79,12 @@ test('parse reads Trae CLI session cache logs and aggregates tokens', async () =
       session_id: sessionUUID,
       created_at: '2026-07-07T20:57:03.521842+08:00',
       message: { message: { role: 'assistant', content: 'hello' } }
+    }),
+    JSON.stringify({
+      id: 'invalid-time-event',
+      session_id: sessionUUID,
+      created_at: 'not-a-timestamp',
+      agent_start: {}
     })
   ].join('\n') + '\n');
 

@@ -1,4 +1,4 @@
-import { existsSync, readFileSync, readdirSync, statSync } from 'node:fs';
+import { readFileSync, readdirSync } from 'node:fs';
 import { basename, join } from 'node:path';
 import { findTraeCliDataDirs } from '../tools.js';
 import { aggregateToBuckets, extractSessions } from './index.js';
@@ -103,9 +103,11 @@ export async function parse() {
       }
 
       // Convert trace map to vibe-usage entries
-      for (const [traceID, trace] of tracesMap) {
+      for (const trace of tracesMap.values()) {
         // Convert microsecond startTime to milliseconds for Date constructor
-        const timestamp = new Date(trace.startTime / 1000);
+        const startTime = Number(trace.startTime);
+        if (!Number.isFinite(startTime) || startTime <= 0) continue;
+        const timestamp = new Date(startTime / 1000);
         entries.push({
           source: 'trae-cli',
           model: trace.model || fallbackModel,
@@ -123,6 +125,7 @@ export async function parse() {
       for (const line of eventLines) {
         if (!line.created_at) continue;
         const timestamp = new Date(line.created_at);
+        if (Number.isNaN(timestamp.getTime())) continue;
 
         if (line.agent_start) {
           events.push({
