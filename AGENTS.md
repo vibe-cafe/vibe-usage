@@ -23,6 +23,7 @@ vibe-usage/
 │   │   ├── kimi-code.js
 │   │   ├── amp.js
 │   │   ├── droid.js
+│   │   ├── antigravity-db.js  # Offline SQLite + protobuf reader for App 2.0 / agy CLI
 │   │   ├── kiro.js            # SQLite (via sqlite.js), JSONL fallback
 │   │   ├── hermes.js          # SQLite (via sqlite.js), multi-profile
 │   │   ├── trae-cli.js        # Trae CLI JSONL telemetry (not Trae IDE/Work)
@@ -90,7 +91,7 @@ Parser pattern:
 - Extract user/assistant timing events → `extractSessions(events)`
 - Handle missing/corrupt files gracefully (try/catch, skip bad lines)
 
-SQLite-backed parsers (cursor, opencode, kiro, hermes):
+SQLite-backed parsers (antigravity, cursor, opencode, kiro, hermes):
 - Use `queryDbJson(dbPath, sql)` from `src/parsers/sqlite.js` — never shell out to `sqlite3` directly. It prefers Node's built-in `node:sqlite` (`DatabaseSync`, opened read-only; Node ≥ 22.5, works on Windows with no extra binary) and falls back to the `sqlite3` CLI on older Node.
 - Rows come back as plain objects (`{ column: value }`), same shape as `sqlite3 -json` — INTEGER → number, TEXT → string, JSON via `json_extract` → string.
 - If neither `node:sqlite` nor the CLI is available the helper throws an `ENOENT`-flavored error; catch it and rethrow `'sqlite3 CLI not found. Install sqlite3 (or use Node >= 22.5) to sync X data.'` so the user gets a hint.
