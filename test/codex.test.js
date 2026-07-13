@@ -14,11 +14,11 @@ function sessionMeta(timestamp, id, extra = {}) {
   };
 }
 
-function taskStarted(timestamp, startedAt) {
+function taskStarted(timestamp, startedAt, type = 'task_started') {
   return {
     timestamp,
     type: 'event_msg',
-    payload: { type: 'task_started', ...(startedAt == null ? {} : { started_at: startedAt }) },
+    payload: { type, ...(startedAt == null ? {} : { started_at: startedAt }) },
   };
 }
 
@@ -172,7 +172,7 @@ test('double-meta sub-agent keeps child identity and skips copied parent tasks a
       // Copied parent task happens to match the spawn second. The later match
       // is the child's actual boundary and must win.
       taskStarted(spawn, epochSeconds(spawn)),
-      taskStarted(ownStart, epochSeconds(ownStart)),
+      taskStarted(ownStart, epochSeconds(ownStart), 'turn_started'),
       tokenCount('2026-07-10T08:10:20.000Z', usage(5, 0, 3, 0), 338),
     ],
   });
@@ -213,6 +213,103 @@ test('ordinary fork skips parent raw tokens only up to fork time', async () => {
   assert.deepEqual(sumBuckets(buckets), { input: 65, output: 9, cached: 0, reasoning: 0 });
 });
 
+test('last-N-turn fork matches a replayed parent suffix without dropping child usage', async () => {
+  const t = '2026-07-10T08:00:00.000Z';
+  const tf = '2026-07-10T08:30:00.000Z';
+  const { buckets } = await parseFixture({
+    'rollout-parent.jsonl': [
+      sessionMeta(t, 'parent-1'),
+      tokenCount('2026-07-10T08:05:00.000Z', usage(10, 0, 1, 0), 11),
+      tokenCount('2026-07-10T08:10:00.000Z', usage(20, 0, 2, 0), 33),
+      tokenCount('2026-07-10T08:15:00.000Z', usage(30, 0, 3, 0), 66),
+      tokenCount('2026-07-10T08:20:00.000Z', usage(40, 0, 4, 0), 110),
+    ],
+    'rollout-fork.jsonl': [
+      sessionMeta(tf, 'fork-1', { forked_from_id: 'parent-1' }),
+      // Current Codex can retain only the last N turns. These are a suffix of
+      // the parent history, not the prefix assumed by the old count heuristic.
+      tokenCount(tf, usage(30, 0, 3, 0), 66),
+      tokenCount(tf, usage(40, 0, 4, 0), 110),
+      tokenCount('2026-07-10T08:31:00.000Z', usage(5, 0, 5, 0), 120),
+    ],
+  });
+
+  assert.deepEqual(sumBuckets(buckets), { input: 105, output: 15, cached: 0, reasoning: 0 });
+});
+
+test('last-N-turn sub-agent finds a delayed own task after the matched replay suffix', async () => {
+  const t = '2026-07-10T08:00:00.000Z';
+  const spawn = '2026-07-10T08:30:00.800Z';
+  const ownStart = '2026-07-10T08:30:20.000Z';
+  const { buckets, sessions } = await parseFixture({
+    'rollout-parent.jsonl': [
+      sessionMeta(t, 'parent-1'),
+      taskStarted(t, epochSeconds(t)),
+      tokenCount('2026-07-10T08:05:00.000Z', usage(10, 0, 1, 0), 11),
+      taskStarted('2026-07-10T08:10:00.000Z', epochSeconds('2026-07-10T08:10:00.000Z')),
+      tokenCount('2026-07-10T08:15:00.000Z', usage(20, 0, 2, 0), 33),
+    ],
+    'rollout-child.jsonl': [
+      sessionMeta(spawn, 'child-1', {
+        forked_from_id: 'parent-1',
+        parent_thread_id: 'parent-1',
+        thread_source: 'subagent',
+      }),
+      // A last-turn suffix has no copied parent session_meta.
+      taskStarted(spawn, epochSeconds('2026-07-10T08:10:00.000Z')),
+      tokenCount(spawn, usage(20, 0, 2, 0), 33),
+      // Startup can exceed the old fixed five-second matching window.
+      taskStarted(ownStart, epochSeconds(ownStart)),
+      tokenCount('2026-07-10T08:30:25.000Z', usage(5, 0, 3, 0), 41),
+    ],
+  });
+
+  assert.deepEqual(sumBuckets(buckets), { input: 35, output: 6, cached: 0, reasoning: 0 });
+  assert.equal(sessions.length, 2);
+  const child = sessions.find(session => session.firstMessageAt === spawn);
+  assert.ok(child);
+  assert.equal(child.messageCount, 3);
+});
+
+test('unmatched fork payloads are counted instead of over-skipping by parent length', async () => {
+  const t = '2026-07-10T08:00:00.000Z';
+  const tf = '2026-07-10T08:30:00.000Z';
+  const { buckets } = await parseFixture({
+    'rollout-parent.jsonl': [
+      sessionMeta(t, 'parent-1'),
+      tokenCount(t, usage(10, 0, 1, 0), 11),
+      tokenCount(t, usage(20, 0, 2, 0), 33),
+    ],
+    'rollout-fork.jsonl': [
+      sessionMeta(tf, 'fork-1', { forked_from_id: 'parent-1' }),
+      tokenCount(tf, usage(7, 0, 4, 0), 11),
+    ],
+  });
+
+  assert.deepEqual(sumBuckets(buckets), { input: 37, output: 7, cached: 0, reasoning: 0 });
+});
+
+test('fork matching rejects an interior parent token that is not the snapshot suffix', async () => {
+  const t = '2026-07-10T08:00:00.000Z';
+  const tf = '2026-07-10T08:30:00.000Z';
+  const repeated = tokenCount(tf, usage(10, 0, 1, 0), 11);
+  const { buckets } = await parseFixture({
+    'rollout-parent.jsonl': [
+      sessionMeta(t, 'parent-1'),
+      tokenCount(t, usage(10, 0, 1, 0), 11),
+      tokenCount('2026-07-10T08:10:00.000Z', usage(20, 0, 2, 0), 33),
+    ],
+    'rollout-fork.jsonl': [
+      sessionMeta(tf, 'fork-1', { forked_from_id: 'parent-1' }),
+      repeated,
+    ],
+  });
+
+  // A LastNTurns snapshot always reaches the parent's current end, so the
+  // repeated first parent payload alone is not sufficient replay evidence.
+  assert.deepEqual(sumBuckets(buckets), { input: 40, output: 4, cached: 0, reasoning: 0 });
+});
+
 test('replayed cumulative totals advance the fallback baseline', async () => {
   const t = '2026-07-10T08:00:00.000Z';
   const firstTotal = usage(100, 0, 10, 0);
@@ -238,6 +335,44 @@ test('replayed cumulative totals advance the fallback baseline', async () => {
   assert.deepEqual(sumBuckets(buckets), { input: 50, output: 10, cached: 0, reasoning: 0 });
 });
 
+test('cumulative-only counter reset starts a fresh non-negative baseline', async () => {
+  const t = '2026-07-10T08:00:00.000Z';
+  const { buckets } = await parseFixture({
+    'rollout-a.jsonl': [
+      sessionMeta(t, 'a-1'),
+      tokenCountInfo(t, {
+        model: 'gpt-5.2',
+        total_token_usage: usage(100, 0, 10, 0),
+      }),
+      tokenCountInfo('2026-07-10T08:05:00.000Z', {
+        model: 'gpt-5.2',
+        total_token_usage: usage(20, 0, 2, 0),
+      }),
+    ],
+  });
+
+  assert.deepEqual(sumBuckets(buckets), { input: 120, output: 12, cached: 0, reasoning: 0 });
+});
+
+test('cumulative-only fallback remains session-wide across model switches', async () => {
+  const t = '2026-07-10T08:00:00.000Z';
+  const { buckets } = await parseFixture({
+    'rollout-a.jsonl': [
+      sessionMeta(t, 'a-1'),
+      tokenCountInfo(t, {
+        model: 'gpt-5.2',
+        total_token_usage: usage(100, 0, 10, 0),
+      }),
+      tokenCountInfo('2026-07-10T08:05:00.000Z', {
+        model: 'gpt-5.3',
+        total_token_usage: usage(150, 0, 20, 0),
+      }),
+    ],
+  });
+
+  assert.deepEqual(sumBuckets(buckets), { input: 150, output: 20, cached: 0, reasoning: 0 });
+});
+
 test('same session in live and archived directories uses the more complete copy once', async () => {
   const t = '2026-07-10T08:00:00.000Z';
   const records = [
@@ -252,6 +387,23 @@ test('same session in live and archived directories uses the more complete copy 
 
   assert.deepEqual(sumBuckets(buckets), { input: 100, output: 10, cached: 0, reasoning: 0 });
   assert.equal(sessions.length, 1);
+});
+
+test('repeated same-id session metadata remains part of the logical session', async () => {
+  const t = '2026-07-10T08:00:00.000Z';
+  const later = '2026-07-10T09:00:00.000Z';
+  const { sessions } = await parseFixture({
+    'rollout-a.jsonl': [
+      sessionMeta(t, 'same-1'),
+      tokenCount(t, usage(100, 0, 10, 0), 110),
+      sessionMeta(later, 'same-1'),
+      tokenCount(later, usage(20, 0, 2, 0), 132),
+    ],
+  });
+
+  assert.equal(sessions.length, 1);
+  assert.equal(sessions[0].messageCount, 4);
+  assert.equal(sessions[0].userMessageCount, 2);
 });
 
 test('sub-agent rollout without a task_started boundary is counted in full', async () => {

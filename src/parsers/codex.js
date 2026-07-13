@@ -2,6 +2,7 @@ import { createReadStream, readdirSync, existsSync } from 'node:fs';
 import { join } from 'node:path';
 import { homedir } from 'node:os';
 import { createInterface } from 'node:readline';
+import { createHash } from 'node:crypto';
 import { aggregateToBuckets, extractSessions } from './index.js';
 
 // Codex stores live sessions in $CODEX_HOME/sessions (default ~/.codex) and,
@@ -90,6 +91,10 @@ function epochMs(value) {
   return value < 1e12 ? value * 1000 : value;
 }
 
+function isTaskStarted(payload) {
+  return payload?.type === 'task_started' || payload?.type === 'turn_started';
+}
+
 function upperBound(sorted, target) {
   let lo = 0;
   let hi = sorted.length;
@@ -99,6 +104,43 @@ function upperBound(sorted, target) {
     else hi = mid;
   }
   return lo;
+}
+
+function tokenFingerprint(payload) {
+  // Copied rollout items are re-serialized with a fresh outer timestamp, but
+  // their token_count payload is unchanged. A compact payload hash therefore
+  // identifies replayed records without retaining raw usage objects in memory.
+  return createHash('sha256')
+    .update(JSON.stringify(payload))
+    .digest('base64url')
+    .slice(0, 16);
+}
+
+/**
+ * Return the longest prefix of `child` that is also a suffix of `parent`.
+ * Codex can fork full history or the last N turns, but the copied block always
+ * reaches the source snapshot's end. Requiring the suffix prevents a child's
+ * coincidentally repeated payload from matching an unrelated interior turn.
+ * KMP keeps this linear even when many token payloads are identical.
+ */
+function longestReplayPrefix(child, parent) {
+  if (child.length === 0 || parent.length === 0) return 0;
+
+  const prefix = new Array(child.length).fill(0);
+  for (let i = 1, matched = 0; i < child.length; i++) {
+    while (matched > 0 && child[i] !== child[matched]) matched = prefix[matched - 1];
+    if (child[i] === child[matched]) matched++;
+    prefix[i] = matched;
+  }
+
+  let matched = 0;
+  for (let i = 0; i < parent.length; i++) {
+    const fingerprint = parent[i];
+    while (matched > 0 && fingerprint !== child[matched]) matched = prefix[matched - 1];
+    if (fingerprint === child[matched]) matched++;
+    if (matched === child.length && i < parent.length - 1) matched = prefix[matched - 1];
+  }
+  return matched;
 }
 
 // `task_started.started_at` is stored at one-second precision while the
@@ -113,9 +155,10 @@ const OWN_TASK_START_WINDOW_MS = 5_000;
  * canonical; later ones are replayed records and must never overwrite it.
  *
  * tokenTimes preserves raw token_count ordinals (including malformed usage
- * records) on a monotonic timeline. This lets a fork skip only the source
- * records that existed at the fork/spawn time, even if the source continues
- * running and grows after the child was created.
+ * records) on a monotonic timeline. tokenFingerprints identifies an exact
+ * copied sequence even when Codex forks only the last N turns instead of a
+ * full prefix. Together they bound matching to source records that existed at
+ * spawn without over-skipping child work when the parent later grows.
  */
 async function indexSessionFile(filePath) {
   let sessionId = null;
@@ -129,7 +172,9 @@ async function indexSessionFile(filePath) {
   let rawTokenCount = 0;
   let logicalTimestamp = Number.NEGATIVE_INFINITY;
   const tokenTimes = [];
+  const tokenFingerprints = [];
   let pendingTokenTimeIndexes = [];
+  const taskBoundaries = [];
   let firstTaskBoundary = null;
   let ownTaskBoundary = null;
 
@@ -162,17 +207,23 @@ async function indexSessionFile(filePath) {
         }
       } else if (obj.type === 'event_msg' && obj.payload?.type === 'token_count') {
         rawTokenCount++;
+        tokenFingerprints.push(tokenFingerprint(obj.payload));
         if (recordTimestamp == null) {
           tokenTimes.push(Number.POSITIVE_INFINITY);
           pendingTokenTimeIndexes.push(tokenTimes.length - 1);
         } else {
           tokenTimes.push(logicalTimestamp);
         }
-      } else if (obj.type === 'event_msg' && obj.payload?.type === 'task_started') {
-        const boundary = { recordIndex: parsedRecordCount, rawTokenCount };
+      } else if (obj.type === 'event_msg' && isTaskStarted(obj.payload)) {
+        const boundary = {
+          recordIndex: parsedRecordCount,
+          rawTokenCount,
+          startedAtMs: epochMs(obj.payload.started_at),
+        };
+        taskBoundaries.push(boundary);
         firstTaskBoundary ??= boundary;
 
-        const startedAtMs = epochMs(obj.payload.started_at);
+        const startedAtMs = boundary.startedAtMs;
         if (sessionStartedAtMs != null && startedAtMs != null
             && Math.abs(startedAtMs - sessionStartedAtMs) <= OWN_TASK_START_WINDOW_MS) {
           // Keep the last match so a copied parent task that happened to start
@@ -197,6 +248,8 @@ async function indexSessionFile(filePath) {
     parsedRecordCount,
     rawTokenCount,
     tokenTimes,
+    tokenFingerprints,
+    taskBoundaries,
     firstTaskBoundary,
     ownTaskBoundary,
   };
@@ -208,22 +261,46 @@ function replayBoundary(meta, sessionById) {
   const parentAtSpawn = parent && meta.sessionStartedAtMs != null
     ? upperBound(parent.tokenTimes, meta.sessionStartedAtMs)
     : null;
+  const replayTokenCount = parentAtSpawn == null
+    ? 0
+    : longestReplayPrefix(
+      meta.tokenFingerprints,
+      parent.tokenFingerprints.slice(0, parentAtSpawn)
+    );
 
   if (meta.isSubagent) {
     // Direct evidence inside the child wins. Legacy single-meta rollouts did
     // not replay task_started records, so their first task remains a safe
     // fallback. Double-meta files must not use their copied parent's first
     // task_started as the boundary.
-    const direct = meta.ownTaskBoundary
-      || (meta.sessionMetaCount === 1 ? meta.firstTaskBoundary : null);
+    // Exact token matching also handles LastNTurns forks. When it identifies
+    // the copied token suffix, the last task_started at that same raw ordinal
+    // is the child's own task boundary (copied history is written first).
+    const matchedTaskBoundaries = replayTokenCount > 0
+      ? meta.taskBoundaries.filter(boundary => (
+        boundary.rawTokenCount === replayTokenCount
+        && boundary.startedAtMs != null
+        && meta.sessionStartedAtMs != null
+        && boundary.startedAtMs >= Math.floor(meta.sessionStartedAtMs / 1000) * 1000
+      ))
+      : [];
+    const matchedTaskBoundary = matchedTaskBoundaries.at(-1) || null;
+    const direct = matchedTaskBoundary
+      || meta.ownTaskBoundary
+      || (meta.sessionMetaCount === 1 && !meta.forkedFromId
+        ? meta.firstTaskBoundary
+        : null);
     if (direct) {
-      return { rawTokenCount: direct.rawTokenCount, recordIndex: direct.recordIndex };
+      return {
+        rawTokenCount: Math.max(replayTokenCount, direct.rawTokenCount),
+        recordIndex: direct.recordIndex,
+      };
     }
-    return { rawTokenCount: parentAtSpawn ?? 0, recordIndex: null };
+    return { rawTokenCount: replayTokenCount, recordIndex: null };
   }
 
   if (meta.forkedFromId) {
-    return { rawTokenCount: parentAtSpawn ?? 0, recordIndex: null };
+    return { rawTokenCount: replayTokenCount, recordIndex: null };
   }
   return { rawTokenCount: 0, recordIndex: null };
 }
@@ -267,7 +344,7 @@ export async function parse() {
     const boundary = replayBoundary(fm, sessionById);
     let rawTokenSeen = 0;
     let parsedRecordIndex = 0;
-    let canonicalSessionMetaSeen = false;
+    let firstSessionMetaSeen = false;
 
     const sessionProject = fm.sessionProject;
     // Group timing events by the real Codex session id, not the file path: the
@@ -278,7 +355,7 @@ export async function parse() {
     const sessionKey = fm.sessionId || filePath;
 
     let turnContextModel = 'unknown';
-    const prevTotal = new Map();
+    let prevTotal = null;
     let prevCumulativeTotal = null;
     for await (const line of readLines(filePath)) {
       if (!line.trim()) continue;
@@ -287,22 +364,28 @@ export async function parse() {
         parsedRecordIndex++;
 
         // A direct child task boundary covers every copied record, including
-        // timing/meta events. The raw-token ordinal also covers ordinary forks
-        // where the source-at-spawn prefix is the only available boundary.
+        // timing/meta events. The raw-token ordinal covers full-history and
+        // last-N-turn forks whose exact payload sequence was matched in pass 1.
         const beforeOwnTask = boundary.recordIndex != null
           && parsedRecordIndex < boundary.recordIndex;
         const inReplayBlock = beforeOwnTask || rawTokenSeen < boundary.rawTokenCount;
 
         const isSessionMeta = obj.type === 'session_meta';
-        const isCanonicalSessionMeta = isSessionMeta && !canonicalSessionMetaSeen;
-        if (isSessionMeta) canonicalSessionMetaSeen = true;
+        const isCanonicalSessionMeta = isSessionMeta && !firstSessionMetaSeen;
+        const isOwnSessionMeta = isSessionMeta
+          && obj.payload?.id != null
+          && obj.payload.id === fm.sessionId;
+        if (isSessionMeta) firstSessionMetaSeen = true;
 
         if (obj.timestamp) {
           const evTs = new Date(obj.timestamp);
           if (!isNaN(evTs.getTime())) {
-            // Keep only the rollout's own first session_meta. A replayed parent
-            // session_meta must not inflate timing stats or user message count.
-            if (isCanonicalSessionMeta || (!isSessionMeta && !inReplayBlock)) {
+            // Repeated same-id metadata can be appended on resume/config
+            // updates and belongs to this logical session. A different-id meta
+            // is copied parent history and must not inflate timing stats.
+            const keepSessionMeta = isCanonicalSessionMeta
+              || (isOwnSessionMeta && !inReplayBlock);
+            if (keepSessionMeta || (!isSessionMeta && !inReplayBlock)) {
               const isUserTurn = obj.type === 'turn_context' || obj.type === 'session_meta';
               sessionEvents.push({
                 sessionId: sessionKey,
@@ -345,30 +428,35 @@ export async function parse() {
         // total_token_usage all-zero can't suppress real usage.
         const cumulativeTotal = info.total_token_usage?.total_tokens;
         const isDuplicateEmission = typeof cumulativeTotal === 'number'
-          && cumulativeTotal > 0 && cumulativeTotal === prevCumulativeTotal;
+          && cumulativeTotal > 0
+          && cumulativeTotal === prevCumulativeTotal;
         if (typeof cumulativeTotal === 'number') prevCumulativeTotal = cumulativeTotal;
 
         // Prefer incremental per-request usage; compute delta from cumulative
         // totals as fallback. Always advance the cumulative baseline, even
         // when last_token_usage exists or the record belongs to a replay.
-        const totalKey = `${info.model || payload.model || turnContextModel || ''}`;
         const curr = info.total_token_usage;
         let usage = info.last_token_usage;
         if (!usage && curr) {
-          const prev = prevTotal.get(totalKey);
-          if (prev) {
-            usage = {
-              input_tokens: (curr.input_tokens || 0) - (prev.input_tokens || 0),
-              output_tokens: (curr.output_tokens || 0) - (prev.output_tokens || 0),
-              cached_input_tokens: (curr.cached_input_tokens || 0) - (prev.cached_input_tokens || 0),
-              reasoning_output_tokens: (curr.reasoning_output_tokens || 0) - (prev.reasoning_output_tokens || 0),
+          if (prevTotal) {
+            const delta = {
+              input_tokens: (curr.input_tokens || 0) - (prevTotal.input_tokens || 0),
+              output_tokens: (curr.output_tokens || 0) - (prevTotal.output_tokens || 0),
+              cached_input_tokens: (curr.cached_input_tokens || 0) - (prevTotal.cached_input_tokens || 0),
+              reasoning_output_tokens: (curr.reasoning_output_tokens || 0) - (prevTotal.reasoning_output_tokens || 0),
             };
+            // Cumulative counters can reset after compaction or a new usage
+            // window. Treat the first post-reset total as a fresh baseline;
+            // allowing a negative delta would cancel legitimate bucket usage.
+            usage = Object.values(delta).some(value => value < 0) ? curr : delta;
           } else {
             // First cumulative entry — use as-is (it's the first event's total)
             usage = curr;
           }
         }
-        if (curr) prevTotal.set(totalKey, { ...curr });
+        // total_token_usage is session-wide, not per model. A global baseline
+        // avoids counting the full cumulative total again after a model switch.
+        if (curr) prevTotal = { ...curr };
         if (!usage) continue;
         if (isReplayedHistory || isDuplicateEmission) continue;
 
