@@ -6,11 +6,20 @@ import { tmpdir } from 'node:os';
 import { parse } from '../src/parsers/codex.js';
 
 function sessionMeta(timestamp, id, extra = {}) {
-  return { timestamp, type: 'session_meta', payload: { id, cwd: '/Users/x/proj', ...extra } };
+  const { metaTimestamp = timestamp, ...payloadExtra } = extra;
+  return {
+    timestamp,
+    type: 'session_meta',
+    payload: { id, cwd: '/Users/x/proj', timestamp: metaTimestamp, ...payloadExtra },
+  };
 }
 
-function taskStarted(timestamp) {
-  return { timestamp, type: 'event_msg', payload: { type: 'task_started' } };
+function taskStarted(timestamp, startedAt) {
+  return {
+    timestamp,
+    type: 'event_msg',
+    payload: { type: 'task_started', ...(startedAt == null ? {} : { started_at: startedAt }) },
+  };
 }
 
 function eventMsg(timestamp, type) {
@@ -43,13 +52,25 @@ function tokenCount(timestamp, last, cumulativeTotal) {
   };
 }
 
+function tokenCountInfo(timestamp, info) {
+  return { timestamp, type: 'event_msg', payload: { type: 'token_count', info } };
+}
+
 /** Write fixture rollouts under a temp CODEX_HOME and run the parser. */
 async function parseFixture(files) {
   const root = mkdtempSync(join(tmpdir(), 'vibe-usage-codex-test-'));
   const dir = join(root, 'sessions', '2026', '07', '10');
   mkdirSync(dir, { recursive: true });
-  for (const [name, records] of Object.entries(files)) {
-    writeFileSync(join(dir, name), records.map((r) => JSON.stringify(r)).join('\n') + '\n');
+  for (const [name, value] of Object.entries(files)) {
+    const spec = Array.isArray(value) ? { records: value } : value;
+    const targetDir = spec.archived
+      ? join(root, 'archived_sessions')
+      : dir;
+    mkdirSync(targetDir, { recursive: true });
+    writeFileSync(
+      join(targetDir, name),
+      spec.records.map((r) => typeof r === 'string' ? r : JSON.stringify(r)).join('\n') + '\n'
+    );
   }
   const prevHome = process.env.CODEX_HOME;
   process.env.CODEX_HOME = root;
@@ -72,6 +93,10 @@ function sumBuckets(buckets) {
     }),
     { input: 0, output: 0, cached: 0, reasoning: 0 }
   );
+}
+
+function epochSeconds(iso) {
+  return Math.floor(Date.parse(iso) / 1000);
 }
 
 test('sub-agent rollout skips inherited parent history before its own task_started', async () => {
@@ -109,6 +134,124 @@ test('sub-agent rollout skips inherited parent history before its own task_start
   assert.equal(sessions.length, 1);
   assert.equal(sessions[0].messageCount, 4);
   assert.equal(sessions[0].userMessageCount, 1);
+});
+
+test('double-meta sub-agent keeps child identity and skips copied parent tasks and tokens', async () => {
+  const parentStart = '2026-07-10T08:00:00.000Z';
+  const spawn = '2026-07-10T08:10:10.800Z';
+  const ownStart = '2026-07-10T08:10:13.000Z';
+  const { buckets, sessions } = await parseFixture({
+    'rollout-parent.jsonl': [
+      sessionMeta(parentStart, 'parent-1', { cwd: '/Users/x/parent-project' }),
+      taskStarted(parentStart, epochSeconds(parentStart)),
+      tokenCount('2026-07-10T08:01:00.000Z', usage(100, 0, 10, 0), 110),
+      tokenCount('2026-07-10T08:09:00.000Z', usage(200, 0, 20, 0), 330),
+      // The parent starts another task in the same rounded second as the
+      // child spawn, then continues producing usage after the spawn.
+      taskStarted('2026-07-10T08:10:10.100Z', epochSeconds(spawn)),
+      tokenCount('2026-07-10T08:11:00.000Z', usage(300, 0, 30, 0), 660),
+    ],
+    'rollout-child.jsonl': [
+      sessionMeta(spawn, 'child-1', {
+        cwd: '/Users/x/child-project',
+        forked_from_id: 'parent-1',
+        parent_thread_id: 'parent-1',
+        thread_source: 'subagent',
+        source: { subagent: { thread_spawn: { parent_thread_id: 'parent-1' } } },
+      }),
+      // Real Codex Desktop layout: the copied parent session_meta and parent
+      // tasks are present before the child's own task_started.
+      sessionMeta(spawn, 'parent-1', {
+        cwd: '/Users/x/parent-project',
+        metaTimestamp: parentStart,
+        thread_source: 'user',
+      }),
+      taskStarted(spawn, epochSeconds(parentStart)),
+      tokenCount(spawn, usage(100, 0, 10, 0), 110),
+      tokenCount(spawn, usage(200, 0, 20, 0), 330),
+      // Copied parent task happens to match the spawn second. The later match
+      // is the child's actual boundary and must win.
+      taskStarted(spawn, epochSeconds(spawn)),
+      taskStarted(ownStart, epochSeconds(ownStart)),
+      tokenCount('2026-07-10T08:10:20.000Z', usage(5, 0, 3, 0), 338),
+    ],
+  });
+
+  // Parent usage is counted once (including its post-spawn work); only the
+  // child's own final token_count is added from the child rollout.
+  assert.deepEqual(sumBuckets(buckets), { input: 605, output: 63, cached: 0, reasoning: 0 });
+  assert.equal(sessions.length, 2);
+  assert.deepEqual(sessions.map(s => s.project).sort(), ['child-project', 'parent-project']);
+  const child = sessions.find(s => s.project === 'child-project');
+  assert.equal(child.messageCount, 3); // child meta + own task_started + own token_count
+  assert.equal(child.userMessageCount, 1);
+});
+
+test('ordinary fork skips parent raw tokens only up to fork time', async () => {
+  const t = '2026-07-10T08:00:00.000Z';
+  const tf = '2026-07-10T08:30:00.000Z';
+  const malformed = eventMsg(null, 'token_count');
+  const copiedMalformed = eventMsg(null, 'token_count');
+  const { buckets } = await parseFixture({
+    'rollout-parent.jsonl': [
+      sessionMeta(t, 'parent-1'),
+      tokenCount('2026-07-10T08:05:00.000Z', usage(10, 0, 1, 0), 11),
+      malformed, // raw ordinal with no info still belongs to the replay prefix
+      tokenCount('2026-07-10T08:20:00.000Z', usage(20, 0, 2, 0), 33),
+      // Parent keeps running after the fork; this record was never copied.
+      tokenCount('2026-07-10T08:40:00.000Z', usage(30, 0, 3, 0), 66),
+    ],
+    'rollout-fork.jsonl': [
+      sessionMeta(tf, 'fork-1', { forked_from_id: 'parent-1' }),
+      tokenCount(tf, usage(10, 0, 1, 0), 11),
+      copiedMalformed,
+      tokenCount(tf, usage(20, 0, 2, 0), 33),
+      tokenCount('2026-07-10T08:31:00.000Z', usage(5, 0, 3, 0), 41),
+    ],
+  });
+
+  assert.deepEqual(sumBuckets(buckets), { input: 65, output: 9, cached: 0, reasoning: 0 });
+});
+
+test('replayed cumulative totals advance the fallback baseline', async () => {
+  const t = '2026-07-10T08:00:00.000Z';
+  const firstTotal = usage(100, 0, 10, 0);
+  const nextTotal = usage(150, 0, 20, 0);
+  const { buckets } = await parseFixture({
+    'rollout-sub.jsonl': [
+      sessionMeta(t, 'sub-1', { thread_source: 'subagent', parent_thread_id: 'missing-parent' }),
+      // A malformed timestamp must not prevent this copied cumulative record
+      // from advancing the fallback baseline.
+      tokenCountInfo(null, {
+        model: 'gpt-5.2',
+        total_token_usage: firstTotal,
+        last_token_usage: firstTotal,
+      }),
+      taskStarted('2026-07-10T08:00:01.000Z'),
+      tokenCountInfo('2026-07-10T08:00:02.000Z', {
+        model: 'gpt-5.2',
+        total_token_usage: nextTotal,
+      }),
+    ],
+  });
+
+  assert.deepEqual(sumBuckets(buckets), { input: 50, output: 10, cached: 0, reasoning: 0 });
+});
+
+test('same session in live and archived directories uses the more complete copy once', async () => {
+  const t = '2026-07-10T08:00:00.000Z';
+  const records = [
+    sessionMeta(t, 'same-1'),
+    taskStarted(t),
+    tokenCount(t, usage(100, 0, 10, 0), 110),
+  ];
+  const { buckets, sessions } = await parseFixture({
+    'rollout-live.jsonl': records.slice(0, 2),
+    'rollout-archived.jsonl': { records, archived: true },
+  });
+
+  assert.deepEqual(sumBuckets(buckets), { input: 100, output: 10, cached: 0, reasoning: 0 });
+  assert.equal(sessions.length, 1);
 });
 
 test('sub-agent rollout without a task_started boundary is counted in full', async () => {
