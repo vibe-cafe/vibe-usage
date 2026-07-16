@@ -190,6 +190,12 @@ export const TOOLS = [
     detectDataDirs: findCodexDataDirs,
   },
   {
+    name: 'Grok',
+    id: 'grok',
+    dataDir: join(homedir(), '.grok', 'sessions'),
+    detectDataDirs: findGrokDataDirs,
+  },
+  {
     name: 'GitHub Copilot CLI',
     id: 'copilot-cli',
     dataDir: join(homedir(), '.copilot', 'session-state'),
@@ -203,12 +209,6 @@ export const TOOLS = [
     name: 'Gemini CLI',
     id: 'gemini-cli',
     dataDir: join(homedir(), '.gemini', 'tmp'),
-  },
-  {
-    name: 'Grok',
-    id: 'grok',
-    dataDir: join(homedir(), '.grok', 'sessions'),
-    detectDataDirs: findGrokDataDirs,
   },
   {
     name: 'OpenCode',

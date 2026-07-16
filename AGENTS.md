@@ -13,11 +13,11 @@ vibe-usage/
 │   │   ├── index.js           # Parser registry, aggregateToBuckets(), extractSessions()
 │   │   ├── claude-code.js
 │   │   ├── codex.js
+│   │   ├── grok.js            # ~/.grok/sessions updates.jsonl turn_completed usage
 │   │   ├── copilot-cli.js
 │   │   ├── sqlite.js          # queryDbJson() — node:sqlite (Node ≥22.5), falls back to sqlite3 CLI
 │   │   ├── cursor.js          # SQLite (read auth token) + cursor.com CSV export
 │   │   ├── gemini-cli.js
-│   │   ├── grok.js            # ~/.grok/sessions updates.jsonl turn_completed usage
 │   │   ├── opencode.js        # SQLite (via sqlite.js), legacy JSON fallback
 │   │   ├── openclaw.js
 │   │   ├── qwen-code.js

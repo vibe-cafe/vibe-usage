@@ -52,10 +52,10 @@ npx @vibe-cafe/vibe-usage status       # Show config & detected tools
 |------|---------------|
 | Claude Code | `~/.claude/projects/` (tokens + sessions), `~/.claude/transcripts/` (sessions only); also scans `$CLAUDE_CONFIG_DIR` when set (deduped), so relocated configs and GUI/CLI env mismatches are both covered |
 | Codex CLI | `$CODEX_HOME/sessions/` and `$CODEX_HOME/archived_sessions/` (default `~/.codex`); forked and sub-agent rollouts replay parent metadata, tasks, and `token_count` records at spawn time — full or last-N-turn replay blocks are matched as a fingerprinted parent suffix plus the child's own task boundary, duplicate cumulative emissions count once, and live/archive copies of the same session are deduplicated |
+| Grok | `$GROK_HOME/sessions/<encoded-cwd>/<session-id>/` (default `~/.grok`); token usage from `updates.jsonl` `turn_completed.usage` (per-model `modelUsage`, cache reads, reasoning); project from `summary.json` cwd; honors `GROK_HOME` |
 | GitHub Copilot CLI | `~/.copilot/session-state/*/events.jsonl` |
 | Cursor | `state.vscdb` (SQLite, reads `cursorAuth/accessToken`, fetches CSV from `cursor.com`); cloud data is stamped with a fixed `cursor-cloud` hostname so multi-machine setups don't double-count |
 | Gemini CLI | `~/.gemini/tmp/<project_hash>/chats/session-*.jsonl` (current line-delimited format) and legacy `session-*.json`; recurses into nested subagent sessions |
-| Grok | `$GROK_HOME/sessions/<encoded-cwd>/<session-id>/` (default `~/.grok`); token usage from `updates.jsonl` `turn_completed.usage` (per-model `modelUsage`, cache reads, reasoning); project from `summary.json` cwd; honors `GROK_HOME` |
 | OpenCode | `~/.local/share/opencode/opencode.db` (SQLite, `json_extract` query) |
 | OpenClaw | `~/.openclaw/agents/`, `~/.openclaw-<profile>/agents/` (profile deployments) |
 | pi | `~/.pi/agent/sessions/` |
