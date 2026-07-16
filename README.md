@@ -55,6 +55,7 @@ npx @vibe-cafe/vibe-usage status       # Show config & detected tools
 | GitHub Copilot CLI | `~/.copilot/session-state/*/events.jsonl` |
 | Cursor | `state.vscdb` (SQLite, reads `cursorAuth/accessToken`, fetches CSV from `cursor.com`); cloud data is stamped with a fixed `cursor-cloud` hostname so multi-machine setups don't double-count |
 | Gemini CLI | `~/.gemini/tmp/<project_hash>/chats/session-*.jsonl` (current line-delimited format) and legacy `session-*.json`; recurses into nested subagent sessions |
+| Grok | `$GROK_HOME/sessions/<encoded-cwd>/<session-id>/` (default `~/.grok`); token usage from `updates.jsonl` `turn_completed.usage` (per-model `modelUsage`, cache reads, reasoning); project from `summary.json` cwd; honors `GROK_HOME` |
 | OpenCode | `~/.local/share/opencode/opencode.db` (SQLite, `json_extract` query) |
 | OpenClaw | `~/.openclaw/agents/`, `~/.openclaw-<profile>/agents/` (profile deployments) |
 | pi | `~/.pi/agent/sessions/` |

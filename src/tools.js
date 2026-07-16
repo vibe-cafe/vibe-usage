@@ -136,6 +136,28 @@ export function findTraeCliDataDirs() {
   return [join(xdgCacheHome, 'trae-cli', 'sessions')].filter(existsSync);
 }
 
+/** Grok home: GROK_HOME env (same as the Grok CLI) or ~/.grok. */
+export function getGrokHome() {
+  const envHome = process.env.GROK_HOME?.trim();
+  if (envHome) {
+    return envHome.startsWith('~') ? join(homedir(), envHome.slice(1)) : envHome;
+  }
+  return join(homedir(), '.grok');
+}
+
+export function getGrokSessionsDir() {
+  const testDir = process.env.VIBE_USAGE_GROK_SESSIONS?.trim();
+  if (testDir) return testDir;
+  return join(getGrokHome(), 'sessions');
+}
+
+// Detect Grok when sessions/ exists under GROK_HOME (or the test override).
+export function findGrokDataDirs() {
+  const testDir = process.env.VIBE_USAGE_GROK_SESSIONS?.trim();
+  if (testDir) return [testDir].filter(existsSync);
+  return [join(getGrokHome(), 'sessions')].filter(existsSync);
+}
+
 export const TOOLS = [
   {
     name: 'Trae CLI',
@@ -181,6 +203,12 @@ export const TOOLS = [
     name: 'Gemini CLI',
     id: 'gemini-cli',
     dataDir: join(homedir(), '.gemini', 'tmp'),
+  },
+  {
+    name: 'Grok',
+    id: 'grok',
+    dataDir: join(homedir(), '.grok', 'sessions'),
+    detectDataDirs: findGrokDataDirs,
   },
   {
     name: 'OpenCode',

@@ -6,6 +6,7 @@ import { parse as parseCopilotCli } from './copilot-cli.js';
 import { parse as parseCursor } from './cursor.js';
 import { parse as parseRooCode } from './roo-code.js';
 import { parse as parseGeminiCli } from './gemini-cli.js';
+import { parse as parseGrok } from './grok.js';
 import { parse as parseOpencode } from './opencode.js';
 import { parse as parseOpenclaw } from './openclaw.js';
 import { parse as parseQwenCode } from './qwen-code.js';
@@ -27,6 +28,7 @@ export const parsers = {
   'cursor': parseCursor,
   'roo-code': parseRooCode,
   'gemini-cli': parseGeminiCli,
+  'grok': parseGrok,
   'opencode': parseOpencode,
   'openclaw': parseOpenclaw,
   'qwen-code': parseQwenCode,
