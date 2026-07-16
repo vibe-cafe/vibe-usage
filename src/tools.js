@@ -160,28 +160,10 @@ export function findGrokDataDirs() {
 
 export const TOOLS = [
   {
-    name: 'Trae CLI',
-    id: 'trae-cli',
-    dataDir: join(homedir(), 'Library', 'Caches', 'trae-cli', 'sessions'),
-    detectDataDirs: findTraeCliDataDirs,
-  },
-  {
-    name: 'Antigravity',
-    id: 'antigravity',
-    dataDir: join(homedir(), '.gemini', 'antigravity'),
-    detectDataDirs: findAntigravityDataDirs,
-  },
-  {
     name: 'Claude Code',
     id: 'claude-code',
     dataDir: join(homedir(), '.claude', 'projects'),
     detectDataDirs: findClaudeCodeDataDirs,
-  },
-  {
-    name: 'Cline',
-    id: 'cline',
-    dataDir: join(homedir(), 'Library', 'Application Support', 'Code', 'User', 'globalStorage', 'saoudrizwan.claude-dev'),
-    detectDataDirs: findClineDataDirs,
   },
   {
     name: 'Codex CLI',
@@ -250,6 +232,18 @@ export const TOOLS = [
     dataDir: join(homedir(), '.factory', 'sessions'),
   },
   {
+    name: 'Antigravity',
+    id: 'antigravity',
+    dataDir: join(homedir(), '.gemini', 'antigravity'),
+    detectDataDirs: findAntigravityDataDirs,
+  },
+  {
+    name: 'Trae CLI',
+    id: 'trae-cli',
+    dataDir: join(homedir(), 'Library', 'Caches', 'trae-cli', 'sessions'),
+    detectDataDirs: findTraeCliDataDirs,
+  },
+  {
     name: 'Hermes',
     id: 'hermes',
     dataDir: join(homedir(), '.hermes', 'state.db'),
@@ -258,6 +252,12 @@ export const TOOLS = [
     name: 'Kiro',
     id: 'kiro',
     dataDir: getKiroAgentPath(),
+  },
+  {
+    name: 'Cline',
+    id: 'cline',
+    dataDir: join(homedir(), 'Library', 'Application Support', 'Code', 'User', 'globalStorage', 'saoudrizwan.claude-dev'),
+    detectDataDirs: findClineDataDirs,
   },
   {
     name: 'Roo Code',

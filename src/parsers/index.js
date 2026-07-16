@@ -22,25 +22,25 @@ import { parse as parseTraeCli } from './trae-cli.js';
 
 export const parsers = {
   'claude-code': parseClaudeCode,
-  'cline': parseCline,
   'codex': parseCodex,
   'grok': parseGrok,
   'copilot-cli': parseCopilotCli,
   'cursor': parseCursor,
-  'roo-code': parseRooCode,
   'gemini-cli': parseGeminiCli,
   'opencode': parseOpencode,
   'openclaw': parseOpenclaw,
+  'pi-coding-agent': parsePiCodingAgent,
   'qwen-code': parseQwenCode,
   'kimi-code': parseKimiCode,
   'amp': parseAmp,
   'droid': parseDroid,
   'antigravity': parseAntigravity,
+  'trae-cli': parseTraeCli,
   'hermes': parseHermes,
   'kiro': parseKiro,
-  'pi-coding-agent': parsePiCodingAgent,
+  'cline': parseCline,
+  'roo-code': parseRooCode,
   'zcode': parseZcode,
-  'trae-cli': parseTraeCli,
 };
 
 

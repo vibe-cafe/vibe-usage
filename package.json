@@ -23,6 +23,7 @@
     "tokens",
     "claude",
     "codex",
+    "grok",
     "gemini"
   ],
   "dependencies": {},

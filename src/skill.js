@@ -68,7 +68,7 @@ Track and answer questions about the user's AI coding token spend via [Vibe Usag
 - \`summary\` 读 \`~/.vibe-usage/config.json\` 里已有的 API key，不需要用户额外输入
 - summary 输出已是 markdown，**原样展示，不要复述**
 - 用户没装过 vibe-usage？提示运行 \`npx @vibe-cafe/vibe-usage\` 先用浏览器登录链接账号
-- 支持的工具：Claude Code, Codex CLI, Copilot CLI, Gemini CLI, OpenCode, OpenClaw, Qwen Code, Kimi Code, Amp, Droid 等
+- 支持的工具：Claude Code, Codex, Grok 等
 `;
 
 export async function runSkill(args = []) {
