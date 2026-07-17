@@ -1,8 +1,9 @@
 import { createInterface } from 'node:readline';
 import { hostname as getHostname } from 'node:os';
-import { loadConfig, saveConfig } from './config.js';
+import { loadConfig } from './config.js';
 import { deleteAllData } from './api.js';
 import { runSync } from './sync.js';
+import { clearState } from './state.js';
 import { success, failure, arrow, link, dim } from './output.js';
 
 function prompt(question) {
@@ -15,7 +16,13 @@ function prompt(question) {
   });
 }
 
-export async function runReset(args = []) {
+export async function runReset(args = [], deps = {}) {
+  // Injectable for tests — the production defaults hit readline, the network,
+  // and the real sync pipeline.
+  const ask = deps.prompt ?? prompt;
+  const deleteRemote = deps.deleteAllData ?? deleteAllData;
+  const resync = deps.runSync ?? runSync;
+
   const hostOnly = args.includes('--local');
   const config = loadConfig();
   if (!config?.apiKey) {
@@ -23,11 +30,14 @@ export async function runReset(args = []) {
     process.exit(1);
   }
 
-  const currentHost = getHostname().replace(/\.local$/, '');
+  // Target the hostname persisted at init — the same one sync.js uploads
+  // under. A fresh os.hostname() can have drifted since (macOS mDNS adds -2
+  // suffixes), which would delete zero rows, or another machine's rows.
+  const currentHost = config.hostname || getHostname().replace(/\.local$/, '');
   const apiUrl = config.apiUrl || 'https://vibecafe.ai';
 
   if (hostOnly) {
-    const answer = await prompt(`将删除当前机器（${currentHost}）的用量数据并从本地日志重新上传，继续? (y/N) `);
+    const answer = await ask(`将删除当前机器（${currentHost}）的用量数据并从本地日志重新上传，继续? (y/N) `);
     if (answer.toLowerCase() !== 'y') {
       console.log(dim('已取消。'));
       return;
@@ -35,7 +45,7 @@ export async function runReset(args = []) {
 
     console.log(dim(`  正在删除 ${currentHost} 的云端数据...`));
     try {
-      const result = await deleteAllData(apiUrl, config.apiKey, { hostname: currentHost });
+      const result = await deleteRemote(apiUrl, config.apiKey, { hostname: currentHost });
       console.log(success(`已删除 ${result.deleted} buckets · ${result.sessions ?? 0} sessions`));
     } catch (err) {
       if (err.message === 'UNAUTHORIZED') {
@@ -46,7 +56,7 @@ export async function runReset(args = []) {
       process.exit(1);
     }
   } else {
-    const answer = await prompt('将删除所有用量数据并从本地日志重新上传，继续? (y/N) ');
+    const answer = await ask('将删除所有用量数据并从本地日志重新上传，继续? (y/N) ');
     if (answer.toLowerCase() !== 'y') {
       console.log(dim('已取消。'));
       return;
@@ -54,7 +64,7 @@ export async function runReset(args = []) {
 
     console.log(dim('  正在删除所有云端数据...'));
     try {
-      const result = await deleteAllData(apiUrl, config.apiKey);
+      const result = await deleteRemote(apiUrl, config.apiKey);
       console.log(success(`已删除 ${result.deleted} buckets · ${result.sessions ?? 0} sessions`));
     } catch (err) {
       if (err.message === 'UNAUTHORIZED') {
@@ -66,13 +76,15 @@ export async function runReset(args = []) {
     }
   }
 
-  // Clear local state (legacy — no state files needed for current parsers)
-  config.lastSync = null;
-  saveConfig(config);
+  // The remote rows are gone, so every local item must count as "changed" on
+  // the re-sync below. Without this, sync.js's incremental diff matches every
+  // item against state.json and uploads zero bytes — the deleted data would
+  // never come back.
+  clearState();
 
   console.log();
   console.log(dim('  从本地日志重新同步...'));
-  await runSync();
+  await resync();
 
   console.log();
   console.log(`${arrow('Dashboard')} ${link(`${apiUrl}/usage`)}`);

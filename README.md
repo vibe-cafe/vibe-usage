@@ -60,7 +60,7 @@ npx @vibe-cafe/vibe-usage status       # Show config & detected tools
 | OpenClaw | `~/.openclaw/agents/`, `~/.openclaw-<profile>/agents/` (profile deployments) |
 | pi | `~/.pi/agent/sessions/` |
 | Qwen Code | `~/.qwen/tmp/` |
-| Kimi Code | `~/.kimi/sessions/<md5(workdir)>/<session-id>/wire.jsonl` (wire protocol 1.9, model from `~/.kimi/config.toml`, project from `~/.kimi/kimi.json`) |
+| Kimi Code | Current `~/.kimi-code/sessions/wd_<slug>_<hash>/session_<id>/agents/<agent>/wire.jsonl` (`usage.record` deltas, including retry/compaction scope and cache creation; main/subagent wires form one session), with project names from `session_index.jsonl`; legacy `~/.kimi/sessions/` remains supported |
 | Amp | `~/.local/share/amp/threads/` |
 | Droid | `~/.factory/sessions/` |
 | Hermes | `~/.hermes/state.db` + `~/.hermes/profiles/<name>/state.db` (SQLite, multi-profile) |
@@ -77,7 +77,7 @@ npx @vibe-cafe/vibe-usage status       # Show config & detected tools
 - Aggregates token usage into 30-minute buckets
 - Extracts session metadata from all parsers: active time (AI generation time, excluding queue/TTFT wait), total duration, message counts
 - Uploads buckets + sessions to your vibecafe.ai dashboard (always gzip-compressed, ~94% smaller)
-- Incremental: parsers still compute full totals from local logs each sync (idempotent), but only buckets/sessions that are new or changed since the last successful upload are sent — a quiet machine uploads nothing. Sync state is kept in `~/.vibe-usage/state.json`; deleting it just triggers a one-time full re-upload
+- Incremental: parsers still compute full totals from local logs each sync (idempotent), but only buckets/sessions that are new or changed since the last successful upload are sent — a quiet machine uploads nothing. Sync state is kept in `~/.vibe-usage/state.json`; failed parsers retain their prior state, while deleted local logs are pruned. Deleting the state file triggers a one-time full re-upload, and `reset` clears it automatically after deleting cloud data
 - SQLite-backed tools (Cursor, OpenCode, Kiro, Hermes) are read via Node's built-in `node:sqlite` on Node ≥ 22.5 — no `sqlite3` binary needed (works on Windows out of the box); on older Node it falls back to the system `sqlite3` CLI
 - For continuous syncing, use `npx @vibe-cafe/vibe-usage daemon` or the [Vibe Usage Mac app](https://github.com/vibe-cafe/vibe-usage-app)
 
@@ -124,6 +124,8 @@ npx skills add vibe-cafe/vibe-usage
 ```
 
 ## Development
+
+Run the Node test suite locally with `npm test`. CI covers Node 20 and 22 on Ubuntu and macOS.
 
 Test against a local vibe-cafe dev server without publishing:
 

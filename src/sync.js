@@ -34,12 +34,23 @@ export async function runSync({ throws = false, quiet = false } = {}) {
   const allBuckets = [];
   const allSessions = [];
   const parserResults = [];
+  // Sources whose parser ran to completion this sync. pruneState() below is
+  // scoped to these so a transient parser failure doesn't evict that tool's
+  // state and force a full re-upload next run.
+  const okSources = new Set();
 
   for (const [source, parse] of Object.entries(parsers)) {
     try {
       const result = await parse();
       const buckets = Array.isArray(result) ? result : result.buckets;
       const sessions = Array.isArray(result) ? [] : (result.sessions || []);
+      if (!Array.isArray(buckets) || !Array.isArray(sessions)) {
+        throw new TypeError('Parser returned an invalid result');
+      }
+      // A parser may deliberately suppress a transient error (Cursor network
+      // timeout) to keep daemon logs quiet. Its empty result is not proof that
+      // its prior data disappeared, so it must not be pruned this run.
+      if (!result?.skipped) okSources.add(source);
       if (buckets.length > 0) allBuckets.push(...buckets);
       if (sessions.length > 0) allSessions.push(...sessions);
       if (buckets.length > 0 || sessions.length > 0) {
@@ -52,6 +63,14 @@ export async function runSync({ throws = false, quiet = false } = {}) {
   }
 
   if (allBuckets.length === 0 && allSessions.length === 0) {
+    // Successful parsers emitted no live items. Prune their old keys even on
+    // this fast path; otherwise deleting the final local log would leave dead
+    // state entries forever. Failed-parser sources remain protected.
+    const state = loadState();
+    const before = Object.keys(state.buckets).length + Object.keys(state.sessions).length;
+    pruneState(state, new Set(), new Set(), okSources);
+    const pruned = before - (Object.keys(state.buckets).length + Object.keys(state.sessions).length);
+    if (pruned > 0) saveState(state);
     if (!quiet) console.log(dim('暂无新数据。'));
     return 0;
   }
@@ -135,7 +154,7 @@ export async function runSync({ throws = false, quiet = false } = {}) {
   // to upload success. If we deferred this to the batch loop, a first-batch
   // failure would throw before any saveState and the prune would be lost.
   const before = Object.keys(state.buckets).length + Object.keys(state.sessions).length;
-  pruneState(state, liveBucketKeys, liveSessionKeys);
+  pruneState(state, liveBucketKeys, liveSessionKeys, okSources);
   const pruned = before - (Object.keys(state.buckets).length + Object.keys(state.sessions).length);
   if (pruned > 0) saveState(state);
 
@@ -241,4 +260,3 @@ export async function runSync({ throws = false, quiet = false } = {}) {
     process.exit(1);
   }
 }
-

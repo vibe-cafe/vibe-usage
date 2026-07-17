@@ -210,7 +210,9 @@ export async function parse() {
   } catch (err) {
     // Network/timeout → silent skip (avoid noisy daemon logs every 5 min).
     // Auth failure → bubble up so user sees they need to re-login in Cursor.
-    if (err && err.skip) return { buckets: [], sessions: [] };
+    // Tell sync.js this was not a successful empty snapshot so it preserves
+    // Cursor's incremental state instead of pruning it as dead history.
+    if (err && err.skip) return { buckets: [], sessions: [], skipped: true };
     throw err;
   }
   const rows = parseCsv(csv);

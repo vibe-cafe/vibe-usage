@@ -146,14 +146,17 @@ export async function run(rawArgs) {
     case 'daemon':
     case '--daemon': {
       const sub = args[1];
-      if (sub && ['install', 'uninstall', 'status', 'stop', 'restart'].includes(sub)) {
-        printSmallHeader();
-        const { manageDaemon } = await import('./daemon-service.js');
-        await manageDaemon(sub);
-      } else {
+      if (sub === undefined) {
         // Foreground daemon loop — no header, just start syncing
         const { runDaemon } = await import('./daemon.js');
         await runDaemon();
+      } else {
+        // manageDaemon validates the subcommand and exits 1 on unknown ones —
+        // a typo (e.g. `daemon stauts`) must never fall through to the
+        // infinite foreground loop.
+        printSmallHeader();
+        const { manageDaemon } = await import('./daemon-service.js');
+        await manageDaemon(sub);
       }
       break;
     }
@@ -202,7 +205,9 @@ export async function run(rawArgs) {
 `);
       break;
     }
-    default: {
+    case undefined: {
+      // Bare invocation (no command): first run OR a one-shot --key setup →
+      // init; already configured → sync.
       const config = loadConfig();
       if (!config?.apiKey || apiKey) {
         // First run OR user passed --key for a one-shot setup — init.js prints the big header
@@ -214,6 +219,12 @@ export async function run(rawArgs) {
         const { runSync } = await import('./sync.js');
         await runSync();
       }
+      break;
+    }
+    default: {
+      console.error(`Unknown command: ${command}`);
+      console.error('Run `vibe-usage help` to see available commands.');
+      process.exit(1);
     }
   }
 }
