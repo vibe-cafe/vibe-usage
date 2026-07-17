@@ -40,7 +40,7 @@ npx @vibe-cafe/vibe-usage daemon status     # Show background service status
 npx @vibe-cafe/vibe-usage daemon stop       # Stop background service
 npx @vibe-cafe/vibe-usage daemon restart    # Restart background service
 npx @vibe-cafe/vibe-usage reset        # Delete all data and re-upload from local logs
-npx @vibe-cafe/vibe-usage reset --local  # Delete this host's data only and re-upload
+npx @vibe-cafe/vibe-usage reset --local  # Delete this host's data only and re-upload (`--host` remains a legacy alias)
 npx @vibe-cafe/vibe-usage skill         # Install skill for AI coding assistants
 npx @vibe-cafe/vibe-usage skill --remove  # Remove installed skills
 npx @vibe-cafe/vibe-usage status       # Show config & detected tools

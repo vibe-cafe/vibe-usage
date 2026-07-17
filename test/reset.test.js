@@ -64,6 +64,16 @@ test('reset --local deletes using the persisted hostname, not os.hostname()', as
   assert.equal(calls.resynced, 1);
 });
 
+test('legacy reset --host remains a host-only alias', async () => {
+  seed();
+  const { calls, deps } = makeDeps();
+  await runReset(['--host'], deps);
+
+  assert.equal(calls.deleted.length, 1);
+  assert.deepEqual(calls.deleted[0].opts, { hostname: 'persisted-host' });
+  assert.equal(calls.resynced, 1);
+});
+
 test('reset aborted at the prompt deletes nothing and keeps state intact', async () => {
   seed();
   const { calls, deps } = makeDeps({ prompt: async () => 'n' });

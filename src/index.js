@@ -194,7 +194,7 @@ export async function run(rawArgs) {
     npx @vibe-cafe/vibe-usage daemon stop       Stop background service
     npx @vibe-cafe/vibe-usage daemon restart    Restart background service
     npx @vibe-cafe/vibe-usage reset        Delete all data and re-upload
-    npx @vibe-cafe/vibe-usage reset --local  Delete data for this host only and re-upload
+    npx @vibe-cafe/vibe-usage reset --local  Delete data for this host only and re-upload (--host is a legacy alias)
     npx @vibe-cafe/vibe-usage skill         Install skill for AI coding tools
     npx @vibe-cafe/vibe-usage skill --remove  Remove installed skills
     npx @vibe-cafe/vibe-usage status       Show config and detected tools
@@ -222,6 +222,9 @@ export async function run(rawArgs) {
       break;
     }
     default: {
+      // Compatibility is explicit above: --key, --daemon, reset --host, and
+      // the no-command init/sync behavior remain supported. Unknown words were
+      // never public commands; failing them avoids typo-triggered side effects.
       console.error(`Unknown command: ${command}`);
       console.error('Run `vibe-usage help` to see available commands.');
       process.exit(1);

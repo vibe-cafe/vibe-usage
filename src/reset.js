@@ -23,7 +23,11 @@ export async function runReset(args = [], deps = {}) {
   const deleteRemote = deps.deleteAllData ?? deleteAllData;
   const resync = deps.runSync ?? runSync;
 
-  const hostOnly = args.includes('--local');
+  // --host was the original public spelling before --local replaced it.
+  // Keep the old flag as an alias so existing reset scripts stay safe: losing
+  // the filter would turn a host-only reset into a destructive account-wide
+  // reset.
+  const hostOnly = args.includes('--local') || args.includes('--host');
   const config = loadConfig();
   if (!config?.apiKey) {
     console.error(failure('尚未配置，请先运行 `npx @vibe-cafe/vibe-usage init`。'));

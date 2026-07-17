@@ -22,3 +22,17 @@ test('unknown daemon subcommand fails instead of starting the foreground loop', 
   assert.equal(result.status, 1);
   assert.match(result.stderr, /daemon.*stauts/);
 });
+
+test('legacy --daemon alias uses the same safe subcommand validation', () => {
+  const result = run('--daemon', 'stauts');
+  assert.equal(result.status, 1);
+  assert.match(result.stderr, /daemon.*stauts/);
+});
+
+test('legacy --key and canonical --manual-key remain accepted global options', () => {
+  for (const flag of ['--key', '--manual-key']) {
+    const result = run(flag, 'vbu_compat_test', '--help');
+    assert.equal(result.status, 0, result.stderr);
+    assert.match(result.stdout, /vibe-usage - Vibe Usage Tracker/);
+  }
+});
