@@ -1,4 +1,4 @@
-import { createReadStream, readdirSync, existsSync } from 'node:fs';
+import { createReadStream, readdirSync, existsSync, statSync } from 'node:fs';
 import { join } from 'node:path';
 import { homedir } from 'node:os';
 import { createInterface } from 'node:readline';
@@ -42,9 +42,15 @@ function findJsonlFiles(dir) {
   return results;
 }
 
-function readLines(filePath) {
+function readLines(filePath, snapshotSize) {
   return createInterface({
-    input: createReadStream(filePath, { encoding: 'utf-8' }),
+    input: createReadStream(filePath, {
+      encoding: 'utf-8',
+      // Rollouts are append-only while Codex is working. Bound both parser
+      // passes to the size captured before pass 1 so they see the same prefix
+      // even when the live file grows between reads.
+      ...(snapshotSize == null ? {} : { end: snapshotSize - 1 }),
+    }),
     crlfDelay: Infinity,
   });
 }
@@ -143,6 +149,34 @@ function longestReplayPrefix(child, parent) {
   return matched;
 }
 
+/**
+ * Return the longest prefix of `child` found contiguously anywhere in
+ * `parent`. A live sub-agent rollout can be observed while Codex is still
+ * copying the parent block, before that copy reaches the parent snapshot's
+ * end. In that state the exact records are inherited history even though the
+ * stricter completed-replay suffix match above deliberately rejects them.
+ */
+function longestPartialReplayPrefix(child, parent) {
+  if (child.length === 0 || parent.length === 0) return 0;
+
+  const prefix = new Array(child.length).fill(0);
+  for (let i = 1, matched = 0; i < child.length; i++) {
+    while (matched > 0 && child[i] !== child[matched]) matched = prefix[matched - 1];
+    if (child[i] === child[matched]) matched++;
+    prefix[i] = matched;
+  }
+
+  let matched = 0;
+  let longest = 0;
+  for (const fingerprint of parent) {
+    while (matched > 0 && fingerprint !== child[matched]) matched = prefix[matched - 1];
+    if (fingerprint === child[matched]) matched++;
+    longest = Math.max(longest, matched);
+    if (matched === child.length) matched = prefix[matched - 1];
+  }
+  return longest;
+}
+
 // `task_started.started_at` is stored at one-second precision while the
 // canonical session timestamp has milliseconds. Real Codex Desktop rollouts
 // start the child task within a few seconds of creating the child session.
@@ -160,7 +194,7 @@ const OWN_TASK_START_WINDOW_MS = 5_000;
  * full prefix. Together they bound matching to source records that existed at
  * spawn without over-skipping child work when the parent later grows.
  */
-async function indexSessionFile(filePath) {
+async function indexSessionFile(filePath, snapshotSize) {
   let sessionId = null;
   let forkedFromId = null;
   let parentThreadId = null;
@@ -178,7 +212,7 @@ async function indexSessionFile(filePath) {
   let firstTaskBoundary = null;
   let ownTaskBoundary = null;
 
-  for await (const line of readLines(filePath)) {
+  for await (const line of readLines(filePath, snapshotSize)) {
     if (!line.trim()) continue;
     try {
       const obj = JSON.parse(line);
@@ -261,12 +295,13 @@ function replayBoundary(meta, sessionById) {
   const parentAtSpawn = parent && meta.sessionStartedAtMs != null
     ? upperBound(parent.tokenTimes, meta.sessionStartedAtMs)
     : null;
-  const replayTokenCount = parentAtSpawn == null
-    ? 0
-    : longestReplayPrefix(
-      meta.tokenFingerprints,
-      parent.tokenFingerprints.slice(0, parentAtSpawn)
-    );
+  const parentSnapshot = parentAtSpawn == null
+    ? []
+    : parent.tokenFingerprints.slice(0, parentAtSpawn);
+  const replayTokenCount = longestReplayPrefix(meta.tokenFingerprints, parentSnapshot);
+  const partialReplayTokenCount = meta.isSubagent
+    ? longestPartialReplayPrefix(meta.tokenFingerprints, parentSnapshot)
+    : 0;
 
   if (meta.isSubagent) {
     // Direct evidence inside the child wins. Legacy single-meta rollouts did
@@ -292,11 +327,25 @@ function replayBoundary(meta, sessionById) {
         : null);
     if (direct) {
       return {
-        rawTokenCount: Math.max(replayTokenCount, direct.rawTokenCount),
+        rawTokenCount: Math.max(
+          replayTokenCount,
+          partialReplayTokenCount,
+          direct.rawTokenCount
+        ),
         recordIndex: direct.recordIndex,
       };
     }
-    return { rawTokenCount: replayTokenCount, recordIndex: null };
+
+    // A recognized sub-agent can be synced while Codex is only partway
+    // through appending the copied parent block. The completed-replay matcher
+    // correctly rejects that interior slice, but counting it would create a
+    // temporary spike that disappears on the next sync. Exact payload overlap
+    // with the known parent is sufficient evidence to defer those leading
+    // records until the rollout reaches a stable suffix or task boundary.
+    return {
+      rawTokenCount: Math.max(replayTokenCount, partialReplayTokenCount),
+      recordIndex: null,
+    };
   }
 
   if (meta.forkedFromId) {
@@ -311,7 +360,16 @@ export async function parse() {
 
   const entries = [];
   const sessionEvents = [];
-  const files = dirs.flatMap(findJsonlFiles);
+  const files = [];
+  for (const filePath of dirs.flatMap(findJsonlFiles)) {
+    try {
+      const snapshotSize = statSync(filePath).size;
+      if (snapshotSize > 0) files.push({ filePath, snapshotSize });
+    } catch {
+      // The file may move to archived_sessions between discovery and stat.
+      // Its archived copy will be picked up on the next sync.
+    }
+  }
   if (files.length === 0) return { buckets: [], sessions: [] };
 
   // Pass 1: build a compact per-file index. Keep the most complete physical
@@ -319,10 +377,10 @@ export async function parse() {
   // sessions/ and archived_sessions/ cannot double its token buckets.
   const sessionById = new Map();
   const fileMeta = new Map();
-  for (const filePath of files) {
+  for (const { filePath, snapshotSize } of files) {
     let meta;
     try {
-      meta = await indexSessionFile(filePath);
+      meta = await indexSessionFile(filePath, snapshotSize);
     } catch {
       continue;
     }
@@ -336,7 +394,7 @@ export async function parse() {
   }
 
   // Pass 2: parse usage while skipping the replay prefix resolved above.
-  for (const filePath of files) {
+  for (const { filePath, snapshotSize } of files) {
     const fm = fileMeta.get(filePath);
     if (!fm) continue;
     if (fm.sessionId && sessionById.get(fm.sessionId)?.filePath !== filePath) continue;
@@ -357,7 +415,7 @@ export async function parse() {
     let turnContextModel = 'unknown';
     let prevTotal = null;
     let prevCumulativeTotal = null;
-    for await (const line of readLines(filePath)) {
+    for await (const line of readLines(filePath, snapshotSize)) {
       if (!line.trim()) continue;
       try {
         const obj = JSON.parse(line);
@@ -482,6 +540,13 @@ export async function parse() {
       } catch {
         continue;
       }
+    }
+
+    // The byte bound makes append-only growth invisible to both passes. If a
+    // rollout was instead truncated or replaced in place, fail the Codex
+    // parser rather than upload totals produced from two different snapshots.
+    if (parsedRecordIndex !== fm.parsedRecordCount || rawTokenSeen !== fm.rawTokenCount) {
+      throw new Error('Codex rollout changed while syncing; retry on the next sync');
     }
   }
 

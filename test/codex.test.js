@@ -1,6 +1,6 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from 'node:fs';
+import { appendFileSync, mkdirSync, mkdtempSync, rmSync, writeFileSync } from 'node:fs';
 import { join } from 'node:path';
 import { tmpdir } from 'node:os';
 import { parse } from '../src/parsers/codex.js';
@@ -271,6 +271,155 @@ test('last-N-turn sub-agent finds a delayed own task after the matched replay su
   assert.equal(child.messageCount, 3);
 });
 
+test('in-progress sub-agent replay does not count a partial parent snapshot', async () => {
+  const t = '2026-07-10T08:00:00.000Z';
+  const spawn = '2026-07-10T08:30:00.000Z';
+  const parentRecords = [
+    sessionMeta(t, 'parent-1'),
+    tokenCount('2026-07-10T08:05:00.000Z', usage(10, 0, 1, 0), 11),
+    tokenCount('2026-07-10T08:10:00.000Z', usage(20, 0, 2, 0), 33),
+    tokenCount('2026-07-10T08:15:00.000Z', usage(30, 0, 3, 0), 66),
+  ];
+  const childMeta = sessionMeta(spawn, 'child-1', {
+    parent_thread_id: 'parent-1',
+    thread_source: 'subagent',
+  });
+
+  // Codex writes the copied parent block before the child's own task. A sync
+  // can catch that append halfway through, when the child prefix is an exact
+  // interior slice of the parent but has not reached the parent snapshot end.
+  const partial = await parseFixture({
+    'rollout-parent.jsonl': parentRecords,
+    'rollout-child.jsonl': [childMeta, parentRecords[1], parentRecords[2]],
+  });
+
+  const complete = await parseFixture({
+    'rollout-parent.jsonl': parentRecords,
+    'rollout-child.jsonl': [
+      childMeta,
+      ...parentRecords.slice(1),
+      taskStarted('2026-07-10T08:30:01.000Z', epochSeconds('2026-07-10T08:30:01.000Z')),
+      tokenCount('2026-07-10T08:30:05.000Z', usage(5, 0, 5, 0), 76),
+    ],
+  });
+
+  assert.deepEqual(sumBuckets(partial.buckets), { input: 60, output: 6, cached: 0, reasoning: 0 });
+  assert.deepEqual(sumBuckets(complete.buckets), { input: 65, output: 11, cached: 0, reasoning: 0 });
+});
+
+test('copied task boundaries inside a partial sub-agent replay stay inherited', async () => {
+  const t = '2026-07-10T08:00:00.000Z';
+  const secondTurn = '2026-07-10T08:10:00.000Z';
+  const spawn = '2026-07-10T08:30:00.000Z';
+  const firstToken = tokenCount('2026-07-10T08:05:00.000Z', usage(10, 0, 1, 0), 11);
+  const secondToken = tokenCount('2026-07-10T08:15:00.000Z', usage(20, 0, 2, 0), 33);
+  const finalToken = tokenCount('2026-07-10T08:20:00.000Z', usage(30, 0, 3, 0), 66);
+  const { buckets } = await parseFixture({
+    'rollout-parent.jsonl': [
+      sessionMeta(t, 'parent-1'),
+      taskStarted(t, epochSeconds(t)),
+      firstToken,
+      taskStarted(secondTurn, epochSeconds(secondTurn)),
+      secondToken,
+      finalToken,
+    ],
+    'rollout-child.jsonl': [
+      sessionMeta(spawn, 'child-1', {
+        parent_thread_id: 'parent-1',
+        thread_source: 'subagent',
+      }),
+      // Single-meta Last-N rollouts can copy parent task markers too. The
+      // legacy first-task fallback must not expose the copied tokens that
+      // follow this parent boundary while the replay is still incomplete.
+      taskStarted(spawn, epochSeconds(t)),
+      firstToken,
+      taskStarted(spawn, epochSeconds(secondTurn)),
+      secondToken,
+    ],
+  });
+
+  assert.deepEqual(sumBuckets(buckets), { input: 60, output: 6, cached: 0, reasoning: 0 });
+});
+
+test('live rollout appends are deferred to the next stable parser snapshot', async () => {
+  const root = mkdtempSync(join(tmpdir(), 'vibe-usage-codex-live-test-'));
+  const dir = join(root, 'sessions', '2026', '07', '10');
+  mkdirSync(dir, { recursive: true });
+
+  const t = '2026-07-10T08:00:00.000Z';
+  const spawn = '2026-07-10T08:30:00.000Z';
+  const parentTokens = [
+    tokenCount('2026-07-10T08:05:00.000Z', usage(10, 0, 1, 0), 11),
+    tokenCount('2026-07-10T08:10:00.000Z', usage(20, 0, 2, 0), 33),
+    tokenCount('2026-07-10T08:15:00.000Z', usage(30, 0, 3, 0), 66),
+  ];
+  const parentPath = join(dir, 'rollout-parent.jsonl');
+  const childPath = join(dir, 'rollout-child.jsonl');
+  writeFileSync(
+    parentPath,
+    [sessionMeta(t, 'parent-1'), ...parentTokens].map(JSON.stringify).join('\n') + '\n'
+  );
+  writeFileSync(
+    childPath,
+    [
+      sessionMeta(spawn, 'child-1', {
+        parent_thread_id: 'parent-1',
+        thread_source: 'subagent',
+      }),
+      parentTokens[0],
+      parentTokens[1],
+    ].map(JSON.stringify).join('\n') + '\n'
+  );
+
+  const prevHome = process.env.CODEX_HOME;
+  process.env.CODEX_HOME = root;
+  try {
+    // parse() captures every rollout's byte size before its first asynchronous
+    // read. Appending immediately afterward must not leak new records into its
+    // second pass; they belong to the next sync's snapshot.
+    const firstParse = parse();
+    appendFileSync(
+      childPath,
+      [
+        parentTokens[2],
+        taskStarted('2026-07-10T08:30:01.000Z', epochSeconds('2026-07-10T08:30:01.000Z')),
+        tokenCount('2026-07-10T08:30:05.000Z', usage(5, 0, 5, 0), 76),
+      ].map(JSON.stringify).join('\n') + '\n'
+    );
+
+    const partial = await firstParse;
+    const complete = await parse();
+    assert.deepEqual(sumBuckets(partial.buckets), { input: 60, output: 6, cached: 0, reasoning: 0 });
+    assert.deepEqual(sumBuckets(complete.buckets), { input: 65, output: 11, cached: 0, reasoning: 0 });
+  } finally {
+    if (prevHome === undefined) delete process.env.CODEX_HOME;
+    else process.env.CODEX_HOME = prevHome;
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test('unmatched sub-agent usage without a task boundary is still counted', async () => {
+  const t = '2026-07-10T08:00:00.000Z';
+  const spawn = '2026-07-10T08:30:00.000Z';
+  const { buckets } = await parseFixture({
+    'rollout-parent.jsonl': [
+      sessionMeta(t, 'parent-1'),
+      tokenCount(t, usage(10, 0, 1, 0), 11),
+    ],
+    'rollout-child.jsonl': [
+      sessionMeta(spawn, 'child-1', {
+        parent_thread_id: 'parent-1',
+        thread_source: 'subagent',
+      }),
+      tokenCount(spawn, usage(7, 0, 4, 0), 22),
+    ],
+  });
+
+  // Partial-replay protection is exact: unrelated child payloads retain the
+  // existing fail-open behavior even without a task_started marker.
+  assert.deepEqual(sumBuckets(buckets), { input: 17, output: 5, cached: 0, reasoning: 0 });
+});
+
 test('unmatched fork payloads are counted instead of over-skipping by parent length', async () => {
   const t = '2026-07-10T08:00:00.000Z';
   const tf = '2026-07-10T08:30:00.000Z';
@@ -406,7 +555,7 @@ test('repeated same-id session metadata remains part of the logical session', as
   assert.equal(sessions[0].userMessageCount, 2);
 });
 
-test('sub-agent rollout without a task_started boundary is counted in full', async () => {
+test('sub-agent rollout without a task boundary or parent evidence is counted in full', async () => {
   const t = '2026-07-10T08:00:00.000Z';
   const { buckets } = await parseFixture({
     'rollout-sub.jsonl': [
