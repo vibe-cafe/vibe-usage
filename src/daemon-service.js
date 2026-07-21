@@ -43,7 +43,23 @@ function getServicePaths(plat) {
   return null;
 }
 
-function generateSystemdUnit(nodePath, binPath) {
+function escapeSystemdEnvironment(value) {
+  return value.replace(/\\/g, '\\\\').replace(/"/g, '\\"');
+}
+
+function escapeXml(value) {
+  return value
+    .replace(/&/g, '&amp;')
+    .replace(/</g, '&lt;')
+    .replace(/>/g, '&gt;')
+    .replace(/"/g, '&quot;')
+    .replace(/'/g, '&apos;');
+}
+
+export function generateSystemdUnit(nodePath, binPath, claudeConfigDir = process.env.CLAUDE_CONFIG_DIR?.trim()) {
+  const claudeEnvironment = claudeConfigDir
+    ? `Environment="CLAUDE_CONFIG_DIR=${escapeSystemdEnvironment(claudeConfigDir)}"\n`
+    : '';
   return `[Unit]
 Description=VibeCafe Usage Tracker
 After=network.target
@@ -54,15 +70,18 @@ ExecStart=${nodePath} ${binPath} daemon
 Restart=on-failure
 RestartSec=10
 Environment=NODE_ENV=production
-WorkingDirectory=${homedir()}
+${claudeEnvironment}WorkingDirectory=${homedir()}
 
 [Install]
 WantedBy=default.target
 `;
 }
 
-function generateLaunchdPlist(nodePath, binPath) {
+export function generateLaunchdPlist(nodePath, binPath, claudeConfigDir = process.env.CLAUDE_CONFIG_DIR?.trim()) {
   const logDir = join(homedir(), '.vibe-usage');
+  const claudeEnvironment = claudeConfigDir
+    ? `        <key>CLAUDE_CONFIG_DIR</key>\n        <string>${escapeXml(claudeConfigDir)}</string>\n`
+    : '';
   return `<?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
 <plist version="1.0">
@@ -89,7 +108,7 @@ function generateLaunchdPlist(nodePath, binPath) {
     <dict>
         <key>NODE_ENV</key>
         <string>production</string>
-    </dict>
+${claudeEnvironment}    </dict>
 </dict>
 </plist>
 `;

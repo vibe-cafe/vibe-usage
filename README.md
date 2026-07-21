@@ -50,7 +50,7 @@ npx @vibe-cafe/vibe-usage status       # Show config & detected tools
 
 | Tool | Data Location |
 |------|---------------|
-| Claude Code | `~/.claude/projects/` (tokens + sessions), `~/.claude/transcripts/` (sessions only); also scans `$CLAUDE_CONFIG_DIR` when set (deduped), so relocated configs and GUI/CLI env mismatches are both covered |
+| Claude Code | `~/.claude/projects/` (tokens + sessions), `~/.claude/transcripts/` (sessions only); also scans `$CLAUDE_CONFIG_DIR` and data-bearing `~/.claude-*` profiles, selects the most complete duplicate session, and streams logs so large active sessions are not silently omitted. Cache creation tokens are included in input usage. |
 | Codex CLI | `$CODEX_HOME/sessions/` and `$CODEX_HOME/archived_sessions/` (default `~/.codex`); a versioned local index avoids re-reading unchanged rollouts and reads only safe append tails for ordinary sessions, while fork/sub-agent replay matching, duplicate suppression, and live/archive deduplication retain their existing semantics |
 | Grok | `$GROK_HOME/sessions/<encoded-cwd>/<session-id>/` (default `~/.grok`); token usage from `updates.jsonl` `turn_completed.usage` (per-model `modelUsage`, cache reads, reasoning); project from `summary.json` cwd; honors `GROK_HOME` |
 | GitHub Copilot CLI | `~/.copilot/session-state/*/events.jsonl` |

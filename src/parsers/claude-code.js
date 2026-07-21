@@ -1,243 +1,305 @@
-import { readdirSync, readFileSync, existsSync, realpathSync } from 'node:fs';
+import { createReadStream, readdirSync, statSync } from 'node:fs';
+import { createInterface } from 'node:readline';
 import { join, basename, sep } from 'node:path';
-import { homedir } from 'node:os';
 import { aggregateToBuckets, extractSessions } from './index.js';
+import { getClaudeRoots } from '../claude-roots.js';
 
-/**
- * Stateless Claude Code parser.
- * Reads ALL *.jsonl files under <root>/projects/ and extracts per-message
- * token usage from assistant messages. No state file needed — every sync
- * computes the full bucket totals from raw data, making server-side
- * ON CONFLICT ... DO UPDATE SET idempotent.
- *
- * Roots: always ~/.claude, plus $CLAUDE_CONFIG_DIR when set to a different
- * path. Claude Code itself relocates its whole tree (incl. projects/) to
- * $CLAUDE_CONFIG_DIR and uses only that dir — but a GUI launched from the
- * Dock may not inherit the shell's env, so usage can be split across both
- * roots. We scan both and dedup so neither source is missed or double-counted.
- */
+const MAX_WARNINGS = 20;
 
-/**
- * Resolve the set of Claude config roots to scan.
- * Always includes ~/.claude; adds $CLAUDE_CONFIG_DIR when set and it resolves
- * to a different real path. Deduped by canonical path.
- */
-function getClaudeRoots() {
-  const roots = [join(homedir(), '.claude')];
-
-  const cfg = process.env.CLAUDE_CONFIG_DIR?.trim();
-  if (cfg) {
-    let custom = cfg;
-    if (custom.startsWith('~')) custom = join(homedir(), custom.slice(1));
-    custom = custom.replace(/[/\\]+$/, '') || custom;
-    roots.push(custom);
-  }
-
-  // Dedup by canonical path (realpath when the dir exists, else the raw string).
-  const seen = new Set();
-  const unique = [];
-  for (const r of roots) {
-    let key = r;
-    try {
-      key = realpathSync(r);
-    } catch {
-      // dir may not exist yet — fall back to the literal path
-    }
-    if (seen.has(key)) continue;
-    seen.add(key);
-    unique.push(r);
-  }
-  return unique;
+function addWarning(ctx, message) {
+  ctx.incomplete = true;
+  if (ctx.warnings.length < MAX_WARNINGS) ctx.warnings.push(message);
 }
 
-/**
- * Recursively find all .jsonl files under a directory.
- * Claude Code stores sessions in two layouts:
- *   2-layer: projects/{projectPath}/{sessionId}.jsonl
- *   3-layer: projects/{projectPath}/{sessionId}/subagents/agent-*.jsonl
- */
-function findJsonlFiles(dir) {
-  const results = [];
-  if (!existsSync(dir)) return results;
+/** Recursively collect JSONL files without making one unreadable branch fatal. */
+function findJsonlFiles(dir, ctx) {
+  let entries;
   try {
-    for (const entry of readdirSync(dir, { withFileTypes: true })) {
-      const fullPath = join(dir, entry.name);
-      if (entry.isDirectory()) {
-        results.push(...findJsonlFiles(fullPath));
-      } else if (entry.name.endsWith('.jsonl')) {
-        results.push(fullPath);
-      }
+    entries = readdirSync(dir, { withFileTypes: true });
+  } catch (err) {
+    if (err?.code !== 'ENOENT') {
+      addWarning(ctx, `Claude Code: cannot read directory ${dir}: ${err.message}`);
     }
-  } catch {
-    // ignore unreadable directories
+    return [];
+  }
+
+  const results = [];
+  for (const entry of entries) {
+    const fullPath = join(dir, entry.name);
+    if (entry.isDirectory()) {
+      results.push(...findJsonlFiles(fullPath, ctx));
+    } else if (entry.name.endsWith('.jsonl')) {
+      results.push(fullPath);
+    }
   }
   return results;
 }
 
-/**
- * Path of a project file relative to its root's projects/ dir, e.g.
- * "<root>/projects/-Users-foo-app/abc.jsonl" → "-Users-foo-app/abc.jsonl".
- * Used both for project-name extraction and cross-root dedup.
- */
 function projectRelativePath(filePath, projectsDir) {
   const prefix = projectsDir + sep;
   return filePath.startsWith(prefix) ? filePath.slice(prefix.length) : null;
 }
 
-/**
- * Extract project name from a projects-relative path.
- * The first segment is the dash-encoded project path (e.g. -Users-foo-myproject);
- * we take its last component as the project name.
- */
-function extractProject(relative) {
+/** Best-effort fallback for old records without cwd. */
+function projectFromRelative(relative) {
   if (!relative) return 'unknown';
-  const firstSeg = relative.split(sep)[0];
-  if (!firstSeg) return 'unknown';
-  const parts = firstSeg.split('-').filter(Boolean);
-  return parts.length > 0 ? parts[parts.length - 1] : 'unknown';
+  const firstSegment = relative.split(sep)[0];
+  if (!firstSegment) return 'unknown';
+  const parts = firstSegment.split('-').filter(Boolean);
+  return parts.at(-1) || 'unknown';
 }
 
-function extractSessionId(filePath) {
-  return basename(filePath, '.jsonl');
+/** Works for Unix and Windows cwd values regardless of the current OS. */
+function projectFromCwd(cwd, fallback) {
+  if (typeof cwd !== 'string') return fallback;
+  const trimmed = cwd.trim().replace(/[\\/]+$/, '');
+  if (!trimmed) return fallback;
+  return trimmed.split(/[\\/]/).filter(Boolean).at(-1) || fallback;
+}
+
+function toCount(value) {
+  const n = Number(value);
+  return Number.isFinite(n) && n > 0 ? n : 0;
+}
+
+function cacheCreationTokens(usage) {
+  const direct = toCount(usage.cache_creation_input_tokens);
+  const breakdown = usage.cache_creation || {};
+  const split =
+    toCount(breakdown.ephemeral_5m_input_tokens) +
+    toCount(breakdown.ephemeral_1h_input_tokens);
+  // Current Claude logs carry both the total and its TTL breakdown. max()
+  // avoids double-counting while remaining tolerant of partially populated logs.
+  return Math.max(direct, split);
+}
+
+function candidateIsBetter(next, current) {
+  if (!current) return true;
+  if (next.size !== current.size) return next.size > current.size;
+  if (next.mtimeMs !== current.mtimeMs) return next.mtimeMs > current.mtimeMs;
+  return next.filePath.localeCompare(current.filePath) < 0;
 }
 
 /**
- * Scan one root's projects/ dir → token entries + session events (mutates ctx).
+ * Group physical files by logical session id and keep candidates ordered by
+ * completeness. A session copied between ~/.claude and CLAUDE_CONFIG_DIR must
+ * use its largest/newest copy, not whichever root happened to be scanned first.
  */
-function scanProjectsRoot(root, ctx) {
-  const projectsDir = join(root, 'projects');
-
-  for (const filePath of findJsonlFiles(projectsDir)) {
-    const relative = projectRelativePath(filePath, projectsDir);
-    // Same session present under two roots (e.g. data copied between them):
-    // process it once so session message counts aren't inflated.
-    if (relative !== null) {
-      if (ctx.seenProjectFiles.has(relative)) continue;
-      ctx.seenProjectFiles.add(relative);
-    }
-
-    let content;
-    try {
-      content = readFileSync(filePath, 'utf-8');
-    } catch {
-      continue;
-    }
-
-    const project = extractProject(relative);
-    const sessionId = extractSessionId(filePath);
-    ctx.seenSessionIds.add(sessionId);
-
-    for (const line of content.split('\n')) {
-      if (!line.trim()) continue;
+function collectCandidates(roots, directoryName, ctx) {
+  const groups = new Map();
+  for (const root of roots) {
+    const baseDir = join(root, directoryName);
+    for (const filePath of findJsonlFiles(baseDir, ctx)) {
+      let stat;
       try {
-        const obj = JSON.parse(line);
-
-        const timestamp = obj.timestamp;
-        if (!timestamp) continue;
-        const ts = new Date(timestamp);
-        if (isNaN(ts.getTime())) continue;
-
-        if (obj.type === 'user' || obj.type === 'assistant' || obj.type === 'tool_use' || obj.type === 'tool_result') {
-          ctx.sessionEvents.push({
-            sessionId,
-            source: 'claude-code',
-            project,
-            timestamp: ts,
-            role: obj.type === 'user' ? 'user' : 'assistant',
-          });
-        }
-
-        if (obj.type !== 'assistant') continue;
-        const msg = obj.message;
-        if (!msg || !msg.usage) continue;
-
-        const usage = msg.usage;
-        if (usage.input_tokens == null && usage.output_tokens == null) continue;
-
-        const uuid = obj.uuid;
-        if (uuid) {
-          if (ctx.seenUuids.has(uuid)) continue;
-          ctx.seenUuids.add(uuid);
-        }
-
-        ctx.entries.push({
-          source: 'claude-code',
-          model: msg.model || 'unknown',
-          project,
-          timestamp: ts,
-          inputTokens: usage.input_tokens || 0,
-          outputTokens: usage.output_tokens || 0,
-          cachedInputTokens: usage.cache_read_input_tokens || 0,
-          reasoningOutputTokens: 0,
-        });
-      } catch {
+        stat = statSync(filePath);
+      } catch (err) {
+        addWarning(ctx, `Claude Code: cannot stat ${filePath}: ${err.message}`);
         continue;
       }
+      const sessionId = basename(filePath, '.jsonl');
+      const relative = projectRelativePath(filePath, baseDir);
+      const candidate = {
+        filePath,
+        sessionId,
+        size: stat.size,
+        mtimeMs: stat.mtimeMs,
+        fallbackProject: directoryName === 'projects'
+          ? projectFromRelative(relative)
+          : 'unknown',
+      };
+      const group = groups.get(sessionId) || [];
+      group.push(candidate);
+      groups.set(sessionId, group);
     }
+  }
+  for (const group of groups.values()) {
+    group.sort((a, b) => candidateIsBetter(a, b) ? -1 : candidateIsBetter(b, a) ? 1 : 0);
+  }
+  return groups;
+}
+
+/** Read only the file size captured during discovery, so live appends wait. */
+async function readJsonl(candidate, onObject) {
+  if (candidate.size === 0) return;
+  const stream = createReadStream(candidate.filePath, {
+    encoding: 'utf8',
+    start: 0,
+    end: candidate.size - 1,
+  });
+  let streamError = null;
+  stream.on('error', (err) => { streamError = err; });
+  const lines = createInterface({ input: stream, crlfDelay: Infinity });
+
+  try {
+    for await (const line of lines) {
+      if (!line.trim()) continue;
+      try {
+        onObject(JSON.parse(line));
+      } catch {
+        // Claude may be appending the final JSONL record while we snapshot it.
+        // A later sync will see the complete line; malformed historical lines
+        // are isolated instead of taking the whole parser down.
+      }
+    }
+    if (streamError) throw streamError;
+  } finally {
+    lines.close();
+    stream.destroy();
   }
 }
 
-/**
- * Scan one root's transcripts/ dir → session events only (no token data).
- * Skips sessions already covered by a projects/ or transcripts/ scan.
- */
-function scanTranscriptsRoot(root, ctx) {
-  for (const filePath of findJsonlFiles(join(root, 'transcripts'))) {
-    const sessionId = extractSessionId(filePath);
-    if (ctx.seenSessionIds.has(sessionId)) continue;
-    ctx.seenSessionIds.add(sessionId);
+function timingEvent(obj, sessionId, project) {
+  if (
+    obj.type !== 'user' &&
+    obj.type !== 'assistant' &&
+    obj.type !== 'tool_use' &&
+    obj.type !== 'tool_result'
+  ) return null;
+  if (!obj.timestamp) return null;
+  const timestamp = new Date(obj.timestamp);
+  if (Number.isNaN(timestamp.getTime())) return null;
+  return {
+    sessionId,
+    source: 'claude-code',
+    project,
+    timestamp,
+    role: obj.type === 'user' ? 'user' : 'assistant',
+  };
+}
 
-    let content;
+async function scanProjectCandidate(candidate) {
+  const entries = [];
+  const events = [];
+  let lastModel = null;
+  let sessionProject = candidate.fallbackProject;
+  let foundSessionCwd = false;
+
+  await readJsonl(candidate, (obj) => {
+    // cwd can change after Claude runs `cd`; project attribution should remain
+    // the directory where this session started, not fragment into subfolders.
+    if (!foundSessionCwd && typeof obj.cwd === 'string' && obj.cwd.trim()) {
+      sessionProject = projectFromCwd(obj.cwd, candidate.fallbackProject);
+      foundSessionCwd = true;
+    }
+    const event = timingEvent(obj, candidate.sessionId, sessionProject);
+    if (event) events.push(event);
+
+    if (obj.type !== 'assistant' || !obj.message?.usage || !obj.timestamp) return;
+    const timestamp = new Date(obj.timestamp);
+    if (Number.isNaN(timestamp.getTime())) return;
+
+    const usage = obj.message.usage;
+    const rawModel = typeof obj.message.model === 'string'
+      ? obj.message.model.trim()
+      : '';
+    if (rawModel && rawModel !== '<synthetic>') lastModel = rawModel;
+    const model = rawModel && rawModel !== '<synthetic>'
+      ? rawModel
+      : lastModel || 'claude-unknown';
+    const inputTokens = toCount(usage.input_tokens) + cacheCreationTokens(usage);
+    const outputTokens = toCount(usage.output_tokens);
+    const cachedInputTokens = toCount(usage.cache_read_input_tokens);
+    const usageScore = inputTokens + outputTokens + cachedInputTokens;
+
+    // Synthetic bookkeeping messages are common and carry zero usage. Do not
+    // inflate the CLI's bucket count with rows the server will discard anyway.
+    if (usageScore === 0) return;
+
+    entries.push({
+      uuid: typeof obj.uuid === 'string' && obj.uuid ? obj.uuid : null,
+      usageScore,
+      source: 'claude-code',
+      model,
+      project: sessionProject,
+      timestamp,
+      inputTokens,
+      outputTokens,
+      cachedInputTokens,
+      reasoningOutputTokens: 0,
+    });
+  });
+
+  // A cwd can appear after initial metadata/messages. Normalize the completed
+  // session in one place so early records receive the same project label.
+  for (const entry of entries) entry.project = sessionProject;
+  for (const event of events) event.project = sessionProject;
+  return { entries, events };
+}
+
+async function scanTranscriptCandidate(candidate) {
+  const events = [];
+  await readJsonl(candidate, (obj) => {
+    const event = timingEvent(
+      obj,
+      candidate.sessionId,
+      projectFromCwd(obj.cwd, 'unknown'),
+    );
+    if (event) events.push(event);
+  });
+  return { entries: [], events };
+}
+
+async function scanBestCandidate(candidates, scanner, ctx) {
+  for (const candidate of candidates) {
     try {
-      content = readFileSync(filePath, 'utf-8');
-    } catch {
-      continue;
+      return await scanner(candidate);
+    } catch (err) {
+      addWarning(ctx, `Claude Code: cannot read ${candidate.filePath}: ${err.message}`);
     }
+  }
+  return null;
+}
 
-    for (const line of content.split('\n')) {
-      if (!line.trim()) continue;
-      try {
-        const obj = JSON.parse(line);
-
-        const timestamp = obj.timestamp;
-        if (!timestamp) continue;
-        const ts = new Date(timestamp);
-        if (isNaN(ts.getTime())) continue;
-
-        if (obj.type === 'user' || obj.type === 'assistant' || obj.type === 'tool_use' || obj.type === 'tool_result') {
-          ctx.sessionEvents.push({
-            sessionId,
-            source: 'claude-code',
-            project: 'unknown',
-            timestamp: ts,
-            role: obj.type === 'user' ? 'user' : 'assistant',
-          });
-        }
-      } catch {
-        continue;
-      }
-    }
+function mergeUsageEntry(ctx, entry) {
+  if (!entry.uuid) {
+    ctx.anonymousEntries.push(entry);
+    return;
+  }
+  const current = ctx.entriesByUuid.get(entry.uuid);
+  // Claude sometimes copies the same UUID into another session with zeroed
+  // usage. Keep the most complete payload, independent of directory order.
+  if (!current || entry.usageScore > current.usageScore) {
+    ctx.entriesByUuid.set(entry.uuid, entry);
   }
 }
 
 export async function parse() {
   const ctx = {
-    entries: [],
+    entriesByUuid: new Map(),
+    anonymousEntries: [],
     sessionEvents: [],
-    seenUuids: new Set(),
-    seenSessionIds: new Set(),
-    seenProjectFiles: new Set(), // projects-relative path → dedup same session across roots
+    warnings: [],
+    incomplete: false,
   };
-
   const roots = getClaudeRoots();
+  const projectGroups = collectCandidates(roots, 'projects', ctx);
+  const projectSessionIds = new Set();
 
-  // projects/ yields BOTH token buckets and session events.
-  for (const root of roots) scanProjectsRoot(root, ctx);
-  // transcripts/ yields session events only, for sessions not already covered.
-  for (const root of roots) scanTranscriptsRoot(root, ctx);
+  for (const [sessionId, candidates] of projectGroups) {
+    const parsed = await scanBestCandidate(candidates, scanProjectCandidate, ctx);
+    if (!parsed) continue;
+    projectSessionIds.add(sessionId);
+    ctx.sessionEvents.push(...parsed.events);
+    for (const entry of parsed.entries) mergeUsageEntry(ctx, entry);
+  }
+
+  const transcriptGroups = collectCandidates(roots, 'transcripts', ctx);
+  for (const [sessionId, candidates] of transcriptGroups) {
+    if (projectSessionIds.has(sessionId)) continue;
+    const parsed = await scanBestCandidate(candidates, scanTranscriptCandidate, ctx);
+    if (parsed) ctx.sessionEvents.push(...parsed.events);
+  }
+
+  const entries = [
+    ...ctx.anonymousEntries,
+    ...ctx.entriesByUuid.values(),
+  ].map(({ uuid: _uuid, usageScore: _usageScore, ...entry }) => entry);
 
   return {
-    buckets: aggregateToBuckets(ctx.entries),
+    buckets: aggregateToBuckets(entries),
     sessions: extractSessions(ctx.sessionEvents),
+    ...(ctx.incomplete ? { skipped: true } : {}),
+    ...(ctx.warnings.length > 0 ? { warnings: ctx.warnings } : {}),
   };
 }

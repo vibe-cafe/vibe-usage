@@ -51,6 +51,11 @@ export async function runSync({ throws = false, quiet = false } = {}) {
       if (result?.indexing) {
         parserProgress.push({ source, ...result.indexing });
       }
+      if (Array.isArray(result?.warnings)) {
+        for (const message of result.warnings) {
+          process.stderr.write(`${dim(`  ${message}`)}\n`);
+        }
+      }
       // A parser may deliberately suppress a transient error (Cursor network
       // timeout) to keep daemon logs quiet. Its empty result is not proof that
       // its prior data disappeared, so it must not be pruned this run.
@@ -185,6 +190,8 @@ export async function runSync({ throws = false, quiet = false } = {}) {
   let totalIngested = 0;
   let totalSessionsSynced = 0;
   let totalDroppedBuckets = 0;
+  let totalDroppedUnknownModels = 0;
+  let totalDroppedImplausible = 0;
   const droppedSources = new Set();
   const bucketBatches = Math.ceil(allBucketsToSend.length / BATCH_SIZE);
   const sessionBatches = Math.ceil(allSessionsToSend.length / SESSION_BATCH_SIZE);
@@ -205,8 +212,11 @@ export async function runSync({ throws = false, quiet = false } = {}) {
       }, batchSessions.length > 0 ? batchSessions : undefined);
       totalIngested += result.ingested ?? batch.length;
       totalSessionsSynced += result.sessions ?? 0;
+      const batchUnknownSources = new Set(result.dropped?.unknownSources || []);
       if (result.dropped) {
         totalDroppedBuckets += Number(result.dropped.buckets) || 0;
+        totalDroppedUnknownModels += Number(result.dropped.unknownModels) || 0;
+        totalDroppedImplausible += Number(result.dropped.implausible) || 0;
         for (const s of result.dropped.unknownSources || []) droppedSources.add(s);
       }
 
@@ -215,6 +225,10 @@ export async function runSync({ throws = false, quiet = false } = {}) {
       // state, so the next sync re-sends exactly those items — no data loss,
       // no silent gaps.
       for (const b of batch) {
+        // A source unknown to an older backend may become valid after deploy.
+        // Leave those hashes uncommitted so the next sync retries them instead
+        // of turning a temporary release-order mismatch into permanent loss.
+        if (batchUnknownSources.has(b.source)) continue;
         const key = bucketKey(b);
         const entry = pendingBucketState.get(key);
         if (entry) state.buckets[key] = entry;
@@ -235,11 +249,14 @@ export async function runSync({ throws = false, quiet = false } = {}) {
     console.log(success(`已同步 ${syncParts.join(' · ')}`));
 
     if (totalDroppedBuckets > 0) {
-      // Server doesn't (yet) recognize these source IDs — usually means the
-      // CLI is newer than the deployed vibe-cafe. Surface so the user knows
-      // the data wasn't lost on their end, just not stored upstream.
-      const sourcesList = Array.from(droppedSources).sort().join(', ');
-      console.log(dim(`  ${totalDroppedBuckets} buckets dropped (服务端未收录的 source: ${sourcesList})`));
+      const reasons = [];
+      if (droppedSources.size > 0) {
+        reasons.push(`服务端未收录的 source: ${Array.from(droppedSources).sort().join(', ')}`);
+      }
+      if (totalDroppedUnknownModels > 0) reasons.push(`模型未知: ${totalDroppedUnknownModels}`);
+      if (totalDroppedImplausible > 0) reasons.push(`超出合理范围: ${totalDroppedImplausible}`);
+      if (reasons.length === 0) reasons.push('服务端拒绝');
+      console.log(dim(`  ${totalDroppedBuckets} buckets dropped (${reasons.join('；')})`));
     }
 
     if (!quiet && totalSessionsSynced > 0) {
