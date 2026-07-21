@@ -34,6 +34,7 @@ export async function runSync({ throws = false, quiet = false } = {}) {
   const allBuckets = [];
   const allSessions = [];
   const parserResults = [];
+  const parserProgress = [];
   // Sources whose parser ran to completion this sync. pruneState() below is
   // scoped to these so a transient parser failure doesn't evict that tool's
   // state and force a full re-upload next run.
@@ -46,6 +47,9 @@ export async function runSync({ throws = false, quiet = false } = {}) {
       const sessions = Array.isArray(result) ? [] : (result.sessions || []);
       if (!Array.isArray(buckets) || !Array.isArray(sessions)) {
         throw new TypeError('Parser returned an invalid result');
+      }
+      if (result?.indexing) {
+        parserProgress.push({ source, ...result.indexing });
       }
       // A parser may deliberately suppress a transient error (Cursor network
       // timeout) to keep daemon logs quiet. Its empty result is not proof that
@@ -71,7 +75,13 @@ export async function runSync({ throws = false, quiet = false } = {}) {
     pruneState(state, new Set(), new Set(), okSources);
     const pruned = before - (Object.keys(state.buckets).length + Object.keys(state.sessions).length);
     if (pruned > 0) saveState(state);
-    if (!quiet) console.log(dim('暂无新数据。'));
+    if (!quiet && parserProgress.length > 0) {
+      for (const p of parserProgress) {
+        console.log(dim(`  ${p.source}: 正在建立本地索引 ${p.completed}/${p.total}（下次同步继续）`));
+      }
+    } else if (!quiet) {
+      console.log(dim('暂无新数据。'));
+    }
     return 0;
   }
 
@@ -81,6 +91,11 @@ export async function runSync({ throws = false, quiet = false } = {}) {
       if (p.buckets > 0) parts.push(`${p.buckets} buckets`);
       if (p.sessions > 0) parts.push(`${p.sessions} sessions`);
       console.log(`  ${dim(p.source.padEnd(14))}${parts.join(' · ')}`);
+    }
+  }
+  if (!quiet && parserProgress.length > 0) {
+    for (const p of parserProgress) {
+      console.log(dim(`  ${p.source}: 正在建立本地索引 ${p.completed}/${p.total}（下次同步继续）`));
     }
   }
 
@@ -112,10 +127,11 @@ export async function runSync({ throws = false, quiet = false } = {}) {
     for (const s of allSessions) s.project = 'unknown';
   }
 
-  // Incremental diff: parsers above always read the full local history (cheap,
-  // local-only). Here we drop anything whose content matches what we already
-  // uploaded, so only new/changed items go over the network. A quiet machine
-  // sends zero bytes; an active one sends just the current 30-min bucket.
+  // Incremental upload diff: parsers above emit a complete view of live local
+  // data (Codex may assemble that view from its disposable parser cache). Here
+  // we drop anything whose content matches what we already uploaded, so only
+  // new/changed items go over the network. A quiet machine sends zero bytes;
+  // an active one sends just the current 30-min bucket.
   // Missing/corrupt state.json => empty maps => one-time full upload, then
   // incremental forever after.
   const state = loadState();

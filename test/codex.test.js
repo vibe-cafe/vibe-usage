@@ -1,9 +1,10 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { appendFileSync, mkdirSync, mkdtempSync, rmSync, writeFileSync } from 'node:fs';
+import { appendFileSync, mkdirSync, mkdtempSync, readdirSync, rmSync, writeFileSync } from 'node:fs';
 import { join } from 'node:path';
 import { tmpdir } from 'node:os';
 import { parse } from '../src/parsers/codex.js';
+import { codexCacheDir } from '../src/parsers/codex-cache.js';
 
 function sessionMeta(timestamp, id, extra = {}) {
   const { metaTimestamp = timestamp, ...payloadExtra } = extra;
@@ -73,13 +74,48 @@ async function parseFixture(files) {
     );
   }
   const prevHome = process.env.CODEX_HOME;
+  const prevCacheDir = process.env.VIBE_USAGE_CACHE_DIR;
   process.env.CODEX_HOME = root;
+  process.env.VIBE_USAGE_CACHE_DIR = join(root, 'cache');
   try {
     return await parse();
   } finally {
     if (prevHome === undefined) delete process.env.CODEX_HOME;
     else process.env.CODEX_HOME = prevHome;
+    if (prevCacheDir === undefined) delete process.env.VIBE_USAGE_CACHE_DIR;
+    else process.env.VIBE_USAGE_CACHE_DIR = prevCacheDir;
     rmSync(root, { recursive: true, force: true });
+  }
+}
+
+function createPersistentFixture(files) {
+  const root = mkdtempSync(join(tmpdir(), 'vibe-usage-codex-cache-test-'));
+  const dir = join(root, 'sessions', '2026', '07', '10');
+  mkdirSync(dir, { recursive: true });
+  for (const [name, records] of Object.entries(files)) {
+    writeFileSync(join(dir, name), records.map(JSON.stringify).join('\n') + '\n');
+  }
+  return { root, dir, cacheDir: join(root, 'cache') };
+}
+
+async function withCodexEnv(fixture, fn) {
+  const prevHome = process.env.CODEX_HOME;
+  const prevCacheDir = process.env.VIBE_USAGE_CACHE_DIR;
+  const prevBudget = process.env.VIBE_USAGE_CODEX_WORK_BUDGET_MS;
+  const prevCacheEnabled = process.env.VIBE_USAGE_CODEX_CACHE;
+  process.env.CODEX_HOME = fixture.root;
+  process.env.VIBE_USAGE_CACHE_DIR = fixture.cacheDir;
+  try {
+    return await fn();
+  } finally {
+    if (prevHome === undefined) delete process.env.CODEX_HOME;
+    else process.env.CODEX_HOME = prevHome;
+    if (prevCacheDir === undefined) delete process.env.VIBE_USAGE_CACHE_DIR;
+    else process.env.VIBE_USAGE_CACHE_DIR = prevCacheDir;
+    if (prevBudget === undefined) delete process.env.VIBE_USAGE_CODEX_WORK_BUDGET_MS;
+    else process.env.VIBE_USAGE_CODEX_WORK_BUDGET_MS = prevBudget;
+    if (prevCacheEnabled === undefined) delete process.env.VIBE_USAGE_CODEX_CACHE;
+    else process.env.VIBE_USAGE_CODEX_CACHE = prevCacheEnabled;
   }
 }
 
@@ -372,7 +408,9 @@ test('live rollout appends are deferred to the next stable parser snapshot', asy
   );
 
   const prevHome = process.env.CODEX_HOME;
+  const prevCacheDir = process.env.VIBE_USAGE_CACHE_DIR;
   process.env.CODEX_HOME = root;
+  process.env.VIBE_USAGE_CACHE_DIR = join(root, 'cache');
   try {
     // parse() captures every rollout's byte size before its first asynchronous
     // read. Appending immediately afterward must not leak new records into its
@@ -394,6 +432,8 @@ test('live rollout appends are deferred to the next stable parser snapshot', asy
   } finally {
     if (prevHome === undefined) delete process.env.CODEX_HOME;
     else process.env.CODEX_HOME = prevHome;
+    if (prevCacheDir === undefined) delete process.env.VIBE_USAGE_CACHE_DIR;
+    else process.env.VIBE_USAGE_CACHE_DIR = prevCacheDir;
     rmSync(root, { recursive: true, force: true });
   }
 });
@@ -623,4 +663,179 @@ test('forked session still skips exactly the source session\'s replayed token_co
 
   // parent (10+20 in, 1+2 out) counted once + fork's own new turn (5 in, 3 out).
   assert.deepEqual(sumBuckets(buckets), { input: 35, output: 6, cached: 0, reasoning: 0 });
+});
+
+test('unchanged ordinary sessions reuse cached headers and results without reading rollouts', async () => {
+  const t = '2026-07-10T08:00:00.000Z';
+  const fixture = createPersistentFixture({
+    'rollout-a.jsonl': [
+      sessionMeta(t, 'cache-a'),
+      tokenCount(t, usage(100, 20, 10, 2), 110),
+    ],
+  });
+  try {
+    await withCodexEnv(fixture, async () => {
+      const cold = await parse();
+      const warm = await parse();
+      assert.deepEqual(warm.buckets, cold.buckets);
+      assert.deepEqual(warm.sessions, cold.sessions);
+      assert.equal(cold.cache.filesRead, 2); // short header discovery + one full parse
+      assert.equal(warm.cache.filesRead, 0);
+      assert.equal(warm.cache.headerHits, 1);
+      assert.equal(warm.cache.resultHits, 1);
+    });
+  } finally {
+    rmSync(fixture.root, { recursive: true, force: true });
+  }
+});
+
+test('an appended rollout invalidates only that file while unchanged files stay cached', async () => {
+  const t = '2026-07-10T08:00:00.000Z';
+  const fixture = createPersistentFixture({
+    'rollout-a.jsonl': [sessionMeta(t, 'cache-a'), tokenCount(t, usage(10, 0, 1, 0), 11)],
+    'rollout-b.jsonl': [sessionMeta(t, 'cache-b'), tokenCount(t, usage(20, 0, 2, 0), 22)],
+  });
+  try {
+    await withCodexEnv(fixture, async () => {
+      await parse();
+      const warm = await parse();
+      assert.equal(warm.cache.filesRead, 0);
+
+      appendFileSync(
+        join(fixture.dir, 'rollout-a.jsonl'),
+        JSON.stringify(tokenCount('2026-07-10T08:05:00.000Z', usage(5, 0, 3, 0), 19)) + '\n'
+      );
+      const changed = await parse();
+      assert.deepEqual(sumBuckets(changed.buckets), { input: 35, output: 6, cached: 0, reasoning: 0 });
+      assert.equal(changed.cache.resultHits, 1);
+      assert.equal(changed.cache.tailHits, 1);
+      assert.equal(changed.cache.filesRead, 1); // only the appended tail
+    });
+  } finally {
+    rmSync(fixture.root, { recursive: true, force: true });
+  }
+});
+
+test('an in-place rollout rewrite rejects the tail cache and rebuilds from raw logs', async () => {
+  const t = '2026-07-10T08:00:00.000Z';
+  const fixture = createPersistentFixture({
+    'rollout-a.jsonl': [sessionMeta(t, 'old-session'), tokenCount(t, usage(10, 0, 1, 0), 11)],
+  });
+  try {
+    await withCodexEnv(fixture, async () => {
+      await parse();
+      writeFileSync(
+        join(fixture.dir, 'rollout-a.jsonl'),
+        [
+          sessionMeta(t, 'replacement-session'),
+          tokenCount(t, usage(30, 0, 3, 0), 33),
+          tokenCount('2026-07-10T08:05:00.000Z', usage(40, 0, 4, 0), 77),
+        ].map(JSON.stringify).join('\n') + '\n'
+      );
+
+      const rebuilt = await parse();
+      assert.deepEqual(sumBuckets(rebuilt.buckets), { input: 70, output: 7, cached: 0, reasoning: 0 });
+      assert.equal(rebuilt.sessions.length, 1);
+      assert.equal(rebuilt.cache.tailHits, 0);
+      assert.equal(rebuilt.cache.filesRead, 2); // replacement header + full replacement file
+    });
+  } finally {
+    rmSync(fixture.root, { recursive: true, force: true });
+  }
+});
+
+test('cache can be disabled without changing parser results', async () => {
+  const t = '2026-07-10T08:00:00.000Z';
+  const fixture = createPersistentFixture({
+    'rollout-a.jsonl': [sessionMeta(t, 'no-cache'), tokenCount(t, usage(10, 2, 3, 1), 13)],
+  });
+  try {
+    await withCodexEnv(fixture, async () => {
+      const cached = await parse();
+      process.env.VIBE_USAGE_CODEX_CACHE = '0';
+      const uncached = await parse();
+      assert.deepEqual(uncached.buckets, cached.buckets);
+      assert.deepEqual(uncached.sessions, cached.sessions);
+      assert.equal(uncached.cache.filesRead, 2);
+      assert.equal(uncached.cache.resultHits, 0);
+    });
+  } finally {
+    rmSync(fixture.root, { recursive: true, force: true });
+  }
+});
+
+test('a corrupt parser cache fails open and rebuilds from raw logs', async () => {
+  const t = '2026-07-10T08:00:00.000Z';
+  const fixture = createPersistentFixture({
+    'rollout-a.jsonl': [sessionMeta(t, 'cache-a'), tokenCount(t, usage(10, 0, 1, 0), 11)],
+  });
+  try {
+    await withCodexEnv(fixture, async () => {
+      const expected = await parse();
+      const dir = codexCacheDir(fixture.root);
+      const [entry] = readdirSync(dir).filter(name => name.endsWith('.json') && !name.endsWith('.tail.json'));
+      assert.ok(entry);
+      writeFileSync(join(dir, entry), '{broken');
+
+      const rebuilt = await parse();
+      assert.deepEqual(rebuilt.buckets, expected.buckets);
+      assert.deepEqual(rebuilt.sessions, expected.sessions);
+      assert.equal(rebuilt.cache.filesRead, 2);
+    });
+  } finally {
+    rmSync(fixture.root, { recursive: true, force: true });
+  }
+});
+
+test('rolling audit re-reads one bounded warm file without changing results', async () => {
+  const t = '2026-07-10T08:00:00.000Z';
+  const fixture = createPersistentFixture({
+    'rollout-a.jsonl': [sessionMeta(t, 'audit-a'), tokenCount(t, usage(10, 0, 1, 0), 11)],
+    'rollout-b.jsonl': [sessionMeta(t, 'audit-b'), tokenCount(t, usage(20, 0, 2, 0), 22)],
+  });
+  const prevInterval = process.env.VIBE_USAGE_CODEX_AUDIT_INTERVAL_MS;
+  try {
+    await withCodexEnv(fixture, async () => {
+      const expected = await parse();
+      process.env.VIBE_USAGE_CODEX_AUDIT_INTERVAL_MS = '0';
+      const audited = await parse();
+      assert.deepEqual(audited.buckets, expected.buckets);
+      assert.deepEqual(audited.sessions, expected.sessions);
+      assert.equal(audited.cache.audited, 1);
+      assert.equal(audited.cache.filesRead, 2); // short header + one ordinary full scan
+      assert.equal(audited.cache.resultHits, 1);
+    });
+  } finally {
+    if (prevInterval === undefined) delete process.env.VIBE_USAGE_CODEX_AUDIT_INTERVAL_MS;
+    else process.env.VIBE_USAGE_CODEX_AUDIT_INTERVAL_MS = prevInterval;
+    rmSync(fixture.root, { recursive: true, force: true });
+  }
+});
+
+test('a cold build checkpoints between files and resumes after its work budget', async () => {
+  const t = '2026-07-10T08:00:00.000Z';
+  const files = {};
+  for (let i = 0; i < 60; i++) {
+    files[`rollout-${i}.jsonl`] = [
+      sessionMeta(t, `budget-${i}`),
+      tokenCount(t, usage(i + 1, 0, 1, 0), i + 2),
+    ];
+  }
+  const fixture = createPersistentFixture(files);
+  try {
+    await withCodexEnv(fixture, async () => {
+      process.env.VIBE_USAGE_CODEX_WORK_BUDGET_MS = '1';
+      const partial = await parse();
+      assert.equal(partial.skipped, true);
+      assert.ok(partial.indexing.completed > 0);
+
+      delete process.env.VIBE_USAGE_CODEX_WORK_BUDGET_MS;
+      const complete = await parse();
+      assert.equal(complete.skipped, undefined);
+      assert.equal(complete.sessions.length, 60);
+      assert.ok(complete.cache.headerHits > 0);
+    });
+  } finally {
+    rmSync(fixture.root, { recursive: true, force: true });
+  }
 });
