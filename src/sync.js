@@ -18,6 +18,15 @@ function formatBytes(bytes) {
   return `${(bytes / (1024 * 1024)).toFixed(1)}MB`;
 }
 
+export function resolveUploadProjectSetting(settings) {
+  if (typeof settings?.uploadProject !== 'boolean') {
+    const error = new Error('SETTINGS_UNAVAILABLE');
+    error.code = 'SETTINGS_UNAVAILABLE';
+    throw error;
+  }
+  return settings.uploadProject;
+}
+
 export async function runSync({ throws = false, quiet = false, surface = 'cli' } = {}) {
   const config = loadConfig();
   if (!config?.apiKey) {
@@ -30,6 +39,26 @@ export async function runSync({ throws = false, quiet = false, surface = 'cli' }
   if ('lastSync' in config) {
     delete config.lastSync;
     saveConfig(config);
+  }
+
+  // Privacy is a required input, not an optional hint. If the settings API is
+  // unavailable, treating it as `false` changes every project-bearing item's
+  // incremental identity to `unknown` and can trigger a full-history upload.
+  // Resolve it before parsing or loading upload state so failure is a true
+  // no-op: no data upload and no state mutation.
+  const apiUrl = config.apiUrl || 'https://vibecafe.ai';
+  let uploadProject;
+  try {
+    const settings = await fetchSettings(apiUrl, config.apiKey);
+    uploadProject = resolveUploadProjectSetting(settings);
+  } catch (err) {
+    if (err.message === 'UNAUTHORIZED') {
+      console.error(failure('API Key 无效，请运行 `npx @vibe-cafe/vibe-usage init` 重新配置。'));
+    } else {
+      console.error(failure('暂时无法读取上传设置，本次同步已安全取消（未上传数据）。请稍后重试。'));
+    }
+    if (throws) throw err;
+    process.exit(1);
   }
 
   const allBuckets = [];
@@ -115,11 +144,6 @@ export async function runSync({ throws = false, quiet = false, surface = 'cli' }
   // the same account data isn't stored as separate rows per machine.
   for (const b of allBuckets) if (!b.hostname) b.hostname = host;
   for (const s of allSessions) if (!s.hostname) s.hostname = host;
-
-  // Privacy: check if user allows project name upload
-  const apiUrl = config.apiUrl || 'https://vibecafe.ai';
-  const settings = await fetchSettings(apiUrl, config.apiKey);
-  const uploadProject = settings?.uploadProject === true;
 
   if (!quiet) {
     if (uploadProject) {
