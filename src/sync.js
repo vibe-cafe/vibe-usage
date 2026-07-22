@@ -5,6 +5,7 @@ import {
   bucketKey, bucketHash, sessionKey, sessionHash,
 } from './state.js';
 import { ingest, fetchSettings } from './api.js';
+import { createSyncClient, forBatch } from './client-meta.js';
 import { parsers } from './parsers/index.js';
 import { success, failure, arrow, link, dim } from './output.js';
 
@@ -17,7 +18,7 @@ function formatBytes(bytes) {
   return `${(bytes / (1024 * 1024)).toFixed(1)}MB`;
 }
 
-export async function runSync({ throws = false, quiet = false } = {}) {
+export async function runSync({ throws = false, quiet = false, surface = 'cli' } = {}) {
   const config = loadConfig();
   if (!config?.apiKey) {
     console.error(failure('尚未配置，请先运行 `npx @vibe-cafe/vibe-usage init`。'));
@@ -192,10 +193,12 @@ export async function runSync({ throws = false, quiet = false } = {}) {
   let totalDroppedBuckets = 0;
   let totalDroppedUnknownModels = 0;
   let totalDroppedImplausible = 0;
+  let totalProtectedBuckets = 0;
   const droppedSources = new Set();
   const bucketBatches = Math.ceil(allBucketsToSend.length / BATCH_SIZE);
   const sessionBatches = Math.ceil(allSessionsToSend.length / SESSION_BATCH_SIZE);
   const totalBatches = Math.max(bucketBatches, sessionBatches, 1);
+  const syncClient = createSyncClient({ defaultSurface: surface, hostname: host });
 
   try {
     for (let batchIdx = 0; batchIdx < totalBatches; batchIdx++) {
@@ -205,6 +208,7 @@ export async function runSync({ throws = false, quiet = false } = {}) {
       const prefix = totalBatches > 1 ? `  ${dim(`[${batchNum}/${totalBatches}]`)} 上传中 ` : '  上传中 ';
 
       const result = await ingest(apiUrl, config.apiKey, batch, {
+        client: forBatch(syncClient, batchIdx, totalBatches),
         onProgress(sent, total) {
           const pct = Math.round((sent / total) * 100);
           process.stdout.write(`\r${prefix}${dim(`${formatBytes(sent)}/${formatBytes(total)} (${pct}%)`)}\x1b[K`);
@@ -219,6 +223,7 @@ export async function runSync({ throws = false, quiet = false } = {}) {
         totalDroppedImplausible += Number(result.dropped.implausible) || 0;
         for (const s of result.dropped.unknownSources || []) droppedSources.add(s);
       }
+      totalProtectedBuckets += Number(result.protected?.buckets) || 0;
 
       // Commit only this batch's hashes, only after it uploaded successfully.
       // A batch that throws aborts the loop with its keys still absent from
@@ -257,6 +262,10 @@ export async function runSync({ throws = false, quiet = false } = {}) {
       if (totalDroppedImplausible > 0) reasons.push(`超出合理范围: ${totalDroppedImplausible}`);
       if (reasons.length === 0) reasons.push('服务端拒绝');
       console.log(dim(`  ${totalDroppedBuckets} buckets dropped (${reasons.join('；')})`));
+    }
+
+    if (totalProtectedBuckets > 0) {
+      console.log(dim(`  服务端保留了 ${totalProtectedBuckets} 个更大的已有 bucket（本次较小快照未覆盖）`));
     }
 
     if (!quiet && totalSessionsSynced > 0) {

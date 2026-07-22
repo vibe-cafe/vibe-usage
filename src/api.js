@@ -14,7 +14,7 @@ export async function ingest(apiUrl, apiKey, buckets, opts, sessions) {
   let lastError;
   for (let attempt = 0; attempt < MAX_RETRIES; attempt++) {
     try {
-      return await _send(apiUrl, apiKey, buckets, opts?.onProgress, sessions);
+      return await _send(apiUrl, apiKey, buckets, opts, sessions);
     } catch (err) {
       lastError = err;
       // Don't retry auth errors or client errors
@@ -30,14 +30,22 @@ export async function ingest(apiUrl, apiKey, buckets, opts, sessions) {
   throw lastError;
 }
 
-function _send(apiUrl, apiKey, buckets, onProgress, sessions) {
+export function encodeIngestBody(buckets, opts, sessions) {
+  const payload = { buckets };
+  if (sessions && sessions.length > 0) payload.sessions = sessions;
+  if (opts?.client) payload.client = opts.client;
+  const raw = Buffer.from(JSON.stringify(payload));
+  const useGzip = raw.length >= GZIP_MIN_BYTES;
+  return {
+    body: useGzip ? gzipSync(raw) : raw,
+    useGzip,
+  };
+}
+
+function _send(apiUrl, apiKey, buckets, opts, sessions) {
   return new Promise((resolve, reject) => {
     const url = new URL('/api/usage/ingest', apiUrl);
-    const payload = { buckets };
-    if (sessions && sessions.length > 0) payload.sessions = sessions;
-    const raw = Buffer.from(JSON.stringify(payload));
-    const useGzip = raw.length >= GZIP_MIN_BYTES;
-    const body = useGzip ? gzipSync(raw) : raw;
+    const { body, useGzip } = encodeIngestBody(buckets, opts, sessions);
     const totalBytes = body.length;
     const mod = url.protocol === 'https:' ? https : http;
 
@@ -89,7 +97,7 @@ function _send(apiUrl, apiKey, buckets, onProgress, sessions) {
       while (ok && sent < totalBytes) {
         const slice = body.subarray(sent, sent + CHUNK);
         sent += slice.length;
-        if (onProgress) onProgress(sent, totalBytes);
+        if (opts?.onProgress) opts.onProgress(sent, totalBytes);
         ok = req.write(slice);
       }
       if (sent < totalBytes) {

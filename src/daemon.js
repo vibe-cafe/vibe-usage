@@ -34,7 +34,7 @@ export async function runDaemon() {
   // eslint-disable-next-line no-constant-condition
   while (true) {
     try {
-      await runSync({ throws: true, quiet: true });
+      await runSync({ throws: true, quiet: true, surface: 'daemon' });
       consecutiveAuthFailures = 0;
     } catch (err) {
       if (err.message === 'UNAUTHORIZED') {
