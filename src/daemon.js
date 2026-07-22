@@ -13,7 +13,7 @@ function sleep(ms) {
   return new Promise(resolve => setTimeout(resolve, ms));
 }
 
-export async function runDaemon() {
+export async function runDaemon({ codexExtraHome } = {}) {
   const config = loadConfig();
   if (!config?.apiKey) {
     console.error(failure('尚未配置，请先运行 `npx @vibe-cafe/vibe-usage init`。'));
@@ -34,7 +34,7 @@ export async function runDaemon() {
   // eslint-disable-next-line no-constant-condition
   while (true) {
     try {
-      await runSync({ throws: true, quiet: true, surface: 'daemon' });
+      await runSync({ throws: true, quiet: true, surface: 'daemon', codexExtraHome });
       consecutiveAuthFailures = 0;
     } catch (err) {
       if (err.message === 'UNAUTHORIZED') {

@@ -8,10 +8,14 @@ import {
   statSync,
 } from 'node:fs';
 import { join } from 'node:path';
-import { homedir } from 'node:os';
 import { createInterface } from 'node:readline';
 import { createHash } from 'node:crypto';
 import { aggregateToBuckets } from './index.js';
+import {
+  codexSessionDirs,
+  resolveCodexHomes,
+  validateExtraCodexHome,
+} from '../codex-roots.js';
 import {
   codexCacheEnabled,
   fileSignature,
@@ -28,17 +32,6 @@ import {
 // both, index them together so fork replay-skip works across directories, and
 // select the most complete physical file when the same session briefly exists
 // in both locations during an archive move.
-function getCodexHome() {
-  return process.env.CODEX_HOME?.trim() || join(homedir(), '.codex');
-}
-
-function sessionsDirs(codexHome) {
-  return [
-    join(codexHome, 'sessions'),
-    join(codexHome, 'archived_sessions'),
-  ];
-}
-
 /**
  * Recursively find all .jsonl files under a directory.
  * Codex CLI stores sessions as: ~/.codex/sessions/YYYY/MM/DD/rollout-*.jsonl
@@ -456,10 +449,10 @@ function boundaryKey(boundary) {
   return `${boundary.rawTokenCount}:${boundary.recordIndex ?? ''}`;
 }
 
-function updateFileCache(codexHome, file, changes) {
+function updateFileCache(file, changes) {
   const data = cacheData(file.cache, changes);
   try {
-    saveCodexFileCache(codexHome, file.filePath, file.signature, data);
+    saveCodexFileCache(file.codexHome, file.filePath, file.signature, data);
   } catch {
     // A read-only home, full disk, or antivirus race must only disable the
     // optimization for this run. Raw-log parsing remains the source of truth.
@@ -803,10 +796,24 @@ function mergeFileResults(results) {
   return { buckets: aggregateToBuckets(entries), sessions };
 }
 
-export async function parse() {
-  const codexHome = getCodexHome();
-  const dirs = sessionsDirs(codexHome);
-  if (!dirs.some(existsSync)) return { buckets: [], sessions: [] };
+export async function parse({ codexExtraHome } = {}) {
+  if (codexExtraHome?.trim()) {
+    const validation = validateExtraCodexHome(codexExtraHome);
+    if (!validation.ok) {
+      return {
+        buckets: [],
+        sessions: [],
+        skipped: true,
+        warnings: [`codex: 额外 Codex Home 不可用，已跳过本次 Codex 同步: ${validation.path}`],
+      };
+    }
+  }
+
+  const codexHomes = resolveCodexHomes(codexExtraHome);
+  const dirs = codexHomes.flatMap(codexHome => (
+    codexSessionDirs(codexHome).map(dir => ({ codexHome, dir }))
+  ));
+  if (!dirs.some(({ dir }) => existsSync(dir))) return { buckets: [], sessions: [] };
 
   const startedAt = Date.now();
   const budget = workBudgetMs();
@@ -820,29 +827,32 @@ export async function parse() {
     audited: 0,
   };
   const files = [];
-  for (const filePath of dirs.flatMap(findJsonlFiles)) {
-    try {
-      const stat = statSync(filePath);
-      if (stat.size <= 0) continue;
-      const signature = fileSignature(stat);
-      const cache = loadCodexFileCache(codexHome, filePath, signature);
-      const priorCache = cache || loadCodexFileCache(codexHome, filePath);
-      const priorTail = cache ? null : loadCodexFileTail(codexHome, filePath);
-      const file = {
-        filePath,
-        snapshotSize: stat.size,
-        signature,
-        cache,
-        priorCache,
-        priorTail,
-        header: null,
-        appendTail: null,
-      };
-      if (!cache && priorCache) file.appendTail = tailStateFor(file);
-      files.push(file);
-    } catch {
-      // The file may move to archived_sessions between discovery and stat.
-      // Its archived copy will be picked up on the next sync.
+  for (const { codexHome, dir } of dirs) {
+    for (const filePath of findJsonlFiles(dir)) {
+      try {
+        const stat = statSync(filePath);
+        if (stat.size <= 0) continue;
+        const signature = fileSignature(stat);
+        const cache = loadCodexFileCache(codexHome, filePath, signature);
+        const priorCache = cache || loadCodexFileCache(codexHome, filePath);
+        const priorTail = cache ? null : loadCodexFileTail(codexHome, filePath);
+        const file = {
+          codexHome,
+          filePath,
+          snapshotSize: stat.size,
+          signature,
+          cache,
+          priorCache,
+          priorTail,
+          header: null,
+          appendTail: null,
+        };
+        if (!cache && priorCache) file.appendTail = tailStateFor(file);
+        files.push(file);
+      } catch {
+        // The file may move to archived_sessions between discovery and stat.
+        // Its archived copy will be picked up on the next sync.
+      }
     }
   }
   if (files.length === 0) return { buckets: [], sessions: [] };
@@ -875,7 +885,7 @@ export async function parse() {
       try {
         file.header = await readSessionHeader(file.filePath, file.snapshotSize);
         cacheStats.filesRead++;
-        updateFileCache(codexHome, file, { header: file.header });
+        updateFileCache(file, { header: file.header });
       } catch {
         continue;
       }
@@ -928,7 +938,7 @@ export async function parse() {
       try {
         meta = await indexSessionFile(file.filePath, file.snapshotSize);
         cacheStats.filesRead++;
-        updateFileCache(codexHome, file, { index: meta });
+        updateFileCache(file, { index: meta });
       } catch {
         continue;
       }
@@ -984,14 +994,14 @@ export async function parse() {
       const { tail, ...summary } = parsed;
       if (tail) {
         try {
-          saveCodexFileTail(codexHome, file.filePath, file.signature, tail);
+          saveCodexFileTail(file.codexHome, file.filePath, file.signature, tail);
         } catch {
           // Same fail-open rule as the summary cache: tail acceleration is
           // optional and a write failure must not fail the parser.
         }
       }
       result = { boundaryKey: key, ...summary };
-      updateFileCache(codexHome, file, { result, lastAuditedAt: Date.now() });
+      updateFileCache(file, { result, lastAuditedAt: Date.now() });
       file.appendTail = null;
       file.priorTail = null;
       if (auditPaths.has(file.filePath)) cacheStats.audited++;

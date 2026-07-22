@@ -27,7 +27,16 @@ export function resolveUploadProjectSetting(settings) {
   return settings.uploadProject;
 }
 
-export async function runSync({ throws = false, quiet = false, surface = 'cli' } = {}) {
+export function resolveCodexExtraHome(configured, temporary) {
+  return temporary ?? configured;
+}
+
+export async function runSync({
+  throws = false,
+  quiet = false,
+  surface = 'cli',
+  codexExtraHome,
+} = {}) {
   const config = loadConfig();
   if (!config?.apiKey) {
     console.error(failure('尚未配置，请先运行 `npx @vibe-cafe/vibe-usage init`。'));
@@ -72,7 +81,9 @@ export async function runSync({ throws = false, quiet = false, surface = 'cli' }
 
   for (const [source, parse] of Object.entries(parsers)) {
     try {
-      const result = await parse();
+      const result = source === 'codex'
+        ? await parse({ codexExtraHome: resolveCodexExtraHome(config.codexExtraHome, codexExtraHome) })
+        : await parse();
       const buckets = Array.isArray(result) ? result : result.buckets;
       const sessions = Array.isArray(result) ? [] : (result.sessions || []);
       if (!Array.isArray(buckets) || !Array.isArray(sessions)) {

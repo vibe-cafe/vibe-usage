@@ -31,6 +31,7 @@ npx @vibe-cafe/vibe-usage              # Init (first run, browser login) or sync
 npx @vibe-cafe/vibe-usage init         # Re-run setup via browser login
 npx @vibe-cafe/vibe-usage init --manual-key <vbu_...>   # Skip browser, use pre-issued key (CI/headless)
 npx @vibe-cafe/vibe-usage sync         # Manual sync
+npx @vibe-cafe/vibe-usage sync --extra-codex-home /path/to/.codex  # Add another Codex Home for this run only
 npx @vibe-cafe/vibe-usage summary       # Print last 7 days as markdown (cost / tokens / by model / by project)
 npx @vibe-cafe/vibe-usage summary --days N  # Same, over the last N days (1-90)
 npx @vibe-cafe/vibe-usage daemon       # Continuous sync (every 30m, foreground)
@@ -51,7 +52,7 @@ npx @vibe-cafe/vibe-usage status       # Show config & detected tools
 | Tool | Data Location |
 |------|---------------|
 | Claude Code | `~/.claude/projects/` (tokens + sessions), `~/.claude/transcripts/` (sessions only); also scans `$CLAUDE_CONFIG_DIR` and data-bearing `~/.claude-*` profiles, selects the most complete duplicate session, and streams logs so large active sessions are not silently omitted. Cache creation tokens are included in input usage. |
-| Codex CLI | `$CODEX_HOME/sessions/` and `$CODEX_HOME/archived_sessions/` (default `~/.codex`); a versioned local index avoids re-reading unchanged rollouts and reads only safe append tails for ordinary sessions, while fork/sub-agent replay matching, duplicate suppression, and live/archive deduplication retain their existing semantics |
+| Codex CLI | `$CODEX_HOME/sessions/` and `$CODEX_HOME/archived_sessions/` (default `~/.codex`), plus an optional temporary `--extra-codex-home` or manually persisted `codexExtraHome`; a versioned local index avoids re-reading unchanged rollouts and reads only safe append tails for ordinary sessions, while fork/sub-agent replay matching, duplicate suppression, and live/archive/cross-root deduplication retain their existing semantics |
 | Grok | `$GROK_HOME/sessions/<encoded-cwd>/<session-id>/` (default `~/.grok`); token usage from `updates.jsonl` `turn_completed.usage` (per-model `modelUsage`, cache reads, reasoning); project from `summary.json` cwd; honors `GROK_HOME` |
 | GitHub Copilot CLI | `~/.copilot/session-state/*/events.jsonl` |
 | Cursor | `state.vscdb` (SQLite, reads `cursorAuth/accessToken`, fetches CSV from `cursor.com`); cloud data is stamped with a fixed `cursor-cloud` hostname so multi-machine setups don't double-count |
@@ -147,6 +148,7 @@ Config stored at `~/.vibe-usage/config.json` (dev: `config.dev.json`).
 | `apiKey` | Your API key (starts with `vbu_`) |
 | `apiUrl` | Server URL (default: `https://vibecafe.ai`) |
 | `hostname` | Stable device name for usage tracking (set at init, reused across syncs) |
+| `codexExtraHome` | Optional additional Codex Home scanned together with `$CODEX_HOME` / `~/.codex` |
 
 The `hostname` is captured once during `init` and reused for all future syncs. This prevents macOS mDNS hostname changes (e.g., `MacBook-Pro` → `MacBook-Pro-2`) from creating duplicate device entries. To change it manually:
 

@@ -119,6 +119,35 @@ async function withCodexEnv(fixture, fn) {
   }
 }
 
+async function parseMultipleHomes(primaryFiles, extraFiles, extraOverride) {
+  const root = mkdtempSync(join(tmpdir(), 'vibe-usage-codex-multi-home-'));
+  const primary = join(root, 'primary');
+  const extra = join(root, 'extra');
+  const writeFiles = (home, files) => {
+    const dir = join(home, 'sessions', '2026', '07', '10');
+    mkdirSync(dir, { recursive: true });
+    for (const [name, records] of Object.entries(files)) {
+      writeFileSync(join(dir, name), records.map(JSON.stringify).join('\n') + '\n');
+    }
+  };
+  writeFiles(primary, primaryFiles);
+  writeFiles(extra, extraFiles);
+
+  const previousHome = process.env.CODEX_HOME;
+  const previousCache = process.env.VIBE_USAGE_CACHE_DIR;
+  process.env.CODEX_HOME = primary;
+  process.env.VIBE_USAGE_CACHE_DIR = join(root, 'cache');
+  try {
+    return await parse({ codexExtraHome: extraOverride ?? extra });
+  } finally {
+    if (previousHome === undefined) delete process.env.CODEX_HOME;
+    else process.env.CODEX_HOME = previousHome;
+    if (previousCache === undefined) delete process.env.VIBE_USAGE_CACHE_DIR;
+    else process.env.VIBE_USAGE_CACHE_DIR = previousCache;
+    rmSync(root, { recursive: true, force: true });
+  }
+}
+
 function sumBuckets(buckets) {
   return buckets.reduce(
     (acc, b) => ({
@@ -576,6 +605,69 @@ test('same session in live and archived directories uses the more complete copy 
 
   assert.deepEqual(sumBuckets(buckets), { input: 100, output: 10, cached: 0, reasoning: 0 });
   assert.equal(sessions.length, 1);
+});
+
+test('primary and extra Codex homes are parsed as one data set', async () => {
+  const t = '2026-07-10T08:00:00.000Z';
+  const result = await parseMultipleHomes(
+    {
+      'rollout-primary.jsonl': [
+        sessionMeta(t, 'primary-1'),
+        taskStarted(t),
+        tokenCount(t, usage(10, 2, 3, 1), 13),
+      ],
+    },
+    {
+      'rollout-extra.jsonl': [
+        sessionMeta(t, 'extra-1'),
+        taskStarted(t),
+        tokenCount(t, usage(20, 4, 6, 2), 26),
+      ],
+    }
+  );
+
+  assert.deepEqual(sumBuckets(result.buckets), {
+    input: 24,
+    output: 6,
+    cached: 6,
+    reasoning: 3,
+  });
+  assert.equal(result.sessions.length, 2);
+});
+
+test('same session across primary and extra homes uses the more complete copy once', async () => {
+  const t = '2026-07-10T08:00:00.000Z';
+  const short = [sessionMeta(t, 'same-cross-root'), taskStarted(t)];
+  const complete = [
+    ...short,
+    tokenCount(t, usage(100, 0, 10, 0), 110),
+  ];
+  const result = await parseMultipleHomes(
+    { 'rollout-primary.jsonl': short },
+    { 'rollout-extra.jsonl': complete }
+  );
+
+  assert.deepEqual(sumBuckets(result.buckets), { input: 100, output: 10, cached: 0, reasoning: 0 });
+  assert.equal(result.sessions.length, 1);
+});
+
+test('missing configured extra Codex home skips the source to protect upload state', async () => {
+  const t = '2026-07-10T08:00:00.000Z';
+  const result = await parseMultipleHomes(
+    {
+      'rollout-primary.jsonl': [
+        sessionMeta(t, 'primary-1'),
+        tokenCount(t, usage(10, 0, 1, 0), 11),
+      ],
+    },
+    {},
+    '/path/that/does/not/exist/vibe-usage-extra-codex'
+  );
+
+  assert.equal(result.skipped, true);
+  assert.deepEqual(result.buckets, []);
+  assert.deepEqual(result.sessions, []);
+  assert.match(result.warnings[0], /额外 Codex Home/);
 });
 
 test('repeated same-id session metadata remains part of the logical session', async () => {

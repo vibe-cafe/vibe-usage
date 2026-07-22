@@ -1,7 +1,8 @@
 import { loadConfig, saveConfig, getConfigPath } from './config.js';
 import { detectInstalledTools, TOOLS } from './tools.js';
 import { existsSync } from 'node:fs';
-import { smallHeader } from './output.js';
+import { validateExtraCodexHome } from './codex-roots.js';
+import { failure, smallHeader } from './output.js';
 
 function printSmallHeader() {
   console.log();
@@ -20,10 +21,14 @@ async function showStatus() {
     console.log(`  Config: ${getConfigPath()}`);
     console.log(`  API key: ${config.apiKey.slice(0, 8)}...`);
     console.log(`  API URL: ${config.apiUrl || 'https://vibecafe.ai'}`);
+    if (config.codexExtraHome) {
+      console.log(`  Extra Codex Home: ${config.codexExtraHome}`);
+    }
   }
 
   console.log('\n  Detected tools:');
-  const detected = detectInstalledTools();
+  const toolOptions = { codexExtraHome: config?.codexExtraHome };
+  const detected = detectInstalledTools(toolOptions);
   if (detected.length === 0) {
     console.log('    (none)\n');
   } else {
@@ -35,13 +40,15 @@ async function showStatus() {
 
   console.log('  All supported tools:');
   for (const tool of TOOLS) {
-    const installed = existsSync(tool.dataDir) ? 'installed' : 'not found';
+    const installed = (tool.detectDataDirs
+      ? tool.detectDataDirs(toolOptions).length > 0
+      : existsSync(tool.dataDir)) ? 'installed' : 'not found';
     console.log(`    ${tool.name}: ${installed}`);
   }
   console.log();
 }
 
-const VALID_CONFIG_KEYS = ['apiKey', 'apiUrl', 'hostname'];
+const VALID_CONFIG_KEYS = ['apiKey', 'apiUrl', 'hostname', 'codexExtraHome'];
 
 function handleConfig(args) {
   const sub = args[0];
@@ -64,7 +71,7 @@ function handleConfig(args) {
     }
     case 'set': {
       const key = args[1];
-      const value = args[2];
+      let value = args[2];
       if (!key || value === undefined) {
         console.error('Usage: vibe-usage config set <key> <value>');
         process.exit(1);
@@ -73,6 +80,14 @@ function handleConfig(args) {
         console.error(`Unknown config key: ${key}`);
         console.error(`Valid keys: ${VALID_CONFIG_KEYS.join(', ')}`);
         process.exit(1);
+      }
+      if (key === 'codexExtraHome' && value !== '') {
+        const validation = validateExtraCodexHome(value);
+        if (!validation.ok) {
+          console.error(failure(`额外 Codex Home 无效，需要包含 sessions/ 或 archived_sessions/: ${validation.path}`));
+          process.exit(1);
+        }
+        value = validation.path;
       }
       const config = loadConfig() || {};
       config[key] = value;
@@ -117,19 +132,30 @@ export async function run(rawArgs) {
   if (apiKey === undefined) {
     ({ args: stripped, value: apiKey } = extractOption(stripped, 'key'));
   }
+  let codexExtraHome;
+  ({ args: stripped, value: codexExtraHome } = extractOption(stripped, 'extra-codex-home'));
+  if (codexExtraHome !== undefined) {
+    const validation = validateExtraCodexHome(codexExtraHome);
+    if (!validation.ok) {
+      console.error(failure(`额外 Codex Home 无效，需要包含 sessions/ 或 archived_sessions/: ${validation.path}`));
+      process.exit(1);
+    }
+    codexExtraHome = validation.path;
+  }
+
   const args = stripped;
   const command = args[0];
 
   switch (command) {
     case 'init': {
       const { runInit } = await import('./init.js');
-      await runInit({ apiKey });
+      await runInit({ apiKey, codexExtraHome });
       break;
     }
     case 'sync': {
       printSmallHeader();
       const { runSync } = await import('./sync.js');
-      await runSync();
+      await runSync({ codexExtraHome });
       break;
     }
     case 'summary': {
@@ -149,8 +175,12 @@ export async function run(rawArgs) {
       if (sub === undefined) {
         // Foreground daemon loop — no header, just start syncing
         const { runDaemon } = await import('./daemon.js');
-        await runDaemon();
+        await runDaemon({ codexExtraHome });
       } else {
+        if (codexExtraHome !== undefined) {
+          console.error(failure('后台 daemon 不接受临时 Codex Home，请先运行 `config set codexExtraHome <path>`。'));
+          process.exit(1);
+        }
         // manageDaemon validates the subcommand and exits 1 on unknown ones —
         // a typo (e.g. `daemon stauts`) must never fall through to the
         // infinite foreground loop.
@@ -185,6 +215,7 @@ export async function run(rawArgs) {
     npx @vibe-cafe/vibe-usage init         Set up via browser login (default)
     npx @vibe-cafe/vibe-usage init --manual-key <vbu_...>   Skip browser, use a pre-issued key (CI/headless)
     npx @vibe-cafe/vibe-usage sync         Manually sync usage data
+    npx @vibe-cafe/vibe-usage sync --extra-codex-home <path>  Use another Codex Home for this run
     npx @vibe-cafe/vibe-usage summary       Print last 7 days as markdown (cost/tokens/model/project)
     npx @vibe-cafe/vibe-usage summary --days N   Same, but over the last N days (1-90)
     npx @vibe-cafe/vibe-usage daemon       Continuous sync (every 30m, foreground)
@@ -201,6 +232,7 @@ export async function run(rawArgs) {
     npx @vibe-cafe/vibe-usage config show  Show full config as JSON
     npx @vibe-cafe/vibe-usage config get <key>   Get a config value
     npx @vibe-cafe/vibe-usage config set <key> <value>  Set a config value
+    npx @vibe-cafe/vibe-usage config set codexExtraHome <path>  Persist another Codex Home
     npx @vibe-cafe/vibe-usage help         Show this help
 `);
       break;
@@ -212,12 +244,12 @@ export async function run(rawArgs) {
       if (!config?.apiKey || apiKey) {
         // First run OR user passed --key for a one-shot setup — init.js prints the big header
         const { runInit } = await import('./init.js');
-        await runInit({ apiKey });
+        await runInit({ apiKey, codexExtraHome });
       } else {
         // Already configured: small header + sync
         printSmallHeader();
         const { runSync } = await import('./sync.js');
-        await runSync();
+        await runSync({ codexExtraHome });
       }
       break;
     }
