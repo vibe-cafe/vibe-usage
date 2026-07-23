@@ -1,6 +1,6 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { aggregateToBuckets } from '../src/parsers/index.js';
+import { aggregateToBuckets, normalizeModelName } from '../src/parsers/index.js';
 
 function entry(overrides = {}) {
   return {
@@ -70,4 +70,35 @@ test('aggregateToBuckets keeps distinct hostnames in distinct buckets', () => {
     { hostname: 'cursor-cloud', inputTokens: 3 },
     { hostname: undefined, inputTokens: 4 },
   ]);
+});
+
+test('normalizeModelName strips provider prefixes', () => {
+  assert.equal(normalizeModelName('moonshot/kimi-k3'), 'kimi-k3');
+  assert.equal(normalizeModelName('moonshotai/kimi-k3'), 'kimi-k3');
+  assert.equal(normalizeModelName('anthropic/claude-opus-4.8'), 'claude-opus-4.8');
+  assert.equal(normalizeModelName('openai/gpt-5.6-sol'), 'gpt-5.6-sol');
+});
+
+test('normalizeModelName maps known aliases to canonical names', () => {
+  assert.equal(normalizeModelName('k3'), 'kimi-k3');
+  assert.equal(normalizeModelName('moonshot/k3'), 'kimi-k3');
+});
+
+test('normalizeModelName passes through already-canonical names', () => {
+  assert.equal(normalizeModelName('kimi-k3'), 'kimi-k3');
+  assert.equal(normalizeModelName('claude-opus-4.8'), 'claude-opus-4.8');
+  assert.equal(normalizeModelName('gpt-5.6-sol'), 'gpt-5.6-sol');
+});
+
+test('aggregateToBuckets merges alias variants into a single bucket', () => {
+  const buckets = aggregateToBuckets([
+    entry({ model: 'k3', inputTokens: 100 }),
+    entry({ model: 'kimi-k3', inputTokens: 200 }),
+    entry({ model: 'moonshot/kimi-k3', inputTokens: 300 }),
+    entry({ model: 'moonshotai/kimi-k3', inputTokens: 400 }),
+  ]);
+
+  const kimiBuckets = buckets.filter(b => b.model === 'kimi-k3');
+  assert.equal(kimiBuckets.length, 1);
+  assert.equal(kimiBuckets[0].inputTokens, 1000);
 });
