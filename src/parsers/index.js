@@ -55,6 +55,40 @@ export function roundToHalfHour(date) {
 const MODEL_MAX_LENGTH = 100;
 const PROJECT_MAX_LENGTH = 200;
 
+// Known model aliases: some APIs use short model IDs that differ from the
+// canonical name the pricing table expects. Map them so all variants land in
+// the same server-side bucket and receive the correct price lookup.
+const MODEL_ALIASES = {
+  // Kimi For Coding (api.kimi.com/coding/v1) uses "k3" for the Kimi K3
+  // flagship; Moonshot AI API and resellers use "kimi-k3".
+  k3: 'kimi-k3',
+};
+
+/**
+ * Normalize a raw model name so the server can price it consistently.
+ *
+ * 1. Strip provider/namespace prefix:
+ *    "moonshot/kimi-k3" → "kimi-k3"
+ *    "anthropic/claude-opus-4.8" → "claude-opus-4.8"
+ *
+ * 2. Map known short aliases to canonical names:
+ *    "k3" → "kimi-k3"
+ *
+ * 3. Clamp to the server's varchar(100) column limit.
+ */
+export function normalizeModelName(rawModel) {
+  let model = String(rawModel || 'unknown').trim();
+  const slashIndex = model.lastIndexOf('/');
+  if (slashIndex >= 0) {
+    model = model.slice(slashIndex + 1);
+  }
+  const aliased = MODEL_ALIASES[model];
+  if (aliased) {
+    model = aliased;
+  }
+  return model.slice(0, MODEL_MAX_LENGTH);
+}
+
 // Server token columns are bigint — a single fractional/NaN value aborts the
 // whole INSERT chunk with 22P02, taking every other tool's rows in the batch
 // down with it.
@@ -68,7 +102,7 @@ export function aggregateToBuckets(entries) {
   const map = new Map();
 
   for (const e of entries) {
-    const model = String(e.model || 'unknown').slice(0, MODEL_MAX_LENGTH);
+    const model = normalizeModelName(e.model);
     const project = String(e.project || 'unknown').slice(0, PROJECT_MAX_LENGTH);
     const bucketStart = roundToHalfHour(e.timestamp).toISOString();
     const key = `${e.source}|${model}|${project}|${e.hostname || ''}|${bucketStart}`;
