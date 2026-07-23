@@ -4,6 +4,7 @@ import { parse as parseCline } from './cline.js';
 import { parse as parseCodex } from './codex.js';
 import { parse as parseCopilotCli } from './copilot-cli.js';
 import { parse as parseCursor } from './cursor.js';
+import { parse as parseDimAgent } from './dimagent.js';
 import { parse as parseRooCode } from './roo-code.js';
 import { parse as parseGeminiCli } from './gemini-cli.js';
 import { parse as parseGrok } from './grok.js';
@@ -26,6 +27,7 @@ export const parsers = {
   'grok': parseGrok,
   'copilot-cli': parseCopilotCli,
   'cursor': parseCursor,
+  'dimagent': parseDimAgent,
   'gemini-cli': parseGeminiCli,
   'opencode': parseOpencode,
   'openclaw': parseOpenclaw,
