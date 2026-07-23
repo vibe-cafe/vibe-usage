@@ -1,5 +1,5 @@
 import { existsSync, readdirSync, statSync } from 'node:fs';
-import { join } from 'node:path';
+import { join, resolve } from 'node:path';
 import { homedir } from 'node:os';
 import { findClaudeCodeDataDirs } from './claude-roots.js';
 
@@ -145,6 +145,24 @@ export function findGrokDataDirs() {
   return [join(getGrokHome(), 'sessions')].filter(existsSync);
 }
 
+export function getDimAgentDbPath() {
+  const override = process.env.VIBE_USAGE_DIMAGENT_DB?.trim();
+  if (override) return resolve(override);
+
+  const explicitHome = process.env.DIMCODE_HOME?.trim();
+  if (explicitHome) return join(resolve(explicitHome), 'dimcode.sqlite');
+
+  const xdgConfigHome = process.env.XDG_CONFIG_HOME?.trim();
+  const home = xdgConfigHome
+    ? resolve(xdgConfigHome, '.dimcode', 'v2')
+    : join(homedir(), '.dimcode', 'v2');
+  return join(home, 'dimcode.sqlite');
+}
+
+export function findDimAgentDataDirs() {
+  return [getDimAgentDbPath()].filter(existsSync);
+}
+
 export const TOOLS = [
   {
     name: 'Claude Code',
@@ -173,6 +191,12 @@ export const TOOLS = [
     name: 'Cursor',
     id: 'cursor',
     dataDir: getCursorStateDbPath(),
+  },
+  {
+    name: 'DimAgent',
+    id: 'dimagent',
+    dataDir: getDimAgentDbPath(),
+    detectDataDirs: findDimAgentDataDirs,
   },
   {
     name: 'Gemini CLI',
