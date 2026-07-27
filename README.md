@@ -58,6 +58,7 @@ npx @vibe-cafe/vibe-usage status       # Show config & detected tools
 | Gemini CLI | `~/.gemini/tmp/<project_hash>/chats/session-*.jsonl` (current line-delimited format) and legacy `session-*.json`; recurses into nested subagent sessions |
 | OpenCode | `~/.local/share/opencode/opencode.db` (SQLite, `json_extract` query) |
 | OpenClaw | `~/.openclaw/agents/`, `~/.openclaw-<profile>/agents/` (profile deployments) |
+| oh-my-pi | `~/.omp/agent/sessions/**/*.jsonl` (pi-fork session format: per-message `usage` input/output/cacheRead/cacheWrite, project from `session` entry `cwd`; honors `OMP_AGENT_DIR`) |
 | pi | `~/.pi/agent/sessions/` |
 | Qwen Code | `~/.qwen/tmp/` |
 | Kimi Code | Current `~/.kimi-code/sessions/wd_<slug>_<hash>/session_<id>/agents/<agent>/wire.jsonl` (`usage.record` deltas, including retry/compaction scope and cache creation; main/subagent wires form one session), data root resolved via `$KIMI_CODE_HOME` like the CLI itself, with project names from `session_index.jsonl`; legacy `~/.kimi/sessions/` is parsed alongside (`kimi migrate` never carries usage over, so both stores are always merged) |

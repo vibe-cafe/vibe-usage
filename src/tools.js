@@ -191,6 +191,11 @@ export const TOOLS = [
     detectDataDirs: findOpenclawDataDirs,
   },
   {
+    name: 'oh-my-pi',
+    id: 'omp',
+    dataDir: join(homedir(), '.omp', 'agent'),
+  },
+  {
     name: 'pi',
     id: 'pi-coding-agent',
     dataDir: join(homedir(), '.pi', 'agent', 'sessions'),
