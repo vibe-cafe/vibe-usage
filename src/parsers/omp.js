@@ -19,7 +19,8 @@ import { aggregateToBuckets, extractSessions } from './index.js';
  *   - type "model_change", "mode_change", "custom", etc.: metadata (ignored for usage)
  *
  * Assistant messages carry per-message token usage:
- *   message.usage = { input, output, cacheRead, cacheWrite, totalTokens }
+ *   message.usage = { input, output, cacheRead, cacheWrite, totalTokens,
+ *                       reasoningTokens? }   // reasoningTokens: newer omp builds
  */
 
 function getSessionsDir() {
@@ -138,7 +139,7 @@ export async function parse() {
         inputTokens: usage.input || 0,
         outputTokens: usage.output || 0,
         cachedInputTokens: usage.cacheRead || 0,
-        reasoningOutputTokens: 0,
+        reasoningOutputTokens: usage.reasoningTokens || 0,
       });
     }
   }

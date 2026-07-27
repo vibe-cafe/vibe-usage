@@ -25,12 +25,13 @@ function writeSessionFixture(sessionsDir) {
       message: { role, content: [], timestamp: new Date(ts).getTime(), ...extra },
     });
 
-  const usage = (input, output, cacheRead) => ({
+  const usage = (input, output, cacheRead, reasoningTokens = 0) => ({
     input,
     output,
     cacheRead,
     cacheWrite: 0,
     totalTokens: input + output + cacheRead,
+    reasoningTokens,
     cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 },
   });
 
@@ -56,7 +57,7 @@ function writeSessionFixture(sessionsDir) {
     msg('a1', 'u1', '2026-07-27T13:20:10.000Z', 'assistant', {
       provider: 'kimi-code',
       model: 'k3-256k',
-      usage: usage(1000, 200, 5000),
+      usage: usage(1000, 200, 5000, 123),
     }),
     msg('t1', 'a1', '2026-07-27T13:20:12.000Z', 'toolResult'),
     JSON.stringify(duplicate),
@@ -98,6 +99,9 @@ test('parse reads omp assistant usage, dedups entries, and extracts sessions', a
     assert.equal(first.inputTokens, 1000 + 500);
     assert.equal(first.outputTokens, 200 + 100);
     assert.equal(first.cachedInputTokens, 5000 + 2000);
+    // reasoningTokens (newer omp builds) maps to reasoningOutputTokens; the
+    // duplicate entry must not double-count it.
+    assert.equal(first.reasoningOutputTokens, 123);
 
     const second = byStart.get('2026-07-27T13:30:00.000Z');
     assert.ok(second, 'expected 13:30 bucket');
