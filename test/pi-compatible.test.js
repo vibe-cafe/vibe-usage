@@ -1,0 +1,144 @@
+import test from 'node:test';
+import assert from 'node:assert/strict';
+import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from 'node:fs';
+import { delimiter, join } from 'node:path';
+import { tmpdir } from 'node:os';
+import { parse as parseCraftAgent } from '../src/parsers/craft-agent.js';
+import { parse as parseOmp } from '../src/parsers/omp.js';
+import { parse as parsePi } from '../src/parsers/pi-coding-agent.js';
+import { getOmpSessionDirs, getPiSessionDirs } from '../src/pi-roots.js';
+
+function restoreEnv(name, value) {
+  if (value == null) delete process.env[name];
+  else process.env[name] = value;
+}
+
+function sessionLines({ sessionId = 'session-1', cwd = '/work/project', input = 100 } = {}) {
+  return [
+    { type: 'session', id: sessionId, timestamp: '2026-07-27T13:19:57.000Z', cwd },
+    {
+      type: 'message',
+      id: 'user-1',
+      timestamp: '2026-07-27T13:20:00.000Z',
+      message: { role: 'user', content: [] },
+    },
+    {
+      type: 'message',
+      id: 'assistant-1',
+      timestamp: '2026-07-27T13:20:05.000Z',
+      message: {
+        role: 'assistant',
+        model: 'test-model',
+        usage: {
+          input,
+          output: 20,
+          cacheRead: 30,
+          cacheWrite: 10,
+          reasoningTokens: 4,
+        },
+      },
+    },
+  ].map((line) => JSON.stringify(line)).join('\n') + '\n';
+}
+
+function writeSession(sessionsDir, relativePath, options) {
+  const path = join(sessionsDir, relativePath);
+  mkdirSync(join(path, '..'), { recursive: true });
+  writeFileSync(path, sessionLines(options));
+  return path;
+}
+
+test('Pi-compatible parsers count cache writes as input tokens', async () => {
+  const root = mkdtempSync(join(tmpdir(), 'vibe-usage-pi-compatible-'));
+  const previousPi = process.env.VIBE_USAGE_PI_SESSION_DIRS;
+  const previousCraft = process.env.CRAFT_AGENT_DIR;
+  try {
+    const piSessions = join(root, 'pi-sessions');
+    writeSession(piSessions, join('--work-project--', 'pi.jsonl'));
+    process.env.VIBE_USAGE_PI_SESSION_DIRS = piSessions;
+
+    const pi = await parsePi();
+    assert.equal(pi.buckets.length, 1);
+    assert.equal(pi.buckets[0].source, 'pi-coding-agent');
+    assert.equal(pi.buckets[0].inputTokens, 110);
+    assert.equal(pi.buckets[0].cachedInputTokens, 30);
+    assert.equal(pi.buckets[0].reasoningOutputTokens, 4);
+
+    const craftRoot = join(root, 'craft');
+    writeSession(
+      join(craftRoot, 'workspaces'),
+      join('workspace', 'sessions', 'branch-name', '.pi-sessions', 'craft.jsonl'),
+      { cwd: null },
+    );
+    process.env.CRAFT_AGENT_DIR = craftRoot;
+
+    const craft = await parseCraftAgent();
+    assert.equal(craft.buckets.length, 1);
+    assert.equal(craft.buckets[0].source, 'craft-agent');
+    assert.equal(craft.buckets[0].project, 'branch-name');
+    assert.equal(craft.buckets[0].inputTokens, 110);
+  } finally {
+    restoreEnv('VIBE_USAGE_PI_SESSION_DIRS', previousPi);
+    restoreEnv('CRAFT_AGENT_DIR', previousCraft);
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test('OMP scans multiple stores and deduplicates copied records', async () => {
+  const root = mkdtempSync(join(tmpdir(), 'vibe-usage-omp-dedup-'));
+  const previous = process.env.VIBE_USAGE_OMP_SESSION_DIRS;
+  try {
+    const first = join(root, 'first');
+    const second = join(root, 'second');
+    writeSession(first, join('project', 'copy.jsonl'));
+    writeSession(second, join('project', 'copy.jsonl'));
+    process.env.VIBE_USAGE_OMP_SESSION_DIRS = `${first}${delimiter}${second}`;
+
+    const result = await parseOmp();
+    assert.equal(result.buckets.length, 1);
+    assert.equal(result.buckets[0].source, 'omp');
+    assert.equal(result.buckets[0].inputTokens, 110);
+    assert.equal(result.buckets[0].outputTokens, 20);
+    assert.equal(result.buckets[0].reasoningOutputTokens, 4);
+    assert.equal(result.sessions.length, 1);
+    assert.equal(result.sessions[0].messageCount, 2);
+  } finally {
+    restoreEnv('VIBE_USAGE_OMP_SESSION_DIRS', previous);
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test('OMP discovers XDG profiles and does not also label its agent store as Pi', () => {
+  const root = mkdtempSync(join(tmpdir(), 'vibe-usage-omp-roots-'));
+  const previous = Object.fromEntries([
+    'VIBE_USAGE_OMP_SESSION_DIRS',
+    'VIBE_USAGE_PI_SESSION_DIRS',
+    'PI_CODING_AGENT_DIR',
+    'PI_CONFIG_DIR',
+    'XDG_DATA_HOME',
+  ].map((name) => [name, process.env[name]]));
+  try {
+    delete process.env.VIBE_USAGE_OMP_SESSION_DIRS;
+    delete process.env.VIBE_USAGE_PI_SESSION_DIRS;
+    process.env.PI_CONFIG_DIR = '.vibe-usage-test-missing-omp-config';
+    process.env.XDG_DATA_HOME = join(root, 'xdg');
+    const xdgSession = join(root, 'xdg', 'omp', 'sessions');
+    const xdgProfile = join(root, 'xdg', 'omp', 'profiles', 'work', 'sessions');
+    mkdirSync(xdgSession, { recursive: true });
+    mkdirSync(xdgProfile, { recursive: true });
+
+    const ompAgent = join(root, '.omp', 'agent');
+    const overriddenSession = join(ompAgent, 'sessions');
+    mkdirSync(overriddenSession, { recursive: true });
+    process.env.PI_CODING_AGENT_DIR = ompAgent;
+
+    const ompDirs = getOmpSessionDirs();
+    assert.ok(ompDirs.includes(xdgSession));
+    assert.ok(ompDirs.includes(xdgProfile));
+    assert.ok(ompDirs.includes(overriddenSession));
+    assert.deepEqual(getPiSessionDirs(), []);
+  } finally {
+    for (const [name, value] of Object.entries(previous)) restoreEnv(name, value);
+    rmSync(root, { recursive: true, force: true });
+  }
+});

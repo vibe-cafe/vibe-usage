@@ -3,6 +3,9 @@ import { isAbsolute, join, resolve } from 'node:path';
 import { homedir } from 'node:os';
 import { findClaudeCodeDataDirs } from './claude-roots.js';
 import { codexSessionDirs, resolveCodexHomes } from './codex-roots.js';
+import { findClineDataDirs } from './cline-roots.js';
+import { findCraftDataDirs } from './craft-roots.js';
+import { findOmpDataDirs, findPiDataDirs } from './pi-roots.js';
 
 function getCursorStateDbPath() {
   const rel = join('User', 'globalStorage', 'state.vscdb');
@@ -61,7 +64,6 @@ function findExtensionDirs(extensionId) {
   return dirs;
 }
 
-const findClineDataDirs = () => findExtensionDirs('saoudrizwan.claude-dev');
 const findRooCodeDataDirs = () => findExtensionDirs('rooveterinaryinc.roo-cline');
 
 /** Find all OpenClaw data roots: ~/.openclaw and ~/.openclaw-<profile> */
@@ -199,6 +201,12 @@ export const TOOLS = [
     dataDir: join(homedir(), '.copilot', 'session-state'),
   },
   {
+    name: 'CraftAgent',
+    id: 'craft-agent',
+    dataDir: join(homedir(), '.craft-agent', 'workspaces'),
+    detectDataDirs: findCraftDataDirs,
+  },
+  {
     name: 'Cursor',
     id: 'cursor',
     dataDir: getCursorStateDbPath(),
@@ -226,9 +234,16 @@ export const TOOLS = [
     detectDataDirs: findOpenclawDataDirs,
   },
   {
+    name: 'Oh My Pi',
+    id: 'omp',
+    dataDir: join(homedir(), '.omp', 'agent', 'sessions'),
+    detectDataDirs: findOmpDataDirs,
+  },
+  {
     name: 'pi',
     id: 'pi-coding-agent',
     dataDir: join(homedir(), '.pi', 'agent', 'sessions'),
+    detectDataDirs: findPiDataDirs,
   },
   {
     name: 'Qwen Code',
@@ -284,7 +299,7 @@ export const TOOLS = [
   {
     name: 'Cline',
     id: 'cline',
-    dataDir: join(homedir(), 'Library', 'Application Support', 'Code', 'User', 'globalStorage', 'saoudrizwan.claude-dev'),
+    dataDir: join(homedir(), '.cline'),
     detectDataDirs: findClineDataDirs,
   },
   {

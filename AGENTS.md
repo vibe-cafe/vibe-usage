@@ -21,6 +21,9 @@ vibe-usage/
 │   │   ├── gemini-cli.js
 │   │   ├── opencode.js        # SQLite (via sqlite.js), legacy JSON fallback
 │   │   ├── openclaw.js
+│   │   ├── omp.js             # Oh My Pi, via the shared Pi-compatible JSONL reader
+│   │   ├── pi-session-jsonl.js # Shared Pi/CraftAgent/OMP reader + copied-record dedup
+│   │   ├── craft-agent.js
 │   │   ├── qwen-code.js
 │   │   ├── kimi-code.js          # Both stores parsed+merged: ~/.kimi-code (root via $KIMI_CODE_HOME) + legacy ~/.kimi
 │   │   ├── amp.js
@@ -30,6 +33,9 @@ vibe-usage/
 │   │   ├── hermes.js          # SQLite (via sqlite.js), multi-profile
 │   │   ├── trae-cli.js        # Trae CLI JSONL telemetry (not Trae IDE/Work)
 │   │   └── zcode.js           # SQLite (via sqlite.js), reads message table
+│   ├── pi-roots.js            # Pi/OMP default, profile, XDG, and override discovery
+│   ├── cline-roots.js         # Standalone + VSCode-host Cline discovery
+│   ├── craft-roots.js         # CraftAgent root resolution and detection
 │   ├── tools.js               # TOOLS[] registry + detectInstalledTools()
 │   ├── sync.js                # Orchestrator: parse all → diff vs state → batch upload only new/changed
 │   ├── state.js               # ~/.vibe-usage/state.json: key→hash of uploaded items (incremental sync), clearState() for reset
@@ -96,6 +102,11 @@ Parser pattern:
 - Extract user/assistant timing events → `extractSessions(events)`
 - Handle missing/corrupt files gracefully (try/catch, skip bad lines)
 
+Pi-compatible JSONL parsers (`pi-coding-agent.js`, `craft-agent.js`, `omp.js`):
+- Use `parsePiSessionJsonl()` instead of duplicating filesystem/message parsing.
+- Fold `usage.cacheWrite` into input tokens, keep `cacheRead` separate, and map OMP `reasoningTokens` to reasoning output.
+- Deduplicate stable message ids across copied/profile stores. Any directory read failure returns `skipped` so incremental state is not pruned.
+
 SQLite-backed parsers (antigravity, cursor, opencode, kiro, hermes):
 - Use `queryDbJson(dbPath, sql)` from `src/parsers/sqlite.js` — never shell out to `sqlite3` directly. It prefers Node's built-in `node:sqlite` (`DatabaseSync`, opened read-only; Node ≥ 22.5, works on Windows with no extra binary) and falls back to the `sqlite3` CLI on older Node.
 - Rows come back as plain objects (`{ column: value }`), same shape as `sqlite3 -json` — INTEGER → number, TEXT → string, JSON via `json_extract` → string.
@@ -139,6 +150,7 @@ Test hooks (env vars honored at module load, set them before importing):
 - Codex cache controls: `VIBE_USAGE_CACHE_DIR` redirects cache writes, `VIBE_USAGE_CODEX_CACHE=0` disables the optimization, `VIBE_USAGE_CODEX_WORK_BUDGET_MS` overrides the non-interactive build budget, and `VIBE_USAGE_CODEX_AUDIT_INTERVAL_MS` / `VIBE_USAGE_CODEX_AUDIT_MAX_BYTES` override rolling-audit bounds
 - Per-parser fixtures: `CODEX_HOME`, `VIBE_USAGE_GROK_SESSIONS`, `VIBE_USAGE_KIMI_CODE_DIR`, `VIBE_USAGE_KIMI_DIR`, `VIBE_USAGE_TRAE_CLI_SESSIONS`, `VIBE_USAGE_KIRO_LEGACY_TOKENS`. The Kimi Code parser resolves its data root as `VIBE_USAGE_KIMI_CODE_DIR` → `KIMI_CODE_HOME` (matching the CLI) → `~/.kimi-code`, and always merges the legacy `~/.kimi` store instead of either/or (`kimi migrate` drops usage records, so no double-count)
 - Claude fixtures: `VIBE_USAGE_CLAUDE_DIRS` replaces normal Claude root discovery with a `path.delimiter`-separated root list; `VIBE_USAGE_CLAUDE_DESKTOP_DIRS` overrides only the Claude Desktop user-data roots. The production parser scans `~/.claude`, `$CLAUDE_CONFIG_DIR`, data-bearing `~/.claude-*` profiles, and the per-session `.claude` roots created below Claude Desktop's `local-agent-mode-sessions`. Desktop Code already writes to the normal Claude Code root, while Cowork uses the private roots. Both remain source `claude-code`. The parser streams each JSONL file to its captured size, keeps the most complete duplicate session/UUID, and returns `skipped` with warnings after any read failure so incremental state is not pruned.
+- Pi-family/Cline/OpenClaw fixtures: `VIBE_USAGE_PI_SESSION_DIRS`, `VIBE_USAGE_OMP_SESSION_DIRS`, `VIBE_USAGE_CLINE_DIRS`, and `VIBE_USAGE_OPENCLAW_DIRS` replace normal discovery with `path.delimiter`-separated roots.
 
 ## Versioning
 

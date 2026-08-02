@@ -55,20 +55,22 @@ npx @vibe-cafe/vibe-usage status       # Show config & detected tools
 | Codex CLI | `$CODEX_HOME/sessions/` and `$CODEX_HOME/archived_sessions/` (default `~/.codex`), plus an optional temporary `--extra-codex-home` or manually persisted `codexExtraHome`; a versioned local index avoids re-reading unchanged rollouts and reads only safe append tails for ordinary sessions, while fork/sub-agent replay matching, duplicate suppression, and live/archive/cross-root deduplication retain their existing semantics |
 | Grok | `$GROK_HOME/sessions/<encoded-cwd>/<session-id>/` (default `~/.grok`); token usage from `updates.jsonl` `turn_completed.usage` (per-model `modelUsage`, cache reads, reasoning); project from `summary.json` cwd; honors `GROK_HOME` |
 | GitHub Copilot CLI | `~/.copilot/session-state/*/events.jsonl` |
+| CraftAgent | `~/.craft-agent/workspaces/*/sessions/*/.pi-sessions/*.jsonl`; honors `$CRAFT_AGENT_DIR` / `$CRAFTAGENT_DIR`; cache writes are included in input usage |
 | Cursor | `state.vscdb` (SQLite, reads `cursorAuth/accessToken`, fetches CSV from `cursor.com`); cloud data is stamped with a fixed `cursor-cloud` hostname so multi-machine setups don't double-count |
 | DimAgent | `$DIMCODE_HOME/dimcode.sqlite` (default `~/.dimcode/v2/dimcode.sqlite`); exact usage from `usage_ledger`, with forked ledger/history copies deduplicated |
 | Gemini CLI | `~/.gemini/tmp/<project_hash>/chats/session-*.jsonl` (current line-delimited format) and legacy `session-*.json`; recurses into nested subagent sessions |
 | OpenCode | `~/.local/share/opencode/opencode.db` (SQLite, `json_extract` query) |
-| OpenClaw | `~/.openclaw/agents/`, `~/.openclaw-<profile>/agents/` (profile deployments) |
-| pi | `~/.pi/agent/sessions/` |
+| OpenClaw | `~/.openclaw/agents/`, `~/.openclaw-<profile>/agents/` (profile deployments); cache-creation/cache-write tokens are included in input usage |
+| Oh My Pi | `~/.omp/agent/sessions/`, `~/.omp/profiles/*/agent/sessions/`, and `$XDG_DATA_HOME/omp/{sessions,profiles/*/sessions}`; recognizes OMP's `$PI_CODING_AGENT_DIR`, deduplicates copied records, and includes cache writes in input usage |
+| pi | `~/.pi/agent/sessions/` or `$PI_CODING_AGENT_DIR/sessions/`; cache writes are included in input usage |
 | Qwen Code | `~/.qwen/tmp/` |
 | Kimi Code | Current `~/.kimi-code/sessions/wd_<slug>_<hash>/session_<id>/agents/<agent>/wire.jsonl` (`usage.record` deltas, including retry/compaction scope and cache creation; main/subagent wires form one session), data root resolved via `$KIMI_CODE_HOME` like the CLI itself, with project names from `session_index.jsonl`; legacy `~/.kimi/sessions/` is parsed alongside (`kimi migrate` never carries usage over, so both stores are always merged) |
 | MiMoCode | `$MIMOCODE_HOME/data/mimocode.db`, `$XDG_DATA_HOME/mimocode/mimocode.db`, or `~/.local/share/mimocode/mimocode.db` (SQLite; exact input, output, reasoning, and cache-read tokens from assistant messages; honors `MIMOCODE_DB`; cache-write tokens are included in input usage) |
-| Amp | `~/.local/share/amp/threads/` |
+| Amp | `~/.local/share/amp/threads/`; cache-creation tokens are included in input usage |
 | Droid | `~/.factory/sessions/` |
 | Hermes | `~/.hermes/state.db` + `~/.hermes/profiles/<name>/state.db` (SQLite, multi-profile) |
 | Kiro | Kiro CLI native event streams `~/.kiro/sessions/cli/*.jsonl` (estimated tokens from message text: input = prompt + tool results, output = reply + tool calls, reasoning = thinking, cacheRead = re-sent context; thinking-block signatures excluded). Falls back to `~/Library/Application Support/kiro-cli/data.sqlite3` / `~/.local/share/kiro-cli/data.sqlite3` + optional `~/.kiro_sessions/*.json` archives, then IDE `q-client.log` whole-credit deltas as `kiro-credits` (floored cumulative diff — the server stores token counts as bigint); legacy IDE `dev_data/devdata.sqlite` token telemetry is opt-in with `VIBE_USAGE_KIRO_LEGACY_TOKENS=1` |
-| Cline | `<host>/User/globalStorage/saoudrizwan.claude-dev/{state/taskHistory.json,tasks/<id>/ui_messages.json}` (walks all VSCode-fork hosts: Code, Cursor, Windsurf, VSCodium, Trae, ...) |
+| Cline | Standalone `~/.cline/` plus `<host>/User/globalStorage/saoudrizwan.claude-dev/` across VSCode-fork hosts; migrated copies are deduplicated and empty leftover extension stores no longer count as installed |
 | Roo Code | `<host>/User/globalStorage/rooveterinaryinc.roo-cline/{tasks/_index.json,tasks/<id>/{history_item,ui_messages}.json}` (walks all VSCode-fork hosts) |
 | Trae CLI | macOS: `~/Library/Caches/trae-cli/sessions/`; Windows: `%LOCALAPPDATA%/trae-cli/cache/sessions/`; Linux: `~/.cache/trae-cli/sessions/` (CLI telemetry only; Trae IDE/Trae Work chats are not supported) |
 | Antigravity | App 2.0 `~/.gemini/antigravity/conversations/*.db` and `agy` CLI `~/.gemini/antigravity-cli/conversations/*.db` are parsed offline (tokens, real model display name, project, sessions); legacy App `.pb` history falls back to Connect RPC while the language server is running |

@@ -7,6 +7,8 @@ import { aggregateToBuckets, extractSessions } from './index.js';
 // Profile deployments use ~/.openclaw-<profile>/agents/...
 // Legacy paths: ~/.clawdbot, ~/.moltbot, ~/.moldbot
 function getPossibleRoots() {
+  const override = process.env.VIBE_USAGE_OPENCLAW_DIRS?.trim();
+  if (override) return override.split(process.platform === 'win32' ? ';' : ':').filter(Boolean);
   const home = homedir();
   const roots = [
     join(home, '.clawdbot'),
@@ -29,7 +31,8 @@ function getPossibleRoots() {
 /** Normalize usage fields — OpenClaw supports multiple naming conventions */
 function getTokens(usage, ...keys) {
   for (const key of keys) {
-    if (usage[key] != null && usage[key] > 0) return usage[key];
+    const value = Number(usage[key]);
+    if (Number.isFinite(value) && value > 0) return value;
   }
   return 0;
 }
@@ -98,12 +101,31 @@ export async function parse() {
             const usage = msg.usage;
             if (!usage) continue;
 
+            const inputTokens = getTokens(
+              usage,
+              'input',
+              'inputTokens',
+              'input_tokens',
+              'promptTokens',
+              'prompt_tokens',
+            );
+            const cacheWriteTokens = getTokens(
+              usage,
+              'cacheCreation',
+              'cacheCreationInputTokens',
+              'cacheWrite',
+              'cache_creation',
+              'cache_write',
+              'cache_creation_input_tokens',
+              'cache_write_input_tokens',
+            );
+
             entries.push({
               source: 'openclaw',
               model: msg.model || obj.model || 'unknown',
               project,
               timestamp: ts,
-              inputTokens: getTokens(usage, 'input', 'inputTokens', 'input_tokens', 'promptTokens', 'prompt_tokens'),
+              inputTokens: inputTokens + cacheWriteTokens,
               outputTokens: getTokens(usage, 'output', 'outputTokens', 'output_tokens', 'completionTokens', 'completion_tokens'),
               cachedInputTokens: getTokens(usage, 'cacheRead', 'cache_read', 'cache_read_input_tokens'),
               reasoningOutputTokens: 0,

@@ -79,17 +79,23 @@ export async function parse() {
 
         const inputTokens = event?.tokens?.input || 0;
         const outputTokens = event?.tokens?.output || 0;
-        if (inputTokens === 0 && outputTokens === 0) continue;
 
         const toMessage = Number.isInteger(event.toMessageId) ? messages[event.toMessageId] : null;
         const cacheReadInputTokens = toMessage?.usage?.cacheReadInputTokens || 0;
+        const cacheCreationInputTokens = toMessage?.usage?.cacheCreationInputTokens || 0;
+        if (
+          inputTokens === 0
+          && outputTokens === 0
+          && cacheReadInputTokens === 0
+          && cacheCreationInputTokens === 0
+        ) continue;
 
         entries.push({
           source: 'amp',
           model: event?.model || 'unknown',
           project: 'unknown',
           timestamp: ts,
-          inputTokens,
+          inputTokens: inputTokens + cacheCreationInputTokens,
           outputTokens,
           cachedInputTokens: cacheReadInputTokens,
           reasoningOutputTokens: 0,
@@ -105,14 +111,20 @@ export async function parse() {
 
         const inputTokens = usage.inputTokens || 0;
         const outputTokens = usage.outputTokens || 0;
-        if (inputTokens === 0 && outputTokens === 0 && (usage.cacheReadInputTokens || 0) === 0) continue;
+        const cacheCreationInputTokens = usage.cacheCreationInputTokens || 0;
+        if (
+          inputTokens === 0
+          && outputTokens === 0
+          && (usage.cacheReadInputTokens || 0) === 0
+          && cacheCreationInputTokens === 0
+        ) continue;
 
         entries.push({
           source: 'amp',
           model: usage.model || 'unknown',
           project: 'unknown',
           timestamp: ts,
-          inputTokens,
+          inputTokens: inputTokens + cacheCreationInputTokens,
           outputTokens,
           cachedInputTokens: usage.cacheReadInputTokens || 0,
           reasoningOutputTokens: 0,

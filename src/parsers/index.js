@@ -3,6 +3,7 @@ import { parse as parseClaudeCode } from './claude-code.js';
 import { parse as parseCline } from './cline.js';
 import { parse as parseCodex } from './codex.js';
 import { parse as parseCopilotCli } from './copilot-cli.js';
+import { parse as parseCraftAgent } from './craft-agent.js';
 import { parse as parseCursor } from './cursor.js';
 import { parse as parseDimAgent } from './dimagent.js';
 import { parse as parseRooCode } from './roo-code.js';
@@ -10,6 +11,7 @@ import { parse as parseGeminiCli } from './gemini-cli.js';
 import { parse as parseGrok } from './grok.js';
 import { parse as parseOpencode } from './opencode.js';
 import { parse as parseOpenclaw } from './openclaw.js';
+import { parse as parseOmp } from './omp.js';
 import { parse as parseQwenCode } from './qwen-code.js';
 import { parse as parseKimiCode } from './kimi-code.js';
 import { parse as parseAmp } from './amp.js';
@@ -27,11 +29,13 @@ export const parsers = {
   'codex': parseCodex,
   'grok': parseGrok,
   'copilot-cli': parseCopilotCli,
+  'craft-agent': parseCraftAgent,
   'cursor': parseCursor,
   'dimagent': parseDimAgent,
   'gemini-cli': parseGeminiCli,
   'opencode': parseOpencode,
   'openclaw': parseOpenclaw,
+  'omp': parseOmp,
   'pi-coding-agent': parsePiCodingAgent,
   'qwen-code': parseQwenCode,
   'kimi-code': parseKimiCode,

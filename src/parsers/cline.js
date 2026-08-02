@@ -1,40 +1,7 @@
 import { readFileSync, statSync } from 'node:fs';
 import { basename, join } from 'node:path';
-import { homedir } from 'node:os';
 import { aggregateToBuckets, extractSessions } from './index.js';
-
-const EXTENSION_ID = 'saoudrizwan.claude-dev';
-
-// VSCode-fork application names that may host extensions.
-const HOSTS = ['Code', 'Cursor', 'Windsurf', 'VSCodium', 'Code - Insiders', 'Trae', 'Trae CN'];
-
-function getHostRoots() {
-  const out = [];
-  if (process.platform === 'darwin') {
-    const base = join(homedir(), 'Library', 'Application Support');
-    for (const h of HOSTS) out.push(join(base, h));
-  } else if (process.platform === 'win32') {
-    const appData = process.env.APPDATA?.trim() || join(homedir(), 'AppData', 'Roaming');
-    for (const h of HOSTS) out.push(join(appData, h));
-  } else {
-    const xdg = process.env.XDG_CONFIG_HOME?.trim() || join(homedir(), '.config');
-    for (const h of HOSTS) out.push(join(xdg, h));
-  }
-  return out;
-}
-
-export function findClineExtensionDirs() {
-  const dirs = [];
-  for (const root of getHostRoots()) {
-    const ext = join(root, 'User', 'globalStorage', EXTENSION_ID);
-    try {
-      if (statSync(ext).isDirectory()) dirs.push(ext);
-    } catch {
-      // not installed in this host; skip
-    }
-  }
-  return dirs;
-}
+import { findClineDataDirs } from '../cline-roots.js';
 
 function readJsonSafe(path) {
   try { return JSON.parse(readFileSync(path, 'utf-8')); } catch { return null; }
@@ -48,24 +15,44 @@ function projectFromPath(absPath) {
 }
 
 export async function parse() {
-  const extDirs = findClineExtensionDirs();
+  const extDirs = findClineDataDirs();
   if (extDirs.length === 0) return { buckets: [], sessions: [] };
 
   const entries = [];
   const events = [];
 
+  const candidates = new Map();
   for (const extDir of extDirs) {
     const history = readJsonSafe(join(extDir, 'state', 'taskHistory.json'));
     if (!Array.isArray(history)) continue;
 
     for (const item of history) {
+      if (!item || typeof item !== 'object' || !item.id) continue;
+      const taskId = String(item.id);
+      const messagesPath = join(extDir, 'tasks', taskId, 'ui_messages.json');
+      let stat;
       try {
-        if (!item || typeof item !== 'object' || !item.id) continue;
-        const taskId = String(item.id);
-        const project = projectFromPath(item.cwdOnTaskInitialization || item.shadowGitConfigWorkTree);
+        stat = statSync(messagesPath);
+      } catch {
+        continue;
+      }
+      const key = item.ulid ? String(item.ulid) : taskId;
+      const next = { item, taskId, messagesPath, size: stat.size, mtimeMs: stat.mtimeMs };
+      const current = candidates.get(key);
+      if (!current || next.size > current.size || (
+        next.size === current.size && next.mtimeMs > current.mtimeMs
+      )) candidates.set(key, next);
+    }
+  }
+
+  for (const { item, taskId, messagesPath } of candidates.values()) {
+      try {
+        const project = projectFromPath(
+          item.cwdOnTaskInitialization || item.shadowGitConfigWorkTree || item.cwd,
+        );
         const fallbackModel = (item.modelId && String(item.modelId).trim()) || 'cline-unknown';
 
-        const messages = readJsonSafe(join(extDir, 'tasks', taskId, 'ui_messages.json'));
+        const messages = readJsonSafe(messagesPath);
         if (!Array.isArray(messages)) continue;
 
         for (const msg of messages) {
@@ -109,7 +96,6 @@ export async function parse() {
       } catch {
         // Skip this task; keep going for the rest of the history.
       }
-    }
   }
 
   return { buckets: aggregateToBuckets(entries), sessions: extractSessions(events) };
