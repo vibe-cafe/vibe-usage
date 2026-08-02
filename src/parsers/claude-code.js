@@ -272,7 +272,9 @@ export async function parse() {
     warnings: [],
     incomplete: false,
   };
-  const roots = getClaudeRoots();
+  const roots = getClaudeRoots({
+    onWarning: (message) => addWarning(ctx, message),
+  });
   const projectGroups = collectCandidates(roots, 'projects', ctx);
   const projectSessionIds = new Set();
 

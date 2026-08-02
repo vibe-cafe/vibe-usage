@@ -51,7 +51,7 @@ npx @vibe-cafe/vibe-usage status       # Show config & detected tools
 
 | Tool | Data Location |
 |------|---------------|
-| Claude Code | `~/.claude/projects/` (tokens + sessions), `~/.claude/transcripts/` (sessions only); also scans `$CLAUDE_CONFIG_DIR` and data-bearing `~/.claude-*` profiles, selects the most complete duplicate session, and streams logs so large active sessions are not silently omitted. Cache creation tokens are included in input usage. |
+| Claude Code + Claude Desktop Code/Cowork | Claude Code data in `~/.claude/projects/` (tokens + sessions) and `~/.claude/transcripts/` (sessions only), plus Claude Desktop Cowork's per-session `.claude/projects/` directories. Also scans `$CLAUDE_CONFIG_DIR` and data-bearing `~/.claude-*` profiles. All variants use the existing `claude-code` source; the parser selects the most complete copy of each session so shared/copied transcripts are not counted twice. Logs are streamed and cache creation tokens are included in input usage. |
 | Codex CLI | `$CODEX_HOME/sessions/` and `$CODEX_HOME/archived_sessions/` (default `~/.codex`), plus an optional temporary `--extra-codex-home` or manually persisted `codexExtraHome`; a versioned local index avoids re-reading unchanged rollouts and reads only safe append tails for ordinary sessions, while fork/sub-agent replay matching, duplicate suppression, and live/archive/cross-root deduplication retain their existing semantics |
 | Grok | `$GROK_HOME/sessions/<encoded-cwd>/<session-id>/` (default `~/.grok`); token usage from `updates.jsonl` `turn_completed.usage` (per-model `modelUsage`, cache reads, reasoning); project from `summary.json` cwd; honors `GROK_HOME` |
 | GitHub Copilot CLI | `~/.copilot/session-state/*/events.jsonl` |

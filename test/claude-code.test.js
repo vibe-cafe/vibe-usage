@@ -4,6 +4,10 @@ import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from 'node:fs';
 import { delimiter, join } from 'node:path';
 import { tmpdir } from 'node:os';
 import { parse } from '../src/parsers/claude-code.js';
+import {
+  findClaudeCodeDataDirs,
+  findClaudeDesktopRoots,
+} from '../src/claude-roots.js';
 
 function record({
   type = 'assistant',
@@ -138,8 +142,16 @@ test('Claude parser keeps the most complete duplicate UUID and preserves unknown
 
 test('Claude parser selects the more complete copy of a session across config roots', async () => {
   const base = mkdtempSync(join(tmpdir(), 'vibe-usage-claude-roots-test-'));
-  const staleRoot = join(base, 'stale');
-  const activeRoot = join(base, 'active');
+  const staleRoot = join(base, 'cli', '.claude');
+  const activeRoot = join(
+    base,
+    'Claude',
+    'local-agent-mode-sessions',
+    'account',
+    'org',
+    'cowork-session',
+    '.claude',
+  );
   try {
     writeSession(staleRoot, '-Users-dev-proj', 'same-session', [
       record({
@@ -168,10 +180,61 @@ test('Claude parser selects the more complete copy of a session across config ro
     );
 
     assert.equal(buckets.length, 1);
+    assert.equal(buckets[0].source, 'claude-code');
     assert.equal(buckets[0].inputTokens, 150);
     assert.equal(buckets[0].outputTokens, 15);
     assert.equal(sessions.length, 1);
     assert.equal(sessions[0].messageCount, 2);
+  } finally {
+    rmSync(base, { recursive: true, force: true });
+  }
+});
+
+test('Claude root discovery includes normal and agent-mode Cowork sessions', () => {
+  const base = mkdtempSync(join(tmpdir(), 'vibe-usage-claude-desktop-test-'));
+  const normalRoot = join(
+    base,
+    'local-agent-mode-sessions',
+    'account',
+    'org',
+    'session-a',
+    '.claude',
+  );
+  const agentRoot = join(
+    base,
+    'local-agent-mode-sessions',
+    'account',
+    'org',
+    'agent',
+    'session-b',
+    '.claude',
+  );
+  try {
+    mkdirSync(join(normalRoot, 'projects'), { recursive: true });
+    mkdirSync(join(agentRoot, 'projects'), { recursive: true });
+
+    assert.deepEqual(
+      findClaudeDesktopRoots([base]).sort(),
+      [agentRoot, normalRoot].sort(),
+    );
+
+    const previousRoots = process.env.VIBE_USAGE_CLAUDE_DIRS;
+    const previousDesktop = process.env.VIBE_USAGE_CLAUDE_DESKTOP_DIRS;
+    delete process.env.VIBE_USAGE_CLAUDE_DIRS;
+    process.env.VIBE_USAGE_CLAUDE_DESKTOP_DIRS = base;
+    try {
+      const dataDirs = findClaudeCodeDataDirs();
+      assert.ok(dataDirs.includes(join(normalRoot, 'projects')));
+      assert.ok(dataDirs.includes(join(agentRoot, 'projects')));
+    } finally {
+      if (previousRoots === undefined) delete process.env.VIBE_USAGE_CLAUDE_DIRS;
+      else process.env.VIBE_USAGE_CLAUDE_DIRS = previousRoots;
+      if (previousDesktop === undefined) {
+        delete process.env.VIBE_USAGE_CLAUDE_DESKTOP_DIRS;
+      } else {
+        process.env.VIBE_USAGE_CLAUDE_DESKTOP_DIRS = previousDesktop;
+      }
+    }
   } finally {
     rmSync(base, { recursive: true, force: true });
   }
