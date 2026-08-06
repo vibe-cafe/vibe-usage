@@ -15,6 +15,7 @@ import { parse as parseOmp } from './omp.js';
 import { parse as parseQwenCode } from './qwen-code.js';
 import { parse as parseKimiCode } from './kimi-code.js';
 import { parse as parseAmp } from './amp.js';
+import { parse as parseAlma } from './alma.js';
 import { parse as parseDroid } from './droid.js';
 import { parse as parseAntigravity } from './antigravity.js';
 import { parse as parseHermes } from './hermes.js';
@@ -46,6 +47,7 @@ export const parsers = {
   'hermes': parseHermes,
   'kiro': parseKiro,
   'mimocode': parseMimocode,
+  'alma': parseAlma,
   'cline': parseCline,
   'roo-code': parseRooCode,
   'zcode': parseZcode,
