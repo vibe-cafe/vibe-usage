@@ -75,6 +75,7 @@ npx @vibe-cafe/vibe-usage status       # Show config & detected tools
 | Trae CLI | macOS: `~/Library/Caches/trae-cli/sessions/`; Windows: `%LOCALAPPDATA%/trae-cli/cache/sessions/`; Linux: `~/.cache/trae-cli/sessions/` (CLI telemetry only; Trae IDE/Trae Work chats are not supported) |
 | Antigravity | App 2.0 `~/.gemini/antigravity/conversations/*.db` and `agy` CLI `~/.gemini/antigravity-cli/conversations/*.db` are parsed offline (tokens, real model display name, project, sessions); legacy App `.pb` history falls back to Connect RPC while the language server is running |
 | ZCode | `~/.zcode/cli/db/db.sqlite` (SQLite; reads the `message` table for per-message tokens, model, and project `cwd`/`root`, joined to `session.directory`) |
+| WorkBuddy | macOS WorkBuddy 5.3.11+: `~/.workbuddy/projects/**/*.jsonl` (or `VIBE_USAGE_WORKBUDDY_DIRS` for relocated/test roots). Uses completed assistant requests only and attributes each bucket to the actual request model (`providerData.requestModelId`), so a task using Auto can appear under multiple routed models. Cache reads and reasoning tokens are split from inclusive input/output totals. SQLite context-window occupancy and web login/API data are never used. |
 
 ## How It Works
 

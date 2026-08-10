@@ -23,6 +23,7 @@ import { parse as parseMimocode } from './mimocode.js';
 import { parse as parsePiCodingAgent } from './pi-coding-agent.js';
 import { parse as parseZcode } from './zcode.js';
 import { parse as parseTraeCli } from './trae-cli.js';
+import { parse as parseWorkbuddy } from './workbuddy.js';
 
 export const parsers = {
   'claude-code': parseClaudeCode,
@@ -49,6 +50,7 @@ export const parsers = {
   'cline': parseCline,
   'roo-code': parseRooCode,
   'zcode': parseZcode,
+  'workbuddy': parseWorkbuddy,
 };
 
 

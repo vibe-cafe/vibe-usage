@@ -6,6 +6,7 @@ import { codexSessionDirs, resolveCodexHomes } from './codex-roots.js';
 import { findClineDataDirs } from './cline-roots.js';
 import { findCraftDataDirs } from './craft-roots.js';
 import { findOmpDataDirs, findPiDataDirs } from './pi-roots.js';
+import { findWorkbuddyDataDirs } from './workbuddy-roots.js';
 
 function getCursorStateDbPath() {
   const rel = join('User', 'globalStorage', 'state.vscdb');
@@ -307,6 +308,12 @@ export const TOOLS = [
     id: 'roo-code',
     dataDir: join(homedir(), 'Library', 'Application Support', 'Code', 'User', 'globalStorage', 'rooveterinaryinc.roo-cline'),
     detectDataDirs: findRooCodeDataDirs,
+  },
+  {
+    name: 'WorkBuddy',
+    id: 'workbuddy',
+    dataDir: join(homedir(), '.workbuddy', 'projects'),
+    detectDataDirs: () => findWorkbuddyDataDirs().filter(existsSync),
   },
   {
     name: 'ZCode',
