@@ -176,6 +176,15 @@ export function findDimAgentDataDirs() {
   return [getDimAgentDbPath()].filter(existsSync);
 }
 
+// WorkBuddy stores one JSONL transcript per session under ~/.workbuddy/projects.
+export function findWorkbuddyDataDirs() {
+  const override = process.env.VIBE_USAGE_WORKBUDDY_DIRS?.trim();
+  if (override) {
+    return override.split(';').map((s) => s.trim()).filter(Boolean);
+  }
+  return [join(homedir(), '.workbuddy', 'projects')];
+}
+
 export const TOOLS = [
   {
     name: 'Claude Code',
@@ -312,6 +321,12 @@ export const TOOLS = [
     name: 'ZCode',
     id: 'zcode',
     dataDir: join(homedir(), '.zcode', 'cli', 'db', 'db.sqlite'),
+  },
+  {
+    name: 'WorkBuddy',
+    id: 'workbuddy',
+    dataDir: join(homedir(), '.workbuddy', 'projects'),
+    detectDataDirs: findWorkbuddyDataDirs,
   },
 ];
 
