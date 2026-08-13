@@ -32,10 +32,13 @@ vibe-usage/
 │   │   ├── kiro.js            # SQLite (via sqlite.js), JSONL fallback
 │   │   ├── hermes.js          # SQLite (via sqlite.js), multi-profile
 │   │   ├── trae-cli.js        # Trae CLI JSONL telemetry (not Trae IDE/Work)
+│   │   ├── alma.js            # SQLite usage ledger; buckets only, no chat reads
+│   │   ├── workbuddy.js       # Streaming JSONL; actual routed-model usage + sessions
 │   │   └── zcode.js           # SQLite (via sqlite.js), reads message table
 │   ├── pi-roots.js            # Pi/OMP default, profile, XDG, and override discovery
 │   ├── cline-roots.js         # Standalone + VSCode-host Cline discovery
 │   ├── craft-roots.js         # CraftAgent root resolution and detection
+│   ├── workbuddy-roots.js     # WorkBuddy default and fixture/relocation roots
 │   ├── tools.js               # TOOLS[] registry + detectInstalledTools()
 │   ├── sync.js                # Orchestrator: parse all → diff vs state → batch upload only new/changed
 │   ├── state.js               # ~/.vibe-usage/state.json: key→hash of uploaded items (incremental sync), clearState() for reset
@@ -57,6 +60,7 @@ vibe-usage/
 - **Pure ESM** (`"type": "module"`) — no CommonJS, no build step
 - **Zero dependencies** — only Node built-ins (fs, path, os, crypto, https, readline, child_process, zlib, `node:sqlite`)
 - **Incremental upload** — parsers emit a complete view of live local data, then `sync.js` diffs each item's content-hash against `~/.vibe-usage/state.json` and uploads only new/changed buckets/sessions — a quiet machine sends zero bytes. State is committed per-batch only after that batch's upload succeeds (failed batch re-sends next run); prune of dead keys (logs the parsers no longer emit) persists unconditionally and is bounded by liveness, never by age — and is scoped to sources whose parser succeeded that run, so a transient failure or an incomplete Codex cache build never evicts that tool's state into a full re-upload. Deleting `state.json` triggers a one-time full re-upload (which is exactly how `reset` re-populates remote data after deleting it).
+- **Hidden-project identity** — parsers aggregate before privacy is applied. When `uploadProject=false`, `sync.js` replaces project names with `unknown` and must re-aggregate buckets before hashing/upload so formerly distinct projects that now share a server key are summed instead of overwriting one another.
 - **Codex parser cache** — unlike the other stateless parsers, Codex keeps versioned, disposable derived data under `~/.vibe-usage/cache/codex/`. This cache is never authoritative: any miss, corruption, unsafe append, parser-algorithm bump, or write failure falls back to raw logs. Keep it separate from `state.json`; `reset` clears upload state but retains the parser cache so it can re-upload without re-reading every rollout.
 - **Stable hostname** — hostname is persisted in config at init; `sync.js` never re-reads `os.hostname()` after first capture. This prevents macOS mDNS hostname drift (e.g., `-2`, `-3` suffixes) from creating duplicate device entries in the DB.
 - **Upload identity** — `client-meta.js` reads the real package version from the shipped `package.json`, creates one `syncId` per `runSync`, and adds batch identity plus runtime/platform/hostname to every ingest request. Direct sync defaults to `surface=cli`, the foreground service passes `surface=daemon`, and desktop apps override via `VIBE_USAGE_SURFACE` / `VIBE_USAGE_SURFACE_VERSION`. Keep the CLI as the only ingest HTTP implementation.
@@ -104,19 +108,26 @@ Parser pattern:
 
 Pi-compatible JSONL parsers (`pi-coding-agent.js`, `craft-agent.js`, `omp.js`):
 - Use `parsePiSessionJsonl()` instead of duplicating filesystem/message parsing.
-- Fold `usage.cacheWrite` into input tokens, keep `cacheRead` separate, and map OMP `reasoningTokens` to reasoning output.
+- Fold `usage.cacheWrite` into input tokens and keep `cacheRead` separate. OMP/Pi `usage.output` already includes `reasoningTokens`, so subtract reasoning from output before storing it in `reasoningOutputTokens`.
 - Deduplicate stable message ids across copied/profile stores. Any directory read failure returns `skipped` so incremental state is not pruned.
 
-SQLite-backed parsers (antigravity, cursor, opencode, kiro, hermes):
+SQLite-backed parsers (alma, cursor, dimagent, hermes, kiro, mimocode, opencode, zcode):
 - Use `queryDbJson(dbPath, sql)` from `src/parsers/sqlite.js` — never shell out to `sqlite3` directly. It prefers Node's built-in `node:sqlite` (`DatabaseSync`, opened read-only; Node ≥ 22.5, works on Windows with no extra binary) and falls back to the `sqlite3` CLI on older Node.
 - Rows come back as plain objects (`{ column: value }`), same shape as `sqlite3 -json` — INTEGER → number, TEXT → string, JSON via `json_extract` → string.
 - If neither `node:sqlite` nor the CLI is available the helper throws an `ENOENT`-flavored error; catch it and rethrow `'sqlite3 CLI not found. Install sqlite3 (or use Node >= 22.5) to sync X data.'` so the user gets a hint.
 - For DBs the source app holds a write lock on (Cursor, Kiro): catch `/database is locked/i`, copy the DB (+ `-wal`/`-shm`) to a temp dir, and re-query the snapshot.
+- Alma reads only `usage_records` token fields plus workspace names. Its ledger represents assistant responses only, so return buckets with `sessions: []` instead of reading chat records to infer timing.
 
 Network-fetch parsers (the Cursor exception):
 - Cursor stores no usage locally — only an auth token in `state.vscdb`. The parser reads the token via `queryDbJson()`, then GETs a CSV from `cursor.com`.
 - Always wrap network calls with `AbortSignal.timeout(...)` so a single hung host can't stall the whole sync (sync.js catches throws per-parser but cannot interrupt a hanging await).
 - Mark transient/network errors with `err.skip = true` and return `{ buckets: [], sessions: [], skipped: true }` so the parser stays quiet without letting `sync.js` prune that source's incremental state. Only auth/permanent errors should bubble up.
+
+WorkBuddy JSONL parser (`workbuddy.js`):
+- Stream each JSONL file only to its captured size; never retain or upload message content.
+- Use the top-level request record id for copied-record dedup and `providerData.requestModelId` for actual Auto-routed model attribution.
+- WorkBuddy aggregate input/output counts include cache reads/reasoning. Split those subsets before `aggregateToBuckets()` so token categories do not overlap.
+- Emit timing events from user and completed assistant records and pass them to `extractSessions()`.
 
 Codex forked sessions (`codex.js`):
 - Forking a Codex conversation writes a *new* rollout file that replays the entire source conversation at the top — every `event_msg/token_count` included, all timestamped in a 1–3s burst at the fork instant. Those tokens are already counted from the source session's own file, so naively parsing the fork double-counts and spikes token/cost at the fork timestamp.
@@ -148,7 +159,7 @@ node -e "import('./src/parsers/<tool-id>.js').then(m => m.parse()).then(r => con
 Test hooks (env vars honored at module load, set them before importing):
 - `VIBE_USAGE_STATE_DIR` / `VIBE_USAGE_CONFIG_DIR` — redirect `state.js` / `config.js` away from the real `~/.vibe-usage` (used by `test/state.test.js`, `test/reset.test.js`)
 - Codex cache controls: `VIBE_USAGE_CACHE_DIR` redirects cache writes, `VIBE_USAGE_CODEX_CACHE=0` disables the optimization, `VIBE_USAGE_CODEX_WORK_BUDGET_MS` overrides the non-interactive build budget, and `VIBE_USAGE_CODEX_AUDIT_INTERVAL_MS` / `VIBE_USAGE_CODEX_AUDIT_MAX_BYTES` override rolling-audit bounds
-- Per-parser fixtures: `CODEX_HOME`, `VIBE_USAGE_GROK_SESSIONS`, `VIBE_USAGE_KIMI_CODE_DIR`, `VIBE_USAGE_KIMI_DIR`, `VIBE_USAGE_TRAE_CLI_SESSIONS`, `VIBE_USAGE_KIRO_LEGACY_TOKENS`. The Kimi Code parser resolves its data root as `VIBE_USAGE_KIMI_CODE_DIR` → `KIMI_CODE_HOME` (matching the CLI) → `~/.kimi-code`, and always merges the legacy `~/.kimi` store instead of either/or (`kimi migrate` drops usage records, so no double-count)
+- Per-parser fixtures: `CODEX_HOME`, `VIBE_USAGE_ALMA_DB`, `VIBE_USAGE_GROK_SESSIONS`, `VIBE_USAGE_KIMI_CODE_DIR`, `VIBE_USAGE_KIMI_DIR`, `VIBE_USAGE_TRAE_CLI_SESSIONS`, `VIBE_USAGE_WORKBUDDY_DIRS`, `VIBE_USAGE_KIRO_LEGACY_TOKENS`. The Kimi Code parser resolves its data root as `VIBE_USAGE_KIMI_CODE_DIR` → `KIMI_CODE_HOME` (matching the CLI) → `~/.kimi-code`, and always merges the legacy `~/.kimi` store instead of either/or (`kimi migrate` drops usage records, so no double-count)
 - Claude fixtures: `VIBE_USAGE_CLAUDE_DIRS` replaces normal Claude root discovery with a `path.delimiter`-separated root list; `VIBE_USAGE_CLAUDE_DESKTOP_DIRS` overrides only the Claude Desktop user-data roots. The production parser scans `~/.claude`, `$CLAUDE_CONFIG_DIR`, data-bearing `~/.claude-*` profiles, and the per-session `.claude` roots created below Claude Desktop's `local-agent-mode-sessions`. Desktop Code already writes to the normal Claude Code root, while Cowork uses the private roots. Both remain source `claude-code`. The parser streams each JSONL file to its captured size, keeps the most complete duplicate session/UUID, and returns `skipped` with warnings after any read failure so incremental state is not pruned.
 - Pi-family/Cline/OpenClaw fixtures: `VIBE_USAGE_PI_SESSION_DIRS`, `VIBE_USAGE_OMP_SESSION_DIRS`, `VIBE_USAGE_CLINE_DIRS`, and `VIBE_USAGE_OPENCLAW_DIRS` replace normal discovery with `path.delimiter`-separated roots.
 

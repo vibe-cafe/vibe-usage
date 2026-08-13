@@ -6,7 +6,7 @@ import {
 } from './state.js';
 import { ingest, fetchSettings } from './api.js';
 import { createSyncClient, forBatch } from './client-meta.js';
-import { parsers } from './parsers/index.js';
+import { aggregateToBuckets, parsers } from './parsers/index.js';
 import { success, failure, arrow, link, dim } from './output.js';
 
 const BATCH_SIZE = 100;
@@ -29,6 +29,16 @@ export function resolveUploadProjectSetting(settings) {
 
 export function resolveCodexExtraHome(configured, temporary) {
   return temporary ?? configured;
+}
+
+// Hiding project names can collapse multiple parser buckets onto one server
+// identity. Merge those buckets before hashing/uploading so no project's usage
+// wins by iteration order.
+export function reaggregateHiddenProjectBuckets(buckets) {
+  return aggregateToBuckets(buckets.map(bucket => ({
+    ...bucket,
+    timestamp: new Date(bucket.bucketStart),
+  })));
 }
 
 export async function runSync({
@@ -70,7 +80,7 @@ export async function runSync({
     process.exit(1);
   }
 
-  const allBuckets = [];
+  let allBuckets = [];
   const allSessions = [];
   const parserResults = [];
   const parserProgress = [];
@@ -166,6 +176,7 @@ export async function runSync({
   if (!uploadProject) {
     for (const b of allBuckets) b.project = 'unknown';
     for (const s of allSessions) s.project = 'unknown';
+    allBuckets = reaggregateHiddenProjectBuckets(allBuckets);
   }
 
   // Incremental upload diff: parsers above emit a complete view of live local

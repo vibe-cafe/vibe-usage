@@ -51,6 +51,7 @@ npx @vibe-cafe/vibe-usage status       # Show config & detected tools
 
 | Tool | Data Location |
 |------|---------------|
+| Alma | Electron app-data `alma/chat_threads.db` (macOS: `~/Library/Application Support/alma/chat_threads.db`; fixture/relocation override: `VIBE_USAGE_ALMA_DB`). Reads the `usage_records` ledger plus workspace names without selecting chat bodies, message metadata, provider credentials, or full workspace paths. Cache writes are included in input usage. The ledger contains assistant responses only, so Alma emits token buckets without session timing. |
 | Claude Code + Claude Desktop Code/Cowork | Claude Code data in `~/.claude/projects/` (tokens + sessions) and `~/.claude/transcripts/` (sessions only), plus Claude Desktop Cowork's per-session `.claude/projects/` directories. Also scans `$CLAUDE_CONFIG_DIR` and data-bearing `~/.claude-*` profiles. All variants use the existing `claude-code` source; the parser selects the most complete copy of each session so shared/copied transcripts are not counted twice. Logs are streamed and cache creation tokens are included in input usage. |
 | Codex CLI | `$CODEX_HOME/sessions/` and `$CODEX_HOME/archived_sessions/` (default `~/.codex`), plus an optional temporary `--extra-codex-home` or manually persisted `codexExtraHome`; a versioned local index avoids re-reading unchanged rollouts and reads only safe append tails for ordinary sessions, while fork/sub-agent replay matching, duplicate suppression, and live/archive/cross-root deduplication retain their existing semantics |
 | Grok | `$GROK_HOME/sessions/<encoded-cwd>/<session-id>/` (default `~/.grok`); token usage from `updates.jsonl` `turn_completed.usage` (per-model `modelUsage`, cache reads, reasoning); project from `summary.json` cwd; honors `GROK_HOME` |
@@ -61,7 +62,7 @@ npx @vibe-cafe/vibe-usage status       # Show config & detected tools
 | Gemini CLI | `~/.gemini/tmp/<project_hash>/chats/session-*.jsonl` (current line-delimited format) and legacy `session-*.json`; recurses into nested subagent sessions |
 | OpenCode | `~/.local/share/opencode/opencode.db` (SQLite, `json_extract` query) |
 | OpenClaw | `~/.openclaw/agents/`, `~/.openclaw-<profile>/agents/` (profile deployments); cache-creation/cache-write tokens are included in input usage |
-| Oh My Pi | `~/.omp/agent/sessions/`, `~/.omp/profiles/*/agent/sessions/`, and `$XDG_DATA_HOME/omp/{sessions,profiles/*/sessions}`; recognizes OMP's `$PI_CODING_AGENT_DIR`, deduplicates copied records, and includes cache writes in input usage |
+| Oh My Pi | `~/.omp/agent/sessions/`, `~/.omp/profiles/*/agent/sessions/`, and `$XDG_DATA_HOME/omp/{sessions,profiles/*/sessions}`; recognizes OMP's `$PI_CODING_AGENT_DIR`, current v3 title slots and path/hashed session directories, deduplicates copied records, includes cache writes in input, and splits reasoning from OMP's inclusive output count |
 | pi | `~/.pi/agent/sessions/` or `$PI_CODING_AGENT_DIR/sessions/`; cache writes are included in input usage |
 | Qwen Code | `~/.qwen/tmp/` |
 | Kimi Code | Current `~/.kimi-code/sessions/wd_<slug>_<hash>/session_<id>/agents/<agent>/wire.jsonl` (`usage.record` deltas, including retry/compaction scope and cache creation; main/subagent wires form one session), data root resolved via `$KIMI_CODE_HOME` like the CLI itself, with project names from `session_index.jsonl`; legacy `~/.kimi/sessions/` is parsed alongside (`kimi migrate` never carries usage over, so both stores are always merged) |
@@ -74,18 +75,19 @@ npx @vibe-cafe/vibe-usage status       # Show config & detected tools
 | Roo Code | `<host>/User/globalStorage/rooveterinaryinc.roo-cline/{tasks/_index.json,tasks/<id>/{history_item,ui_messages}.json}` (walks all VSCode-fork hosts) |
 | Trae CLI | macOS: `~/Library/Caches/trae-cli/sessions/`; Windows: `%LOCALAPPDATA%/trae-cli/cache/sessions/`; Linux: `~/.cache/trae-cli/sessions/` (CLI telemetry only; Trae IDE/Trae Work chats are not supported) |
 | Antigravity | App 2.0 `~/.gemini/antigravity/conversations/*.db` and `agy` CLI `~/.gemini/antigravity-cli/conversations/*.db` are parsed offline (tokens, real model display name, project, sessions); legacy App `.pb` history falls back to Connect RPC while the language server is running |
+| WorkBuddy | macOS WorkBuddy 5.3.11+: `~/.workbuddy/projects/**/*.jsonl` (fixture/relocation override: `VIBE_USAGE_WORKBUDDY_DIRS`). Uses completed assistant requests and their actual `providerData.requestModelId`, so Auto-routed requests can produce multiple model buckets. Splits cache reads and reasoning from inclusive input/output totals, deduplicates copied request IDs, and extracts local session timing without uploading message content. |
 | ZCode | `~/.zcode/cli/db/db.sqlite` (SQLite; reads the `message` table for per-message tokens, model, and project `cwd`/`root`, joined to `session.directory`) |
 
 ## How It Works
 
 - Parses local session logs from each AI coding tool
 - Aggregates token usage into 30-minute buckets
-- Extracts session metadata from all parsers: active time (AI generation time, excluding queue/TTFT wait), total duration, message counts
+- Extracts session metadata where the source safely exposes user/assistant timing: active time (AI generation time, excluding queue/TTFT wait), total duration, and message counts. Alma intentionally emits buckets only because its usage ledger contains assistant responses and the parser does not read chat records.
 - Uploads buckets + sessions to your vibecafe.ai dashboard (always gzip-compressed, ~94% smaller)
 - Incremental upload: every parser emits a complete local snapshot, then only buckets/sessions that are new or changed since the last successful upload are sent — a quiet machine uploads nothing. Upload state remains in `~/.vibe-usage/state.json`; failed or still-indexing parsers retain their prior state, while deleted local logs are pruned. Deleting the state file triggers a one-time full re-upload, and `reset` clears it automatically after deleting cloud data
 - Incremental Codex parsing: a versioned, disposable cache under `~/.vibe-usage/cache/codex/` stores per-rollout aggregate results and parser continuation state. Unchanged rollouts require no raw-log reads; an ordinary append reads only the new tail; forks, sub-agents, replacements, truncations, and failed safety checks fall back to the full correctness path. A bounded rolling audit occasionally re-reads one historical file. Very large first-time indexes checkpoint before the Mac app timeout and resume on the next sync instead of restarting
 - The Codex parser cache contains derived aggregates and replay metadata, not raw prompt or response text. It is independent of upload state and can be deleted safely (the next sync rebuilds it). `reset` intentionally keeps it so the required full re-upload does not also require a full disk rescan. Set `VIBE_USAGE_CODEX_CACHE=0` to disable the optimization for diagnosis
-- SQLite-backed tools (Cursor, OpenCode, Kiro, Hermes) are read via Node's built-in `node:sqlite` on Node ≥ 22.5 — no `sqlite3` binary needed (works on Windows out of the box); on older Node it falls back to the system `sqlite3` CLI
+- SQLite-backed tools are read via Node's built-in `node:sqlite` on Node ≥ 22.5 — no `sqlite3` binary needed (works on Windows out of the box); on older Node the CLI falls back to the system `sqlite3` executable
 - For continuous syncing, use `npx @vibe-cafe/vibe-usage daemon` or the [Vibe Usage Mac app](https://github.com/vibe-cafe/vibe-usage-app)
 
 ## Trust Model

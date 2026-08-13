@@ -15,6 +15,7 @@ import { parse as parseOmp } from './omp.js';
 import { parse as parseQwenCode } from './qwen-code.js';
 import { parse as parseKimiCode } from './kimi-code.js';
 import { parse as parseAmp } from './amp.js';
+import { parse as parseAlma } from './alma.js';
 import { parse as parseDroid } from './droid.js';
 import { parse as parseAntigravity } from './antigravity.js';
 import { parse as parseHermes } from './hermes.js';
@@ -23,6 +24,7 @@ import { parse as parseMimocode } from './mimocode.js';
 import { parse as parsePiCodingAgent } from './pi-coding-agent.js';
 import { parse as parseZcode } from './zcode.js';
 import { parse as parseTraeCli } from './trae-cli.js';
+import { parse as parseWorkbuddy } from './workbuddy.js';
 
 export const parsers = {
   'claude-code': parseClaudeCode,
@@ -40,6 +42,7 @@ export const parsers = {
   'qwen-code': parseQwenCode,
   'kimi-code': parseKimiCode,
   'amp': parseAmp,
+  'alma': parseAlma,
   'droid': parseDroid,
   'antigravity': parseAntigravity,
   'trae-cli': parseTraeCli,
@@ -48,6 +51,7 @@ export const parsers = {
   'mimocode': parseMimocode,
   'cline': parseCline,
   'roo-code': parseRooCode,
+  'workbuddy': parseWorkbuddy,
   'zcode': parseZcode,
 };
 

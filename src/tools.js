@@ -1,11 +1,29 @@
 import { existsSync, readdirSync, statSync } from 'node:fs';
-import { isAbsolute, join, resolve } from 'node:path';
+import { isAbsolute, join, posix, resolve, win32 } from 'node:path';
 import { homedir } from 'node:os';
 import { findClaudeCodeDataDirs } from './claude-roots.js';
 import { codexSessionDirs, resolveCodexHomes } from './codex-roots.js';
 import { findClineDataDirs } from './cline-roots.js';
 import { findCraftDataDirs } from './craft-roots.js';
 import { findOmpDataDirs, findPiDataDirs } from './pi-roots.js';
+import { findWorkbuddyDataDirs } from './workbuddy-roots.js';
+
+export function getAlmaDbPath(env = process.env, platform = process.platform, home = homedir()) {
+  const pathImpl = platform === 'win32' ? win32 : posix;
+  const override = env.VIBE_USAGE_ALMA_DB?.trim();
+  if (override) {
+    return platform === process.platform ? resolve(override) : pathImpl.resolve(override);
+  }
+  if (platform === 'darwin') {
+    return pathImpl.join(home, 'Library', 'Application Support', 'alma', 'chat_threads.db');
+  }
+  if (platform === 'win32') {
+    const appData = env.APPDATA?.trim() || pathImpl.join(home, 'AppData', 'Roaming');
+    return pathImpl.join(appData, 'alma', 'chat_threads.db');
+  }
+  const configHome = env.XDG_CONFIG_HOME?.trim() || pathImpl.join(home, '.config');
+  return pathImpl.join(configHome, 'alma', 'chat_threads.db');
+}
 
 function getCursorStateDbPath() {
   const rel = join('User', 'globalStorage', 'state.vscdb');
@@ -178,6 +196,12 @@ export function findDimAgentDataDirs() {
 
 export const TOOLS = [
   {
+    name: 'Alma',
+    id: 'alma',
+    dataDir: getAlmaDbPath(),
+    detectDataDirs: () => [getAlmaDbPath()].filter(existsSync),
+  },
+  {
     name: 'Claude Code',
     id: 'claude-code',
     dataDir: join(homedir(), '.claude', 'projects'),
@@ -307,6 +331,12 @@ export const TOOLS = [
     id: 'roo-code',
     dataDir: join(homedir(), 'Library', 'Application Support', 'Code', 'User', 'globalStorage', 'rooveterinaryinc.roo-cline'),
     detectDataDirs: findRooCodeDataDirs,
+  },
+  {
+    name: 'WorkBuddy',
+    id: 'workbuddy',
+    dataDir: join(homedir(), '.workbuddy', 'projects'),
+    detectDataDirs: () => findWorkbuddyDataDirs().filter(existsSync),
   },
   {
     name: 'ZCode',

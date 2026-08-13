@@ -106,9 +106,11 @@ export async function parsePiSessionJsonl({
         if (message.role !== 'assistant' || !message.usage) continue;
         const usage = message.usage;
         const inputTokens = tokenCount(usage.input) + tokenCount(usage.cacheWrite);
-        const outputTokens = tokenCount(usage.output);
-        const cachedInputTokens = tokenCount(usage.cacheRead);
         const reasoningOutputTokens = tokenCount(usage.reasoningTokens);
+        // OMP/Pi usage.output includes reasoning; the shared bucket contract
+        // stores non-reasoning output and reasoning separately.
+        const outputTokens = Math.max(0, tokenCount(usage.output) - reasoningOutputTokens);
+        const cachedInputTokens = tokenCount(usage.cacheRead);
         const score = inputTokens + outputTokens + cachedInputTokens + reasoningOutputTokens;
         if (score === 0) continue;
 

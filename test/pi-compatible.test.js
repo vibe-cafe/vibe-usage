@@ -13,8 +13,20 @@ function restoreEnv(name, value) {
   else process.env[name] = value;
 }
 
-function sessionLines({ sessionId = 'session-1', cwd = '/work/project', input = 100 } = {}) {
+function sessionLines({
+  sessionId = 'session-1',
+  cwd = '/work/project',
+  input = 100,
+  titleSlot = false,
+} = {}) {
   return [
+    ...(titleSlot ? [{
+      type: 'title',
+      v: 1,
+      title: 'Current OMP v3 title slot',
+      updatedAt: '2026-07-27T13:19:56.000Z',
+      pad: '',
+    }] : []),
     { type: 'session', id: sessionId, timestamp: '2026-07-27T13:19:57.000Z', cwd },
     {
       type: 'message',
@@ -63,6 +75,8 @@ test('Pi-compatible parsers count cache writes as input tokens', async () => {
     assert.equal(pi.buckets[0].inputTokens, 110);
     assert.equal(pi.buckets[0].cachedInputTokens, 30);
     assert.equal(pi.buckets[0].reasoningOutputTokens, 4);
+    assert.equal(pi.buckets[0].outputTokens, 16);
+    assert.equal(pi.buckets[0].totalTokens, 130);
 
     const craftRoot = join(root, 'craft');
     writeSession(
@@ -90,16 +104,17 @@ test('OMP scans multiple stores and deduplicates copied records', async () => {
   try {
     const first = join(root, 'first');
     const second = join(root, 'second');
-    writeSession(first, join('project', 'copy.jsonl'));
-    writeSession(second, join('project', 'copy.jsonl'));
+    writeSession(first, join('project', 'copy.jsonl'), { titleSlot: true });
+    writeSession(second, join('project', 'copy.jsonl'), { titleSlot: true });
     process.env.VIBE_USAGE_OMP_SESSION_DIRS = `${first}${delimiter}${second}`;
 
     const result = await parseOmp();
     assert.equal(result.buckets.length, 1);
     assert.equal(result.buckets[0].source, 'omp');
     assert.equal(result.buckets[0].inputTokens, 110);
-    assert.equal(result.buckets[0].outputTokens, 20);
+    assert.equal(result.buckets[0].outputTokens, 16);
     assert.equal(result.buckets[0].reasoningOutputTokens, 4);
+    assert.equal(result.buckets[0].totalTokens, 130);
     assert.equal(result.sessions.length, 1);
     assert.equal(result.sessions[0].messageCount, 2);
   } finally {
