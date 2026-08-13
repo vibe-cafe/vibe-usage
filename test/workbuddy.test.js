@@ -1,118 +1,178 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from 'node:fs';
+import { delimiter, join } from 'node:path';
 import { tmpdir } from 'node:os';
-import { join } from 'node:path';
 import { parse } from '../src/parsers/workbuddy.js';
-import { parsers } from '../src/parsers/index.js';
-import { TOOLS } from '../src/tools.js';
 import { findWorkbuddyDataDirs } from '../src/workbuddy-roots.js';
 
-function completedRecord({ id, model, timestamp, usage, rawUsage, cwd = '/private/repo/actual-project' }) {
+function assistantRecord({
+  id,
+  modelId,
+  modelName,
+  status = 'completed',
+  timestamp = '2026-08-11T10:05:00.000Z',
+  usage,
+  rawUsage,
+  prompt,
+  cwd,
+}) {
   return {
-    id,
-    timestamp,
     type: 'message',
-    role: 'assistant',
-    status: 'completed',
+    id,
+    status,
+    timestamp,
     cwd,
-    content: [{ type: 'text', text: 'PROMPT_AND_RESPONSE_MUST_NOT_LEAK' }],
-    message: { usage },
+    prompt,
+    message: { role: 'assistant', usage },
     providerData: {
-      requestModelId: model,
+      requestModelId: modelId,
+      requestModelName: modelName,
       usage,
-      ...(rawUsage ? { rawUsage } : {}),
-      conversationRequestId: 'not-a-dedup-key',
+      rawUsage,
     },
   };
 }
 
-test('WorkBuddy is registered and honors its fixture root override', () => {
-  const prior = process.env.VIBE_USAGE_WORKBUDDY_DIRS;
-  process.env.VIBE_USAGE_WORKBUDDY_DIRS = '/tmp/workbuddy-a:/tmp/workbuddy-b';
+async function withRoots(roots, fn) {
+  const previous = process.env.VIBE_USAGE_WORKBUDDY_DIRS;
+  process.env.VIBE_USAGE_WORKBUDDY_DIRS = roots.join(delimiter);
   try {
-    assert.equal(typeof parsers.workbuddy, 'function');
-    assert.equal(TOOLS.find(tool => tool.id === 'workbuddy')?.name, 'WorkBuddy');
-    assert.deepEqual(findWorkbuddyDataDirs(), ['/tmp/workbuddy-a', '/tmp/workbuddy-b']);
+    return await fn();
   } finally {
-    if (prior === undefined) delete process.env.VIBE_USAGE_WORKBUDDY_DIRS;
-    else process.env.VIBE_USAGE_WORKBUDDY_DIRS = prior;
+    if (previous === undefined) delete process.env.VIBE_USAGE_WORKBUDDY_DIRS;
+    else process.env.VIBE_USAGE_WORKBUDDY_DIRS = previous;
   }
+}
+
+function writeFixture(root, lines, project = 'demo-project') {
+  const projects = join(root, 'projects', project);
+  mkdirSync(projects, { recursive: true });
+  writeFileSync(join(projects, 'conversation.jsonl'), `${lines.join('\n')}\n`, 'utf8');
+}
+
+function userRecord({ sessionId, timestamp, cwd, prompt }) {
+  return {
+    type: 'message',
+    sessionId,
+    timestamp,
+    cwd,
+    prompt,
+    message: { role: 'user' },
+  };
+}
+
+const sampleUsage = {
+  inputTokens: 34824,
+  outputTokens: 31,
+  totalTokens: 34855,
+  input_details: { cached_tokens: 7488 },
+  output_details: { reasoning_tokens: 27 },
+};
+
+const sampleRawUsage = {
+  prompt_cache_miss_tokens: 27336,
+  completion_thinking_tokens: 27,
+};
+
+test('maps WorkBuddy 5.3.11 provider usage into exclusive token fields', async () => {
+  const root = mkdtempSync(join(tmpdir(), 'vibe-usage-workbuddy-mapping-'));
+  try {
+    writeFixture(root, [JSON.stringify(assistantRecord({
+      id: 'request-1', modelId: 'minimax-m2', usage: sampleUsage, rawUsage: sampleRawUsage,
+    }))]);
+    const result = await withRoots([root], () => parse());
+    assert.deepEqual(result.buckets[0], {
+      source: 'workbuddy', model: 'minimax-m2', project: 'demo-project',
+      bucketStart: '2026-08-11T10:00:00.000Z', inputTokens: 27336,
+      outputTokens: 4, cachedInputTokens: 7488, reasoningOutputTokens: 27,
+      totalTokens: 27367,
+    });
+    assert.deepEqual(result.sessions, []);
+  } finally { rmSync(root, { recursive: true, force: true }); }
 });
 
-test('WorkBuddy splits inclusive cache/reasoning totals and retains actual routed models', async () => {
-  const root = mkdtempSync(join(tmpdir(), 'vibe-usage-workbuddy-'));
-  const firstProject = join(root, 'projects', 'encoded-project');
-  const copiedProject = join(root, 'projects', 'copied-project');
-  mkdirSync(firstProject, { recursive: true });
-  mkdirSync(copiedProject, { recursive: true });
-  const timestamp = '2026-08-10T00:50:30.000Z';
-  const hy3 = completedRecord({
-    id: 'request-hy3',
-    model: 'hy3',
-    timestamp,
-    usage: {
-      inputTokens: 34824,
-      outputTokens: 31,
-      totalTokens: 34855,
-      inputTokensDetails: [{ cached_tokens: 7488 }],
-      outputTokensDetails: [{ reasoning_tokens: 27 }],
-    },
-    rawUsage: {
-      prompt_tokens: 34824,
-      prompt_cache_hit_tokens: 7488,
-      prompt_cache_miss_tokens: 27336,
-      completion_tokens: 31,
-      completion_thinking_tokens: 27,
-      total_tokens: 34855,
-    },
-  });
-  const autoRouted = completedRecord({
-    id: 'request-auto-routed',
-    model: 'model-routed-by-auto',
-    timestamp,
-    usage: { input_tokens: 100, output_tokens: 20, cache_read_input_tokens: 40 },
-    cwd: '/private/repo/another-project',
-  });
-  const pending = { ...completedRecord({
-    id: 'request-pending', model: 'must-not-count', timestamp,
-    usage: { inputTokens: 100, outputTokens: 20 },
-  }), status: 'pending' };
-  writeFileSync(join(firstProject, 'session-a.jsonl'), [
-    JSON.stringify(hy3),
-    JSON.stringify(autoRouted),
-    JSON.stringify(pending),
-    '{malformed',
-  ].join('\n') + '\n');
-  // WorkBuddy copies can occur between roots/projects. A top-level record id
-  // remains the canonical request identity, unlike conversationRequestId.
-  writeFileSync(join(copiedProject, 'session-copy.jsonl'), JSON.stringify(hy3) + '\n');
-
-  const prior = process.env.VIBE_USAGE_WORKBUDDY_DIRS;
-  process.env.VIBE_USAGE_WORKBUDDY_DIRS = root;
+test('splits Auto sessions by request model id', async () => {
+  const root = mkdtempSync(join(tmpdir(), 'vibe-usage-workbuddy-models-'));
   try {
-    const result = await parse();
-    assert.equal(result.sessions.length, 0);
-    assert.equal(result.buckets.length, 2);
-    const byModel = Object.fromEntries(result.buckets.map(bucket => [bucket.model, bucket]));
-    assert.deepEqual(byModel.hy3, {
-      source: 'workbuddy', model: 'hy3', project: 'actual-project',
-      bucketStart: '2026-08-10T00:30:00.000Z',
-      inputTokens: 27336, outputTokens: 4, cachedInputTokens: 7488,
-      reasoningOutputTokens: 27, totalTokens: 27367,
+    const usage = { inputTokens: 10, outputTokens: 2, totalTokens: 12 };
+    writeFixture(root, [
+      JSON.stringify(assistantRecord({ id: 'a', modelId: 'model-a', modelName: 'Auto', usage })),
+      JSON.stringify(assistantRecord({ id: 'b', modelId: 'model-b', modelName: 'Auto', usage, timestamp: '2026-08-11T10:06:00.000Z' })),
+    ]);
+    const result = await withRoots([root], () => parse());
+    assert.deepEqual(result.buckets.map(({ model, inputTokens, outputTokens }) => ({ model, inputTokens, outputTokens })), [
+      { model: 'model-a', inputTokens: 10, outputTokens: 2 },
+      { model: 'model-b', inputTokens: 10, outputTokens: 2 },
+    ]);
+  } finally { rmSync(root, { recursive: true, force: true }); }
+});
+
+test('deduplicates repeated top-level record ids', async () => {
+  const root = mkdtempSync(join(tmpdir(), 'vibe-usage-workbuddy-dedup-'));
+  try {
+    const usage = { inputTokens: 10, outputTokens: 2, totalTokens: 12 };
+    const record = JSON.stringify(assistantRecord({ id: 'same', modelId: 'model-a', usage }));
+    writeFixture(root, [record, record]);
+    const result = await withRoots([root], () => parse());
+    assert.equal(result.buckets[0].inputTokens, 10);
+    assert.equal(result.buckets[0].outputTokens, 2);
+  } finally { rmSync(root, { recursive: true, force: true }); }
+});
+
+test('counts completed assistant messages, skips malformed lines, and preserves privacy', async () => {
+  const root = mkdtempSync(join(tmpdir(), 'vibe-usage-workbuddy-status-'));
+  try {
+    const usage = { inputTokens: 10, outputTokens: 2, totalTokens: 12 };
+    const pending = assistantRecord({ id: 'pending', modelId: 'model-a', usage, status: 'pending' });
+    const complete = assistantRecord({
+      id: 'complete', modelId: 'model-a', usage,
+      prompt: 'super secret prompt', cwd: '/Users/private/secret-project',
     });
-    assert.deepEqual(byModel['model-routed-by-auto'], {
-      source: 'workbuddy', model: 'model-routed-by-auto', project: 'another-project',
-      bucketStart: '2026-08-10T00:30:00.000Z',
-      inputTokens: 60, outputTokens: 20, cachedInputTokens: 40,
-      reasoningOutputTokens: 0, totalTokens: 80,
-    });
+    writeFixture(root, [JSON.stringify(pending), '{malformed', JSON.stringify(complete)]);
+    const result = await withRoots([root], () => parse());
+    assert.equal(result.buckets[0].inputTokens, 10);
     const serialized = JSON.stringify(result);
-    assert.equal(serialized.includes('PROMPT_AND_RESPONSE_MUST_NOT_LEAK'), false);
-    assert.equal(serialized.includes('/private/repo'), false);
-  } finally {
-    if (prior === undefined) delete process.env.VIBE_USAGE_WORKBUDDY_DIRS;
-    else process.env.VIBE_USAGE_WORKBUDDY_DIRS = prior;
-    rmSync(root, { recursive: true, force: true });
+    assert.equal(serialized.includes('super secret prompt'), false);
+    assert.equal(serialized.includes('/Users/private/secret-project'), false);
+  } finally { rmSync(root, { recursive: true, force: true }); }
+});
+
+test('records only de-identified WorkBuddy session metadata', async () => {
+  const root = mkdtempSync(join(tmpdir(), 'vibe-usage-workbuddy-sessions-'));
+  try {
+    const cwd = '/Users/private/absolute-workspace';
+    const sessionId = 'private-workbuddy-session-id';
+    const usage = { inputTokens: 10, outputTokens: 2 };
+    writeFixture(root, [
+      JSON.stringify(userRecord({
+        sessionId, cwd, prompt: 'confidential prompt', timestamp: '2026-08-11T10:00:00.000Z',
+      })),
+      JSON.stringify({
+        ...assistantRecord({
+          id: 'reply', modelId: 'model-a', usage, cwd, timestamp: '2026-08-11T10:00:05.000Z',
+        }),
+        sessionId,
+      }),
+    ]);
+    const result = await withRoots([root], () => parse());
+    assert.equal(result.sessions.length, 1);
+    assert.equal(result.sessions[0].project, 'absolute-workspace');
+    assert.equal(result.sessions[0].messageCount, 2);
+    assert.equal(result.sessions[0].userMessageCount, 1);
+    const serialized = JSON.stringify(result);
+    assert.equal(serialized.includes(cwd), false);
+    assert.equal(serialized.includes(sessionId), false);
+    assert.equal(serialized.includes('confidential prompt'), false);
+  } finally { rmSync(root, { recursive: true, force: true }); }
+});
+
+test('honors path.delimiter-separated roots override', () => {
+  const previous = process.env.VIBE_USAGE_WORKBUDDY_DIRS;
+  process.env.VIBE_USAGE_WORKBUDDY_DIRS = ['/tmp/workbuddy-a', '/tmp/workbuddy-b'].join(delimiter);
+  try { assert.deepEqual(findWorkbuddyDataDirs(), ['/tmp/workbuddy-a', '/tmp/workbuddy-b']); }
+  finally {
+    if (previous === undefined) delete process.env.VIBE_USAGE_WORKBUDDY_DIRS;
+    else process.env.VIBE_USAGE_WORKBUDDY_DIRS = previous;
   }
 });

@@ -2,7 +2,7 @@ import { createReadStream, readdirSync, statSync } from 'node:fs';
 import { createInterface } from 'node:readline';
 import { basename, join, relative, sep } from 'node:path';
 import { findWorkbuddyDataDirs } from '../workbuddy-roots.js';
-import { aggregateToBuckets } from './index.js';
+import { aggregateToBuckets, extractSessions } from './index.js';
 
 const SOURCE = 'workbuddy';
 
@@ -170,8 +170,29 @@ function timestampFor(record) {
   return dateFrom(record.completedAt ?? record.completed_at ?? record.timestamp ?? record.createdAt ?? record.created_at ?? record.message?.createdAt);
 }
 
+function timingEventFor(record, sessionId, project) {
+  if (record.type !== 'message') return null;
+  const role = record.role ?? record.message?.role;
+  if (role !== 'user' && role !== 'assistant' && role !== 'assistant_message') return null;
+  const timestamp = timestampFor(record);
+  if (!timestamp) return null;
+  return {
+    sessionId,
+    source: SOURCE,
+    project,
+    timestamp,
+    role: role === 'user' ? 'user' : 'assistant',
+  };
+}
+
+function sessionEventsWithPrompts(events) {
+  const hasUserPrompt = new Set(events.filter(event => event.role === 'user').map(event => event.sessionId));
+  return events.filter(event => hasUserPrompt.has(event.sessionId));
+}
+
 export async function parse() {
   const entries = [];
+  const events = [];
   const ctx = { skipped: false, warnings: [] };
   const seenIds = new Set();
 
@@ -188,7 +209,13 @@ export async function parse() {
         continue;
       }
       const fileProject = projectFromFile(filePath, projectsDir);
+      // Only this derived relative identifier reaches extractSessions(), which
+      // hashes it before upload. Never retain or upload the absolute file path.
+      const fileSessionId = `workbuddy:${relative(projectsDir, filePath)}`;
       await readJsonl(filePath, size, (record) => {
+        const project = projectFromRecord(record, fileProject);
+        const event = timingEventFor(record, record.sessionId ?? record.session_id ?? fileSessionId, project);
+        if (event) events.push(event);
         if (!isCompletedAssistant(record)) return;
         if (typeof record.id !== 'string' || !record.id || seenIds.has(record.id)) return;
         const usage = usageFor(record);
@@ -198,7 +225,7 @@ export async function parse() {
         entries.push({
           source: SOURCE,
           model: modelFor(record),
-          project: projectFromRecord(record, fileProject),
+          project,
           timestamp,
           inputTokens: usage.inputTokens,
           outputTokens: usage.outputTokens,
@@ -211,7 +238,7 @@ export async function parse() {
 
   return {
     buckets: aggregateToBuckets(entries),
-    sessions: [],
+    sessions: extractSessions(sessionEventsWithPrompts(events)),
     ...(ctx.skipped ? { skipped: true } : {}),
     ...(ctx.warnings.length > 0 ? { warnings: ctx.warnings } : {}),
   };

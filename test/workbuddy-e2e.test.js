@@ -35,6 +35,18 @@ function fixtureRecord(id, model, cwd) {
   };
 }
 
+function userFixtureRecord(sessionId, cwd) {
+  return {
+    sessionId,
+    timestamp: '2026-08-10T00:50:00.000Z',
+    type: 'message',
+    role: 'user',
+    cwd,
+    content: [{ type: 'text', text: 'PRIVATE_WORKBUDDY_PROMPT' }],
+    message: { role: 'user' },
+  };
+}
+
 test('WorkBuddy E2E sync uploads actual routed model buckets once and no conversation data', async () => {
   const root = mkdtempSync(join(tmpdir(), 'vibe-usage-workbuddy-e2e-'));
   const projects = join(root, 'workbuddy', 'projects', 'encoded');
@@ -44,8 +56,9 @@ test('WorkBuddy E2E sync uploads actual routed model buckets once and no convers
   mkdirSync(projects, { recursive: true });
   mkdirSync(homeDir, { recursive: true });
   writeFileSync(join(projects, 'session.jsonl'), [
-    JSON.stringify(fixtureRecord('request-a', 'actual-model-a', '/private/workspace/a')),
-    JSON.stringify(fixtureRecord('request-b', 'actual-model-b', '/private/workspace/b')),
+    JSON.stringify(userFixtureRecord('private-session-id', '/private/workspace/a')),
+    JSON.stringify({ ...fixtureRecord('request-a', 'actual-model-a', '/private/workspace/a'), sessionId: 'private-session-id' }),
+    JSON.stringify({ ...fixtureRecord('request-b', 'actual-model-b', '/private/workspace/b'), sessionId: 'private-session-id' }),
   ].join('\n') + '\n');
 
   const received = [];
@@ -72,13 +85,22 @@ test('WorkBuddy E2E sync uploads actual routed model buckets once and no convers
       writeFileSync(join(configDir, 'config.json'), JSON.stringify({
         apiKey: 'vbu_e2e_test', apiUrl, hostname: 'workbuddy-e2e',
       }));
-      const env = {
-        ...process.env,
+      // Keep the child process hermetic: host-level parser overrides such as
+      // CODEX_HOME must not add unrelated uploads to this assertion.
+      const env = Object.fromEntries(Object.entries(process.env).filter(([key]) => (
+        !key.startsWith('VIBE_USAGE_')
+        && ![
+          'CODEX_HOME', 'CLAUDE_CONFIG_DIR', 'GROK_HOME', 'KIMI_CODE_HOME',
+          'MIMOCODE_HOME', 'MIMOCODE_DB', 'DIMCODE_HOME', 'XDG_CONFIG_HOME',
+          'XDG_DATA_HOME', 'XDG_CACHE_HOME', 'APPDATA', 'LOCALAPPDATA',
+        ].includes(key)
+      )));
+      Object.assign(env, {
         HOME: homeDir,
         VIBE_USAGE_CONFIG_DIR: configDir,
         VIBE_USAGE_STATE_DIR: stateDir,
         VIBE_USAGE_WORKBUDDY_DIRS: join(root, 'workbuddy'),
-      };
+      });
       const command = "import { runSync } from './src/sync.js'; await runSync({ throws: true, quiet: true });";
       await execFileAsync(process.execPath, ['--input-type=module', '-e', command], {
         cwd: process.cwd(), env,
@@ -94,9 +116,11 @@ test('WorkBuddy E2E sync uploads actual routed model buckets once and no convers
       'actual-model-a', 'actual-model-b',
     ]));
     assert.equal(received[0].buckets.every(bucket => bucket.source === 'workbuddy'), true);
+    assert.equal(received[0].sessions.length, 1);
     const payload = JSON.stringify(received[0]);
     assert.equal(payload.includes('PRIVATE_WORKBUDDY_PROMPT'), false);
     assert.equal(payload.includes('/private/workspace'), false);
+    assert.equal(payload.includes('private-session-id'), false);
   } finally {
     rmSync(root, { recursive: true, force: true });
   }
