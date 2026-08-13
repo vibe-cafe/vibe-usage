@@ -4,7 +4,7 @@ import { execFileSync } from 'node:child_process';
 import { mkdtempSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
-import { parse, resolveAlmaDbPath } from '../src/parsers/alma.js';
+import { normalizeAlmaModel, parse, resolveAlmaDbPath } from '../src/parsers/alma.js';
 import { parsers } from '../src/parsers/index.js';
 import { detectInstalledTools, TOOLS } from '../src/tools.js';
 
@@ -103,6 +103,50 @@ test('resolveAlmaDbPath follows Electron platform paths and fixture override', (
 test('tool detection honors the Alma database override', async () => {
   await withAlmaDb(schema, async () => {
     assert.equal(detectInstalledTools().some(tool => tool.id === 'alma'), true);
+  });
+});
+
+test('normalizeAlmaModel strips provider prefixes and handles invalid values', () => {
+  assert.equal(normalizeAlmaModel('plugin:openai-codex-auth:openai-codex:gpt-5.4'), 'gpt-5.4');
+  assert.equal(normalizeAlmaModel('plugin:openai-codex-auth:openai-codex:gpt-5.6-sol'), 'gpt-5.6-sol');
+  assert.equal(normalizeAlmaModel('motw9woq9az6u1r1cw:gpt-5.6-sol'), 'gpt-5.6-sol');
+  assert.equal(normalizeAlmaModel('claude-sonnet'), 'claude-sonnet');
+  assert.equal(normalizeAlmaModel('  claude-sonnet  '), 'claude-sonnet');
+  assert.equal(normalizeAlmaModel(null), 'unknown');
+  assert.equal(normalizeAlmaModel('   '), 'unknown');
+  assert.equal(normalizeAlmaModel('provider:'), 'unknown');
+});
+
+test('Alma merges provider-prefixed forms of the same model into one bucket', async () => {
+  await withAlmaDb(`${schema}
+    INSERT INTO workspaces (id, path, name) VALUES
+      ('ws_shared', '/Users/private/shared-project', 'Shared Project');
+    INSERT INTO chat_threads (id, workspace_id) VALUES
+      ('thread_1', 'ws_shared');
+    INSERT INTO usage_records (
+      id, message_id, thread_id, model, provider_id,
+      input_tokens, output_tokens, cached_input_tokens, reasoning_tokens,
+      timestamp, cache_write_input_tokens
+    ) VALUES
+      ('usage_1', 'message_1', 'thread_1', 'plugin:openai-codex-auth:openai-codex:gpt-5.6-sol', NULL,
+       10, 3, 0, 0, '2026-08-06T09:05:00.000Z', 0),
+      ('usage_2', 'message_2', 'thread_1', 'motw9woq9az6u1r1cw:gpt-5.6-sol', NULL,
+       20, 7, 0, 0, '2026-08-06T09:25:00.000Z', 0);
+  `, async () => {
+    const result = await parse();
+    assert.deepEqual(result.buckets, [
+      {
+        source: 'alma',
+        model: 'gpt-5.6-sol',
+        project: 'Shared Project',
+        bucketStart: '2026-08-06T09:00:00.000Z',
+        inputTokens: 30,
+        outputTokens: 10,
+        cachedInputTokens: 0,
+        reasoningOutputTokens: 0,
+        totalTokens: 40,
+      },
+    ]);
   });
 });
 

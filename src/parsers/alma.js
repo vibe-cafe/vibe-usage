@@ -6,6 +6,15 @@ import { queryDbJson } from './sqlite.js';
 
 export { getAlmaDbPath as resolveAlmaDbPath };
 
+export function normalizeAlmaModel(value) {
+  if (typeof value !== 'string') return 'unknown';
+  const model = value.trim();
+  if (!model) return 'unknown';
+  const separator = model.lastIndexOf(':');
+  if (separator === -1) return model;
+  return model.slice(separator + 1).trim() || 'unknown';
+}
+
 const ALMA_USAGE_SQL = `
   SELECT
     usage_records.model AS model,
@@ -72,7 +81,7 @@ export async function parse() {
 
     entries.push({
       source: 'alma',
-      model: row.model || 'unknown',
+      model: normalizeAlmaModel(row.model),
       project: safeWorkspaceName(row.workspaceName),
       timestamp,
       inputTokens,
