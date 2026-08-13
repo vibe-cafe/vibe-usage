@@ -40,7 +40,12 @@ function projectFromFile(filePath, projectsDir) {
 function projectFromRecord(record) {
   const cwd = typeof record.cwd === 'string' ? record.cwd.trim() : '';
   if (!cwd) return null;
-  return basename(cwd.replace(/[\\/]+$/, '')) || null;
+  const parts = cwd
+    .replace(/[\\/]+$/, '')
+    .split(/[\\/]/)
+    .filter(Boolean)
+    .filter(part => !/^[a-zA-Z]:$/.test(part));
+  return parts.at(-1) || null;
 }
 
 function findJsonlFiles(dir, ctx) {
@@ -115,6 +120,13 @@ function isCompletedAssistant(record) {
   return status === 'completed' || status === 'complete' || status === 'success';
 }
 
+function isUsageRecord(record) {
+  return isCompletedAssistant(record)
+    || (record.type === 'function_call'
+      && record.providerData
+      && typeof record.providerData === 'object');
+}
+
 function modelFor(record) {
   const providerData = record.providerData && typeof record.providerData === 'object'
     ? record.providerData
@@ -156,20 +168,24 @@ function usageFor(record) {
 
   const inputDetails = primary?.input_details
     ?? primary?.inputDetails
-    ?? primary?.inputTokensDetails;
+    ?? primary?.inputTokensDetails
+    ?? raw?.prompt_tokens_details;
   const outputDetails = primary?.output_details
     ?? primary?.outputDetails
-    ?? primary?.outputTokensDetails;
+    ?? primary?.outputTokensDetails
+    ?? raw?.completion_tokens_details;
   const cachedInputTokens = firstDetailValue(inputDetails, 'cached_tokens', 'cachedTokens')
     || finite(
-      primary?.cache_read_input_tokens
+      primary?.cachedInputTokens
+      ?? primary?.cache_read_input_tokens
       ?? primary?.cacheReadInputTokens
       ?? raw?.prompt_cache_hit_tokens
       ?? raw?.cache_read_input_tokens
     );
   const reasoningOutputTokens = firstDetailValue(outputDetails, 'reasoning_tokens', 'reasoningTokens')
     || finite(
-      primary?.completion_thinking_tokens
+      primary?.reasoningOutputTokens
+      ?? primary?.completion_thinking_tokens
       ?? primary?.reasoning_tokens
       ?? primary?.reasoningTokens
       ?? raw?.completion_thinking_tokens
@@ -207,10 +223,16 @@ function timestampFor(record) {
   );
 }
 
+function sessionEventsWithPrompts(events) {
+  const sessionsWithUsers = new Set(
+    events.filter(event => event.role === 'user').map(event => event.sessionId)
+  );
+  return events.filter(event => sessionsWithUsers.has(event.sessionId));
+}
+
 export async function parse() {
   const entriesById = new Map();
-  const eventsById = new Map();
-  const anonymousEvents = [];
+  const eventsByKey = new Map();
   const ctx = { skipped: false, warnings: [] };
   const projectDirs = [...new Set(findWorkbuddyDataDirs().map(root => (
     basename(root) === 'projects' ? root : join(root, 'projects')
@@ -226,7 +248,7 @@ export async function parse() {
         continue;
       }
 
-      const sessionId = basename(filePath, '.jsonl');
+      const fallbackSessionId = basename(filePath, '.jsonl');
       let project = projectFromFile(filePath, projectsDir);
       const fileEntries = [];
       const fileEvents = [];
@@ -236,14 +258,22 @@ export async function parse() {
         const timestamp = timestampFor(record);
         const id = recordId(record);
         const role = roleFor(record);
+        const explicitSessionId = record.sessionId ?? record.session_id;
+        const sessionId = explicitSessionId == null || String(explicitSessionId).trim() === ''
+          ? fallbackSessionId
+          : String(explicitSessionId);
 
-        if (timestamp && (role === 'user' || isCompletedAssistant(record))) {
-          fileEvents.push({ id, sessionId, timestamp, role });
+        const usage = isUsageRecord(record) ? usageFor(record) : null;
+        const eventRole = role === 'user'
+          ? 'user'
+          : isCompletedAssistant(record) || (record.type === 'function_call' && usage)
+            ? 'assistant'
+            : null;
+        if (timestamp && eventRole) {
+          fileEvents.push({ id, sessionId, timestamp, role: eventRole });
         }
 
-        if (!id || !timestamp || !isCompletedAssistant(record)) return;
-        const usage = usageFor(record);
-        if (!usage) return;
+        if (!id || !timestamp || !usage) return;
         fileEntries.push({
           id,
           score: usage.score,
@@ -272,15 +302,17 @@ export async function parse() {
           timestamp: candidate.timestamp,
           role: candidate.role,
         };
-        if (candidate.id) eventsById.set(candidate.id, event);
-        else anonymousEvents.push(event);
+        const key = candidate.id
+          ? `id:${candidate.sessionId}:${candidate.id}:${candidate.role}`
+          : `fallback:${candidate.sessionId}:${candidate.role}:${candidate.timestamp.toISOString()}`;
+        eventsByKey.set(key, event);
       }
     }
   }
 
   return {
     buckets: aggregateToBuckets([...entriesById.values()].map(({ entry }) => entry)),
-    sessions: extractSessions([...eventsById.values(), ...anonymousEvents]),
+    sessions: extractSessions(sessionEventsWithPrompts([...eventsByKey.values()])),
     ...(ctx.skipped ? { skipped: true } : {}),
     ...(ctx.warnings.length > 0 ? { warnings: ctx.warnings } : {}),
   };

@@ -125,9 +125,9 @@ Network-fetch parsers (the Cursor exception):
 
 WorkBuddy JSONL parser (`workbuddy.js`):
 - Stream each JSONL file only to its captured size; never retain or upload message content.
-- Use the top-level request record id for copied-record dedup and `providerData.requestModelId` for actual Auto-routed model attribution.
-- WorkBuddy aggregate input/output counts include cache reads/reasoning. Split those subsets before `aggregateToBuckets()` so token categories do not overlap.
-- Emit timing events from user and completed assistant records and pass them to `extractSessions()`.
+- Use the top-level usage-record id for copied-record dedup and `providerData.requestModelId` for the routed model identifier exposed by WorkBuddy. A conversation request id can span multiple billable model calls and is not a dedup key.
+- WorkBuddy aggregate input/output counts include cache reads/reasoning. Split those subsets before `aggregateToBuckets()` so token categories do not overlap. Count usage from completed assistant records and usage-bearing `function_call` records.
+- Emit timing events from user records, completed assistant records, and usage-bearing `function_call` records; pass only sessions with a user prompt to `extractSessions()`.
 
 Codex forked sessions (`codex.js`):
 - Forking a Codex conversation writes a *new* rollout file that replays the entire source conversation at the top — every `event_msg/token_count` included, all timestamped in a 1–3s burst at the fork instant. Those tokens are already counted from the source session's own file, so naively parsing the fork double-counts and spikes token/cost at the fork timestamp.

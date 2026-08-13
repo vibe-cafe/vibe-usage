@@ -335,7 +335,7 @@ export const TOOLS = [
   {
     name: 'WorkBuddy',
     id: 'workbuddy',
-    dataDir: join(homedir(), '.workbuddy', 'projects'),
+    dataDir: join(homedir(), '.workbuddy-ai', 'projects'),
     detectDataDirs: () => findWorkbuddyDataDirs().filter(existsSync),
   },
   {
