@@ -195,6 +195,7 @@ export async function parse() {
   const events = [];
   const ctx = { skipped: false, warnings: [] };
   const seenIds = new Set();
+  const seenEventIds = new Set();
 
   for (const configuredRoot of findWorkbuddyDataDirs()) {
     const projectsDir = basename(configuredRoot) === 'projects' ? configuredRoot : join(configuredRoot, 'projects');
@@ -215,7 +216,11 @@ export async function parse() {
       await readJsonl(filePath, size, (record) => {
         const project = projectFromRecord(record, fileProject);
         const event = timingEventFor(record, record.sessionId ?? record.session_id ?? fileSessionId, project);
-        if (event) events.push(event);
+        const eventId = typeof record.id === 'string' && record.id ? record.id : null;
+        if (event && (!eventId || !seenEventIds.has(eventId))) {
+          events.push(event);
+          if (eventId) seenEventIds.add(eventId);
+        }
         if (!isCompletedAssistant(record)) return;
         if (typeof record.id !== 'string' || !record.id || seenIds.has(record.id)) return;
         const usage = usageFor(record);

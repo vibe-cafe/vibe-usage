@@ -51,9 +51,10 @@ function writeFixture(root, lines, project = 'demo-project') {
   writeFileSync(join(projects, 'conversation.jsonl'), `${lines.join('\n')}\n`, 'utf8');
 }
 
-function userRecord({ sessionId, timestamp, cwd, prompt }) {
+function userRecord({ id, sessionId, timestamp, cwd, prompt }) {
   return {
     type: 'message',
+    id,
     sessionId,
     timestamp,
     cwd,
@@ -146,7 +147,7 @@ test('records only de-identified WorkBuddy session metadata', async () => {
     const usage = { inputTokens: 10, outputTokens: 2 };
     writeFixture(root, [
       JSON.stringify(userRecord({
-        sessionId, cwd, prompt: 'confidential prompt', timestamp: '2026-08-11T10:00:00.000Z',
+        id: 'prompt', sessionId, cwd, prompt: 'confidential prompt', timestamp: '2026-08-11T10:00:00.000Z',
       })),
       JSON.stringify({
         ...assistantRecord({
@@ -164,6 +165,29 @@ test('records only de-identified WorkBuddy session metadata', async () => {
     assert.equal(serialized.includes(cwd), false);
     assert.equal(serialized.includes(sessionId), false);
     assert.equal(serialized.includes('confidential prompt'), false);
+  } finally { rmSync(root, { recursive: true, force: true }); }
+});
+
+test('deduplicates timing records by stable record id', async () => {
+  const root = mkdtempSync(join(tmpdir(), 'vibe-usage-workbuddy-event-dedup-'));
+  try {
+    const sessionId = 'session-with-copied-records';
+    const cwd = '/private/workspace';
+    const usage = { inputTokens: 10, outputTokens: 2 };
+    const prompt = userRecord({
+      id: 'copied-user', sessionId, cwd, timestamp: '2026-08-11T10:00:00.000Z',
+    });
+    const reply = {
+      ...assistantRecord({
+        id: 'copied-assistant', modelId: 'model-a', usage, cwd, timestamp: '2026-08-11T10:00:05.000Z',
+      }),
+      sessionId,
+    };
+    writeFixture(root, [JSON.stringify(prompt), JSON.stringify(reply), JSON.stringify(prompt), JSON.stringify(reply)]);
+    const result = await withRoots([root], () => parse());
+    assert.equal(result.sessions.length, 1);
+    assert.equal(result.sessions[0].messageCount, 2);
+    assert.equal(result.sessions[0].userMessageCount, 1);
   } finally { rmSync(root, { recursive: true, force: true }); }
 });
 
