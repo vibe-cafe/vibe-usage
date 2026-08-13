@@ -1,44 +1,65 @@
 # WorkBuddy parser
 
-Parses token usage from [WorkBuddy](https://www.workbuddy.cn) into the standard
-`{ buckets, sessions }` shape consumed by `vibe-usage sync`.
+Parses AI-coding token usage from [WorkBuddy](https://www.workbuddy.cn) into the
+standard `{ buckets, sessions }` shape consumed by `vibe-usage sync`.
 
-- Source string sent to the backend: **`workbuddy`**
-- Parser file: [`src/parsers/workbuddy.js`](./workbuddy.js)
-- Data-root discovery: [`src/workbuddy-roots.js`](../workbuddy-roots.js)
-- Registered in [`src/parsers/index.js`](./index.js) and [`src/tools.js`](./tools.js)
+- **Source string sent to the backend:** `workbuddy`
+- **Parser file:** [`src/parsers/workbuddy.js`](../../src/parsers/workbuddy.js)
+- **Data-root discovery:** [`src/workbuddy-roots.js`](../../src/workbuddy-roots.js)
+- **Registered in:** [`src/parsers/index.js`](../../src/parsers/index.js)
+  (`'workbuddy': parseWorkbuddy`) and
+  [`src/tools.js`](../../src/tools.js) (`TOOLS` entry `id: 'workbuddy'`)
+- **Status:** integrated upstream in `ebe797e`
+  ("Fix current WorkBuddy storage and usage records", co-authored with
+  @poying2018), building on `cb255fba99` ("Add WorkBuddy and Alma usage support").
 
-> Integrated upstream in `ebe797e` (co-authored with @poying2018). This document
-> describes the current upstream implementation.
+> ⚠️ **Backend allow-list required (action needed).** The parser parses
+> correctly and `vibe-usage sync` uploads the data, but the vibecafe.ai backend
+> currently drops any `workbuddy` bucket with
+> `服务端未收录的 source: workbuddy`. `workbuddy` must be registered as an
+> accepted `source` server-side before data appears on the dashboard. Tracked
+> in issue #56.
 
-> ⚠️ **Backend allow-list required.** The parser parses correctly, but the
-> vibecafe.ai backend currently drops any `workbuddy` bucket
-> (`服务端未收录的 source: workbuddy`). `workbuddy` must be registered as an
-> accepted `source` on the backend before data shows on the dashboard. See
-> issue #56.
+---
 
-## Where the data lives
+## 1. Where the data lives
 
-WorkBuddy stores one JSONL transcript per session. The parser discovers data
-roots via `findWorkbuddyDataDirs()` (in `src/workbuddy-roots.js`) and appends
-`projects` to each root, scanning:
+WorkBuddy keeps one JSONL transcript per session. The parser discovers data
+roots via `findWorkbuddyDataDirs()` (in
+[`src/workbuddy-roots.js`](../../src/workbuddy-roots.js)) and **appends
+`projects` to each root if missing**, then scans every `*.jsonl` file
+recursively:
 
 ```
-~/.workbuddy/projects/<project>/<sessionId>.jsonl
 ~/.workbuddy-ai/projects/<project>/<sessionId>.jsonl
+~/.workbuddy/projects/<project>/<sessionId>.jsonl
 ```
 
-- `<project>` — the workspace / project name (last path component of the session
-  `cwd`, or the first path segment of the file relative to the projects dir).
-- `<sessionId>` — the session id (also used as a fallback session id when a
-  record has no explicit `sessionId`).
+`findWorkbuddyDataDirs()` returns (in priority order):
 
-The parser walks every `*.jsonl` file under each `projects` directory recursively.
+1. `VIBE_USAGE_WORKBUDDY_DIRS` (env override, see §6) when set.
+2. Otherwise the two defaults above, **`.workbuddy-ai` first, then
+   `.workbuddy`**.
 
-## JSONL event schema
+`<project>` — the workspace / project name. The parser prefers the last path
+component of the session `cwd`, and falls back to the first path segment of the
+file relative to its `projects` directory. Bare drive-letter components
+(`C:`, `g:`) are dropped.
+
+`<sessionId>` — the session id. It is also used as a **fallback session id** when
+a record carries no explicit `sessionId`.
+
+The `TOOLS` entry in `src/tools.js` uses `dataDir: join(homedir(),
+'.workbuddy-ai', 'projects')` as the canonical install root for
+`detectInstalledTools`, and its `detectDataDirs` returns
+`findWorkbuddyDataDirs().filter(existsSync)`.
+
+---
+
+## 2. JSONL event schema
 
 Each line is one event object with a `type` field. The parser reads two families
-of records for tokens, and `message` records for session timing.
+of records for tokens and `message` records for session timing.
 
 ### `message` — timing / session events
 
@@ -46,15 +67,22 @@ of records for tokens, and `message` records for session timing.
 {
   "type": "message",
   "role": "user" | "assistant",
-  "status": "completed",          // assistant messages must be "completed" to count
-  "cwd": "F:\\aigame",            // used to derive the project name
+  "status": "completed",                 // assistant must be "completed/complete/success" to count
+  "cwd": "F:\\aigame",                   // derives the project name
   "sessionId": "a1b2c3...",
-  "id": "msg_001",                // stable per-record id (dedup key)
+  "id": "msg_001",                       // stable per-record id (dedup key)
   "timestamp": "2026-07-15T12:10:18.000Z"
 }
 ```
 
-### `function_call` — token usage (primary)
+- `role` resolves from `record.role ?? record.message?.role` → `user` or
+  `assistant`.
+- A completed assistant message is one whose `type === 'message'`, role is
+  `assistant`, **and** `status` (checked across `status` / `message.status` /
+  `state` / `message.state`, lower-cased) is `completed` / `complete` /
+  `success`. Completed assistant messages may also carry usage (see §3).
+
+### `function_call` — token usage (primary path)
 
 ```jsonc
 {
@@ -64,22 +92,25 @@ of records for tokens, and `message` records for session timing.
   "sessionId": "a1b2c3...",
   "providerData": {
     "model": "hy3",
-    "usage": { /* normalized shape, see below */ },
-    "rawUsage": { /* provider-native shape, see below */ }
+    "usage": { /* normalized shape, see §3 */ },
+    "rawUsage": { /* provider-native shape, see §3 */ }
   }
 }
 ```
 
-Unlike Claude Code (which puts usage on the assistant `message`), WorkBuddy
-attaches the per-request token usage to the `function_call` that triggered the
-underlying LLM request. The parser reads `providerData.usage`, falls back to
-`providerData.rawUsage`, and also accepts `message.usage` on completed assistant
-messages.
+Unlike Claude Code (usage on the assistant `message`), WorkBuddy attaches the
+per-request token usage to the `function_call` that triggered the underlying LLM
+request. The parser treats a record as a usage record when it is a completed
+assistant `message` **or** a `function_call` whose `providerData` is an object.
 
-## Usage shapes (both supported)
+---
 
-WorkBuddy may emit either a normalized shape or a provider-native (OpenAI-style)
-shape. The parser handles both, plus a few extra field-name variants.
+## 3. Usage shapes (both supported)
+
+WorkBuddy may emit either a **normalized** shape or a **provider-native
+(OpenAI-style)** shape, plus a few extra field-name variants. The parser reads
+`providerData.usage` first, falls back to `message.usage`, and uses
+`providerData.rawUsage` as a supplementary detail source.
 
 **Normalized**
 
@@ -103,56 +134,73 @@ shape. The parser handles both, plus a few extra field-name variants.
 }
 ```
 
-Mapping to bucket fields (first non-null match wins for each detail group):
+### Field mapping (first non-null match wins per detail group)
 
-| Bucket field            | Normalized sources                                                         | Raw (OpenAI) sources                              |
-| ----------------------- | -------------------------------------------------------------------------- | ------------------------------------------------ |
-| `inputTokens`           | `inputTokens` / `input_tokens`                                            | `prompt_tokens`                                  |
-| `outputTokens`          | `outputTokens` / `output_tokens`                                           | `completion_tokens`                              |
-| `cachedInputTokens`     | `inputTokensDetails[].cached_tokens`, `cache_read_input_tokens`           | `prompt_tokens_details.cached_tokens`, `prompt_cache_hit_tokens` |
-| `reasoningOutputTokens` | `outputTokensDetails[].reasoning_tokens`, `completion_thinking_tokens`    | `completion_tokens_details.reasoning_tokens`, `completion_thinking_tokens` |
+| Bucket field            | Normalized sources                                                                  | Raw (OpenAI) sources                                                       |
+| ----------------------- | ----------------------------------------------------------------------------------- | -------------------------------------------------------------------------- |
+| `inputTokens`           | `inputTokens` / `input_tokens`                                                     | `prompt_tokens`                                                            |
+| `outputTokens`          | `outputTokens` / `output_tokens`                                                   | `completion_tokens`                                                        |
+| `cachedInputTokens`     | `inputTokensDetails[].cached_tokens`, `cache_read_input_tokens`                    | `prompt_tokens_details.cached_tokens`, `prompt_cache_hit_tokens`           |
+| `reasoningOutputTokens` | `outputTokensDetails[].reasoning_tokens`, `completion_thinking_tokens`            | `completion_tokens_details.reasoning_tokens`, `completion_thinking_tokens` |
 
-Notes:
-- Input/output aggregates in WorkBuddy include cache reads and reasoning. The
-  parser subtracts `cachedInputTokens` / `reasoningOutputTokens` from the
-  inclusive totals to avoid double counting. When a provider exposes an
-  exclusive `prompt_cache_miss_tokens` field, that is preferred as `inputTokens`.
-- `model` priority: `providerData.requestModelId` → `requestModelName` →
-  `providerData.model`, defaulting to `unknown`.
+Detail objects are searched across `input_details` / `inputDetails` /
+`inputTokensDetails` / `prompt_tokens_details` (input) and the matching output
+variants.
 
-## Project name derivation
+### Counting rules
 
-The project name is the last path component of the session `cwd` (bare
-drive-letter components like `C:` / `g:` are dropped), falling back to the first
-path segment of the file relative to its `projects` directory. This matches how
-other parsers (Claude Code, etc.) name projects.
+- WorkBuddy's aggregate input/output fields **include** cache reads and
+  reasoning tokens. The parser subtracts `cachedInputTokens` /
+  `reasoningOutputTokens` from the inclusive totals to avoid double counting.
+- When a provider exposes an **exclusive** `prompt_cache_miss_tokens` field, that
+  value is preferred directly as `inputTokens` (no subtraction).
+- A usage record with a total score of 0 (all token fields empty) is skipped.
 
-## Buckets & sessions
+### Model resolution (priority)
 
-- **Buckets** are produced by `aggregateToBuckets(entries)` (shared helper):
-  keyed by `source | model | project | hostname | halfHourBucket`, summing
+```
+providerData.requestModelId
+  → record.requestModelName
+  → providerData.requestModelName
+  → providerData.model
+  → "unknown"
+```
+
+### Timestamp resolution (priority)
+
+```
+completedAt / completed_at
+  → timestamp
+  → createdAt / created_at
+  → message.createdAt
+```
+
+Acceptable as a Date, a numeric epoch (ms if ≥ 1e12 else seconds), or an
+ISO-8601 string.
+
+---
+
+## 4. Buckets & sessions
+
+- **Buckets** — produced by `aggregateToBuckets(entries)` (shared helper). Keyed
+  by `source | model | project | hostname | halfHourBucket`, summing
   input/output/cached/reasoning tokens. Records are de-duplicated by their stable
-  `id`, keeping the highest-score (most complete) usage per id.
-- **Sessions** are produced by `extractSessions(events)` (shared helper) from the
-  `message` / `function_call` timing events, grouped by `sessionId`. Only sessions
-  that contain at least one user prompt are emitted. Fields: `sessionHash`,
+  `id`, keeping the **highest-score** (most complete) usage per id.
+- **Sessions** — produced by `extractSessions(events)` (shared helper) from the
+  `message` / `function_call` timing events, grouped by `sessionId`. Only
+  sessions that contain **at least one user prompt** are emitted (the helper
+  filters out sessions with no `user` event). Fields: `sessionHash`,
   `firstMessageAt`, `lastMessageAt`, `durationSeconds`, `activeSeconds`,
   `messageCount`, `userMessageCount`, `userPromptHours[24]`.
 
-## Configuration & testing
+The `hostname` is filled by the shared `aggregateToBuckets` helper (from the
+local machine), not by the parser itself.
 
-- `VIBE_USAGE_WORKBUDDY_DIRS` — semicolon-separated list of data roots to scan
-  instead of the discovered defaults (each is treated the same way — `projects`
-  is appended when missing). Handy for pointing the parser at a test fixture:
+---
 
-  ```sh
-  VIBE_USAGE_WORKBUDDY_DIRS="$PWD/test/fixtures/workbuddy" vibe-usage status
-  ```
+## 5. Local verification (real example)
 
-- The tool entry in `TOOLS` (`findWorkbuddyDataDirs`) also honors this override
-  and is used by `detectInstalledTools`.
-
-## Local verification (example)
+Running the parser against a real `~/.workbuddy/projects` tree:
 
 ```
 buckets:   132
@@ -161,3 +209,71 @@ models:    hy3, deepseek-v4-flash, deepseek-v4-pro, glm-5.2,
            mimo-v2.5-pro-ultraspeed, agnes-2.0-flash
 elapsed:   ~560ms
 ```
+
+(Numbers vary with the local transcript history.)
+
+You can confirm the parser is wired up with:
+
+```sh
+vibe-usage status        # "WorkBuddy" should appear under detected tools
+vibe-usage sync --dry-run # parses and prints buckets/sessions without uploading
+```
+
+---
+
+## 6. Configuration & testing
+
+`VIBE_USAGE_WORKBUDDY_DIRS` — semicolon/path-delimited list of data roots to
+scan instead of the discovered defaults. Each entry may name either the
+WorkBuddy home (e.g. `~/.workbuddy`) **or** its `projects/` directory; the parser
+normalizes both forms (appends `projects` when missing). Handy for pointing at a
+test fixture:
+
+```sh
+VIBE_USAGE_WORKBUDDY_DIRS="$PWD/test/fixtures/workbuddy" vibe-usage status
+```
+
+The override is honored by both `findWorkbuddyDataDirs()` (parser) and the
+`TOOLS` `detectDataDirs` entry.
+
+---
+
+## 7. FAQ / troubleshooting
+
+**Q: My data isn't showing on the vibecafe.ai dashboard.**
+A: The parser works, but the backend allow-list does not yet contain `workbuddy`.
+Sync uploads succeed but the buckets are dropped server-side
+(`服务端未收录的 source: workbuddy`). This is a backend change, not a parser bug.
+See issue #56.
+
+**Q: Should I point at `~/.workbuddy` or `~/.workbuddy-ai`?**
+A: Both are scanned. `findWorkbuddyDataDirs()` tries `.workbuddy-ai/projects`
+first, then `.workbuddy/projects`. Use `VIBE_USAGE_WORKBUDDY_DIRS` to force a
+specific root.
+
+**Q: Buckets come back as 0.**
+A: Check that sessions contain `function_call` records with a non-empty
+`providerData.usage` (or completed assistant `message.usage`), and that
+`VIBE_USAGE_WORKBUDDY_DIRS` (if set) points at a directory that contains
+`*.jsonl` transcripts. The parser emits `warnings` in its result when it cannot
+read a directory or file.
+
+**Q: Why does the model sometimes show as `unknown`?**
+A: None of the four model fields (`requestModelId`, `requestModelName`,
+`providerData.requestModelName`, `providerData.model`) was present on the usage
+record. Add the field to the provider payload or extend `modelFor()`.
+
+---
+
+## 8. Backend registration checklist (for maintainers)
+
+To fully light up WorkBuddy on the dashboard:
+
+1. Merge the parser (already in `main` via `ebe797e`).
+2. Register `workbuddy` as an accepted `source` in the vibecafe.ai backend
+   allow-list. (issue #56)
+3. (Optional) Add a unit-test fixture under `test/fixtures/workbuddy/` and a
+   case in the parser test suite.
+
+Once step 2 lands, existing and future `vibe-usage sync` uploads from WorkBuddy
+users will appear with no client-side change.
