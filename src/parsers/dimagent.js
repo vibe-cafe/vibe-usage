@@ -1,6 +1,7 @@
 import { existsSync } from 'node:fs';
-import { aggregateToBuckets, extractSessions } from './index.js';
-import { queryDbJson } from './sqlite.js';
+import { aggregateToBuckets, extractSessions } from './aggregate.js';
+import { toCount } from './fs-utils.js';
+import { queryDbJson, sqliteUnavailableError, isSqliteUnavailableError } from './sqlite.js';
 import { getDimAgentDbPath } from '../tools.js';
 
 const SOURCE = 'dimagent';
@@ -10,11 +11,6 @@ function projectName(cwd) {
   if (!cwd) return 'unknown';
   const parts = String(cwd).replace(/[/\\]+$/, '').split(/[/\\]/);
   return parts.at(-1) || 'unknown';
-}
-
-function tokenCount(value) {
-  const count = Number(value);
-  return Number.isFinite(count) && count > 0 ? count : 0;
 }
 
 function usageSignature(row) {
@@ -55,10 +51,10 @@ function parseUsageRows(rows) {
     const timestamp = new Date(row.createdAt);
     if (Number.isNaN(timestamp.getTime())) continue;
 
-    const promptTokens = tokenCount(usage.promptTokens);
-    const cachedInputTokens = tokenCount(usage.cacheReadTokens);
+    const promptTokens = toCount(usage.promptTokens);
+    const cachedInputTokens = toCount(usage.cacheReadTokens);
     const inputTokens = Math.max(0, promptTokens - cachedInputTokens);
-    const outputTokens = tokenCount(usage.completionTokens);
+    const outputTokens = toCount(usage.completionTokens);
     if (inputTokens + outputTokens + cachedInputTokens === 0) continue;
 
     entries.push({
@@ -80,9 +76,7 @@ function queryDb(dbPath, sql) {
   try {
     return queryDbJson(dbPath, sql);
   } catch (err) {
-    if (err.code === 'ENOENT' || err.status === 127 || err.message?.includes('ENOENT')) {
-      throw new Error('sqlite3 CLI not found. Install sqlite3 (or use Node >= 22.5) to sync DimAgent data.');
-    }
+    if (isSqliteUnavailableError(err)) throw sqliteUnavailableError('DimAgent');
     throw err;
   }
 }

@@ -1,8 +1,8 @@
 import { existsSync } from 'node:fs';
 import { join, basename } from 'node:path';
 import { homedir } from 'node:os';
-import { aggregateToBuckets, extractSessions } from './index.js';
-import { queryDbJson } from './sqlite.js';
+import { aggregateToBuckets, extractSessions } from './aggregate.js';
+import { queryDbJson, sqliteUnavailableError, isSqliteUnavailableError } from './sqlite.js';
 
 // ZCode (z.ai / Zhipu's coding agent) stores everything in a SQLite database
 // at ~/.zcode/cli/db/db.sqlite. The `message` table is the canonical source:
@@ -46,9 +46,7 @@ export async function parse() {
   try {
     rows = queryDbJson(DB_PATH, query);
   } catch (err) {
-    if (err.status === 127 || (err.message && err.message.includes('ENOENT'))) {
-      throw new Error('sqlite3 CLI not found. Install sqlite3 (or use Node >= 22.5) to sync ZCode data.');
-    }
+    if (isSqliteUnavailableError(err)) throw sqliteUnavailableError('ZCode');
     throw err;
   }
   if (!rows.length) return { buckets: [], sessions: [] };

@@ -1,7 +1,7 @@
 import { readdirSync, readFileSync, existsSync } from 'node:fs';
 import { join, basename } from 'node:path';
 import { homedir } from 'node:os';
-import { aggregateToBuckets, extractSessions } from './index.js';
+import { aggregateToBuckets, extractSessions } from './aggregate.js';
 
 const TMP_DIR = join(homedir(), '.gemini', 'tmp');
 

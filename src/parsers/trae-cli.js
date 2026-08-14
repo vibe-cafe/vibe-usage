@@ -1,18 +1,8 @@
 import { readFileSync, readdirSync } from 'node:fs';
-import { basename, join } from 'node:path';
+import { join } from 'node:path';
 import { findTraeCliDataDirs } from '../tools.js';
-import { aggregateToBuckets, extractSessions } from './index.js';
-
-function readJsonSafe(path) {
-  try { return JSON.parse(readFileSync(path, 'utf-8')); } catch { return null; }
-}
-
-function projectFromPath(absPath) {
-  if (!absPath || typeof absPath !== 'string') return 'unknown';
-  const trimmed = absPath.replace(/[\\/]+$/, '');
-  const name = basename(trimmed);
-  return name || 'unknown';
-}
+import { aggregateToBuckets, extractSessions } from './aggregate.js';
+import { readJsonSafe, projectFromPath } from './fs-utils.js';
 
 function parseJsonlSafe(path) {
   try {

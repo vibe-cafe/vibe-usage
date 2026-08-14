@@ -1,8 +1,8 @@
 import { readdirSync, readFileSync, existsSync } from 'node:fs';
 import { join, basename } from 'node:path';
 import { homedir } from 'node:os';
-import { aggregateToBuckets, extractSessions } from './index.js';
-import { queryDbJson } from './sqlite.js';
+import { aggregateToBuckets, extractSessions } from './aggregate.js';
+import { queryDbJson, sqliteUnavailableError, isSqliteUnavailableError } from './sqlite.js';
 
 const DATA_DIR = join(homedir(), '.local', 'share', 'opencode');
 const DB_PATH = join(DATA_DIR, 'opencode.db');
@@ -37,9 +37,7 @@ function parseFromSqlite() {
   try {
     rows = queryDbJson(DB_PATH, query);
   } catch (err) {
-    if (err.status === 127 || (err.message && err.message.includes('ENOENT'))) {
-      throw new Error('sqlite3 CLI not found. Install sqlite3 (or use Node >= 22.5) to sync opencode data.');
-    }
+    if (isSqliteUnavailableError(err)) throw sqliteUnavailableError('OpenCode');
     throw err;
   }
   if (!rows.length) return { buckets: [], sessions: [] };

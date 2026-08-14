@@ -1,7 +1,7 @@
-import { readFileSync, writeFileSync, unlinkSync, mkdirSync, existsSync } from 'node:fs';
+import { readFileSync, writeFileSync, unlinkSync, mkdirSync, existsSync, renameSync, rmSync } from 'node:fs';
 import { join } from 'node:path';
 import { homedir } from 'node:os';
-import { createHash } from 'node:crypto';
+import { createHash, randomBytes } from 'node:crypto';
 
 // Persisted sync state, kept next to config.js's files (same dir + dev split).
 // Maps a stable item key -> hash of its mutable fields, recording what we have
@@ -34,7 +34,18 @@ export function loadState() {
 
 export function saveState(state) {
   mkdirSync(STATE_DIR, { recursive: true });
-  writeFileSync(STATE_FILE, JSON.stringify(state) + '\n', 'utf-8');
+  // Atomic replace: write to a unique temp file then rename over the target.
+  // A crash mid-write can no longer truncate state.json into an unreadable
+  // file that loadState() would treat as empty (triggering a full re-upload).
+  const tempPath = `${STATE_FILE}.${process.pid}.${randomBytes(6).toString('hex')}.tmp`;
+  try {
+    writeFileSync(tempPath, JSON.stringify(state) + '\n', 'utf-8');
+    renameSync(tempPath, STATE_FILE);
+  } finally {
+    // No-op after a successful rename (the temp file is already gone); cleans
+    // up the partial write if writeFileSync threw.
+    rmSync(tempPath, { force: true });
+  }
 }
 
 // Drop all recorded upload state so the next sync re-uploads everything.

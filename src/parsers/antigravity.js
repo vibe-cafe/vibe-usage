@@ -2,7 +2,7 @@ import { execSync } from 'node:child_process';
 import { readdirSync } from 'node:fs';
 import { join } from 'node:path';
 import { homedir } from 'node:os';
-import { aggregateToBuckets, extractSessions } from './index.js';
+import { aggregateToBuckets, extractSessions } from './aggregate.js';
 import { listDbCascades, readDbUsageRecords, readDbWorkspaceUri, readDbSessionEvents } from './antigravity-db.js';
 
 

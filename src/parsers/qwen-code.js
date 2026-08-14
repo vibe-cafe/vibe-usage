@@ -1,7 +1,7 @@
 import { readdirSync, readFileSync, existsSync } from 'node:fs';
 import { join, basename, sep } from 'node:path';
 import { homedir } from 'node:os';
-import { aggregateToBuckets, extractSessions } from './index.js';
+import { aggregateToBuckets, extractSessions } from './aggregate.js';
 
 /**
  * Qwen Code parser (Gemini CLI fork).

@@ -1,6 +1,7 @@
 import { existsSync, readdirSync, readFileSync } from 'node:fs';
 import { basename, join, relative } from 'node:path';
-import { aggregateToBuckets, extractSessions } from './index.js';
+import { aggregateToBuckets, extractSessions } from './aggregate.js';
+import { projectFromCwd, toCount } from './fs-utils.js';
 
 const MAX_WARNINGS = 20;
 
@@ -26,17 +27,6 @@ function findJsonlFiles(dir, includeFile, ctx) {
     else if (child.name.endsWith('.jsonl') && includeFile(filePath)) files.push(filePath);
   }
   return files;
-}
-
-function tokenCount(value) {
-  const number = Number(value);
-  return Number.isFinite(number) && number > 0 ? number : 0;
-}
-
-export function projectFromCwd(cwd) {
-  if (typeof cwd !== 'string') return 'unknown';
-  const parts = cwd.replace(/\\/g, '/').split('/').filter(Boolean);
-  return parts.at(-1) || 'unknown';
 }
 
 export function projectFromFirstDir(filePath, sessionsDir) {
@@ -105,12 +95,12 @@ export async function parsePiSessionJsonl({
 
         if (message.role !== 'assistant' || !message.usage) continue;
         const usage = message.usage;
-        const inputTokens = tokenCount(usage.input) + tokenCount(usage.cacheWrite);
-        const reasoningOutputTokens = tokenCount(usage.reasoningTokens);
+        const inputTokens = toCount(usage.input) + toCount(usage.cacheWrite);
+        const reasoningOutputTokens = toCount(usage.reasoningTokens);
         // OMP/Pi usage.output includes reasoning; the shared bucket contract
         // stores non-reasoning output and reasoning separately.
-        const outputTokens = Math.max(0, tokenCount(usage.output) - reasoningOutputTokens);
-        const cachedInputTokens = tokenCount(usage.cacheRead);
+        const outputTokens = Math.max(0, toCount(usage.output) - reasoningOutputTokens);
+        const cachedInputTokens = toCount(usage.cacheRead);
         const score = inputTokens + outputTokens + cachedInputTokens + reasoningOutputTokens;
         if (score === 0) continue;
 

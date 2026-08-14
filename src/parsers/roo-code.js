@@ -1,7 +1,8 @@
-import { readFileSync, readdirSync, statSync } from 'node:fs';
-import { basename, join } from 'node:path';
+import { readdirSync, statSync } from 'node:fs';
+import { join } from 'node:path';
 import { homedir } from 'node:os';
-import { aggregateToBuckets, extractSessions } from './index.js';
+import { aggregateToBuckets, extractSessions } from './aggregate.js';
+import { readJsonSafe, projectFromPath } from './fs-utils.js';
 
 const EXTENSION_ID = 'rooveterinaryinc.roo-cline';
 
@@ -33,17 +34,6 @@ export function findRooCodeExtensionDirs() {
     }
   }
   return dirs;
-}
-
-function readJsonSafe(path) {
-  try { return JSON.parse(readFileSync(path, 'utf-8')); } catch { return null; }
-}
-
-function projectFromPath(absPath) {
-  if (!absPath || typeof absPath !== 'string') return 'unknown';
-  const trimmed = absPath.replace(/[\\/]+$/, '');
-  const name = basename(trimmed);
-  return name || 'unknown';
 }
 
 // Read all HistoryItems from `_index.json` if present, else fall back to

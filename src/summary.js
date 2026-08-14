@@ -1,32 +1,30 @@
-import https from 'node:https';
-import http from 'node:http';
-import { URL } from 'node:url';
 import { loadConfig } from './config.js';
+import { getJson } from './api.js';
+import { failure } from './output.js';
 
 export async function runSummary(args = []) {
   const days = parseDays(args);
   const config = loadConfig();
   if (!config?.apiKey) {
-    console.error('No vibe-usage config found. Run `npx @vibe-cafe/vibe-usage init` first.');
+    console.error(failure('尚未配置，请先运行 `npx @vibe-cafe/vibe-usage init`。'));
     process.exit(1);
   }
 
-  const url = new URL('/api/usage', config.apiUrl || 'https://vibecafe.ai');
-  url.searchParams.set('days', String(days));
+  const apiUrl = config.apiUrl || 'https://vibecafe.ai';
 
   let data;
   try {
-    data = await fetchJson(url, config.apiKey);
+    data = await getJson(apiUrl, config.apiKey, `/api/usage?days=${days}`, { timeoutMs: 15_000 });
   } catch (err) {
     if (err.statusCode === 401) {
-      console.error('API key invalid or revoked. Run `npx @vibe-cafe/vibe-usage init` to re-link.');
+      console.error(failure('API Key 无效，请运行 `npx @vibe-cafe/vibe-usage init` 重新配置。'));
     } else {
-      console.error(`Failed to fetch usage: ${err.message}`);
+      console.error(failure(`获取用量数据失败: ${err.message}`));
     }
     process.exit(1);
   }
 
-  console.log(render(data, days));
+  console.log(render(data, days, apiUrl));
 }
 
 function parseDays(args) {
@@ -38,12 +36,13 @@ function parseDays(args) {
   return v;
 }
 
-function render(data, days) {
+function render(data, days, apiUrl) {
   const buckets = Array.isArray(data?.buckets) ? data.buckets : [];
   const sessions = Array.isArray(data?.sessions) ? data.sessions : [];
+  const dashboard = `${apiUrl}/usage`;
 
   if (buckets.length === 0) {
-    return `# Vibe Usage Summary (Last ${days} ${days === 1 ? 'day' : 'days'})\n\n暂无数据。运行 \`npx @vibe-cafe/vibe-usage sync\` 上传本地 token 记录。\n\n详情: https://vibecafe.ai/usage\n`;
+    return `# Vibe Usage Summary (Last ${days} ${days === 1 ? 'day' : 'days'})\n\n暂无数据。运行 \`npx @vibe-cafe/vibe-usage sync\` 上传本地 token 记录。\n\n详情: ${dashboard}\n`;
   }
 
   let totalCost = 0;
@@ -94,7 +93,7 @@ function render(data, days) {
   }
   lines.push('');
 
-  lines.push('详情: https://vibecafe.ai/usage');
+  lines.push(`详情: ${dashboard}`);
   return lines.join('\n');
 }
 
@@ -114,33 +113,4 @@ function formatTokens(n) {
   if (n >= 1_000_000) return (n / 1_000_000).toFixed(1) + 'M';
   if (n >= 1_000) return (n / 1_000).toFixed(0) + 'K';
   return String(n);
-}
-
-function fetchJson(url, apiKey) {
-  return new Promise((resolve, reject) => {
-    const mod = url.protocol === 'https:' ? https : http;
-    const req = mod.request(url, {
-      method: 'GET',
-      timeout: 15_000,
-      headers: { 'Authorization': `Bearer ${apiKey}` },
-    }, (res) => {
-      let data = '';
-      res.on('data', (chunk) => { data += chunk; });
-      res.on('end', () => {
-        if (res.statusCode === 401) {
-          const err = new Error('Unauthorized'); err.statusCode = 401; reject(err); return;
-        }
-        if (res.statusCode < 200 || res.statusCode >= 300) {
-          const err = new Error(`HTTP ${res.statusCode}: ${data.slice(0, 200)}`);
-          err.statusCode = res.statusCode;
-          reject(err); return;
-        }
-        try { resolve(JSON.parse(data)); }
-        catch { reject(new Error('Invalid JSON response')); }
-      });
-    });
-    req.on('error', reject);
-    req.on('timeout', () => { req.destroy(); reject(new Error('timeout (15s)')); });
-    req.end();
-  });
 }
