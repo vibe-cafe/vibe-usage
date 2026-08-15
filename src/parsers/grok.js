@@ -1,8 +1,9 @@
 import { createReadStream, existsSync, readdirSync, readFileSync } from 'node:fs';
 import { createInterface } from 'node:readline';
-import { basename, join } from 'node:path';
+import { join } from 'node:path';
 import { findGrokDataDirs, getGrokSessionsDir } from '../tools.js';
-import { aggregateToBuckets, extractSessions } from './index.js';
+import { aggregateToBuckets, extractSessions } from './aggregate.js';
+import { readJsonSafe, projectFromPath } from './fs-utils.js';
 
 const SOURCE = 'grok';
 
@@ -22,21 +23,6 @@ const SOURCE = 'grok';
  * `modelUsage` when present). inputTokens is non-cached prompt (total − cache
  * reads), matching Codex/Copilot so totalTokens does not double-count cache.
  */
-
-function readJsonSafe(path) {
-  try {
-    return JSON.parse(readFileSync(path, 'utf-8'));
-  } catch {
-    return null;
-  }
-}
-
-function projectFromPath(absPath) {
-  if (!absPath || typeof absPath !== 'string') return 'unknown';
-  const trimmed = absPath.replace(/[\\/]+$/, '');
-  const name = basename(trimmed);
-  return name || 'unknown';
-}
 
 /** Decode a sessions group dirname; fall back to basename after decode. */
 function projectFromGroupDir(groupName, groupPath) {

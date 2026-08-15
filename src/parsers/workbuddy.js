@@ -2,7 +2,7 @@ import { createReadStream, readdirSync, statSync } from 'node:fs';
 import { createInterface } from 'node:readline';
 import { basename, join, relative, sep } from 'node:path';
 import { findWorkbuddyDataDirs } from '../workbuddy-roots.js';
-import { aggregateToBuckets, extractSessions } from './index.js';
+import { aggregateToBuckets, extractSessions } from './aggregate.js';
 
 const SOURCE = 'workbuddy';
 const MAX_WARNINGS = 20;

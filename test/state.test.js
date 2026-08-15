@@ -1,6 +1,6 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { mkdtempSync, writeFileSync, existsSync, statSync } from 'node:fs';
+import { mkdtempSync, writeFileSync, existsSync, statSync, readdirSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 
@@ -18,6 +18,13 @@ test('saveState/loadState round-trips buckets and sessions', () => {
   const state = { buckets: { 'codex|m|p|h|t': 'hash1' }, sessions: { 'kiro|abc': 'hash2' } };
   saveState(state);
   assert.deepEqual(loadState(), state);
+});
+
+test('saveState writes atomically without leaving temp files behind', () => {
+  saveState({ buckets: { a: '1' }, sessions: {} });
+  const files = readdirSync(dir);
+  assert.equal(files.includes('state.json'), true);
+  assert.equal(files.some((f) => f.endsWith('.tmp')), false);
 });
 
 test('loadState treats a corrupt state file as empty (full re-upload)', () => {

@@ -1,5 +1,8 @@
 import { execFileSync } from 'node:child_process';
 import { createRequire } from 'node:module';
+import { copyFileSync, existsSync, mkdtempSync, rmSync } from 'node:fs';
+import { tmpdir } from 'node:os';
+import { basename, join } from 'node:path';
 
 const require = createRequire(import.meta.url);
 
@@ -71,4 +74,47 @@ function queryViaCli(dbPath, sql, { timeout, maxBuffer }) {
   const trimmed = out.trim();
   if (!trimmed || trimmed === '[]') return [];
   return JSON.parse(trimmed);
+}
+
+/** Standard "sqlite3 unavailable" hint, reused by every SQLite-backed parser. */
+export function sqliteUnavailableError(label) {
+  return new Error(`sqlite3 CLI not found. Install sqlite3 (or use Node >= 22.5) to sync ${label} data.`);
+}
+
+/** True when the error is the "no sqlite3" hint (node:sqlite absent + CLI absent). */
+export function isSqliteUnavailableError(err) {
+  return !!err && (
+    err.code === 'ENOENT'
+    || err.status === 127
+    || /ENOENT|sqlite3.*not found/i.test(err?.message || '')
+  );
+}
+
+export function isLockError(err) {
+  return !!err && typeof err.message === 'string' && /database is locked/i.test(err.message);
+}
+
+/**
+ * Run a query, and if the source app holds a write lock on the database, copy
+ * the DB (plus its -wal/-shm companions) to a temp dir and re-query the
+ * snapshot. Shared by Cursor / Antigravity / Kiro.
+ */
+export function queryDbJsonSnapshotOnLock(dbPath, sql, { tempPrefix = 'vibe-usage-sqlite', opts } = {}) {
+  try {
+    return queryDbJson(dbPath, sql, opts);
+  } catch (err) {
+    if (!isLockError(err)) throw err;
+    const snapshotDir = mkdtempSync(join(tmpdir(), tempPrefix));
+    const queryPath = join(snapshotDir, basename(dbPath));
+    try {
+      copyFileSync(dbPath, queryPath);
+      for (const suffix of ['-shm', '-wal']) {
+        const companion = `${dbPath}${suffix}`;
+        if (existsSync(companion)) copyFileSync(companion, `${queryPath}${suffix}`);
+      }
+      return queryDbJson(queryPath, sql, opts);
+    } finally {
+      rmSync(snapshotDir, { recursive: true, force: true });
+    }
+  }
 }

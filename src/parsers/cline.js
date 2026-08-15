@@ -1,18 +1,8 @@
-import { readFileSync, statSync } from 'node:fs';
-import { basename, join } from 'node:path';
-import { aggregateToBuckets, extractSessions } from './index.js';
+import { statSync } from 'node:fs';
+import { join } from 'node:path';
+import { aggregateToBuckets, extractSessions } from './aggregate.js';
+import { readJsonSafe, projectFromPath } from './fs-utils.js';
 import { findClineDataDirs } from '../cline-roots.js';
-
-function readJsonSafe(path) {
-  try { return JSON.parse(readFileSync(path, 'utf-8')); } catch { return null; }
-}
-
-function projectFromPath(absPath) {
-  if (!absPath || typeof absPath !== 'string') return 'unknown';
-  const trimmed = absPath.replace(/[\\/]+$/, '');
-  const name = basename(trimmed);
-  return name || 'unknown';
-}
 
 export async function parse() {
   const extDirs = findClineDataDirs();

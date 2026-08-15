@@ -1,6 +1,6 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { aggregateToBuckets } from '../src/parsers/index.js';
+import { aggregateToBuckets } from '../src/parsers/aggregate.js';
 
 function entry(overrides = {}) {
   return {

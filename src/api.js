@@ -231,6 +231,56 @@ function _jsonRequest(apiUrl, path, method, body, timeoutMs) {
 }
 
 /**
+ * Authenticated GET returning parsed JSON. Shared by summary and settings so
+ * callers don't hand-roll their own https request + error mapping.
+ * - 401 → Error('UNAUTHORIZED') with statusCode 401
+ * - other non-2xx / timeout / bad JSON → Error with statusCode
+ * @param {string} apiUrl
+ * @param {string} apiKey
+ * @param {string} path
+ * @param {{timeoutMs?: number}} [opts]
+ * @returns {Promise<any>}
+ */
+export function getJson(apiUrl, apiKey, path, { timeoutMs = 15_000 } = {}) {
+  return new Promise((resolve, reject) => {
+    const url = new URL(path, apiUrl);
+    const mod = url.protocol === 'https:' ? https : http;
+
+    const req = mod.request(url, {
+      method: 'GET',
+      timeout: timeoutMs,
+      headers: { 'Authorization': `Bearer ${apiKey}` },
+    }, (res) => {
+      let data = '';
+      res.on('data', (chunk) => { data += chunk; });
+      res.on('end', () => {
+        if (res.statusCode === 401) {
+          const err = new Error('UNAUTHORIZED');
+          err.statusCode = 401;
+          reject(err);
+          return;
+        }
+        if (res.statusCode < 200 || res.statusCode >= 300) {
+          const err = new Error(`HTTP ${res.statusCode}: ${data.slice(0, 200)}`);
+          err.statusCode = res.statusCode;
+          reject(err);
+          return;
+        }
+        try {
+          resolve(JSON.parse(data));
+        } catch {
+          reject(new Error('Invalid JSON response'));
+        }
+      });
+    });
+
+    req.on('error', reject);
+    req.on('timeout', () => { req.destroy(); reject(new Error(`Request timed out (${timeoutMs}ms)`)); });
+    req.end();
+  });
+}
+
+/**
  * GET user settings from the vibecafe API.
  * Returns null after transient failures are exhausted. A 401 remains distinct
  * so callers can surface invalid credentials instead of calling it an outage.
@@ -260,46 +310,10 @@ export async function fetchSettings(apiUrl, apiKey, retry = {}) {
   return null;
 }
 
-function fetchSettingsOnce(apiUrl, apiKey) {
-  return new Promise((resolve, reject) => {
-    const url = new URL('/api/usage/settings', apiUrl);
-    const mod = url.protocol === 'https:' ? https : http;
-
-    const req = mod.request(url, {
-      method: 'GET',
-      timeout: 10_000,
-      headers: {
-        'Authorization': `Bearer ${apiKey}`,
-      },
-    }, (res) => {
-      let data = '';
-      res.on('data', (chunk) => { data += chunk; });
-      res.on('end', () => {
-        if (res.statusCode === 401) {
-          reject(new Error('UNAUTHORIZED'));
-          return;
-        }
-        if (res.statusCode < 200 || res.statusCode >= 300) {
-          const err = new Error(`HTTP ${res.statusCode}: ${data}`);
-          err.statusCode = res.statusCode;
-          reject(err);
-          return;
-        }
-        try {
-          const settings = JSON.parse(data);
-          if (typeof settings?.uploadProject !== 'boolean') {
-            reject(new Error('Invalid settings response'));
-            return;
-          }
-          resolve(settings);
-        } catch {
-          reject(new Error('Invalid settings response'));
-        }
-      });
-    });
-
-    req.on('error', reject);
-    req.on('timeout', () => { req.destroy(new Error('Settings request timed out')); });
-    req.end();
-  });
+async function fetchSettingsOnce(apiUrl, apiKey) {
+  const settings = await getJson(apiUrl, apiKey, '/api/usage/settings', { timeoutMs: 10_000 });
+  if (typeof settings?.uploadProject !== 'boolean') {
+    throw new Error('Invalid settings response');
+  }
+  return settings;
 }

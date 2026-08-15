@@ -1,8 +1,8 @@
-import { copyFileSync, existsSync, mkdtempSync, rmSync } from 'node:fs';
+import { existsSync } from 'node:fs';
 import { join, resolve } from 'node:path';
-import { homedir, tmpdir } from 'node:os';
-import { aggregateToBuckets } from './index.js';
-import { queryDbJson } from './sqlite.js';
+import { homedir } from 'node:os';
+import { aggregateToBuckets } from './aggregate.js';
+import { queryDbJsonSnapshotOnLock, sqliteUnavailableError, isSqliteUnavailableError } from './sqlite.js';
 
 const STATE_DB_RELATIVE = join('User', 'globalStorage', 'state.vscdb');
 const ACCESS_TOKEN_KEY = 'cursorAuth/accessToken';
@@ -42,39 +42,17 @@ export function getCursorStateDbPath() {
 }
 
 function readAccessToken(dbPath) {
-  let snapshotDir = null;
-  let queryPath = dbPath;
-  try {
-    return queryAccessToken(queryPath);
-  } catch (err) {
-    // Cursor app holds a write lock; copy WAL set to a temp dir and retry
-    if (!isLockError(err)) throw err;
-    snapshotDir = mkdtempSync(join(tmpdir(), 'vibe-usage-cursor-'));
-    queryPath = join(snapshotDir, 'state.vscdb');
-    copyFileSync(dbPath, queryPath);
-    for (const suffix of ['-shm', '-wal']) {
-      const companion = `${dbPath}${suffix}`;
-      if (existsSync(companion)) copyFileSync(companion, `${queryPath}${suffix}`);
-    }
-    try {
-      return queryAccessToken(queryPath);
-    } finally {
-      rmSync(snapshotDir, { recursive: true, force: true });
-    }
-  }
-}
-
-function queryAccessToken(dbPath) {
+  // Cursor app holds a write lock; queryDbJsonSnapshotOnLock copies the WAL set
+  // to a temp dir and retries on "database is locked".
   const sql = `SELECT value FROM ItemTable WHERE key = '${ACCESS_TOKEN_KEY}' LIMIT 1`;
-  const rows = queryDbJson(dbPath, sql, { maxBuffer: 4 * 1024 * 1024, timeout: 15000 });
+  const rows = queryDbJsonSnapshotOnLock(dbPath, sql, {
+    tempPrefix: 'vibe-usage-cursor-',
+    opts: { maxBuffer: 4 * 1024 * 1024, timeout: 15000 },
+  });
   const value = rows[0]?.value;
   if (typeof value !== 'string') return null;
   const t = value.trim();
   return t || null;
-}
-
-function isLockError(err) {
-  return err && typeof err.message === 'string' && /database is locked/i.test(err.message);
 }
 
 function decodeJwtSub(token) {
@@ -197,8 +175,8 @@ export async function parse() {
   try {
     token = readAccessToken(dbPath);
   } catch (err) {
-    if (err && typeof err.message === 'string' && err.message.includes('ENOENT')) {
-      throw new Error('sqlite3 CLI not found. Install sqlite3 (or use Node >= 22.5) to sync Cursor data.');
+    if (isSqliteUnavailableError(err)) {
+      throw sqliteUnavailableError('Cursor');
     }
     throw err;
   }

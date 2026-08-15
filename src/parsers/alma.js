@@ -1,8 +1,9 @@
 import { existsSync } from 'node:fs';
 import { basename } from 'node:path';
 import { getAlmaDbPath } from '../tools.js';
-import { aggregateToBuckets } from './index.js';
-import { queryDbJson } from './sqlite.js';
+import { aggregateToBuckets } from './aggregate.js';
+import { toCount } from './fs-utils.js';
+import { queryDbJson, sqliteUnavailableError, isSqliteUnavailableError } from './sqlite.js';
 
 export { getAlmaDbPath as resolveAlmaDbPath };
 
@@ -20,11 +21,6 @@ const ALMA_USAGE_SQL = `
   LEFT JOIN chat_threads ON chat_threads.id = usage_records.thread_id
   LEFT JOIN workspaces ON workspaces.id = chat_threads.workspace_id
 `;
-
-function tokenCount(value) {
-  const number = Number(value);
-  return Number.isFinite(number) && number > 0 ? number : 0;
-}
 
 function safeWorkspaceName(value) {
   if (typeof value !== 'string') return 'unknown';
@@ -53,9 +49,7 @@ export async function parse() {
   try {
     rows = queryDbJson(dbPath, ALMA_USAGE_SQL);
   } catch (error) {
-    if (error?.status === 127 || /ENOENT/i.test(error?.message)) {
-      throw new Error('sqlite3 CLI not found. Install sqlite3 (or use Node >= 22.5) to sync Alma data.');
-    }
+    if (isSqliteUnavailableError(error)) throw sqliteUnavailableError('Alma');
     return skippedResult(error);
   }
 
@@ -64,10 +58,10 @@ export async function parse() {
     const timestamp = new Date(row.timestamp);
     if (Number.isNaN(timestamp.getTime())) continue;
 
-    const inputTokens = tokenCount(row.inputTokens) + tokenCount(row.cacheWriteInputTokens);
-    const outputTokens = tokenCount(row.outputTokens);
-    const cachedInputTokens = tokenCount(row.cachedInputTokens);
-    const reasoningOutputTokens = tokenCount(row.reasoningOutputTokens);
+    const inputTokens = toCount(row.inputTokens) + toCount(row.cacheWriteInputTokens);
+    const outputTokens = toCount(row.outputTokens);
+    const cachedInputTokens = toCount(row.cachedInputTokens);
+    const reasoningOutputTokens = toCount(row.reasoningOutputTokens);
     if (inputTokens + outputTokens + cachedInputTokens + reasoningOutputTokens === 0) continue;
 
     entries.push({

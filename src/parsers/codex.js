@@ -10,7 +10,7 @@ import {
 import { join } from 'node:path';
 import { createInterface } from 'node:readline';
 import { createHash } from 'node:crypto';
-import { aggregateToBuckets } from './index.js';
+import { aggregateToBuckets } from './aggregate.js';
 import {
   codexSessionDirs,
   resolveCodexHomes,

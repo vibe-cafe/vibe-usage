@@ -1,7 +1,8 @@
 import { createReadStream, readdirSync, statSync } from 'node:fs';
 import { createInterface } from 'node:readline';
 import { join, basename, sep } from 'node:path';
-import { aggregateToBuckets, extractSessions } from './index.js';
+import { aggregateToBuckets, extractSessions } from './aggregate.js';
+import { projectFromCwd, toCount } from './fs-utils.js';
 import { getClaudeRoots } from '../claude-roots.js';
 
 const MAX_WARNINGS = 20;
@@ -47,19 +48,6 @@ function projectFromRelative(relative) {
   if (!firstSegment) return 'unknown';
   const parts = firstSegment.split('-').filter(Boolean);
   return parts.at(-1) || 'unknown';
-}
-
-/** Works for Unix and Windows cwd values regardless of the current OS. */
-function projectFromCwd(cwd, fallback) {
-  if (typeof cwd !== 'string') return fallback;
-  const trimmed = cwd.trim().replace(/[\\/]+$/, '');
-  if (!trimmed) return fallback;
-  return trimmed.split(/[\\/]/).filter(Boolean).at(-1) || fallback;
-}
-
-function toCount(value) {
-  const n = Number(value);
-  return Number.isFinite(n) && n > 0 ? n : 0;
 }
 
 function cacheCreationTokens(usage) {

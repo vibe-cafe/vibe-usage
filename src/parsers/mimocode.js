@@ -1,8 +1,8 @@
 import { existsSync } from 'node:fs';
 import { basename } from 'node:path';
 import { getMimocodeDbPath } from '../tools.js';
-import { aggregateToBuckets, extractSessions } from './index.js';
-import { queryDbJson } from './sqlite.js';
+import { aggregateToBuckets, extractSessions } from './aggregate.js';
+import { queryDbJson, sqliteUnavailableError, isSqliteUnavailableError } from './sqlite.js';
 
 export { getMimocodeDbPath as resolveMimocodeDbPath };
 
@@ -36,9 +36,7 @@ export async function parse() {
       ${externalImportFilter}
     `);
   } catch (err) {
-    if (err.status === 127 || err.message?.includes('ENOENT')) {
-      throw new Error('sqlite3 CLI not found. Install sqlite3 (or use Node >= 22.5) to sync MiMoCode data.');
-    }
+    if (isSqliteUnavailableError(err)) throw sqliteUnavailableError('MiMoCode');
     throw err;
   }
 

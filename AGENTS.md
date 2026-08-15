@@ -10,7 +10,10 @@ vibe-usage/
 ├── src/
 │   ├── index.js               # Command router (init, sync, daemon, reset, skill, status, config)
 │   ├── parsers/               # One parser per tool, all export async parse() → { buckets, sessions }
-│   │   ├── index.js           # Parser registry, aggregateToBuckets(), extractSessions()
+│   │   ├── index.js           # Parser registry
+│   │   ├── aggregate.js       # aggregateToBuckets() / extractSessions() (kept out of index.js to avoid the registry import cycle)
+│   │   ├── contract.js        # normalizeParserResult(): parser result contract + source cross-check
+│   │   ├── fs-utils.js        # readJsonSafe() / projectFromPath() / projectFromCwd() / toCount()
 │   │   ├── claude-code.js
 │   │   ├── codex.js
 │   │   ├── codex-cache.js     # Versioned, disposable per-rollout Codex parser cache
