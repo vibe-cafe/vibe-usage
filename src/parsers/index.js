@@ -17,6 +17,7 @@ import { parse as parseKimiCode } from './kimi-code.js';
 import { parse as parseAmp } from './amp.js';
 import { parse as parseAlma } from './alma.js';
 import { parse as parseDroid } from './droid.js';
+import { parse as parseDsh } from './dsh.js';
 import { parse as parseAntigravity } from './antigravity.js';
 import { parse as parseHermes } from './hermes.js';
 import { parse as parseKiro } from './kiro.js';
@@ -44,6 +45,7 @@ export const parsers = {
   'amp': parseAmp,
   'alma': parseAlma,
   'droid': parseDroid,
+  'dsh': parseDsh,
   'antigravity': parseAntigravity,
   'trae-cli': parseTraeCli,
   'hermes': parseHermes,

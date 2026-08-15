@@ -120,6 +120,31 @@ function findKimiCodeDataDirs() {
   ].filter(existsSync);
 }
 
+/** DeepSeek Harness home: DSH_HOME env (same as the dsh CLI) or ~/.dsh. */
+export function getDshHome(env = process.env) {
+  const explicit = env.DSH_HOME?.trim();
+  if (explicit) {
+    if (explicit === '~') return homedir();
+    const backslash = String.fromCharCode(92);
+    if (explicit.startsWith('~/') || explicit.startsWith('~' + backslash)) {
+      return join(homedir(), explicit.slice(2));
+    }
+    return explicit;
+  }
+  return join(homedir(), '.dsh');
+}
+
+export function getDshSessionsDir() {
+  const testDir = process.env.VIBE_USAGE_DSH_SESSIONS?.trim();
+  if (testDir) return testDir;
+  return join(getDshHome(), 'sessions');
+}
+
+// Detect DeepSeek Harness when its sessions tree exists (or the test override).
+export function findDshDataDirs() {
+  return [getDshSessionsDir()].filter(existsSync);
+}
+
 export function getMimocodeDbPath(env = process.env) {
   if (env.MIMOCODE_HOME && !isAbsolute(env.MIMOCODE_HOME)) {
     throw new Error(`MIMOCODE_HOME must be an absolute path, got: ${JSON.stringify(env.MIMOCODE_HOME)}`);
@@ -297,6 +322,12 @@ export const TOOLS = [
     name: 'Droid',
     id: 'droid',
     dataDir: join(homedir(), '.factory', 'sessions'),
+  },
+  {
+    name: 'DeepSeek Harness',
+    id: 'dsh',
+    dataDir: join(homedir(), '.dsh', 'sessions'),
+    detectDataDirs: findDshDataDirs,
   },
   {
     name: 'Antigravity',
