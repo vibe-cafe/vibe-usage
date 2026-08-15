@@ -29,6 +29,13 @@ export function resolveUploadProjectSetting(settings) {
   return settings.uploadProject;
 }
 
+export function resolveCachedUploadProjectSetting(config, apiUrl) {
+  if (config?.lastUploadProjectApiUrl !== apiUrl) return undefined;
+  return typeof config.lastUploadProject === 'boolean'
+    ? config.lastUploadProject
+    : undefined;
+}
+
 export function resolveCodexExtraHome(configured, temporary) {
   return temporary ?? configured;
 }
@@ -93,10 +100,15 @@ export async function runSync({
   try {
     const settings = await fetchSettings(apiUrl, config.apiKey);
     uploadProject = resolveUploadProjectSetting(settings);
-    // Cache the confirmed value so a later transient settings outage can fall
-    // back to it instead of blocking the whole sync.
-    if (config.lastUploadProject !== uploadProject) {
+    // Scope the cached privacy choice to the server that returned it. Reusing
+    // the value after `apiUrl` changes could expose project names to a
+    // different server during its first settings outage.
+    if (
+      config.lastUploadProject !== uploadProject
+      || config.lastUploadProjectApiUrl !== apiUrl
+    ) {
       config.lastUploadProject = uploadProject;
+      config.lastUploadProjectApiUrl = apiUrl;
       saveConfig(config);
     }
   } catch (err) {
@@ -106,11 +118,10 @@ export async function runSync({
       process.exit(1);
     }
     // Settings endpoint unreachable (not auth): degrade to the last confirmed
-    // value rather than hard-aborting every upload. The cache only ever holds a
-    // value the server previously returned, so this persists the user's existing
-    // privacy choice for the narrow window until settings are reachable again.
-    if (typeof config.lastUploadProject === 'boolean') {
-      uploadProject = config.lastUploadProject;
+    // choice for this same server rather than hard-aborting every upload.
+    const cachedUploadProject = resolveCachedUploadProjectSetting(config, apiUrl);
+    if (typeof cachedUploadProject === 'boolean') {
+      uploadProject = cachedUploadProject;
       if (!quiet) console.log(warn('设置接口不可用，沿用上次的项目名设置。'));
     } else {
       console.error(failure('暂时无法读取上传设置，本次同步已安全取消（未上传数据）。请稍后重试。'));
@@ -326,10 +337,10 @@ export async function runSync({
       }
       totalProtectedBuckets += Number(result.protected?.buckets) || 0;
 
-      // Advance state in memory for this batch only after it uploaded
-      // successfully. The whole sync persists once below; a batch that throws
-      // aborts before that save, so the next sync re-sends the failed sync's
-      // batches (an idempotent upsert) — no data loss, no silent gaps.
+      // Commit only hashes from this successful batch. Persist before starting
+      // the next batch: if a later upload fails or the process exits abruptly,
+      // the next sync retries only the uncommitted suffix.
+      let batchStateChanged = false;
       for (const b of batch) {
         // A source unknown to an older backend may become valid after deploy.
         // Leave those hashes uncommitted so the next sync retries them instead
@@ -337,18 +348,21 @@ export async function runSync({
         if (batchUnknownSources.has(b.source)) continue;
         const key = bucketKey(b);
         const entry = pendingBucketState.get(key);
-        if (entry) state.buckets[key] = entry;
+        if (entry) {
+          state.buckets[key] = entry;
+          batchStateChanged = true;
+        }
       }
       for (const s of batchSessions) {
         const key = sessionKey(s);
         const entry = pendingSessionState.get(key);
-        if (entry) state.sessions[key] = entry;
+        if (entry) {
+          state.sessions[key] = entry;
+          batchStateChanged = true;
+        }
       }
+      if (batchStateChanged) saveState(state);
     }
-
-    // Persist the whole diff once after every batch succeeded. One atomic
-    // write replaces the old per-batch full-file rewrites (O(batches × state)).
-    saveState(state);
 
     if (totalBatches > 1 || allBucketsToSend.length > 0) {
       process.stdout.write('\r\x1b[K');

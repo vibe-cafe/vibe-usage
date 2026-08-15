@@ -12,10 +12,10 @@
  */
 
 /**
- * Normalize a raw parser return value into a validated shape, and cross-check
- * that every emitted item's source matches the registry key the parser is
- * registered under. A hardcoded source typo in a parser would otherwise only
- * surface server-side as a dropped source, silently losing that tool's data.
+ * Normalize a raw parser return value into a validated shape. Every emitted
+ * item's source must match the registry key the parser is registered under;
+ * rejecting a typo keeps that parser out of state pruning and prevents a
+ * server-side dropped source from silently discarding its prior upload state.
  *
  * @param {string} source registry key
  * @param {unknown} result raw return value
@@ -28,20 +28,22 @@ export function normalizeParserResult(source, result) {
     throw new TypeError('Parser returned an invalid result');
   }
 
-  const warnings = Array.isArray(result?.warnings) ? result.warnings.slice() : [];
-
   for (const bucket of buckets) {
     if (bucket?.source !== source) {
-      warnings.push('parser ' + source + ' emitted a bucket with source=' + JSON.stringify(bucket?.source));
-      break;
+      throw new TypeError(
+        'parser ' + source + ' emitted a bucket with source=' + JSON.stringify(bucket?.source),
+      );
     }
   }
   for (const session of sessions) {
     if (session?.source !== source) {
-      warnings.push('parser ' + source + ' emitted a session with source=' + JSON.stringify(session?.source));
-      break;
+      throw new TypeError(
+        'parser ' + source + ' emitted a session with source=' + JSON.stringify(session?.source),
+      );
     }
   }
+
+  const warnings = Array.isArray(result?.warnings) ? result.warnings.slice() : [];
 
   return {
     buckets,
