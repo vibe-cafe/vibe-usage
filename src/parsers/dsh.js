@@ -19,8 +19,8 @@ const SESSION_FORMAT_VERSION = 0;
 // file; anything beyond this is either a runaway log or not a session file.
 const MAX_SESSION_FILE_BYTES = 256 * 1024 * 1024;
 
-// execFileSync maxBuffer for the zstd CLI fallback (decompressed size cap).
-const ZSTD_CLI_MAX_BUFFER = 512 * 1024 * 1024;
+// Maximum decompressed size for one session log, for both decoder paths.
+const MAX_DECOMPRESSED_SESSION_BYTES = 512 * 1024 * 1024;
 
 // Zstandard frame magic (0xFD2FB528 little-endian) and the skippable-frame
 // magic range (0x184D2A50–0x184D2A5F), per RFC 8878.
@@ -28,72 +28,81 @@ const ZSTD_MAGIC = 0xfd2fb528;
 const SKIPPABLE_MAGIC_MIN = 0x184d2a50;
 const SKIPPABLE_MAGIC_MAX = 0x184d2a5f;
 
-// How many session files to decompress at once. Decompression is CPU-bound, so
-// a small pool keeps a large session tree from spiking memory.
-const FILE_CONCURRENCY = 4;
+const MAX_WARNINGS = 20;
 
 /**
- * Split a buffer of concatenated Zstandard frames into frame boundaries.
+ * Split concatenated Zstandard input into independently decodable frame ranges.
  *
- * DSH compresses every write batch as its own frame, and Node's zstd support
- * (zlib.zstdDecompressSync / createZstdDecompress) decodes exactly one frame
- * per call, so the whole log must be walked frame-by-frame. Returns the byte
- * offset just past each frame (i.e. [frame0End, frame1End, ...]). Trailing
- * bytes that do not begin a frame are ignored: DSH's own reader treats them as
- * a torn append and truncates to the last complete frame.
+ * DSH writes one frame for the header and one per durable append batch. Node's
+ * one-shot zstd API decodes only one standard frame, so each standard frame is
+ * returned as an independent `{ start, end }` range. Complete skippable frames
+ * are omitted without joining the standard frames around them. An incomplete
+ * tail is ignored, matching DSH's append-recovery boundary.
  *
  * @param {Buffer} buffer
- * @returns {number[]} frame end offsets, strictly increasing
+ * @returns {{ start: number, end: number }[]}
  */
 export function splitZstdFrames(buffer) {
-  const ends = [];
+  const frames = [];
   let pos = 0;
   while (pos < buffer.length) {
-    if (pos + 4 > buffer.length) break; // torn tail: keep complete frames only
+    if (pos + 4 > buffer.length) break;
     const magic = buffer.readUInt32LE(pos);
     if (magic >= SKIPPABLE_MAGIC_MIN && magic <= SKIPPABLE_MAGIC_MAX) {
       if (pos + 8 > buffer.length) break;
-      pos += 8 + buffer.readUInt32LE(pos + 4);
+      const end = pos + 8 + buffer.readUInt32LE(pos + 4);
+      if (end > buffer.length) break;
+      pos = end;
       continue;
     }
-    if (magic !== ZSTD_MAGIC) break; // non-frame tail: treat as torn append
+    if (magic !== ZSTD_MAGIC) {
+      throw new Error('invalid Zstandard frame magic at byte ' + pos);
+    }
 
+    const start = pos;
     pos += 4;
     if (pos >= buffer.length) break;
-    const fhd = buffer[pos++];
-    const singleSegment = (fhd & 0x20) !== 0;
-    const checksum = (fhd & 0x04) !== 0;
-    const didFlag = fhd & 0x03;
-    const fcsFlag = fhd >>> 6;
-
-    if (!singleSegment) pos += 1; // window descriptor
-    pos += [0, 1, 2, 4][didFlag]; // dictionary id
-    if (fcsFlag === 0) {
-      if (singleSegment) pos += 1;
-    } else if (fcsFlag === 1) {
-      pos += 2;
-    } else if (fcsFlag === 2) {
-      pos += 4;
-    } else {
-      pos += 8;
+    const descriptor = buffer[pos++];
+    if ((descriptor & 0x18) !== 0) {
+      throw new Error('reserved Zstandard frame-header bit at byte ' + (pos - 1));
     }
+    const singleSegment = (descriptor & 0x20) !== 0;
+    const checksum = (descriptor & 0x04) !== 0;
+    const dictionaryFlag = descriptor & 0x03;
+    const contentSizeFlag = descriptor >>> 6;
 
-    // Walk the block section: 3-byte little-endian header per block, top 21
-    // bits are the block content size, low 3 bits are flags (bit 0 = last).
+    const dictionaryBytes = dictionaryFlag === 3 ? 4 : dictionaryFlag;
+    const contentSizeBytes = contentSizeFlag === 0
+      ? (singleSegment ? 1 : 0)
+      : 1 << contentSizeFlag;
+    const remainingHeaderBytes = (singleSegment ? 0 : 1) + dictionaryBytes + contentSizeBytes;
+    if (pos + remainingHeaderBytes > buffer.length) break;
+    pos += remainingHeaderBytes;
+
     for (;;) {
-      if (pos + 3 > buffer.length) return ends; // torn block header
-      const b0 = buffer[pos];
-      const b1 = buffer[pos + 1];
-      const b2 = buffer[pos + 2];
-      const blockSize = (b0 >> 3) | (b1 << 5) | (b2 << 13);
-      pos += 3 + blockSize;
-      if (b0 & 0x01) break;
+      if (pos + 3 > buffer.length) return frames;
+      const blockHeader = buffer.readUIntLE(pos, 3);
+      pos += 3;
+      const lastBlock = (blockHeader & 1) !== 0;
+      const blockType = (blockHeader >>> 1) & 0x03;
+      const blockSize = blockHeader >>> 3;
+      if (blockType === 0x03) {
+        throw new Error('reserved Zstandard block type at byte ' + (pos - 3));
+      }
+      // An RLE block stores one encoded byte; blockSize is its decoded size.
+      const payloadBytes = blockType === 0x01 ? 1 : blockSize;
+      if (pos + payloadBytes > buffer.length) return frames;
+      pos += payloadBytes;
+      if (lastBlock) break;
     }
-    if (checksum) pos += 4;
-    if (pos > buffer.length) return ends; // torn frame body
-    ends.push(pos);
+
+    if (checksum) {
+      if (pos + 4 > buffer.length) return frames;
+      pos += 4;
+    }
+    frames.push({ start, end: pos });
   }
-  return ends;
+  return frames;
 }
 
 const hasBuiltinZstd = typeof zlib.zstdDecompressSync === 'function';
@@ -101,7 +110,7 @@ let zstdCliProbe = null;
 function hasZstdCli() {
   if (zstdCliProbe !== null) return zstdCliProbe;
   try {
-    execFileSync('zstd', ['--version'], { stdio: 'ignore' });
+    execFileSync('zstd', ['--version'], { stdio: 'ignore', timeout: 5000 });
     zstdCliProbe = true;
   } catch {
     zstdCliProbe = false;
@@ -112,29 +121,45 @@ function hasZstdCli() {
 const ZSTD_HINT =
   'decompress with node:zlib zstd (Node >= 22.15) or install the zstd CLI';
 
-/** Decompress one DSH session log buffer back to JSONL text. */
+/** Decompress the complete frames captured from one DSH session log. */
 function decompressSessionLog(buffer, file) {
+  const frames = splitZstdFrames(buffer);
+  if (frames.length === 0) {
+    throw new Error('no complete zstd frames found in ' + relative(process.cwd(), file));
+  }
+
   if (hasBuiltinZstd) {
-    const frameEnds = splitZstdFrames(buffer);
-    if (frameEnds.length === 0) {
-      throw new Error('no complete zstd frames found in ' + relative(process.cwd(), file));
-    }
     const parts = [];
-    let start = 0;
-    for (const end of frameEnds) {
-      parts.push(zlib.zstdDecompressSync(buffer.subarray(start, end)));
-      start = end;
+    let remaining = MAX_DECOMPRESSED_SESSION_BYTES;
+    for (const { start, end } of frames) {
+      if (remaining <= 0) throw new Error('decompressed session log is too large');
+      const part = zlib.zstdDecompressSync(buffer.subarray(start, end), {
+        maxOutputLength: remaining,
+      });
+      parts.push(part);
+      remaining -= part.length;
     }
     return Buffer.concat(parts).toString('utf8');
   }
+
   if (!hasZstdCli()) {
     const error = new Error('zstd unavailable for ' + file + ': ' + ZSTD_HINT);
     error.code = 'ENOENT';
     throw error;
   }
-  return execFileSync('zstd', ['-d', '-c', file], {
-    maxBuffer: ZSTD_CLI_MAX_BUFFER,
-    stdio: ['ignore', 'pipe', 'ignore'],
+
+  const first = frames[0];
+  const last = frames.at(-1);
+  const contiguous = frames.every((frame, index) =>
+    index === 0 || frame.start === frames[index - 1].end
+  );
+  const completeInput = contiguous
+    ? buffer.subarray(first.start, last.end)
+    : Buffer.concat(frames.map(({ start, end }) => buffer.subarray(start, end)));
+  return execFileSync('zstd', ['-d', '-c'], {
+    input: completeInput,
+    maxBuffer: MAX_DECOMPRESSED_SESSION_BYTES,
+    stdio: ['pipe', 'pipe', 'ignore'],
   }).toString('utf8');
 }
 
@@ -173,7 +198,8 @@ function isUserMessageRecord(rec) {
  *   {"type":"session/end-seed",...}          (absent in fresh sessions)
  *   {"type":"assistant/message","data":{"turn","step","message":{"source":
  *     {"kind":"model","provider","model"},...},"usage":{"inputTokens",
- *     "outputTokens","cacheReadTokens","reasoningTokens"}},...}
+ *     "outputTokens","cacheReadTokens","cacheWriteTokens",
+ *     "reasoningTokens"}},...}
  *
  * When a session is resumed (or forked) the stored log begins with a replay of
  * the seed history. Everything before the LAST session/end-seed marker is a
@@ -208,7 +234,7 @@ function parseSessionText(text) {
   if (!header || typeof header.id !== 'string' || header.id.length === 0) {
     throw new Error('missing session header record');
   }
-  if (typeof header.version === 'number' && header.version !== SESSION_FORMAT_VERSION) {
+  if (header.version !== SESSION_FORMAT_VERSION) {
     const error = new Error(
       'session ' + header.id + ' uses format version ' + header.version +
       ' (parser supports ' + SESSION_FORMAT_VERSION + ')',
@@ -245,10 +271,16 @@ function parseSessionText(text) {
 
     const usage = rec.data.usage;
     if (!usage || typeof usage !== 'object') continue;
-    const inputTokens = toCount(usage.inputTokens);
+    // Harness counts are disjoint. The common bucket model has no cache-write
+    // column, so cache writes join uncached input, matching the other parsers.
+    const inputTokens = toCount(usage.inputTokens) + toCount(usage.cacheWriteTokens);
     const cachedInputTokens = toCount(usage.cacheReadTokens);
-    const reasoningOutputTokens = toCount(usage.reasoningTokens);
-    const outputTokens = Math.max(0, toCount(usage.outputTokens) - reasoningOutputTokens);
+    const totalOutputTokens = toCount(usage.outputTokens);
+    const reasoningOutputTokens = Math.min(
+      totalOutputTokens,
+      toCount(usage.reasoningTokens),
+    );
+    const outputTokens = totalOutputTokens - reasoningOutputTokens;
     if (inputTokens + cachedInputTokens + reasoningOutputTokens + outputTokens === 0) continue;
 
     const model =
@@ -272,19 +304,27 @@ function parseSessionText(text) {
 }
 
 /** List session log files under a DSH sessions root (session.jsonl[.zstd]). */
-function listSessionFiles(sessionsDir) {
+function listSessionFiles(sessionsDir, onFailure) {
   const files = [];
-  for (const projectKey of readdirSync(sessionsDir, { withFileTypes: true })) {
+  const projectKeys = readdirSync(sessionsDir, { withFileTypes: true })
+    .sort((a, b) => a.name.localeCompare(b.name));
+  for (const projectKey of projectKeys) {
     if (!projectKey.isDirectory()) continue;
+    const projectDir = join(sessionsDir, projectKey.name);
     let sessionDirs;
     try {
-      sessionDirs = readdirSync(join(sessionsDir, projectKey.name), { withFileTypes: true });
-    } catch {
+      sessionDirs = readdirSync(projectDir, { withFileTypes: true })
+        .sort((a, b) => a.name.localeCompare(b.name));
+    } catch (error) {
+      onFailure(
+        'dsh: cannot read project directory ' + projectKey.name +
+        ' (' + (error?.code || error?.message || 'read failed') + ')',
+      );
       continue;
     }
     for (const sessionDir of sessionDirs) {
       if (!sessionDir.isDirectory()) continue;
-      const sessionPath = join(sessionsDir, projectKey.name, sessionDir.name);
+      const sessionPath = join(projectDir, sessionDir.name);
       for (const name of ['session.jsonl.zstd', 'session.jsonl']) {
         const file = join(sessionPath, name);
         try {
@@ -292,28 +332,19 @@ function listSessionFiles(sessionsDir) {
             files.push({ file, compressed: name.endsWith('.zstd') });
             break;
           }
-        } catch {
-          // not present under this name
+        } catch (error) {
+          if (error?.code !== 'ENOENT') {
+            onFailure(
+              'dsh: cannot inspect ' + relative(sessionsDir, file) +
+              ' (' + (error?.code || error?.message || 'stat failed') + ')',
+            );
+            break;
+          }
         }
       }
     }
   }
   return files;
-}
-
-function mapWithConcurrency(items, limit, fn) {
-  const results = new Array(items.length);
-  let nextIndex = 0;
-  const workerCount = Math.max(1, Math.min(limit, items.length));
-  return Promise.all(
-    Array.from({ length: workerCount }, async () => {
-      while (true) {
-        const index = nextIndex++;
-        if (index >= items.length) return;
-        results[index] = await fn(items[index], index);
-      }
-    }),
-  ).then(() => results);
 }
 
 /**
@@ -329,57 +360,68 @@ export async function parse() {
   const sessionsDir = getDshSessionsDir();
   if (!existsSync(sessionsDir)) return { buckets: [], sessions: [] };
 
-  let files;
-  try {
-    files = listSessionFiles(sessionsDir);
-  } catch {
-    return {
-      buckets: [],
-      sessions: [],
-      skipped: true,
-      warnings: ['dsh: cannot read sessions directory ' + sessionsDir],
-    };
-  }
-  if (files.length === 0) return { buckets: [], sessions: [] };
-
   const warnings = [];
   let anyFailure = false;
+  const recordFailure = (message) => {
+    anyFailure = true;
+    if (warnings.length < MAX_WARNINGS && !warnings.includes(message)) {
+      warnings.push(message);
+    }
+  };
 
-  const perSession = new Map(); // sessionId -> parsed view (largest file wins)
-  await mapWithConcurrency(files, FILE_CONCURRENCY, async ({ file, compressed }) => {
+  let files;
+  try {
+    files = listSessionFiles(sessionsDir, recordFailure);
+  } catch (error) {
+    recordFailure(
+      'dsh: cannot read sessions directory ' + sessionsDir +
+      ' (' + (error?.code || error?.message || 'read failed') + ')',
+    );
+    return { buckets: [], sessions: [], skipped: true, warnings };
+  }
+  if (files.length === 0) {
+    const result = { buckets: [], sessions: [] };
+    if (anyFailure) Object.assign(result, { skipped: true, warnings });
+    return result;
+  }
+
+  const perSession = new Map(); // sessionId -> parsed view (largest complete log wins)
+  for (const { file, compressed } of files) {
     let text;
     try {
-      if (!statSync(file).isFile()) return;
-      const size = statSync(file).size;
-      if (size > MAX_SESSION_FILE_BYTES) {
-        throw new Error('session log too large (' + size + ' bytes)');
+      const stat = statSync(file);
+      if (!stat.isFile()) throw new Error('session log is no longer a file');
+      if (stat.size > MAX_SESSION_FILE_BYTES) {
+        throw new Error('session log too large (' + stat.size + ' bytes)');
       }
       const buffer = readFileSync(file);
-      text = compressed ? decompressSessionLog(buffer, file) : buffer.toString('utf8');
+      if (buffer.length < stat.size) throw new Error('session log changed while reading');
+      const snapshot = buffer.length === stat.size ? buffer : buffer.subarray(0, stat.size);
+      text = compressed ? decompressSessionLog(snapshot, file) : snapshot.toString('utf8');
     } catch (error) {
-      anyFailure = true;
       const reason = error?.code === 'ENOENT' && !hasBuiltinZstd && compressed
         ? ZSTD_HINT
         : error?.message || String(error);
-      warnings.push('dsh: skipping ' + relative(process.cwd(), file) + ' (' + reason + ')');
-      return;
+      recordFailure('dsh: skipping ' + relative(process.cwd(), file) + ' (' + reason + ')');
+      continue;
     }
 
     let parsed;
     try {
       parsed = parseSessionText(text);
     } catch (error) {
-      anyFailure = true;
-      warnings.push('dsh: skipping ' + relative(process.cwd(), file) + ' (' + error.message + ')');
-      return;
+      recordFailure(
+        'dsh: skipping ' + relative(process.cwd(), file) + ' (' + error.message + ')',
+      );
+      continue;
     }
 
-    const weight = parsed.entries.length * 2 + parsed.events.length;
+    const weight = text.length;
     const previous = perSession.get(parsed.sessionId);
     if (!previous || weight > previous.weight) {
       perSession.set(parsed.sessionId, { ...parsed, weight });
     }
-  });
+  }
 
   const entries = [];
   const eventsBySession = new Map();

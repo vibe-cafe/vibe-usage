@@ -123,15 +123,12 @@ function findKimiCodeDataDirs() {
 /** DeepSeek Harness home: DSH_HOME env (same as the dsh CLI) or ~/.dsh. */
 export function getDshHome(env = process.env) {
   const explicit = env.DSH_HOME?.trim();
-  if (explicit) {
-    if (explicit === '~') return homedir();
-    const backslash = String.fromCharCode(92);
-    if (explicit.startsWith('~/') || explicit.startsWith('~' + backslash)) {
-      return join(homedir(), explicit.slice(2));
-    }
-    return explicit;
+  if (!explicit) return join(homedir(), '.dsh');
+  if (explicit === '~') return homedir();
+  if (explicit.startsWith('~/') || explicit.startsWith('~\\')) {
+    return resolve(homedir(), explicit.slice(2));
   }
-  return join(homedir(), '.dsh');
+  return resolve(explicit);
 }
 
 export function getDshSessionsDir() {
@@ -326,7 +323,7 @@ export const TOOLS = [
   {
     name: 'DeepSeek Harness',
     id: 'dsh',
-    dataDir: join(homedir(), '.dsh', 'sessions'),
+    dataDir: getDshSessionsDir(),
     detectDataDirs: findDshDataDirs,
   },
   {

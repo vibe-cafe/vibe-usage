@@ -1,8 +1,8 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from 'node:fs';
+import { chmodSync, mkdirSync, mkdtempSync, readdirSync, rmSync, writeFileSync } from 'node:fs';
 import { homedir, tmpdir } from 'node:os';
-import { join } from 'node:path';
+import { join, resolve } from 'node:path';
 import zlib from 'node:zlib';
 import { parse, splitZstdFrames } from '../src/parsers/dsh.js';
 import { parsers } from '../src/parsers/index.js';
@@ -84,6 +84,7 @@ test('getDshHome honors DSH_HOME, tilde prefixes, and the default', () => {
   assert.equal(getDshHome({ DSH_HOME: '/custom/dsh' }), '/custom/dsh');
   assert.equal(getDshHome({ DSH_HOME: '~' }), join(homedir()));
   assert.equal(getDshHome({ DSH_HOME: '~/data' }), join(homedir(), 'data'));
+  assert.equal(getDshHome({ DSH_HOME: 'relative-dsh' }), resolve('relative-dsh'));
   assert.equal(getDshHome({}), join(homedir(), '.dsh'));
 });
 
@@ -94,24 +95,54 @@ test('tool detection follows the sessions fixture override', async () => {
   });
 });
 
-test('splitZstdFrames walks a multi-frame buffer and ignores a torn tail', () => {
-  // Two concatenated zstd frames (session header + user message) plus a
-  // 7-byte non-frame tail, embedded so the splitter is testable on Node 20
-  // where zlib zstd does not exist.
-  const buffer = Buffer.from(
+test('splitZstdFrames walks complete frames and ignores only an incomplete tail', () => {
+  // Two concatenated zstd frames (session header + user message), embedded so
+  // the scanner is testable on Node 20 where node:zlib zstd does not exist.
+  const encoded = Buffer.from(
     'KLUv/QRYVQEAFAJ7InR5cGUiOiJzZXNzaW9uIiwidmVyOjAsImlkLXgifQoCAD63aFua9+P91Ci1L/0EWNEBAHsidHlwZSI6InVzZXIvbWVzc2FnZSIsImRhdGEiOnsic291cmNlIjp7ImtpbmQiOiJ1c2VyIn19fQqIx3MQR0FSQkFHRQ==',
     'base64',
   );
-  const ends = splitZstdFrames(buffer);
-  assert.equal(ends.length, 2);
-  assert.ok(ends[0] > 0 && ends[1] > ends[0]);
-  assert.ok(ends[1] < buffer.length); // GARBAGE tail stays outside the frames
+  const complete = encoded.subarray(0, -7); // strip the embedded "GARBAGE"
+  const buffer = Buffer.concat([complete, complete.subarray(0, 2)]);
+  const frames = splitZstdFrames(buffer);
+  assert.equal(frames.length, 2);
+  assert.equal(frames[0].start, 0);
+  assert.equal(frames[0].end, frames[1].start);
+  assert.equal(frames[1].end, complete.length);
+  assert.throws(
+    () => splitZstdFrames(Buffer.concat([complete, Buffer.from('GARB')])),
+    /invalid Zstandard frame magic/,
+  );
   if (hasBuiltinZstd) {
     const text = Buffer.concat(
-      ends.map((end, i) => zlib.zstdDecompressSync(buffer.subarray(i === 0 ? 0 : ends[i - 1], end))),
+      frames.map(({ start, end }) => zlib.zstdDecompressSync(buffer.subarray(start, end))),
     ).toString('utf8');
     assert.match(text, /"type":"session"/);
     assert.match(text, /"type":"user\/message"/);
+  }
+});
+
+test('splitZstdFrames handles RLE blocks and preserves frames around skippable data', () => {
+  // A valid single-segment frame whose sole block expands one "A" byte to five.
+  const rleFrame = Buffer.from('28b52ffd20052b000041', 'hex');
+  const skippable = Buffer.alloc(11);
+  skippable.writeUInt32LE(0x184d2a50, 0);
+  skippable.writeUInt32LE(3, 4);
+  skippable.fill(0x7a, 8);
+
+  const buffer = Buffer.concat([rleFrame, skippable, rleFrame]);
+  const frames = splitZstdFrames(buffer);
+  assert.deepEqual(frames, [
+    { start: 0, end: 10 },
+    { start: 21, end: 31 },
+  ]);
+  if (hasBuiltinZstd) {
+    assert.deepEqual(
+      frames.map(({ start, end }) =>
+        zlib.zstdDecompressSync(buffer.subarray(start, end)).toString('utf8')
+      ),
+      ['AAAAA', 'AAAAA'],
+    );
   }
 });
 
@@ -121,7 +152,8 @@ test('DSH buckets map uncached input, cache reads, and split reasoning from outp
       sessionRecord('session-1', '/home/me/proj-a'),
       userRecord(1700000100000),
       assistantRecord(1700000120000, 'deepseek-v4-pro', {
-        inputTokens: 100, outputTokens: 30, cacheReadTokens: 400, reasoningTokens: 10,
+        inputTokens: 100, outputTokens: 30, cacheReadTokens: 400,
+        cacheWriteTokens: 20, reasoningTokens: 10,
       }),
       assistantRecord(1700000130000, 'deepseek-v4-pro', {
         inputTokens: 50, outputTokens: 15, cacheReadTokens: 0, reasoningTokens: 5,
@@ -136,11 +168,11 @@ test('DSH buckets map uncached input, cache reads, and split reasoning from outp
         model: 'deepseek-v4-pro',
         project: 'proj-a',
         bucketStart: '2023-11-14T22:00:00.000Z',
-        inputTokens: 150,
+        inputTokens: 170,
         outputTokens: 30,
         cachedInputTokens: 400,
         reasoningOutputTokens: 15,
-        totalTokens: 195,
+        totalTokens: 215,
       },
     ]);
     assert.equal(result.sessions.length, 1);
@@ -211,7 +243,7 @@ test('DSH ignores plugin-sourced user messages and assistant-only sessions', { s
   });
 });
 
-test('DSH reads plain .jsonl session logs as well', { skip: !hasBuiltinZstd }, async () => {
+test('DSH reads plain .jsonl session logs as well', async () => {
   await withDshSessions(async (sessions) => {
     writeSession(sessions, 'proj-e', 'session-5', [
       sessionRecord('session-5', '/home/me/proj-e'),
@@ -254,6 +286,38 @@ test('DSH returns empty when the sessions directory is missing', async () => {
   });
 });
 
+test('DSH marks nested project read failures as skipped', { skip: process.platform === 'win32' }, async (t) => {
+  await withDshSessions(async (sessions) => {
+    writeSession(sessions, 'readable', 'session-readable', [
+      sessionRecord('session-readable', '/home/me/readable'),
+      userRecord(1700000100000),
+      assistantRecord(1700000120000, 'model-a', {
+        inputTokens: 11, outputTokens: 1, cacheReadTokens: 0, reasoningTokens: 0,
+      }),
+    ], true);
+
+    const blocked = join(sessions, 'blocked');
+    mkdirSync(blocked, { recursive: true });
+    chmodSync(blocked, 0o000);
+    try {
+      try {
+        readdirSync(blocked);
+        t.skip('filesystem permissions are not enforced for this user');
+        return;
+      } catch (error) {
+        assert.equal(error.code, 'EACCES');
+      }
+
+      const result = await parse();
+      assert.equal(result.skipped, true);
+      assert.equal(result.buckets.length, 1);
+      assert.ok(result.warnings.some((warning) => warning.includes('blocked')));
+    } finally {
+      chmodSync(blocked, 0o700);
+    }
+  });
+});
+
 test('DSH skips corrupt files and protects prior state', { skip: !hasBuiltinZstd }, async () => {
   await withDshSessions(async (sessions) => {
     writeSession(sessions, 'proj-f', 'session-7', [
@@ -273,13 +337,13 @@ test('DSH skips corrupt files and protects prior state', { skip: !hasBuiltinZstd
   });
 });
 
-test('DSH skips logs with an unknown session format version', { skip: !hasBuiltinZstd }, async () => {
+test('DSH skips logs with an unknown session format version', async () => {
   await withDshSessions(async (sessions) => {
     writeSession(sessions, 'proj-g', 'session-9', [
       sessionRecord('session-9', '/home/me/proj-g', 1),
       userRecord(1700000100000),
       assistantRecord(1700000120000, 'model-a', { inputTokens: 1, outputTokens: 1, cacheReadTokens: 0, reasoningTokens: 0 }),
-    ]);
+    ], true);
 
     const result = await parse();
     assert.equal(result.skipped, true);
