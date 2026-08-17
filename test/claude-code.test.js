@@ -16,10 +16,16 @@ function record({
   uuid,
   model = 'claude-opus-4-8',
   usage,
+  messageId,
+  requestId,
 }) {
   const value = { type, timestamp, cwd };
   if (uuid) value.uuid = uuid;
-  if (type === 'assistant') value.message = { model, usage };
+  if (requestId) value.requestId = requestId;
+  if (type === 'assistant') {
+    value.message = { model, usage };
+    if (messageId) value.message.id = messageId;
+  }
   return value;
 }
 
@@ -251,5 +257,60 @@ test('Claude parser reports unreadable roots as incomplete instead of pruning up
     assert.ok(result.warnings.some((warning) => warning.includes('cannot read directory')));
   } finally {
     rmSync(base, { recursive: true, force: true });
+  }
+});
+
+test('Claude parser counts one API call once across its content-block lines', async () => {
+  const root = mkdtempSync(join(tmpdir(), 'vibe-usage-claude-call-'));
+  try {
+    // Claude Code writes one assistant line per content block. They share
+    // message.id/requestId and repeat the same usage; streaming also emits an
+    // early partial line before the final one. Counting per line multiplied
+    // input and cache tokens by the block count.
+    const usage = {
+      input_tokens: 2,
+      cache_read_input_tokens: 61608,
+      cache_creation_input_tokens: 100,
+      output_tokens: 211,
+    };
+    writeSession(root, '-Users-dev-my-hyphen-project', 'session-blocks', [
+      record({ uuid: 'line-1', messageId: 'msg_1', requestId: 'req_1', usage: { ...usage, output_tokens: 5 } }),
+      record({ uuid: 'line-2', messageId: 'msg_1', requestId: 'req_1', usage }),
+      record({ uuid: 'line-3', messageId: 'msg_1', requestId: 'req_1', usage }),
+    ]);
+
+    const result = await withClaudeRoots([root], () => parse());
+    const totals = result.buckets.reduce(
+      (acc, bucket) => ({
+        inputTokens: acc.inputTokens + bucket.inputTokens,
+        cachedInputTokens: acc.cachedInputTokens + bucket.cachedInputTokens,
+        outputTokens: acc.outputTokens + bucket.outputTokens,
+      }),
+      { inputTokens: 0, cachedInputTokens: 0, outputTokens: 0 },
+    );
+
+    assert.equal(totals.inputTokens, 102, 'input + cache creation counted once');
+    assert.equal(totals.cachedInputTokens, 61608, 'cache read counted once');
+    assert.equal(totals.outputTokens, 211, 'keeps the final line, not the partial one');
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test('Claude parser still de-duplicates by uuid when the call ids are absent', async () => {
+  const root = mkdtempSync(join(tmpdir(), 'vibe-usage-claude-legacy-'));
+  try {
+    // Older transcripts carry neither message.id nor requestId. Those must keep
+    // the previous per-line behaviour instead of collapsing into one entry.
+    writeSession(root, '-Users-dev-my-hyphen-project', 'session-legacy', [
+      record({ uuid: 'legacy-1', usage: { input_tokens: 11, output_tokens: 1 } }),
+      record({ uuid: 'legacy-2', usage: { input_tokens: 13, output_tokens: 1 } }),
+    ]);
+
+    const result = await withClaudeRoots([root], () => parse());
+    const inputTokens = result.buckets.reduce((sum, bucket) => sum + bucket.inputTokens, 0);
+    assert.equal(inputTokens, 24);
+  } finally {
+    rmSync(root, { recursive: true, force: true });
   }
 });
