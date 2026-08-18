@@ -190,33 +190,40 @@ function isUserMessageRecord(rec) {
 }
 
 /**
- * Parse one decompressed session log into flat entries/events.
+ * Build a session model from one decompressed session log.
  *
  * Layout (DeepSeek Harness session-persistence-jsonl):
- *   line 0: {"type":"session","version":0,"id":...,"createdAt":...,"cwd":...,...}
+ *   line 0: {"type":"session","version":0,"id":...,"createdAt":...,"cwd":...,
+ *            "parentSession":...?, ...}
  *   ... possibly a resumed/forked seed replay, then ...
- *   {"type":"session/end-seed",...}          (absent in fresh sessions)
- *   {"type":"assistant/message","data":{"turn","step","message":{"source":
- *     {"kind":"model","provider","model"},...},"usage":{"inputTokens",
- *     "outputTokens","cacheReadTokens","cacheWriteTokens",
- *     "reasoningTokens"}},...}
+ *   {"type":"user/message"|"assistant/message","time":...,"data":{...}}
  *
- * When a session is resumed (or forked) the stored log begins with a replay of
- * the seed history. Everything before the LAST session/end-seed marker is a
- * replay of records that were already counted from their original file, so it
- * must be skipped or the same usage would be counted twice.
+ * DSH (developer preview) writes session/end-seed records in three situations:
+ * right after session creation (empty seed), at each resume boundary, and
+ * appended at the END of a file when that session becomes the seed for a
+ * further resume. The marker's position is therefore NOT a replay boundary —
+ * a trailing marker would make "skip everything before the last marker"
+ * discard the session's entire real history.
+ *
+ * Fork/subagent lineage is encoded separately in the immutable header.
+ * `parentSession` identifies the source and `seedLength` is the exact number
+ * of leading event seqs inherited from it. Only those seqs are skipped, and
+ * only while the parent file is also present, so a missing/corrupt source
+ * fails open instead of dropping the sole local copy of its usage.
+ *
+ * Only user/message (source.kind === 'user') and assistant/message records
+ * are kept in the model — they are the only records that produce usage
+ * entries or timing events. Their seq is retained so the header's seed
+ * boundary can be applied without inspecting or hashing message content.
  *
  * usage.outputTokens includes reasoningTokens (verified against the
  * session_projcache totals DSH itself maintains), so reasoning is split out of
  * output before aggregation, like the Pi-family parsers.
  */
-function parseSessionText(text) {
-  const entries = [];
-  const events = [];
+function buildSessionModel(text) {
   const lines = text.split('\n');
 
   let header = null;
-  let endSeedIndex = -1;
   for (let i = 0; i < lines.length; i++) {
     if (lines[i].length === 0) continue;
     let rec;
@@ -225,9 +232,8 @@ function parseSessionText(text) {
     } catch {
       continue; // torn final line: keep the complete records
     }
-    if (rec && typeof rec === 'object') {
-      if (header === null && rec.type === 'session') header = rec;
-      if (rec.type === 'session/end-seed') endSeedIndex = i;
+    if (rec && typeof rec === 'object' && header === null && rec.type === 'session') {
+      header = rec;
     }
   }
 
@@ -243,11 +249,8 @@ function parseSessionText(text) {
     throw error;
   }
 
-  const sessionId = header.id;
-  const project = projectFromCwd(header.cwd);
-
+  const messages = [];
   for (let i = 0; i < lines.length; i++) {
-    if (i <= endSeedIndex) continue;
     if (lines[i].length === 0) continue;
     let rec;
     try {
@@ -256,51 +259,142 @@ function parseSessionText(text) {
       continue;
     }
     if (!rec || typeof rec !== 'object') continue;
-    const timestamp = new Date(rec.time);
-    if (Number.isNaN(timestamp.getTime())) continue;
+    const timeMs = recordTimeMs(rec);
+    if (timeMs == null) continue;
+    const seq = Number.isSafeInteger(rec.seq) && rec.seq >= 0 ? rec.seq : null;
 
     if (isUserMessageRecord(rec)) {
-      events.push({ sessionId, source: SOURCE, project, timestamp, role: 'user' });
+      messages.push({ seq, role: 'user', timeMs, usage: null, model: null });
       continue;
     }
     if (!isUsageRecord(rec)) continue;
 
     // Every assistant/message marks the end of a billable step, even when its
-    // usage block is missing.
-    events.push({ sessionId, source: SOURCE, project, timestamp, role: 'assistant' });
-
-    const usage = rec.data.usage;
-    if (!usage || typeof usage !== 'object') continue;
-    // Harness counts are disjoint. The common bucket model has no cache-write
-    // column, so cache writes join uncached input, matching the other parsers.
-    const inputTokens = toCount(usage.inputTokens) + toCount(usage.cacheWriteTokens);
-    const cachedInputTokens = toCount(usage.cacheReadTokens);
-    const totalOutputTokens = toCount(usage.outputTokens);
-    const reasoningOutputTokens = Math.min(
-      totalOutputTokens,
-      toCount(usage.reasoningTokens),
-    );
-    const outputTokens = totalOutputTokens - reasoningOutputTokens;
-    if (inputTokens + cachedInputTokens + reasoningOutputTokens + outputTokens === 0) continue;
-
-    const model =
-      typeof rec.data.message?.source?.model === 'string' && rec.data.message.source.model
-        ? rec.data.message.source.model
-        : 'unknown';
-
-    entries.push({
-      source: SOURCE,
-      model,
-      project,
-      timestamp,
-      inputTokens,
-      outputTokens,
-      cachedInputTokens,
-      reasoningOutputTokens,
+    // usage block is missing; the model keeps it so timing survives.
+    messages.push({
+      seq,
+      role: 'assistant',
+      timeMs,
+      usage: parseUsage(rec.data.usage),
+      model:
+        typeof rec.data.message?.source?.model === 'string' && rec.data.message.source.model
+          ? rec.data.message.source.model
+          : 'unknown',
     });
   }
 
-  return { sessionId, entries, events };
+  return {
+    sessionId: header.id,
+    parentSessionId:
+      typeof header.parentSession === 'string' && header.parentSession
+        ? header.parentSession
+        : null,
+    seedLength:
+      Number.isSafeInteger(header.seedLength) && header.seedLength > 0
+        ? header.seedLength
+        : 0,
+    cwd: header.cwd,
+    messages,
+  };
+}
+
+/** Record wall-clock time in epoch ms; null when absent/invalid. */
+function recordTimeMs(rec) {
+  const t = rec.time;
+  if (typeof t === 'number' && Number.isFinite(t)) return t;
+  if (typeof t === 'string' && t.trim()) {
+    const d = new Date(t);
+    return Number.isNaN(d.getTime()) ? null : d.getTime();
+  }
+  return null;
+}
+
+/** Usage numbers from an assistant/message usage block, or null when empty. */
+function parseUsage(usage) {
+  if (!usage || typeof usage !== 'object') return null;
+  // Harness counts are disjoint. The common bucket model has no cache-write
+  // column, so cache writes join uncached input, matching the other parsers.
+  const inputTokens = toCount(usage.inputTokens) + toCount(usage.cacheWriteTokens);
+  const cachedInputTokens = toCount(usage.cacheReadTokens);
+  const totalOutputTokens = toCount(usage.outputTokens);
+  const reasoningOutputTokens = Math.min(totalOutputTokens, toCount(usage.reasoningTokens));
+  const outputTokens = totalOutputTokens - reasoningOutputTokens;
+  if (inputTokens + cachedInputTokens + reasoningOutputTokens + outputTokens === 0) return null;
+  return { inputTokens, outputTokens, cachedInputTokens, reasoningOutputTokens };
+}
+
+/** Token-accounting equality for a copied assistant record. */
+function sameUsage(left, right) {
+  if (left == null || right == null) return left === right;
+  return (
+    left.inputTokens === right.inputTokens &&
+    left.outputTokens === right.outputTokens &&
+    left.cachedInputTokens === right.cachedInputTokens &&
+    left.reasoningOutputTokens === right.reasoningOutputTokens
+  );
+}
+
+/**
+ * Number of leading child messages inherited from a parent seed.
+ *
+ * `header.seedLength` is DSH's durable fork-lineage boundary: event seqs below
+ * it came from the parent, while later seqs belong to the child. Each skipped
+ * message must still exist at the same seq in the selected parent copy.
+ * Missing, invalid, or divergent records fail open so usage is not lost.
+ */
+function replaySkipCount(child, parent) {
+  if (child.seedLength <= 0 || child.messages.length === 0) return 0;
+  let parentIndex = 0;
+  let previousSeq = -1;
+  let count = 0;
+  for (const message of child.messages) {
+    if (message.seq == null || message.seq <= previousSeq) return 0;
+    previousSeq = message.seq;
+    if (message.seq >= child.seedLength) break;
+
+    while (
+      parentIndex < parent.messages.length &&
+      parent.messages[parentIndex].seq != null &&
+      parent.messages[parentIndex].seq < message.seq
+    ) {
+      parentIndex++;
+    }
+    const source = parent.messages[parentIndex];
+    if (
+      source?.seq !== message.seq ||
+      source.role !== message.role ||
+      source.model !== message.model ||
+      !sameUsage(source.usage, message.usage)
+    ) {
+      return 0;
+    }
+    parentIndex++;
+    count++;
+  }
+  return count;
+}
+
+/** Fold a (possibly replay-trimmed) model into flat usage entries + timing events. */
+function modelToResult(model, skipCount) {
+  const sessionId = model.sessionId;
+  const project = projectFromCwd(model.cwd);
+  const entries = [];
+  const events = [];
+  for (let i = skipCount; i < model.messages.length; i++) {
+    const msg = model.messages[i];
+    const timestamp = new Date(msg.timeMs);
+    events.push({ sessionId, source: SOURCE, project, timestamp, role: msg.role });
+    if (msg.usage) {
+      entries.push({
+        source: SOURCE,
+        model: msg.model || 'unknown',
+        project,
+        timestamp,
+        ...msg.usage,
+      });
+    }
+  }
+  return { entries, events };
 }
 
 /** List session log files under a DSH sessions root (session.jsonl[.zstd]). */
@@ -355,6 +449,12 @@ function listSessionFiles(sessionsDir, onFailure) {
  * Zstandard session logs are multi-frame; node:zlib zstd (Node >= 22.15)
  * decodes one frame per call, so the buffer is walked frame-by-frame, with a
  * `zstd` CLI fallback for older Node.
+ *
+ * Replay handling: `header.parentSession` identifies a fork/subagent source,
+ * and `header.seedLength` is the exact count of leading event seqs inherited
+ * from it. Those records are skipped only when the parent file is also
+ * present. Files without either field, and children whose parent is missing,
+ * are counted in full. `session/end-seed` positions are never used.
  */
 export async function parse() {
   const sessionsDir = getDshSessionsDir();
@@ -385,7 +485,9 @@ export async function parse() {
     return result;
   }
 
-  const perSession = new Map(); // sessionId -> parsed view (largest complete log wins)
+  // sessionId -> most complete model (largest decompressed log wins, so a
+  // session copied between project dirs is counted once).
+  const perSession = new Map();
   for (const { file, compressed } of files) {
     let text;
     try {
@@ -406,9 +508,9 @@ export async function parse() {
       continue;
     }
 
-    let parsed;
+    let model;
     try {
-      parsed = parseSessionText(text);
+      model = buildSessionModel(text);
     } catch (error) {
       recordFailure(
         'dsh: skipping ' + relative(process.cwd(), file) + ' (' + error.message + ')',
@@ -417,17 +519,24 @@ export async function parse() {
     }
 
     const weight = text.length;
-    const previous = perSession.get(parsed.sessionId);
+    const previous = perSession.get(model.sessionId);
     if (!previous || weight > previous.weight) {
-      perSession.set(parsed.sessionId, { ...parsed, weight });
+      perSession.set(model.sessionId, { model, weight });
     }
   }
 
   const entries = [];
   const eventsBySession = new Map();
-  for (const parsed of perSession.values()) {
-    entries.push(...parsed.entries);
-    for (const event of parsed.events) {
+  for (const { model } of perSession.values()) {
+    // seedLength supplies the exact inherited boundary; matching source seqs
+    // prove the selected parent copy still contains what the child inherited.
+    // Missing/corrupt parents fail open so the child remains the local copy.
+    const parent =
+      model.parentSessionId == null ? null : perSession.get(model.parentSessionId);
+    const skip = parent ? replaySkipCount(model, parent.model) : 0;
+    const { entries: fileEntries, events: fileEvents } = modelToResult(model, skip);
+    entries.push(...fileEntries);
+    for (const event of fileEvents) {
       if (!eventsBySession.has(event.sessionId)) eventsBySession.set(event.sessionId, []);
       eventsBySession.get(event.sessionId).push(event);
     }
