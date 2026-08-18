@@ -2,6 +2,7 @@ import { execFileSync } from 'node:child_process';
 import { existsSync, readFileSync, readdirSync, statSync } from 'node:fs';
 import { basename, join, relative } from 'node:path';
 import zlib from 'node:zlib';
+import { createHash } from 'node:crypto';
 import { getDshSessionsDir } from '../tools.js';
 import { aggregateToBuckets, extractSessions } from './aggregate.js';
 
@@ -14,6 +15,12 @@ const SOURCE = 'dsh';
 // after re-checking the on-disk format instead of guessing against stale
 // assumptions.
 const SESSION_FORMAT_VERSION = 0;
+
+// Fork/resume replays are only skipped when the fingerprint match covers at
+// least this many message records. A smaller match is treated as coincidence
+// (fail-open: count everything) rather than risking the loss of a session's
+// own first turns.
+const MIN_REPLAY_MESSAGES = 3;
 
 // Safety cap for a single session log. DSH stores many small zstd frames per
 // file; anything beyond this is either a runaway log or not a session file.
@@ -190,33 +197,41 @@ function isUserMessageRecord(rec) {
 }
 
 /**
- * Parse one decompressed session log into flat entries/events.
+ * Build a session model from one decompressed session log.
  *
  * Layout (DeepSeek Harness session-persistence-jsonl):
- *   line 0: {"type":"session","version":0,"id":...,"createdAt":...,"cwd":...,...}
+ *   line 0: {"type":"session","version":0,"id":...,"createdAt":...,"cwd":...,
+ *            "parentSession":...?, ...}
  *   ... possibly a resumed/forked seed replay, then ...
- *   {"type":"session/end-seed",...}          (absent in fresh sessions)
- *   {"type":"assistant/message","data":{"turn","step","message":{"source":
- *     {"kind":"model","provider","model"},...},"usage":{"inputTokens",
- *     "outputTokens","cacheReadTokens","cacheWriteTokens",
- *     "reasoningTokens"}},...}
+ *   {"type":"user/message"|"assistant/message","time":...,"data":{...}}
  *
- * When a session is resumed (or forked) the stored log begins with a replay of
- * the seed history. Everything before the LAST session/end-seed marker is a
- * replay of records that were already counted from their original file, so it
- * must be skipped or the same usage would be counted twice.
+ * DSH (developer preview) writes session/end-seed records in three situations:
+ * right after session creation (empty seed), at each resume boundary, and
+ * appended at the END of a file when that session becomes the seed for a
+ * further resume. The marker's position is therefore NOT a reliable replay
+ * boundary — a trailing marker would make "skip everything before the last
+ * marker" discard the session's entire real history. Replays are instead
+ * detected by content: a fork/resume file (header.parentSession) begins with
+ * a copy of its parent's message records, so the leading message sequence is
+ * verified against the parent's records and only the matched prefix is
+ * skipped (see parse()).
+ *
+ * Only user/message (source.kind === 'user') and assistant/message records
+ * are kept in the model — they are the only records that produce usage
+ * entries or timing events, and they are the records DSH copies into replays
+ * verbatim. Chunk/bookkeeping records (assistant/chunk, reasoning-chunks,
+ * tool-call-chunks, text-chunks, tool/call, ...) are excluded: they carry no
+ * usage, emit no timing, and are re-serialized in replays, so including them
+ * would break the exact fingerprint match.
  *
  * usage.outputTokens includes reasoningTokens (verified against the
  * session_projcache totals DSH itself maintains), so reasoning is split out of
  * output before aggregation, like the Pi-family parsers.
  */
-function parseSessionText(text) {
-  const entries = [];
-  const events = [];
+function buildSessionModel(text) {
   const lines = text.split('\n');
 
   let header = null;
-  let endSeedIndex = -1;
   for (let i = 0; i < lines.length; i++) {
     if (lines[i].length === 0) continue;
     let rec;
@@ -225,9 +240,8 @@ function parseSessionText(text) {
     } catch {
       continue; // torn final line: keep the complete records
     }
-    if (rec && typeof rec === 'object') {
-      if (header === null && rec.type === 'session') header = rec;
-      if (rec.type === 'session/end-seed') endSeedIndex = i;
+    if (rec && typeof rec === 'object' && header === null && rec.type === 'session') {
+      header = rec;
     }
   }
 
@@ -243,11 +257,8 @@ function parseSessionText(text) {
     throw error;
   }
 
-  const sessionId = header.id;
-  const project = projectFromCwd(header.cwd);
-
+  const messages = [];
   for (let i = 0; i < lines.length; i++) {
-    if (i <= endSeedIndex) continue;
     if (lines[i].length === 0) continue;
     let rec;
     try {
@@ -256,51 +267,153 @@ function parseSessionText(text) {
       continue;
     }
     if (!rec || typeof rec !== 'object') continue;
-    const timestamp = new Date(rec.time);
-    if (Number.isNaN(timestamp.getTime())) continue;
+    const timeMs = recordTimeMs(rec);
+    if (timeMs == null) continue;
 
     if (isUserMessageRecord(rec)) {
-      events.push({ sessionId, source: SOURCE, project, timestamp, role: 'user' });
+      messages.push({ role: 'user', timeMs, fp: fingerprintRecord(rec), usage: null, model: null });
       continue;
     }
     if (!isUsageRecord(rec)) continue;
 
     // Every assistant/message marks the end of a billable step, even when its
-    // usage block is missing.
-    events.push({ sessionId, source: SOURCE, project, timestamp, role: 'assistant' });
-
-    const usage = rec.data.usage;
-    if (!usage || typeof usage !== 'object') continue;
-    // Harness counts are disjoint. The common bucket model has no cache-write
-    // column, so cache writes join uncached input, matching the other parsers.
-    const inputTokens = toCount(usage.inputTokens) + toCount(usage.cacheWriteTokens);
-    const cachedInputTokens = toCount(usage.cacheReadTokens);
-    const totalOutputTokens = toCount(usage.outputTokens);
-    const reasoningOutputTokens = Math.min(
-      totalOutputTokens,
-      toCount(usage.reasoningTokens),
-    );
-    const outputTokens = totalOutputTokens - reasoningOutputTokens;
-    if (inputTokens + cachedInputTokens + reasoningOutputTokens + outputTokens === 0) continue;
-
-    const model =
-      typeof rec.data.message?.source?.model === 'string' && rec.data.message.source.model
-        ? rec.data.message.source.model
-        : 'unknown';
-
-    entries.push({
-      source: SOURCE,
-      model,
-      project,
-      timestamp,
-      inputTokens,
-      outputTokens,
-      cachedInputTokens,
-      reasoningOutputTokens,
+    // usage block is missing; the model keeps it so timing survives.
+    messages.push({
+      role: 'assistant',
+      timeMs,
+      fp: fingerprintRecord(rec),
+      usage: parseUsage(rec.data.usage),
+      model:
+        typeof rec.data.message?.source?.model === 'string' && rec.data.message.source.model
+          ? rec.data.message.source.model
+          : 'unknown',
     });
   }
 
-  return { sessionId, entries, events };
+  return {
+    sessionId: header.id,
+    parentSessionId:
+      typeof header.parentSession === 'string' && header.parentSession
+        ? header.parentSession
+        : null,
+    createdAtMs:
+      typeof header.createdAt === 'number' && Number.isFinite(header.createdAt)
+        ? header.createdAt
+        : null,
+    cwd: header.cwd,
+    messages,
+  };
+}
+
+/** Record wall-clock time in epoch ms; null when absent/invalid. */
+function recordTimeMs(rec) {
+  const t = rec.time;
+  if (typeof t === 'number' && Number.isFinite(t)) return t;
+  if (typeof t === 'string' && t.trim()) {
+    const d = new Date(t);
+    return Number.isNaN(d.getTime()) ? null : d.getTime();
+  }
+  return null;
+}
+
+/**
+ * Fingerprint of a message record for replay matching. DSH rewrites the outer
+ * seq (append ordinal) and time on a copied record, but the rest is copied
+ * verbatim, so a content hash identifies replayed records without retaining
+ * raw prompt/response text.
+ */
+function fingerprintRecord(rec) {
+  const copy = { ...rec };
+  delete copy.seq;
+  delete copy.time;
+  return createHash('sha256').update(JSON.stringify(copy)).digest('base64url').slice(0, 16);
+}
+
+/** Usage numbers from an assistant/message usage block, or null when empty. */
+function parseUsage(usage) {
+  if (!usage || typeof usage !== 'object') return null;
+  // Harness counts are disjoint. The common bucket model has no cache-write
+  // column, so cache writes join uncached input, matching the other parsers.
+  const inputTokens = toCount(usage.inputTokens) + toCount(usage.cacheWriteTokens);
+  const cachedInputTokens = toCount(usage.cacheReadTokens);
+  const totalOutputTokens = toCount(usage.outputTokens);
+  const reasoningOutputTokens = Math.min(totalOutputTokens, toCount(usage.reasoningTokens));
+  const outputTokens = totalOutputTokens - reasoningOutputTokens;
+  if (inputTokens + cachedInputTokens + reasoningOutputTokens + outputTokens === 0) return null;
+  return { inputTokens, outputTokens, cachedInputTokens, reasoningOutputTokens };
+}
+
+/**
+ * Longest prefix of `child` that is also a suffix of `parent` (KMP).
+ * A fork's replayed history is the parent's records as they existed at the
+ * fork instant, so the copied block is a suffix of the parent's message
+ * stream at spawn. Requiring the suffix prevents a child's own first records
+ * from matching an unrelated interior slice of the parent. Same algorithm as
+ * the Codex parser's replay-boundary matching.
+ */
+function longestReplayPrefix(child, parent) {
+  if (child.length === 0 || parent.length === 0) return 0;
+
+  const prefix = new Array(child.length).fill(0);
+  for (let i = 1, matched = 0; i < child.length; i++) {
+    while (matched > 0 && child[i] !== child[matched]) matched = prefix[matched - 1];
+    if (child[i] === child[matched]) matched++;
+    prefix[i] = matched;
+  }
+
+  let matched = 0;
+  for (let i = 0; i < parent.length; i++) {
+    const fingerprint = parent[i];
+    while (matched > 0 && fingerprint !== child[matched]) matched = prefix[matched - 1];
+    if (fingerprint === child[matched]) matched++;
+    if (matched === child.length && i < parent.length - 1) matched = prefix[matched - 1];
+  }
+  return matched;
+}
+
+/**
+ * Number of leading message records of `child` that are a verified replay of
+ * `parent`, or 0 to fail open. The parent snapshot is bounded to records at
+ * or before the child's creation time so a parent that kept running after the
+ * fork cannot mask the copied suffix. A match below MIN_REPLAY_MESSAGES is
+ * treated as coincidence and counts everything — the project's bias is to
+ * over-count rather than silently drop a session's own first turns.
+ */
+function replaySkipCount(child, parent) {
+  if (child.messages.length === 0 || parent.messages.length === 0) return 0;
+  const snapshotFps = [];
+  for (const msg of parent.messages) {
+    if (child.createdAtMs == null || msg.timeMs <= child.createdAtMs) snapshotFps.push(msg.fp);
+  }
+  if (snapshotFps.length === 0) return 0;
+  const matched = longestReplayPrefix(
+    child.messages.map((msg) => msg.fp),
+    snapshotFps,
+  );
+  return matched >= MIN_REPLAY_MESSAGES ? matched : 0;
+}
+
+/** Fold a (possibly replay-trimmed) model into flat usage entries + timing events. */
+function modelToResult(model, skipCount) {
+  const sessionId = model.sessionId;
+  const project = projectFromCwd(model.cwd);
+  const entries = [];
+  const events = [];
+  const messages = skipCount > 0 ? model.messages.slice(skipCount) : model.messages;
+  for (const msg of messages) {
+    const timestamp = new Date(msg.timeMs);
+    events.push({ sessionId, source: SOURCE, project, timestamp, role: msg.role });
+    if (msg.usage) {
+      entries.push({
+        source: SOURCE,
+        model: msg.model || 'unknown',
+        project,
+        timestamp,
+        ...msg.usage,
+      });
+    }
+  }
+  return { entries, events };
 }
 
 /** List session log files under a DSH sessions root (session.jsonl[.zstd]). */
@@ -355,6 +468,13 @@ function listSessionFiles(sessionsDir, onFailure) {
  * Zstandard session logs are multi-frame; node:zlib zstd (Node >= 22.15)
  * decodes one frame per call, so the buffer is walked frame-by-frame, with a
  * `zstd` CLI fallback for older Node.
+ *
+ * Replay handling: a fork/resume file (header.parentSession) begins with a
+ * copy of its parent's message records; the copy is verified by content
+ * fingerprint against the parent's records at the fork instant and only the
+ * matched prefix is skipped. Files without a parentSession are counted in
+ * full — their session/end-seed records are resume/seed markers, not replay
+ * boundaries.
  */
 export async function parse() {
   const sessionsDir = getDshSessionsDir();
@@ -385,7 +505,9 @@ export async function parse() {
     return result;
   }
 
-  const perSession = new Map(); // sessionId -> parsed view (largest complete log wins)
+  // sessionId -> most complete model (largest decompressed log wins, so a
+  // session copied between project dirs is counted once).
+  const perSession = new Map();
   for (const { file, compressed } of files) {
     let text;
     try {
@@ -406,9 +528,9 @@ export async function parse() {
       continue;
     }
 
-    let parsed;
+    let model;
     try {
-      parsed = parseSessionText(text);
+      model = buildSessionModel(text);
     } catch (error) {
       recordFailure(
         'dsh: skipping ' + relative(process.cwd(), file) + ' (' + error.message + ')',
@@ -417,17 +539,27 @@ export async function parse() {
     }
 
     const weight = text.length;
-    const previous = perSession.get(parsed.sessionId);
+    const previous = perSession.get(model.sessionId);
     if (!previous || weight > previous.weight) {
-      perSession.set(parsed.sessionId, { ...parsed, weight });
+      perSession.set(model.sessionId, { model, weight });
     }
   }
 
   const entries = [];
   const eventsBySession = new Map();
-  for (const parsed of perSession.values()) {
-    entries.push(...parsed.entries);
-    for (const event of parsed.events) {
+  for (const { model } of perSession.values()) {
+    // Fork/resume files replay their parent's leading message records; skip
+    // only the prefix whose content fingerprints match the parent's records
+    // at the fork instant. Everything else (sub-agent fresh content, a
+    // deleted parent, an unmatched/partial replay) counts in full.
+    let skip = 0;
+    if (model.parentSessionId) {
+      const parent = perSession.get(model.parentSessionId);
+      if (parent) skip = replaySkipCount(model, parent.model);
+    }
+    const { entries: fileEntries, events: fileEvents } = modelToResult(model, skip);
+    entries.push(...fileEntries);
+    for (const event of fileEvents) {
       if (!eventsBySession.has(event.sessionId)) eventsBySession.set(event.sessionId, []);
       eventsBySession.get(event.sessionId).push(event);
     }

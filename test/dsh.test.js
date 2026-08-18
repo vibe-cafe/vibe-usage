@@ -20,10 +20,16 @@ function zstdFrames(records) {
   return Buffer.concat(frames);
 }
 
-function sessionRecord(id, cwd, version = 0) {
-  const header = { type: 'session', version, id, createdAt: 1700000000000, delegationDepth: 0 };
+function sessionRecord(id, cwd, version = 0, extra = {}) {
+  const header = { type: 'session', version, id, createdAt: 1700000000000, delegationDepth: 0, ...extra };
   if (cwd !== undefined) header.cwd = cwd;
   return header;
+}
+
+// Replay fixtures copy the parent's message records verbatim (DSH rewrites
+// seq/time on copies; the parser fingerprints content minus seq/time).
+function replayOf(records) {
+  return records.filter((record) => record.type === 'user/message' || record.type === 'assistant/message');
 }
 
 function endSeedRecord() {
@@ -81,7 +87,8 @@ test('DSH is registered as a parser and detected tool', () => {
 });
 
 test('getDshHome honors DSH_HOME, tilde prefixes, and the default', () => {
-  assert.equal(getDshHome({ DSH_HOME: '/custom/dsh' }), '/custom/dsh');
+  // resolve() normalizes the drive-root form on Windows (D:\custom\dsh).
+  assert.equal(getDshHome({ DSH_HOME: '/custom/dsh' }), resolve('/custom/dsh'));
   assert.equal(getDshHome({ DSH_HOME: '~' }), join(homedir()));
   assert.equal(getDshHome({ DSH_HOME: '~/data' }), join(homedir(), 'data'));
   assert.equal(getDshHome({ DSH_HOME: 'relative-dsh' }), resolve('relative-dsh'));
@@ -205,27 +212,175 @@ test('DSH buckets split across half-hour windows and models', { skip: !hasBuilti
   });
 });
 
-test('DSH skips the seed replay before the last session/end-seed marker', { skip: !hasBuiltinZstd }, async () => {
+test('DSH counts all records of a session without a parent, regardless of end-seed markers', { skip: !hasBuiltinZstd }, async () => {
+  // Regression: DSH (dev preview) appends session/end-seed at resume boundaries
+  // and at the END of a file when the session becomes a seed. Those markers are
+  // NOT replay boundaries — a session without a parentSession has no replayed
+  // history, so every record must be counted. The old "skip everything before
+  // the last end-seed" rule discarded this file entirely.
   await withDshSessions(async (sessions) => {
     writeSession(sessions, 'proj-c', 'session-3', [
       sessionRecord('session-3', '/home/me/proj-c'),
       userRecord(1699990000000),
       assistantRecord(1699990010000, 'model-a', { inputTokens: 999, outputTokens: 99, cacheReadTokens: 9999, reasoningTokens: 9 }),
       endSeedRecord(),
-      endSeedRecord(), // only the LAST marker matters; the first is inside the replay
       userRecord(1700000100000),
       assistantRecord(1700000120000, 'model-a', { inputTokens: 10, outputTokens: 2, cacheReadTokens: 3, reasoningTokens: 1 }),
+      endSeedRecord(), // trailing marker (session became a seed) — must not skip anything
     ]);
 
     const result = await parse();
     assert.deepEqual(
-      result.buckets.map((bucket) => bucket.inputTokens),
-      [10],
+      result.buckets.map((bucket) => bucket.inputTokens).sort((a, b) => a - b),
+      [10, 999],
     );
     assert.equal(result.sessions.length, 1);
-    assert.equal(result.sessions[0].messageCount, 2);
-    assert.equal(result.sessions[0].userMessageCount, 1);
-    assert.equal(result.sessions[0].firstMessageAt, '2023-11-14T22:15:00.000Z');
+    assert.equal(result.sessions[0].messageCount, 4);
+    assert.equal(result.sessions[0].userMessageCount, 2);
+    assert.equal(result.sessions[0].firstMessageAt, '2023-11-14T19:26:40.000Z');
+  });
+});
+
+test('DSH skips a fork file\'s verified parent replay and counts only its own work', { skip: !hasBuiltinZstd }, async () => {
+  await withDshSessions(async (sessions) => {
+    // Parent: two real turns.
+    const parentRecords = [
+      sessionRecord('parent-1', '/home/me/parent'),
+      userRecord(1700000100000),
+      assistantRecord(1700000120000, 'model-a', { inputTokens: 111, outputTokens: 11, cacheReadTokens: 1111, reasoningTokens: 1 }),
+      userRecord(1700000130000),
+      assistantRecord(1700000140000, 'model-a', { inputTokens: 222, outputTokens: 22, cacheReadTokens: 2222, reasoningTokens: 2 }),
+    ];
+    writeSession(sessions, 'proj-p', 'parent-1', parentRecords);
+    // Fork: replays the parent's message records verbatim, then its own turn.
+    writeSession(sessions, 'proj-c', 'child-1', [
+      sessionRecord('child-1', '/home/me/child', 0, { parentSession: 'parent-1', createdAt: 1700000200000 }),
+      ...replayOf(parentRecords),
+      userRecord(1700000210000),
+      assistantRecord(1700000230000, 'model-a', { inputTokens: 333, outputTokens: 33, cacheReadTokens: 0, reasoningTokens: 3 }),
+    ]);
+
+    const result = await parse();
+    // The parent's own work is counted from its own file; the child's replayed
+    // 111/222 are skipped, and only the child's own work survives.
+    assert.deepEqual(
+      result.buckets
+        .filter((bucket) => bucket.project === 'child')
+        .map((bucket) => [bucket.inputTokens, bucket.reasoningOutputTokens]),
+      [[333, 3]],
+    );
+    const childSession = result.sessions.find((session) => session.project === 'child');
+    assert.ok(childSession);
+    assert.equal(childSession.messageCount, 2);
+    assert.equal(childSession.userMessageCount, 1);
+  });
+});
+
+test('DSH skips a last-N-turn fork replay matched as a parent suffix', { skip: !hasBuiltinZstd }, async () => {
+  await withDshSessions(async (sessions) => {
+    const parentRecords = [
+      sessionRecord('parent-2', '/home/me/parent'),
+      userRecord(1700000100000),
+      assistantRecord(1700000120000, 'model-a', { inputTokens: 111, outputTokens: 11, cacheReadTokens: 0, reasoningTokens: 1 }),
+      userRecord(1700000130000),
+      assistantRecord(1700000140000, 'model-a', { inputTokens: 222, outputTokens: 22, cacheReadTokens: 0, reasoningTokens: 2 }),
+      userRecord(1700000150000),
+      assistantRecord(1700000160000, 'model-a', { inputTokens: 333, outputTokens: 33, cacheReadTokens: 0, reasoningTokens: 3 }),
+      userRecord(1700000170000),
+      assistantRecord(1700000180000, 'model-a', { inputTokens: 444, outputTokens: 44, cacheReadTokens: 0, reasoningTokens: 4 }),
+    ];
+    writeSession(sessions, 'proj-p', 'parent-2', parentRecords);
+    // Fork copies only the last two turns (a suffix of the parent at spawn).
+    const lastTwo = parentRecords.slice(-4);
+    writeSession(sessions, 'proj-c', 'child-2', [
+      sessionRecord('child-2', '/home/me/child', 0, { parentSession: 'parent-2', createdAt: 1700000190000 }),
+      ...replayOf(lastTwo),
+      userRecord(1700000200000),
+      assistantRecord(1700000220000, 'model-a', { inputTokens: 555, outputTokens: 55, cacheReadTokens: 0, reasoningTokens: 5 }),
+    ]);
+
+    const result = await parse();
+    // Parent (111+222+333+444=1110) counted from its own file; child's replay
+    // (last two turns) skipped; only child's own 555 survives.
+    assert.deepEqual(
+      result.buckets.filter((bucket) => bucket.project === 'child').map((bucket) => bucket.inputTokens),
+      [555],
+    );
+  });
+});
+
+test('DSH counts a subagent session in full when its content does not match the parent', { skip: !hasBuiltinZstd }, async () => {
+  await withDshSessions(async (sessions) => {
+    writeSession(sessions, 'proj-p', 'parent-3', [
+      sessionRecord('parent-3', '/home/me/parent'),
+      userRecord(1700000100000),
+      assistantRecord(1700000120000, 'model-a', { inputTokens: 111, outputTokens: 11, cacheReadTokens: 0, reasoningTokens: 1 }),
+    ]);
+    // A subagent starts fresh: parentSession is set but no history is replayed.
+    writeSession(sessions, 'proj-s', 'sub-1', [
+      sessionRecord('sub-1', '/home/me/sub', 0, { parentSession: 'parent-3', createdAt: 1700000200000 }),
+      userRecord(1700000210000),
+      assistantRecord(1700000230000, 'model-b', { inputTokens: 222, outputTokens: 22, cacheReadTokens: 0, reasoningTokens: 2 }),
+    ]);
+
+    const result = await parse();
+    // Parent's own turn (111) is counted from its own file; the subagent's
+    // fresh content (222) matches nothing in the parent and counts in full.
+    assert.deepEqual(
+      result.buckets.filter((bucket) => bucket.project === 'sub').map((bucket) => bucket.inputTokens),
+      [222],
+    );
+  });
+});
+
+test('DSH counts a fork file in full when its parent is missing (fail open)', { skip: !hasBuiltinZstd }, async () => {
+  await withDshSessions(async (sessions) => {
+    writeSession(sessions, 'proj-c', 'child-3', [
+      sessionRecord('child-3', '/home/me/child', 0, { parentSession: 'ghost-parent', createdAt: 1700000200000 }),
+      userRecord(1700000210000),
+      assistantRecord(1700000230000, 'model-a', { inputTokens: 777, outputTokens: 77, cacheReadTokens: 0, reasoningTokens: 7 }),
+    ]);
+
+    const result = await parse();
+    // No parent file to verify against: the only copy must not be dropped.
+    assert.deepEqual(
+      result.buckets.map((bucket) => bucket.inputTokens),
+      [777],
+    );
+  });
+});
+
+test('DSH does not skip a tiny sub-threshold replay (fail open, bias to over-count)', { skip: !hasBuiltinZstd }, async () => {
+  await withDshSessions(async (sessions) => {
+    writeSession(sessions, 'proj-p', 'parent-4', [
+      sessionRecord('parent-4', '/home/me/parent'),
+      userRecord(1700000100000),
+      assistantRecord(1700000120000, 'model-a', { inputTokens: 111, outputTokens: 11, cacheReadTokens: 0, reasoningTokens: 1 }),
+      userRecord(1700000130000),
+      assistantRecord(1700000140000, 'model-a', { inputTokens: 222, outputTokens: 22, cacheReadTokens: 0, reasoningTokens: 2 }),
+    ]);
+    // Fork replays only ONE turn (2 messages < MIN_REPLAY_MESSAGES=3): the
+    // match is treated as coincidence and everything counts.
+    const oneTurn = [
+      userRecord(1700000130000),
+      assistantRecord(1700000140000, 'model-a', { inputTokens: 222, outputTokens: 22, cacheReadTokens: 0, reasoningTokens: 2 }),
+    ];
+    writeSession(sessions, 'proj-c', 'child-4', [
+      sessionRecord('child-4', '/home/me/child', 0, { parentSession: 'parent-4', createdAt: 1700000150000 }),
+      ...oneTurn,
+      userRecord(1700000160000),
+      assistantRecord(1700000180000, 'model-a', { inputTokens: 333, outputTokens: 33, cacheReadTokens: 0, reasoningTokens: 3 }),
+    ]);
+
+    const result = await parse();
+    // The 2-message replay is below MIN_REPLAY_MESSAGES, so the child's 222 is
+    // not skipped (fail open) and its own 333 counts too — 222+333 land in the
+    // same half-hour bucket and merge to 555. Had the replay been skipped the
+    // bucket would be 333.
+    assert.deepEqual(
+      result.buckets.filter((bucket) => bucket.project === 'child').map((bucket) => bucket.inputTokens),
+      [555],
+    );
   });
 });
 
