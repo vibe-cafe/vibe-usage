@@ -7,9 +7,12 @@ import {
   listDbCascades,
   parseGenMetadataBlob,
   parseStepMetadata,
+  parseStepTimestamp,
   readDbSessionEvents,
+  readDbStepTimestamps,
   readDbUsageRecords,
   readDbWorkspaceUri,
+  resolveUsageTimestamp,
 } from '../src/parsers/antigravity-db.js';
 
 // ── Minimal protobuf encoder (mirrors the wire format the decoder reads) ──
@@ -92,6 +95,34 @@ test('parseGenMetadataBlob tolerates missing timestamp', () => {
   assert.equal(r.timestamp, null);
 });
 
+test('parseGenMetadataBlob keeps Gemini 3.7 CLI blobs that omit displayName and createdAt', () => {
+  // 3.7 CLI writes responseModel (19) and usage (4), but dropped field 21
+  // (modelDisplayName) and field 9.4 (chatStartMetadata.createdAt).
+  const blob = buildBlob({
+    input: 2386023, output: 151615, cache: 48601436, thinking: 88650,
+    responseId: 'RESP_37',
+    responseModel: 'gemini-3.7-flash-safety-le',
+  });
+  const r = parseGenMetadataBlob(blob);
+  assert.equal(r.inputTokens, 2386023);
+  assert.equal(r.outputTokens, 151615);
+  assert.equal(r.cacheReadTokens, 48601436);
+  assert.equal(r.thinkingOutputTokens, 88650);
+  assert.equal(r.responseModel, 'gemini-3.7-flash-safety-le');
+  assert.equal(r.displayName, '');
+  assert.equal(r.timestamp, null);
+});
+
+test('resolveUsageTimestamp prefers blob createdAt then steps.idx join', () => {
+  const blobTs = new Date(1787350732000);
+  const stepTs = new Date(1787350800000);
+  const byIdx = new Map([[7, stepTs]]);
+  assert.equal(resolveUsageTimestamp({ timestamp: blobTs, idx: 7 }, byIdx).getTime(), blobTs.getTime());
+  assert.equal(resolveUsageTimestamp({ timestamp: null, idx: 7 }, byIdx).getTime(), stepTs.getTime());
+  assert.equal(resolveUsageTimestamp({ timestamp: null, idx: 8 }, byIdx), null);
+  assert.equal(resolveUsageTimestamp({ timestamp: null }, byIdx), null);
+});
+
 // ── Step metadata (session timing) ──
 // steps.metadata: createdAt Timestamp at field 1 (seconds=1.1), source enum
 // at field 3 (4=user, 2=model). Behavior-verified against payload contents.
@@ -160,6 +191,55 @@ test('offline DB reader loads usage, workspace, and session events', async (t) =
     assert.equal(records[0].thinkingOutputTokens, 25);
     assert.equal(readDbWorkspaceUri(conversationsDir, cascadeId), 'file:///Users/example/project-one');
     assert.deepEqual(readDbSessionEvents(conversationsDir, cascadeId).map((event) => event.role), ['user', 'assistant']);
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test('Gemini 3.7 CLI usage without blob createdAt is timestamped from steps.idx', async (t) => {
+  let DatabaseSync;
+  try {
+    ({ DatabaseSync } = await import('node:sqlite'));
+  } catch {
+    t.skip('node:sqlite is unavailable on this Node version');
+    return;
+  }
+
+  const root = mkdtempSync(join(tmpdir(), 'vibe-usage-antigravity-3.7-'));
+  const conversationsDir = join(root, 'conversations');
+  mkdirSync(conversationsDir, { recursive: true });
+  const cascadeId = 'cascade-37';
+  const db = new DatabaseSync(join(conversationsDir, `${cascadeId}.db`));
+  try {
+    db.exec(`
+      CREATE TABLE gen_metadata (idx INTEGER, data BLOB);
+      CREATE TABLE steps (idx INTEGER, metadata BLOB);
+    `);
+    const usageBlob = buildBlob({
+      input: 5000, output: 80, cache: 40000, thinking: 12,
+      responseId: 'RESP_37_JOIN',
+      responseModel: 'gemini-3.7-flash-safety-le',
+    });
+    db.prepare('INSERT INTO gen_metadata (idx, data) VALUES (?, ?)').run(12, usageBlob);
+    // source=5 is skipped for session timing but still carries createdAt.
+    db.prepare('INSERT INTO steps (idx, metadata) VALUES (?, ?)').run(12, buildStep({ source: 5, seconds: 1787350732 }));
+  } finally {
+    db.close();
+  }
+
+  try {
+    const records = readDbUsageRecords(conversationsDir, cascadeId);
+    assert.equal(records.length, 1);
+    assert.equal(records[0].idx, 12);
+    assert.equal(records[0].timestamp, null);
+    assert.equal(records[0].responseModel, 'gemini-3.7-flash-safety-le');
+
+    const stepTs = readDbStepTimestamps(conversationsDir, cascadeId);
+    assert.equal(stepTs.get(12).getTime(), 1787350732 * 1000);
+    assert.equal(parseStepTimestamp(buildStep({ source: 5, seconds: 1787350732 })).getTime(), 1787350732 * 1000);
+
+    const ts = resolveUsageTimestamp(records[0], stepTs);
+    assert.equal(ts.getTime(), 1787350732 * 1000);
   } finally {
     rmSync(root, { recursive: true, force: true });
   }

@@ -3,7 +3,7 @@ import assert from 'node:assert/strict';
 import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from 'node:fs';
 import { join } from 'node:path';
 import { tmpdir } from 'node:os';
-import { parse } from '../src/parsers/trae-cli.js';
+import { parse, selectTraeUsageSpans } from '../src/parsers/trae-cli.js';
 
 test('parse reads Trae CLI session cache logs and aggregates tokens', async () => {
   const root = mkdtempSync(join(tmpdir(), 'vibe-usage-trae-cli-test-'));
@@ -115,6 +115,97 @@ test('parse reads Trae CLI session cache logs and aggregates tokens', async () =
     } else {
       delete process.env.VIBE_USAGE_TRAE_CLI_SESSIONS;
     }
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
+function usageSpan(category, usage, startTime = 1783429023825200, model = 'GLM-5.3') {
+  return { category, model, startTime, usage };
+}
+
+test('selectTraeUsageSpans keeps one layer per LLM call and sums sequential calls', () => {
+  const u1 = { inputTokens: 100, outputTokens: 10, cacheReadTokens: 50, reasoningTokens: 5 };
+  const u2 = { inputTokens: 200, outputTokens: 20, cacheReadTokens: 80, reasoningTokens: 8 };
+  const selected = selectTraeUsageSpans([
+    usageSpan('model.stream.eino', u1),
+    usageSpan('model.real_call', u1),
+    usageSpan('model.call', u1),
+    usageSpan('model.stream.eino', u2, 1783429023900000),
+    usageSpan('model.real_call', u2, 1783429023900000),
+    usageSpan('model.call', u2, 1783429023900000),
+  ]);
+  assert.equal(selected.length, 2);
+  assert.deepEqual(selected.map((s) => s.category), ['model.stream.eino', 'model.stream.eino']);
+  assert.equal(selected.reduce((n, s) => n + s.usage.inputTokens, 0), 300);
+});
+
+test('selectTraeUsageSpans includes failover generate spans alongside stream.eino', () => {
+  const glm = { inputTokens: 100, outputTokens: 10, cacheReadTokens: 0, reasoningTokens: 4 };
+  const doubao = { inputTokens: 80, outputTokens: 70, cacheReadTokens: 0, reasoningTokens: 0 };
+  const selected = selectTraeUsageSpans([
+    usageSpan('model.stream.eino', glm, 1, 'GLM-5.3'),
+    usageSpan('model.generate', doubao, 2, 'Doubao-Seed-Evolving'),
+  ]);
+  assert.equal(selected.length, 2);
+  assert.deepEqual(selected.map((s) => s.model).sort(), ['Doubao-Seed-Evolving', 'GLM-5.3']);
+});
+
+test('selectTraeUsageSpans falls back to model.real_call when stream.eino is absent', () => {
+  const usage = { inputTokens: 40, outputTokens: 2, cacheReadTokens: 0, reasoningTokens: 0 };
+  const selected = selectTraeUsageSpans([
+    usageSpan('model.real_call', usage),
+    usageSpan('model.call', usage),
+  ]);
+  assert.equal(selected.length, 1);
+  assert.equal(selected[0].category, 'model.real_call');
+});
+
+test('parse sums sequential LLM calls that share one session traceID', async () => {
+  const root = mkdtempSync(join(tmpdir(), 'vibe-usage-trae-cli-sum-'));
+  const sessionsDir = join(root, 'sessions');
+  const sessionPath = join(sessionsDir, 'same-trace');
+  mkdirSync(sessionPath, { recursive: true });
+  writeFileSync(join(sessionPath, 'session.json'), JSON.stringify({
+    id: 'same-trace',
+    metadata: { cwd: '/tmp/demo', model_name: 'GLM-5.3' },
+  }));
+  const traceID = 'aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa';
+  function span(category, input, output, startTime, reasoning = 0) {
+    return JSON.stringify({
+      traceID,
+      startTime,
+      tags: [
+        { key: 'span.category', value: category },
+        { key: 'model.name', value: 'GLM-5.3' },
+        { key: 'usage.input_tokens', value: input },
+        { key: 'usage.output_tokens', value: output },
+        { key: 'usage.cache_read_tokens', value: 0 },
+        { key: 'usage.reasoning_tokens', value: reasoning },
+      ],
+    });
+  }
+  writeFileSync(join(sessionPath, 'traces.jsonl'), [
+    span('model.stream.eino', 1000, 10, 1787345117880722, 4),
+    span('model.real_call', 1000, 10, 1787345117880722, 0),
+    span('model.call', 1000, 10, 1787345117880722, 0),
+    span('model.stream.eino', 2000, 20, 1787345118880722, 6),
+    span('model.real_call', 2000, 20, 1787345118880722, 0),
+    span('model.call', 2000, 20, 1787345118880722, 0),
+  ].join('\n') + '\n');
+  writeFileSync(join(sessionPath, 'events.jsonl'), '');
+
+  const prev = process.env.VIBE_USAGE_TRAE_CLI_SESSIONS;
+  process.env.VIBE_USAGE_TRAE_CLI_SESSIONS = sessionsDir;
+  try {
+    const result = await parse();
+    assert.equal(result.buckets.length, 1);
+    assert.equal(result.buckets[0].inputTokens, 3000);
+    assert.equal(result.buckets[0].outputTokens, 30);
+    assert.equal(result.buckets[0].reasoningOutputTokens, 10);
+    assert.equal(result.buckets[0].model, 'GLM-5.3');
+  } finally {
+    if (prev) process.env.VIBE_USAGE_TRAE_CLI_SESSIONS = prev;
+    else delete process.env.VIBE_USAGE_TRAE_CLI_SESSIONS;
     rmSync(root, { recursive: true, force: true });
   }
 });
