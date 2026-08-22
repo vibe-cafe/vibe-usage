@@ -26,6 +26,10 @@ import { queryDbJsonSnapshotOnLock, sqliteUnavailableError, isSqliteUnavailableE
  *       createdAt (Timestamp) = 9.4  → seconds = 9.4.1
  *     responseModel      = field 19  ("gemini-3-flash-a" / "gemini-default")
  *     modelDisplayName   = field 21  ("Gemini 3.5 Flash (High/Medium/Low)")
+ *
+ * Gemini 3.7 CLI blobs still have usage (4) and responseModel (19) but omit
+ * 9.4 and 21. Timestamps are recovered from steps.metadata field 1.1 at the
+ * same gen_metadata.idx; the model name falls back to responseModel.
  */
 
 // ── Minimal protobuf wire-format decoder (no dependency) ──────────────
@@ -146,6 +150,40 @@ export function parseGenMetadataBlob(buf) {
   };
 }
 
+/**
+ * Extract createdAt seconds from a steps.metadata blob, regardless of step
+ * source. Gemini 3.7 CLI gen_metadata blobs no longer carry chatStartMetadata
+ * (field 9.4); the step timestamp at field 1.1 is the remaining clock.
+ *
+ * @param {Buffer} buf
+ * @returns {Date|null}
+ */
+export function parseStepTimestamp(buf) {
+  const meta = decodeMessage(buf);
+  const createdAt = firstMessage(meta, 1);
+  const seconds = createdAt ? firstVarint(createdAt, 1) : undefined;
+  if (!seconds) return null;
+  const timestamp = new Date(seconds * 1000);
+  return Number.isNaN(timestamp.getTime()) ? null : timestamp;
+}
+
+/**
+ * Prefer the blob's own createdAt; if Gemini 3.7 omitted it, use the step
+ * with the same idx. idx-join is exact on current CLI stores (every
+ * gen_metadata idx exists in steps).
+ *
+ * @param {{timestamp: Date|null, idx?: number}} rec
+ * @param {Map<number, Date>} stepTimestampsByIdx
+ * @returns {Date|null}
+ */
+export function resolveUsageTimestamp(rec, stepTimestampsByIdx) {
+  if (rec?.timestamp && !Number.isNaN(rec.timestamp.getTime())) return rec.timestamp;
+  if (rec?.idx == null || !stepTimestampsByIdx) return null;
+  const stepTs = stepTimestampsByIdx.get(rec.idx);
+  if (stepTs && !Number.isNaN(stepTs.getTime())) return stepTs;
+  return null;
+}
+
 // ── SQLite store reading ──────────────────────────────────────────────
 
 function queryCascadeDb(conversationsDir, cascadeId, sql) {
@@ -182,7 +220,7 @@ export function listDbCascades(conversationsDir) {
 export function readDbUsageRecords(conversationsDir, cascadeId) {
   let rows;
   try {
-    rows = queryCascadeDb(conversationsDir, cascadeId, 'SELECT hex(data) AS h FROM gen_metadata ORDER BY idx');
+    rows = queryCascadeDb(conversationsDir, cascadeId, 'SELECT idx, hex(data) AS h FROM gen_metadata ORDER BY idx');
   } catch (err) {
     if (isSqliteUnavailableError(err)) throw err;
     return [];
@@ -196,9 +234,45 @@ export function readDbUsageRecords(conversationsDir, cascadeId) {
     } catch {
       continue; // one malformed blob must not kill the rest
     }
-    if (rec) records.push(rec);
+    if (rec) {
+      rec.idx = Number.isFinite(Number(row.idx)) ? Number(row.idx) : null;
+      records.push(rec);
+    }
   }
   return records;
+}
+
+/**
+ * Map steps.idx → createdAt for every step that has a timestamp, including
+ * system/tool steps that parseStepMetadata skips. Used to timestamp 3.7
+ * gen_metadata rows that no longer embed chatStartMetadata.
+ */
+export function readDbStepTimestamps(conversationsDir, cascadeId) {
+  let rows;
+  try {
+    rows = queryCascadeDb(
+      conversationsDir,
+      cascadeId,
+      'SELECT idx, hex(metadata) AS h FROM steps WHERE metadata IS NOT NULL ORDER BY idx',
+    );
+  } catch (err) {
+    if (isSqliteUnavailableError(err)) throw err;
+    return new Map();
+  }
+  const byIdx = new Map();
+  for (const row of rows) {
+    if (!row.h) continue;
+    let ts;
+    try {
+      ts = parseStepTimestamp(Buffer.from(row.h, 'hex'));
+    } catch {
+      continue;
+    }
+    if (!ts) continue;
+    const idx = Number(row.idx);
+    if (Number.isFinite(idx)) byIdx.set(idx, ts);
+  }
+  return byIdx;
 }
 
 /**

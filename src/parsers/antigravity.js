@@ -3,7 +3,7 @@ import { readdirSync } from 'node:fs';
 import { join } from 'node:path';
 import { homedir } from 'node:os';
 import { aggregateToBuckets, extractSessions } from './aggregate.js';
-import { listDbCascades, readDbUsageRecords, readDbWorkspaceUri, readDbSessionEvents } from './antigravity-db.js';
+import { listDbCascades, readDbUsageRecords, readDbWorkspaceUri, readDbSessionEvents, readDbStepTimestamps, resolveUsageTimestamp } from './antigravity-db.js';
 
 
 
@@ -327,18 +327,25 @@ export async function parse() {
     for (const cascadeId of listDbCascades(dir)) {
       const records = readDbUsageRecords(dir, cascadeId);
       const project = projectFromUri(readDbWorkspaceUri(dir, cascadeId)) || 'unknown';
+      const stepTimestampsByIdx = records.some((rec) => !rec.timestamp || isNaN(rec.timestamp.getTime()))
+        ? readDbStepTimestamps(dir, cascadeId)
+        : new Map();
 
       if (records.length > 0) {
         dbHandled.add(cascadeId);
         for (const rec of records) {
           if (rec.responseId && seenResponseIds.has(rec.responseId)) continue;
           if (rec.responseId) seenResponseIds.add(rec.responseId);
-          if (!rec.timestamp || isNaN(rec.timestamp.getTime())) continue;
+          // Gemini 3.7 CLI blobs dropped chatStartMetadata.createdAt (9.4.1)
+          // and modelDisplayName (21). Usage is still in field 4; clock is
+          // recovered from steps.metadata at the same idx.
+          const timestamp = resolveUsageTimestamp(rec, stepTimestampsByIdx);
+          if (!timestamp || isNaN(timestamp.getTime())) continue;
           entries.push({
             source: SOURCE,
             model: modelFromRecord(rec),
             project,
-            timestamp: rec.timestamp,
+            timestamp,
             inputTokens: toSafeNumber(rec.inputTokens),
             outputTokens: toSafeNumber(rec.outputTokens),
             cachedInputTokens: toSafeNumber(rec.cacheReadTokens),
