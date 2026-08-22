@@ -8,6 +8,13 @@ import { parse as parseOmp } from '../src/parsers/omp.js';
 import { parse as parsePi } from '../src/parsers/pi-coding-agent.js';
 import { getOmpSessionDirs, getPiSessionDirs } from '../src/pi-roots.js';
 
+const previousCindyDirs = process.env.VIBE_USAGE_CINDY_DIRS;
+process.env.VIBE_USAGE_CINDY_DIRS = join(tmpdir(), 'vibe-usage-cindy-disabled');
+test.after(() => {
+  if (previousCindyDirs === undefined) delete process.env.VIBE_USAGE_CINDY_DIRS;
+  else process.env.VIBE_USAGE_CINDY_DIRS = previousCindyDirs;
+});
+
 function restoreEnv(name, value) {
   if (value == null) delete process.env[name];
   else process.env[name] = value;

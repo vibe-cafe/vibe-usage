@@ -15,6 +15,7 @@ vibe-usage/
 │   │   ├── contract.js        # normalizeParserResult(): parser result contract + source cross-check
 │   │   ├── fs-utils.js        # readJsonSafe() / projectFromPath() / projectFromCwd() / toCount()
 │   │   ├── claude-code.js
+│   │   ├── cindy-ledger.js      # Cindy-private Codex/Pi daily ledger augmentation; no chat reads
 │   │   ├── codex.js
 │   │   ├── codex-cache.js     # Versioned, disposable per-rollout Codex parser cache
 │   │   ├── grok.js            # ~/.grok/sessions updates.jsonl turn_completed usage
@@ -41,6 +42,7 @@ vibe-usage/
 │   │   └── zcode.js           # SQLite (via sqlite.js), reads message table
 │   ├── pi-roots.js            # Pi/OMP default, profile, XDG, and override discovery
 │   ├── cline-roots.js         # Standalone + VSCode-host Cline discovery
+│   ├── cindy-roots.js          # Cindy Global/CN Electron roots + per-owner DB discovery
 │   ├── craft-roots.js         # CraftAgent root resolution and detection
 │   ├── workbuddy-roots.js     # WorkBuddy default and fixture/relocation roots
 │   ├── tools.js               # TOOLS[] registry + detectInstalledTools()
@@ -115,12 +117,13 @@ Pi-compatible JSONL parsers (`pi-coding-agent.js`, `craft-agent.js`, `omp.js`):
 - Fold `usage.cacheWrite` into input tokens and keep `cacheRead` separate. OMP/Pi `usage.output` already includes `reasoningTokens`, so subtract reasoning from output before storing it in `reasoningOutputTokens`.
 - Deduplicate stable message ids across copied/profile stores. Any directory read failure returns `skipped` so incremental state is not pruned.
 
-SQLite-backed parsers (alma, cursor, dimagent, hermes, kiro, mimocode, opencode, zcode):
+SQLite-backed parsers (alma, cindy, cursor, dimagent, hermes, kiro, mimocode, opencode, zcode):
 - Use `queryDbJson(dbPath, sql)` from `src/parsers/sqlite.js` — never shell out to `sqlite3` directly. It prefers Node's built-in `node:sqlite` (`DatabaseSync`, opened read-only; Node ≥ 22.5, works on Windows with no extra binary) and falls back to the `sqlite3` CLI on older Node.
 - Rows come back as plain objects (`{ column: value }`), same shape as `sqlite3 -json` — INTEGER → number, TEXT → string, JSON via `json_extract` → string.
 - If neither `node:sqlite` nor the CLI is available the helper throws an `ENOENT`-flavored error; catch it and rethrow `'sqlite3 CLI not found. Install sqlite3 (or use Node >= 22.5) to sync X data.'` so the user gets a hint.
-- For DBs the source app holds a write lock on (Cursor, Kiro): catch `/database is locked/i`, copy the DB (+ `-wal`/`-shm`) to a temp dir, and re-query the snapshot.
+- For DBs the source app holds a write lock on (Cursor, Kiro), use `queryDbJsonSnapshotOnLock()`. Cindy always uses `queryDbJsonSnapshot()` because a clean WAL-mode database may need SQLite to initialize shared-memory metadata; writable access is confined to the disposable DB/WAL/SHM copy, while the source stays untouched.
 - Alma reads only `usage_records` token fields plus workspace names. Its ledger represents assistant responses only, so return buckets with `sessions: []` instead of reading chat records to infer timing.
+- Cindy reads only `daily_model_usage` across both regional user-data roots and every per-owner DB. Claude Code rows are excluded because Cindy's SDK already writes normal `~/.claude` transcripts; merge Codex/Pi rows into their existing parser/source, sum currency rows, fold `cache_create_tokens` into input, and add no sessions. Never select `messages`, credentials, costs, or owner ids.
 
 Network-fetch parsers (the Cursor exception):
 - Cursor stores no usage locally — only an auth token in `state.vscdb`. The parser reads the token via `queryDbJson()`, then GETs a CSV from `cursor.com`.
@@ -170,7 +173,7 @@ node -e "import('./src/parsers/<tool-id>.js').then(m => m.parse()).then(r => con
 Test hooks (env vars honored at module load, set them before importing):
 - `VIBE_USAGE_STATE_DIR` / `VIBE_USAGE_CONFIG_DIR` — redirect `state.js` / `config.js` away from the real `~/.vibe-usage` (used by `test/state.test.js`, `test/reset.test.js`)
 - Codex cache controls: `VIBE_USAGE_CACHE_DIR` redirects cache writes, `VIBE_USAGE_CODEX_CACHE=0` disables the optimization, `VIBE_USAGE_CODEX_WORK_BUDGET_MS` overrides the non-interactive build budget, and `VIBE_USAGE_CODEX_AUDIT_INTERVAL_MS` / `VIBE_USAGE_CODEX_AUDIT_MAX_BYTES` override rolling-audit bounds
-- Per-parser fixtures: `CODEX_HOME`, `VIBE_USAGE_ALMA_DB`, `VIBE_USAGE_GROK_SESSIONS`, `VIBE_USAGE_KIMI_CODE_DIR`, `VIBE_USAGE_KIMI_DIR`, `VIBE_USAGE_TRAE_CLI_SESSIONS`, `VIBE_USAGE_WORKBUDDY_DIRS`, `VIBE_USAGE_KIRO_LEGACY_TOKENS`, `VIBE_USAGE_DSH_SESSIONS`. The Kimi Code parser resolves its data root as `VIBE_USAGE_KIMI_CODE_DIR` → `KIMI_CODE_HOME` (matching the CLI) → `~/.kimi-code`, and always merges the legacy `~/.kimi` store instead of either/or (`kimi migrate` drops usage records, so no double-count)
+- Per-parser fixtures: `CODEX_HOME`, `VIBE_USAGE_ALMA_DB`, `VIBE_USAGE_CINDY_DIRS`, `VIBE_USAGE_GROK_SESSIONS`, `VIBE_USAGE_KIMI_CODE_DIR`, `VIBE_USAGE_KIMI_DIR`, `VIBE_USAGE_TRAE_CLI_SESSIONS`, `VIBE_USAGE_WORKBUDDY_DIRS`, `VIBE_USAGE_KIRO_LEGACY_TOKENS`, `VIBE_USAGE_DSH_SESSIONS`. The Kimi Code parser resolves its data root as `VIBE_USAGE_KIMI_CODE_DIR` → `KIMI_CODE_HOME` (matching the CLI) → `~/.kimi-code`, and always merges the legacy `~/.kimi` store instead of either/or (`kimi migrate` drops usage records, so no double-count)
 - Claude fixtures: `VIBE_USAGE_CLAUDE_DIRS` replaces normal Claude root discovery with a `path.delimiter`-separated root list; `VIBE_USAGE_CLAUDE_DESKTOP_DIRS` overrides only the Claude Desktop user-data roots. The production parser scans `~/.claude`, `$CLAUDE_CONFIG_DIR`, data-bearing `~/.claude-*` profiles, and the per-session `.claude` roots created below Claude Desktop's `local-agent-mode-sessions`. Desktop Code already writes to the normal Claude Code root, while Cowork uses the private roots. Both remain source `claude-code`. The parser streams each JSONL file to its captured size, de-duplicates usage by API call identity (`message.id` + `requestId`, falling back to the line `uuid` when a record carries neither) keeping the most complete payload for each call, and returns `skipped` with warnings after any read failure so incremental state is not pruned. Claude Code writes one assistant line per content block - all sharing the call ids and repeating the same `usage` object - plus an early partial line while streaming, so a per-line key counted a single call once per block.
 - Pi-family/Cline/OpenClaw fixtures: `VIBE_USAGE_PI_SESSION_DIRS`, `VIBE_USAGE_OMP_SESSION_DIRS`, `VIBE_USAGE_CLINE_DIRS`, and `VIBE_USAGE_OPENCLAW_DIRS` replace normal discovery with `path.delimiter`-separated roots.
 

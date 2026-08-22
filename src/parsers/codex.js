@@ -11,6 +11,7 @@ import { join } from 'node:path';
 import { createInterface } from 'node:readline';
 import { createHash } from 'node:crypto';
 import { aggregateToBuckets } from './aggregate.js';
+import { mergeCindyHarnessUsage, readCindyHarnessUsage } from './cindy-ledger.js';
 import {
   codexSessionDirs,
   resolveCodexHomes,
@@ -796,7 +797,7 @@ function mergeFileResults(results) {
   return { buckets: aggregateToBuckets(entries), sessions };
 }
 
-export async function parse({ codexExtraHome } = {}) {
+async function parseNativeCodex({ codexExtraHome } = {}) {
   if (codexExtraHome?.trim()) {
     const validation = validateExtraCodexHome(codexExtraHome);
     if (!validation.ok) {
@@ -1018,4 +1019,9 @@ export async function parse({ codexExtraHome } = {}) {
   }
 
   return { ...mergeFileResults(results), cache: cacheStats };
+}
+
+export async function parse(options = {}) {
+  const nativeResult = await parseNativeCodex(options);
+  return mergeCindyHarnessUsage(nativeResult, readCindyHarnessUsage('codex'));
 }

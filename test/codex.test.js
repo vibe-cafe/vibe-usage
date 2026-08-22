@@ -6,6 +6,13 @@ import { tmpdir } from 'node:os';
 import { parse } from '../src/parsers/codex.js';
 import { codexCacheDir } from '../src/parsers/codex-cache.js';
 
+const previousCindyDirs = process.env.VIBE_USAGE_CINDY_DIRS;
+process.env.VIBE_USAGE_CINDY_DIRS = join(tmpdir(), 'vibe-usage-cindy-disabled');
+test.after(() => {
+  if (previousCindyDirs === undefined) delete process.env.VIBE_USAGE_CINDY_DIRS;
+  else process.env.VIBE_USAGE_CINDY_DIRS = previousCindyDirs;
+});
+
 function sessionMeta(timestamp, id, extra = {}) {
   const { metaTimestamp = timestamp, ...payloadExtra } = extra;
   return {

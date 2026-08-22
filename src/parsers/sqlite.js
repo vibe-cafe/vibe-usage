@@ -17,8 +17,12 @@ const require = createRequire(import.meta.url);
  * If neither is available, throws an Error whose message contains "ENOENT" so
  * callers can surface an "Install sqlite3" hint, matching the previous behavior.
  */
-export function queryDbJson(dbPath, sql, { timeout = 30000, maxBuffer = 100 * 1024 * 1024 } = {}) {
-  const db = openNodeSqlite(dbPath);
+export function queryDbJson(
+  dbPath,
+  sql,
+  { timeout = 30000, maxBuffer = 100 * 1024 * 1024, readOnly = true } = {},
+) {
+  const db = openNodeSqlite(dbPath, readOnly);
   if (db) {
     try {
       return db.prepare(sql).all();
@@ -55,12 +59,22 @@ function getNodeSqlite() {
   return nodeSqlite;
 }
 
-function openNodeSqlite(dbPath) {
+function openNodeSqlite(dbPath, readOnly = true) {
   const mod = getNodeSqlite();
   if (!mod || !mod.DatabaseSync) return null;
+  let db;
   try {
-    return new mod.DatabaseSync(dbPath, { readOnly: true });
+    db = new mod.DatabaseSync(dbPath, { readOnly });
+    // Writable access is used only for disposable snapshots whose WAL metadata
+    // may need initialization. Keep the SQL connection itself read-only.
+    if (!readOnly) db.exec('PRAGMA query_only = ON');
+    return db;
   } catch {
+    try {
+      db?.close();
+    } catch {
+      // Ignore cleanup failure while falling back to the sqlite3 CLI.
+    }
     return null;
   }
 }
@@ -94,6 +108,31 @@ export function isLockError(err) {
   return !!err && typeof err.message === 'string' && /database is locked/i.test(err.message);
 }
 
+function querySnapshot(dbPath, sql, { tempPrefix, opts } = {}) {
+  const snapshotDir = mkdtempSync(join(tmpdir(), tempPrefix || 'vibe-usage-sqlite-'));
+  const queryPath = join(snapshotDir, basename(dbPath));
+  try {
+    copyFileSync(dbPath, queryPath);
+    for (const suffix of ['-shm', '-wal']) {
+      const companion = `${dbPath}${suffix}`;
+      if (existsSync(companion)) copyFileSync(companion, `${queryPath}${suffix}`);
+    }
+    return queryDbJson(queryPath, sql, { ...opts, readOnly: false });
+  } finally {
+    rmSync(snapshotDir, { recursive: true, force: true });
+  }
+}
+
+/**
+ * Query a disposable writable snapshot. Some WAL-mode databases cannot be
+ * opened read-only until SQLite has initialized their shared-memory metadata;
+ * doing that only in the temp copy keeps the source application database
+ * untouched and works without a sqlite3 binary on Node >= 22.5.
+ */
+export function queryDbJsonSnapshot(dbPath, sql, options = {}) {
+  return querySnapshot(dbPath, sql, options);
+}
+
 /**
  * Run a query, and if the source app holds a write lock on the database, copy
  * the DB (plus its -wal/-shm companions) to a temp dir and re-query the
@@ -104,17 +143,6 @@ export function queryDbJsonSnapshotOnLock(dbPath, sql, { tempPrefix = 'vibe-usag
     return queryDbJson(dbPath, sql, opts);
   } catch (err) {
     if (!isLockError(err)) throw err;
-    const snapshotDir = mkdtempSync(join(tmpdir(), tempPrefix));
-    const queryPath = join(snapshotDir, basename(dbPath));
-    try {
-      copyFileSync(dbPath, queryPath);
-      for (const suffix of ['-shm', '-wal']) {
-        const companion = `${dbPath}${suffix}`;
-        if (existsSync(companion)) copyFileSync(companion, `${queryPath}${suffix}`);
-      }
-      return queryDbJson(queryPath, sql, opts);
-    } finally {
-      rmSync(snapshotDir, { recursive: true, force: true });
-    }
+    return querySnapshot(dbPath, sql, { tempPrefix, opts });
   }
 }

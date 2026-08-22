@@ -2,6 +2,7 @@ import { existsSync, readdirSync, statSync } from 'node:fs';
 import { isAbsolute, join, posix, resolve, win32 } from 'node:path';
 import { homedir } from 'node:os';
 import { findClaudeCodeDataDirs } from './claude-roots.js';
+import { findCindyDataDirs, getCindyDataRoots } from './cindy-roots.js';
 import { codexSessionDirs, resolveCodexHomes } from './codex-roots.js';
 import { findClineDataDirs } from './cline-roots.js';
 import { findCraftDataDirs } from './craft-roots.js';
@@ -222,6 +223,12 @@ export const TOOLS = [
     id: 'alma',
     dataDir: getAlmaDbPath(),
     detectDataDirs: () => [getAlmaDbPath()].filter(existsSync),
+  },
+  {
+    name: 'Cindy',
+    id: 'cindy',
+    dataDir: getCindyDataRoots()[0],
+    detectDataDirs: findCindyDataDirs,
   },
   {
     name: 'Claude Code',
