@@ -61,12 +61,50 @@ vibe-usage/
 └── package.json               # @vibe-cafe/vibe-usage, ESM, Node >=20 (≥22.5 enables built-in node:sqlite), zero dependencies
 ```
 
+## Architecture Approval Gate
+
+A GitHub issue, pull request, or feature request is a **proposal**, not approval
+to change product architecture. A broad maintenance request such as "fix every
+meaningful issue" authorizes triage and ordinary fixes; it does **not** waive
+this gate.
+
+Get explicit maintainer approval for the concrete design and rollout **before
+editing, merging, version-bumping, publishing, or deploying** any change that
+affects one or more of:
+
+- source of truth or control-plane ownership (backend vs. local config);
+- privacy/security policy, collected metadata, or precedence between settings;
+- first-run defaults, onboarding questions, or opt-in/opt-out semantics;
+- hostname/device/session identity, dedup keys, incremental-state keys, or reset behavior;
+- cross-repository API contracts, backend storage/schema, or migrations;
+- automatic update behavior across CLI, daemon, Mac, and Windows distributions.
+
+Before requesting approval, state the current invariant, proposed invariant,
+affected repositories/data/users, compatibility and migration behavior,
+release ordering, and rollback plan. Do not infer approval from issue labels,
+age, detail, author confidence, or the absence of objections. A bug fix that
+only restores already-documented behavior does not need a new architecture
+decision.
+
+**Current Vibe Usage invariant:** upload/privacy policy is backend-owned.
+`sync.js` fetches `/api/usage/settings`, caches the last backend answer only for
+same-server outages, and the ingest endpoint independently enforces
+`usageUploadProject`. Local `config.json` contains operational client state; it
+must not gain higher-priority policy controls without an explicitly approved,
+cross-repository RFC. `hostname` is a stable upload identity, so changing its
+meaning is also an architecture change.
+
+Incident marker: v0.10.15 introduced local privacy precedence and new defaults
+from issue #49 without architecture approval; v0.10.16 fully reverted it. Do
+not reintroduce any part as a "compatibility" or "small privacy" fix without
+passing this gate.
+
 ## Key Conventions
 
 - **Pure ESM** (`"type": "module"`) — no CommonJS, no build step
 - **Zero dependencies** — only Node built-ins (fs, path, os, crypto, https, readline, child_process, zlib, `node:sqlite`)
 - **Incremental upload** — parsers emit a complete view of live local data, then `sync.js` diffs each item's content-hash against `~/.vibe-usage/state.json` and uploads only new/changed buckets/sessions — a quiet machine sends zero bytes. State is committed per-batch only after that batch's upload succeeds (failed batch re-sends next run); prune of dead keys (logs the parsers no longer emit) persists unconditionally and is bounded by liveness, never by age — and is scoped to sources whose parser succeeded that run, so a transient failure or an incomplete Codex cache build never evicts that tool's state into a full re-upload. Deleting `state.json` triggers a one-time full re-upload (which is exactly how `reset` re-populates remote data after deleting it).
-- **Hidden-project identity** — parsers aggregate before privacy is applied. When `uploadProject=false`, `sync.js` replaces project names with `unknown` and must re-aggregate buckets before hashing/upload so formerly distinct projects that now share a server key are summed instead of overwriting one another.
+- **Hidden-project identity** — parsers aggregate before the backend-provided privacy setting is applied. When the fetched `uploadProject=false`, `sync.js` replaces project names with `unknown` and must re-aggregate buckets before hashing/upload so formerly distinct projects that now share a server key are summed instead of overwriting one another. This is enforcement of backend policy, not a local setting.
 - **Codex parser cache** — unlike the other stateless parsers, Codex keeps versioned, disposable derived data under `~/.vibe-usage/cache/codex/`. This cache is never authoritative: any miss, corruption, unsafe append, parser-algorithm bump, or write failure falls back to raw logs. Keep it separate from `state.json`; `reset` clears upload state but retains the parser cache so it can re-upload without re-reading every rollout.
 - **Stable hostname** — hostname is persisted in config at init; `sync.js` never re-reads `os.hostname()` after first capture. This prevents macOS mDNS hostname drift (e.g., `-2`, `-3` suffixes) from creating duplicate device entries in the DB.
 - **Upload identity** — `client-meta.js` reads the real package version from the shipped `package.json`, creates one `syncId` per `runSync`, and adds batch identity plus runtime/platform/hostname to every ingest request. Direct sync defaults to `surface=cli`, the foreground service passes `surface=daemon`, and desktop apps override via `VIBE_USAGE_SURFACE` / `VIBE_USAGE_SURFACE_VERSION`. Keep the CLI as the only ingest HTTP implementation.
