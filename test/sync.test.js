@@ -10,8 +10,6 @@ import { gunzipSync } from 'node:zlib';
 import {
   resolveCodexExtraHome,
   resolveCachedUploadProjectSetting,
-  resolveOptionalBoolean,
-  resolveSyncHostname,
   resolveUploadProjectSetting,
   mapWithConcurrency,
 } from '../src/sync.js';
@@ -33,11 +31,9 @@ async function withServer(handler, run) {
   }
 }
 
-test('local project deny overrides the server and works without a response', () => {
+test('explicit project-upload settings preserve both privacy choices', () => {
   assert.equal(resolveUploadProjectSetting({ uploadProject: true }), true);
   assert.equal(resolveUploadProjectSetting({ uploadProject: false }), false);
-  assert.equal(resolveUploadProjectSetting({ uploadProject: true }, false), false);
-  assert.equal(resolveUploadProjectSetting(undefined, false), false);
 });
 
 test('unavailable or malformed settings abort instead of becoming false', () => {
@@ -47,45 +43,6 @@ test('unavailable or malformed settings abort instead of becoming false', () => 
       error => error.code === 'SETTINGS_UNAVAILABLE',
     );
   }
-});
-
-test('privacy config accepts only JSON booleans', () => {
-  assert.equal(resolveOptionalBoolean(undefined, 'uploadProject'), undefined);
-  assert.equal(resolveOptionalBoolean(true, 'uploadProject'), true);
-  assert.equal(resolveOptionalBoolean(false, 'uploadProject'), false);
-  assert.throws(
-    () => resolveOptionalBoolean('false', 'uploadProject'),
-    error => error.code === 'INVALID_CONFIG',
-  );
-});
-
-test('hostname privacy uses a stable opaque id without reading the system hostname', () => {
-  const config = {
-    hostname: 'secret-workstation',
-    uploadHostname: false,
-  };
-  let hostnameReads = 0;
-  const first = resolveSyncHostname(config, {
-    systemHostname: () => {
-      hostnameReads++;
-      return 'must-not-be-read';
-    },
-    createDeviceId: () => 'device-0011223344556677',
-  });
-  const second = resolveSyncHostname(config, {
-    systemHostname: () => {
-      hostnameReads++;
-      return 'must-not-be-read';
-    },
-    createDeviceId: () => 'device-8899aabbccddeeff',
-  });
-
-  assert.equal(first.hostname, 'device-0011223344556677');
-  assert.equal(first.previousHostname, 'secret-workstation');
-  assert.equal(first.changed, true);
-  assert.equal(second.hostname, first.hostname);
-  assert.equal(second.changed, false);
-  assert.equal(hostnameReads, 0);
 });
 
 test('cached project-upload settings are scoped to the confirming API', () => {
@@ -264,103 +221,6 @@ test('a successful batch is persisted before a later batch fails', async () => {
       { phase: 'first', buckets: 1 },
       { phase: 'retry', buckets: 1 },
     ]);
-  } finally {
-    rmSync(root, { recursive: true, force: true });
-  }
-});
-
-test('local privacy controls sanitize every network hostname and project field', async () => {
-  const root = mkdtempSync(join(tmpdir(), 'vibe-usage-network-privacy-'));
-  const configDir = join(root, 'config');
-  const stateDir = join(root, 'state');
-  const homeDir = join(root, 'home');
-  mkdirSync(configDir, { recursive: true });
-  mkdirSync(homeDir, { recursive: true });
-
-  let settingsRequests = 0;
-  let received;
-  try {
-    await withServer((req, res) => {
-      if (req.method === 'GET' && req.url === '/api/usage/settings') {
-        settingsRequests++;
-        res.writeHead(500).end();
-        return;
-      }
-      if (req.method === 'POST' && req.url === '/api/usage/ingest') {
-        const chunks = [];
-        req.on('data', chunk => chunks.push(chunk));
-        req.on('end', () => {
-          const compressed = Buffer.concat(chunks);
-          const body = req.headers['content-encoding'] === 'gzip'
-            ? gunzipSync(compressed)
-            : compressed;
-          received = JSON.parse(body.toString('utf8'));
-          res.writeHead(200, { 'content-type': 'application/json' });
-          res.end(JSON.stringify({ ingested: 1, sessions: 1 }));
-        });
-        return;
-      }
-      res.writeHead(404).end();
-    }, async apiUrl => {
-      writeFileSync(join(configDir, 'config.json'), JSON.stringify({
-        apiKey: 'vbu_privacy_test',
-        apiUrl,
-        hostname: 'employee-secret-mac',
-        uploadProject: false,
-        uploadHostname: false,
-        deviceId: 'device-0011223344556677',
-      }));
-      const env = {
-        ...process.env,
-        HOME: homeDir,
-        VIBE_USAGE_DEV: '0',
-        VIBE_USAGE_CONFIG_DIR: configDir,
-        VIBE_USAGE_STATE_DIR: stateDir,
-      };
-      const command = `
-        import { parsers } from './src/parsers/index.js';
-        for (const source of Object.keys(parsers)) delete parsers[source];
-        parsers['privacy-test'] = async () => ({
-          buckets: [{
-            source: 'privacy-test',
-            model: 'model',
-            project: 'customer-secret-project',
-            bucketStart: '2026-08-25T00:00:00.000Z',
-            inputTokens: 10,
-            outputTokens: 2,
-            cachedInputTokens: 0,
-            reasoningOutputTokens: 0,
-            totalTokens: 12,
-          }],
-          sessions: [{
-            source: 'privacy-test',
-            project: 'customer-secret-project',
-            sessionHash: 'session-hash',
-            firstMessageAt: '2026-08-25T00:00:00.000Z',
-            lastMessageAt: '2026-08-25T00:01:00.000Z',
-            durationSeconds: 60,
-            activeSeconds: 30,
-            messageCount: 2,
-            userMessageCount: 1,
-            userPromptHours: [0, 1],
-          }],
-        });
-        const { runSync } = await import('./src/sync.js');
-        await runSync({ throws: true, quiet: true });
-      `;
-      await execFileAsync(process.execPath, ['--input-type=module', '-e', command], {
-        cwd: process.cwd(),
-        env,
-      });
-    });
-
-    assert.equal(settingsRequests, 0);
-    assert.equal(received.buckets[0].project, 'unknown');
-    assert.equal(received.buckets[0].hostname, 'device-0011223344556677');
-    assert.equal(received.sessions[0].project, 'unknown');
-    assert.equal(received.sessions[0].hostname, 'device-0011223344556677');
-    assert.equal(received.client.hostname, 'device-0011223344556677');
-    assert.doesNotMatch(JSON.stringify(received), /employee-secret-mac|customer-secret-project/);
   } finally {
     rmSync(root, { recursive: true, force: true });
   }

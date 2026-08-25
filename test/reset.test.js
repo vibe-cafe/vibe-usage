@@ -64,22 +64,6 @@ test('reset --local deletes using the persisted hostname, not os.hostname()', as
   assert.equal(calls.resynced, 1);
 });
 
-test('reset --local targets the anonymous identity when hostname upload is disabled', async () => {
-  seed();
-  saveConfig({
-    apiKey: 'vbu_test',
-    hostname: 'persisted-host',
-    uploadHostname: false,
-    deviceId: 'device-0011223344556677',
-  });
-  const { calls, deps } = makeDeps();
-  await runReset(['--local'], deps);
-
-  assert.equal(calls.deleted.length, 1);
-  assert.deepEqual(calls.deleted[0].opts, { hostname: 'device-0011223344556677' });
-  assert.equal(calls.resynced, 1);
-});
-
 test('legacy reset --host remains a host-only alias', async () => {
   seed();
   const { calls, deps } = makeDeps();

@@ -1,7 +1,8 @@
 import { createInterface } from 'node:readline';
-import { loadConfig, saveConfig } from './config.js';
+import { hostname as getHostname } from 'node:os';
+import { loadConfig } from './config.js';
 import { deleteAllData } from './api.js';
-import { resolveSyncHostname, runSync } from './sync.js';
+import { runSync } from './sync.js';
 import { clearState } from './state.js';
 import { success, failure, arrow, link, dim } from './output.js';
 
@@ -33,18 +34,10 @@ export async function runReset(args = [], deps = {}) {
     process.exit(1);
   }
 
-  // Target the exact privacy-safe identity sync.js uploads under. This keeps
-  // `reset --local` aligned with both the stable configured hostname and the
-  // anonymous per-install device id used when hostname upload is disabled.
-  let hostIdentity;
-  try {
-    hostIdentity = resolveSyncHostname(config);
-    if (hostIdentity.changed) saveConfig(config);
-  } catch (err) {
-    console.error(failure(err.message));
-    process.exit(1);
-  }
-  const currentHost = hostIdentity.hostname;
+  // Target the hostname persisted at init — the same one sync.js uploads
+  // under. A fresh os.hostname() can have drifted since (macOS mDNS adds -2
+  // suffixes), which would delete zero rows, or another machine's rows.
+  const currentHost = config.hostname || getHostname().replace(/\.local$/, '');
   const apiUrl = config.apiUrl || 'https://vibecafe.ai';
 
   if (hostOnly) {

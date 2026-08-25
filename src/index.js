@@ -24,8 +24,6 @@ async function showStatus() {
     if (config.codexExtraHome) {
       console.log(`  Extra Codex Home: ${config.codexExtraHome}`);
     }
-    console.log(`  Project names: ${config.uploadProject === false ? 'hidden locally' : 'server setting'}`);
-    console.log(`  Device name: ${config.uploadHostname === false ? 'anonymous device id' : 'uploaded'}`);
   }
 
   console.log('\n  Detected tools:');
@@ -50,15 +48,7 @@ async function showStatus() {
   console.log();
 }
 
-const BOOLEAN_CONFIG_KEYS = new Set(['uploadProject', 'uploadHostname']);
-const VALID_CONFIG_KEYS = [
-  'apiKey',
-  'apiUrl',
-  'hostname',
-  'uploadProject',
-  'uploadHostname',
-  'codexExtraHome',
-];
+const VALID_CONFIG_KEYS = ['apiKey', 'apiUrl', 'hostname', 'codexExtraHome'];
 
 function handleConfig(args) {
   const sub = args[0];
@@ -90,14 +80,6 @@ function handleConfig(args) {
         console.error(`Unknown config key: ${key}`);
         console.error(`Valid keys: ${VALID_CONFIG_KEYS.join(', ')}`);
         process.exit(1);
-      }
-      if (BOOLEAN_CONFIG_KEYS.has(key)) {
-        const normalized = value.toLowerCase();
-        if (normalized !== 'true' && normalized !== 'false') {
-          console.error(`${key} must be true or false.`);
-          process.exit(1);
-        }
-        value = normalized === 'true';
       }
       if (key === 'codexExtraHome' && value !== '') {
         const validation = validateExtraCodexHome(value);
@@ -251,8 +233,6 @@ export async function run(rawArgs) {
     npx @vibe-cafe/vibe-usage config get <key>   Get a config value
     npx @vibe-cafe/vibe-usage config set <key> <value>  Set a config value
     npx @vibe-cafe/vibe-usage config set codexExtraHome <path>  Persist another Codex Home
-    npx @vibe-cafe/vibe-usage config set uploadProject false  Never upload project names
-    npx @vibe-cafe/vibe-usage config set uploadHostname false  Replace the device name with an anonymous id
     npx @vibe-cafe/vibe-usage help         Show this help
 `);
       break;

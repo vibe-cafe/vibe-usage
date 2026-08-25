@@ -118,29 +118,6 @@ test('config set rejects an invalid non-empty codexExtraHome', () => {
   }
 });
 
-test('config set stores privacy controls as booleans and rejects ambiguous values', () => {
-  const root = mkdtempSync(join(tmpdir(), 'vibe-usage-cli-config-privacy-'));
-  const env = { VIBE_USAGE_CONFIG_DIR: root };
-  try {
-    for (const [key, value] of [
-      ['uploadProject', 'false'],
-      ['uploadHostname', 'true'],
-    ]) {
-      const result = runWithEnv(['config', 'set', key, value], env);
-      assert.equal(result.status, 0, result.stderr);
-    }
-    const config = JSON.parse(readFileSync(join(root, 'config.json'), 'utf8'));
-    assert.equal(config.uploadProject, false);
-    assert.equal(config.uploadHostname, true);
-
-    const invalid = runWithEnv(['config', 'set', 'uploadHostname', 'no'], env);
-    assert.equal(invalid.status, 1);
-    assert.match(invalid.stderr, /must be true or false/);
-  } finally {
-    rmSync(root, { recursive: true, force: true });
-  }
-});
-
 test('daemon service commands require manual persistence instead of ignoring a temporary home', () => {
   const root = mkdtempSync(join(tmpdir(), 'vibe-usage-cli-daemon-codex-'));
   const extraHome = join(root, 'extra-codex');

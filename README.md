@@ -8,10 +8,10 @@ Track your AI coding tool token usage and sync to [vibecafe.ai](https://vibecafe
 npx @vibe-cafe/vibe-usage
 ```
 
-That's it. On first setup, the CLI asks whether project names and the device name may leave the machine (both default to **No**), then opens [vibecafe.ai/usage/device](https://vibecafe.ai/usage/device) in your browser. Sign in, confirm the verification code shown in your terminal, click 「确认链接」, and the CLI receives an API key automatically.
+That's it. The CLI opens [vibecafe.ai/usage/device](https://vibecafe.ai/usage/device) in your browser; sign in, confirm the verification code shown in your terminal, click 「确认链接」, and the CLI receives an API key automatically.
 
 After approval, it will:
-1. Save your API key and local privacy choices to `~/.vibe-usage/config.json`
+1. Save your API key to `~/.vibe-usage/config.json`
 2. Detect installed AI coding tools
 3. Run an initial sync of your usage data
 4. Prompt you to enable the background daemon for continuous syncing (recommended)
@@ -32,8 +32,6 @@ npx @vibe-cafe/vibe-usage init         # Re-run setup via browser login
 npx @vibe-cafe/vibe-usage init --manual-key <vbu_...>   # Skip browser, use pre-issued key (CI/headless)
 npx @vibe-cafe/vibe-usage sync         # Manual sync
 npx @vibe-cafe/vibe-usage sync --extra-codex-home /path/to/.codex  # Add another Codex Home for this run only
-npx @vibe-cafe/vibe-usage config set uploadProject false   # Never upload project names
-npx @vibe-cafe/vibe-usage config set uploadHostname false  # Use an opaque per-install device id
 npx @vibe-cafe/vibe-usage summary       # Print last 7 days as markdown (cost / tokens / by model / by project)
 npx @vibe-cafe/vibe-usage summary --days N  # Same, over the last N days (1-90)
 npx @vibe-cafe/vibe-usage daemon       # Continuous sync (every 30m, foreground)
@@ -157,40 +155,10 @@ Config stored at `~/.vibe-usage/config.json` (dev: `config.dev.json`).
 |-----|-------------|
 | `apiKey` | Your API key (starts with `vbu_`) |
 | `apiUrl` | Server URL (default: `https://vibecafe.ai`) |
-| `hostname` | Stable device name or user-chosen alias; stays local when `uploadHostname=false` |
-| `uploadProject` | Local project-name control. `false` always wins over the Web setting |
-| `uploadHostname` | Local device-name control. `false` replaces the name at the final network boundary |
-| `deviceId` | Generated opaque per-install identity used when `uploadHostname=false` |
+| `hostname` | Stable device name for usage tracking (set at init, reused across syncs) |
 | `codexExtraHome` | Optional additional Codex Home scanned together with `$CODEX_HOME` / `~/.codex` |
 
-New setups default both local upload controls to `false`. Existing configs without
-these keys retain their previous behavior until you choose a value: the Web
-project-name setting remains authoritative, and the configured device name is
-uploaded.
-
-```bash
-# Local false cannot be overridden by a later Web setting.
-npx @vibe-cafe/vibe-usage config set uploadProject false
-
-# Replaces the device name in buckets, sessions, and sync metadata with a
-# persistent random id such as device-0011223344556677.
-npx @vibe-cafe/vibe-usage config set uploadHostname false
-```
-
-The sanitization happens after every parser and before hashing or HTTP
-serialization. `cursor-cloud` remains a fixed, non-identifying sentinel so
-Cursor account exports still deduplicate across computers.
-
-These controls prevent future transmissions; they do not silently delete data
-already stored in the cloud. To remove previously uploaded identifiers, run
-`vibe-usage reset` after enabling both controls. A full reset deletes the
-account's existing usage before re-uploading the logs available on this
-computer, so coordinate first if the account syncs multiple computers.
-
-When device-name upload is enabled, `hostname` is captured once during `init`
-and reused for all future syncs. This prevents macOS mDNS hostname changes
-(for example, `MacBook-Pro` → `MacBook-Pro-2`) from creating duplicate device
-entries. It can also be set to a non-identifying alias:
+The `hostname` is captured once during `init` and reused for all future syncs. This prevents macOS mDNS hostname changes (e.g., `MacBook-Pro` → `MacBook-Pro-2`) from creating duplicate device entries. To change it manually:
 
 ```bash
 npx @vibe-cafe/vibe-usage config set hostname my-device-name
