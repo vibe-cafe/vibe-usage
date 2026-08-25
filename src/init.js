@@ -1,9 +1,9 @@
 import { createInterface } from 'node:readline';
 import { execFile } from 'node:child_process';
-import { hostname as osHostname, platform } from 'node:os';
+import { platform } from 'node:os';
 import { loadConfig, saveConfig } from './config.js';
 import { ingest, requestDeviceCode, pollDeviceCode } from './api.js';
-import { runSync } from './sync.js';
+import { resolveOptionalBoolean, resolveSyncHostname, runSync } from './sync.js';
 import { detectInstalledTools } from './tools.js';
 import { bigHeader, success, failure, warn, arrow, link, dim, divider } from './output.js';
 
@@ -30,6 +30,14 @@ function isDaemonPlatform() {
   return process.platform === 'linux' || process.platform === 'darwin';
 }
 
+async function resolvePrivacyChoice(existingValue, key, question) {
+  const configured = resolveOptionalBoolean(existingValue, key);
+  if (configured !== undefined) return configured;
+  if (!process.stdin.isTTY) return false;
+  const answer = (await prompt(question)).toLowerCase();
+  return answer === 'y' || answer === 'yes';
+}
+
 export async function runInit(options = {}) {
   const { apiKey: providedKey, codexExtraHome } = options;
 
@@ -51,7 +59,31 @@ export async function runInit(options = {}) {
   }
 
   const apiUrl = process.env.VIBE_USAGE_API_URL || 'https://vibecafe.ai';
-  const host = existing?.hostname || osHostname().replace(/\.local$/, '');
+  let uploadProject;
+  let uploadHostname;
+  let draftConfig;
+  let host;
+  try {
+    uploadProject = await resolvePrivacyChoice(
+      existing?.uploadProject,
+      'uploadProject',
+      '上传项目名以查看按项目统计？项目名可能包含客户或内部代号。 [y/N] ',
+    );
+    uploadHostname = await resolvePrivacyChoice(
+      existing?.uploadHostname,
+      'uploadHostname',
+      '上传设备名以区分电脑？选择否将使用匿名设备 ID。 [y/N] ',
+    );
+    draftConfig = {
+      ...(existing || {}),
+      uploadProject,
+      uploadHostname,
+    };
+    host = resolveSyncHostname(draftConfig).hostname;
+  } catch (err) {
+    console.error(failure(err.message));
+    process.exit(1);
+  }
 
   let apiKey;
   if (providedKey) {
@@ -77,10 +109,9 @@ export async function runInit(options = {}) {
   }
 
   const config = {
+    ...draftConfig,
     apiKey,
     apiUrl,
-    hostname: host,
-    ...(existing?.codexExtraHome ? { codexExtraHome: existing.codexExtraHome } : {}),
   };
   saveConfig(config);
 

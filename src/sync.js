@@ -1,4 +1,5 @@
 import { hostname as osHostname } from 'node:os';
+import { randomBytes } from 'node:crypto';
 import { loadConfig, saveConfig } from './config.js';
 import {
   loadState, saveState, pruneState,
@@ -14,13 +15,83 @@ import { success, failure, warn, arrow, link, dim } from './output.js';
 const BATCH_SIZE = 100;
 const SESSION_BATCH_SIZE = 500;
 
+const ANONYMOUS_DEVICE_ID_PATTERN = /^device-[0-9a-f]{16}$/;
+const SHARED_HOSTNAME_SENTINELS = new Set(['cursor-cloud']);
+
+export function resolveOptionalBoolean(value, key) {
+  if (value === undefined) return undefined;
+  if (typeof value === 'boolean') return value;
+  const error = new Error(`配置 ${key} 必须是 true 或 false。`);
+  error.code = 'INVALID_CONFIG';
+  throw error;
+}
+
+export function resolveSyncHostname(config, {
+  systemHostname = () => osHostname().replace(/\.local$/, ''),
+  createDeviceId = () => `device-${randomBytes(8).toString('hex')}`,
+} = {}) {
+  const uploadHostname = resolveOptionalBoolean(config.uploadHostname, 'uploadHostname') ?? true;
+  const previousHostname = typeof config.hostname === 'string' && config.hostname.trim()
+    ? config.hostname.trim()
+    : undefined;
+
+  if (!uploadHostname) {
+    const existingDeviceId = typeof config.deviceId === 'string'
+      ? config.deviceId.trim().toLowerCase()
+      : '';
+    const hostname = ANONYMOUS_DEVICE_ID_PATTERN.test(existingDeviceId)
+      ? existingDeviceId
+      : createDeviceId();
+    const changed = config.deviceId !== hostname;
+    if (changed) config.deviceId = hostname;
+    return { hostname, previousHostname, uploadHostname, changed };
+  }
+
+  const hostname = previousHostname || systemHostname();
+  const changed = config.hostname !== hostname;
+  if (changed) config.hostname = hostname;
+  return { hostname, previousHostname, uploadHostname, changed };
+}
+
+export function applyHostnamePrivacy(records, hostname, uploadHostname) {
+  for (const record of records) {
+    if (uploadHostname) {
+      if (!record.hostname) record.hostname = hostname;
+    } else if (!SHARED_HOSTNAME_SENTINELS.has(record.hostname)) {
+      record.hostname = hostname;
+    }
+  }
+}
+
+// A hostname privacy toggle changes the server bucket key. Carry unchanged
+// local state across that key change so enabling privacy does not re-upload
+// all historical buckets beside their older server rows. Changed buckets still
+// upload under the anonymous id; `reset` remains the explicit way to remove
+// identifiers that were uploaded before the local control was enabled.
+export function migrateHiddenHostnameState(state, buckets, previousHostname, hostname) {
+  if (!previousHostname || previousHostname === hostname) return false;
+  let changed = false;
+  for (const bucket of buckets) {
+    if (bucket.hostname !== hostname) continue;
+    const oldKey = bucketKey({ ...bucket, hostname: previousHostname });
+    const newKey = bucketKey(bucket);
+    const currentHash = bucketHash(bucket);
+    if (state.buckets[oldKey] !== currentHash) continue;
+    if (!(newKey in state.buckets)) state.buckets[newKey] = currentHash;
+    delete state.buckets[oldKey];
+    changed = true;
+  }
+  return changed;
+}
+
 function formatBytes(bytes) {
   if (bytes < 1024) return `${bytes}B`;
   if (bytes < 1024 * 1024) return `${(bytes / 1024).toFixed(1)}KB`;
   return `${(bytes / (1024 * 1024)).toFixed(1)}MB`;
 }
 
-export function resolveUploadProjectSetting(settings) {
+export function resolveUploadProjectSetting(settings, localSetting) {
+  if (localSetting === false) return false;
   if (typeof settings?.uploadProject !== 'boolean') {
     const error = new Error('SETTINGS_UNAVAILABLE');
     error.code = 'SETTINGS_UNAVAILABLE';
@@ -90,6 +161,18 @@ export async function runSync({
     saveConfig(config);
   }
 
+  let localUploadProject;
+  let hostIdentity;
+  try {
+    localUploadProject = resolveOptionalBoolean(config.uploadProject, 'uploadProject');
+    hostIdentity = resolveSyncHostname(config);
+    if (hostIdentity.changed) saveConfig(config);
+  } catch (err) {
+    console.error(failure(err.message));
+    if (throws) throw err;
+    process.exit(1);
+  }
+
   // Privacy is a required input, not an optional hint. If the settings API is
   // unavailable, treating it as `false` changes every project-bearing item's
   // incremental identity to `unknown` and can trigger a full-history upload.
@@ -97,36 +180,45 @@ export async function runSync({
   // no-op: no data upload and no state mutation.
   const apiUrl = config.apiUrl || 'https://vibecafe.ai';
   let uploadProject;
-  try {
-    const settings = await fetchSettings(apiUrl, config.apiKey);
-    uploadProject = resolveUploadProjectSetting(settings);
-    // Scope the cached privacy choice to the server that returned it. Reusing
-    // the value after `apiUrl` changes could expose project names to a
-    // different server during its first settings outage.
-    if (
-      config.lastUploadProject !== uploadProject
-      || config.lastUploadProjectApiUrl !== apiUrl
-    ) {
-      config.lastUploadProject = uploadProject;
-      config.lastUploadProjectApiUrl = apiUrl;
-      saveConfig(config);
-    }
-  } catch (err) {
-    if (err.message === 'UNAUTHORIZED') {
-      console.error(failure('API Key 无效，请运行 `npx @vibe-cafe/vibe-usage init` 重新配置。'));
-      if (throws) throw err;
-      process.exit(1);
-    }
-    // Settings endpoint unreachable (not auth): degrade to the last confirmed
-    // choice for this same server rather than hard-aborting every upload.
-    const cachedUploadProject = resolveCachedUploadProjectSetting(config, apiUrl);
-    if (typeof cachedUploadProject === 'boolean') {
-      uploadProject = cachedUploadProject;
-      if (!quiet) console.log(warn('设置接口不可用，沿用上次的项目名设置。'));
-    } else {
-      console.error(failure('暂时无法读取上传设置，本次同步已安全取消（未上传数据）。请稍后重试。'));
-      if (throws) throw err;
-      process.exit(1);
+  if (localUploadProject === false) {
+    // A local deny is authoritative and needs no server round trip. This is
+    // both fail-closed and usable when the settings endpoint is unavailable.
+    uploadProject = false;
+  } else {
+    try {
+      const settings = await fetchSettings(apiUrl, config.apiKey);
+      uploadProject = resolveUploadProjectSetting(settings, localUploadProject);
+      // Scope the cached privacy choice to the server that returned it. Reusing
+      // the value after `apiUrl` changes could expose project names to a
+      // different server during its first settings outage.
+      if (
+        config.lastUploadProject !== uploadProject
+        || config.lastUploadProjectApiUrl !== apiUrl
+      ) {
+        config.lastUploadProject = uploadProject;
+        config.lastUploadProjectApiUrl = apiUrl;
+        saveConfig(config);
+      }
+    } catch (err) {
+      if (err.message === 'UNAUTHORIZED') {
+        console.error(failure('API Key 无效，请运行 `npx @vibe-cafe/vibe-usage init` 重新配置。'));
+        if (throws) throw err;
+        process.exit(1);
+      }
+      // Settings endpoint unreachable (not auth): degrade to the last confirmed
+      // choice for this same server rather than hard-aborting every upload.
+      const cachedUploadProject = resolveCachedUploadProjectSetting(config, apiUrl);
+      if (typeof cachedUploadProject === 'boolean') {
+        uploadProject = resolveUploadProjectSetting(
+          { uploadProject: cachedUploadProject },
+          localUploadProject,
+        );
+        if (!quiet) console.log(warn('设置接口不可用，沿用上次的项目名设置。'));
+      } else {
+        console.error(failure('暂时无法读取上传设置，本次同步已安全取消（未上传数据）。请稍后重试。'));
+        if (throws) throw err;
+        process.exit(1);
+      }
     }
   }
 
@@ -221,23 +313,24 @@ export async function runSync({
     }
   }
 
-  let host = config.hostname;
-  if (!host) {
-    host = osHostname().replace(/\.local$/, '');
-    config.hostname = host;
-    saveConfig(config);
-  }
-  // Cloud-sourced parsers (e.g. cursor) pre-set their own hostname sentinel so
-  // the same account data isn't stored as separate rows per machine.
-  for (const b of allBuckets) if (!b.hostname) b.hostname = host;
-  for (const s of allSessions) if (!s.hostname) s.hostname = host;
+  const host = hostIdentity.hostname;
+  // Cloud-backed parsers use explicit non-identifying sentinels (currently
+  // `cursor-cloud`) so the same account data deduplicates across computers.
+  // Every other hostname is assigned here, at the final network boundary.
+  applyHostnamePrivacy(allBuckets, host, hostIdentity.uploadHostname);
+  applyHostnamePrivacy(allSessions, host, hostIdentity.uploadHostname);
 
   if (!quiet) {
     if (uploadProject) {
-      console.log(dim('  项目名: 上传（可在 Web 设置中关闭）'));
+      console.log(dim('  项目名: 上传（本机或 Web 设置均可关闭）'));
     } else {
       console.log(dim('  项目名: 已隐藏'));
     }
+    console.log(dim(
+      hostIdentity.uploadHostname
+        ? '  设备名: 上传'
+        : `  设备名: 已替换为匿名 ID (${host})`,
+    ));
   }
   if (!uploadProject) {
     for (const b of allBuckets) b.project = 'unknown';
@@ -253,6 +346,13 @@ export async function runSync({
   // Missing/corrupt state.json => empty maps => one-time full upload, then
   // incremental forever after.
   const state = loadState();
+  const migratedHostnameState = !hostIdentity.uploadHostname
+    && migrateHiddenHostnameState(
+      state,
+      allBuckets,
+      hostIdentity.previousHostname,
+      host,
+    );
   const changedBuckets = [];
   const changedSessions = [];
   const liveBucketKeys = new Set();
@@ -290,7 +390,7 @@ export async function runSync({
   const before = Object.keys(state.buckets).length + Object.keys(state.sessions).length;
   pruneState(state, liveBucketKeys, liveSessionKeys, okSources);
   const pruned = before - (Object.keys(state.buckets).length + Object.keys(state.sessions).length);
-  if (pruned > 0) saveState(state);
+  if (pruned > 0 || migratedHostnameState) saveState(state);
 
   if (changedBuckets.length === 0 && changedSessions.length === 0) {
     if (!quiet) console.log(dim('无新增数据。'));
