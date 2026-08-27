@@ -81,6 +81,93 @@ export function aggregateToBuckets(entries) {
 }
 
 /**
+ * Incremental session aggregation for parsers whose event stream is already
+ * chronological. `extractSessions()` below keeps the sorting fallback for
+ * parsers that emit mixed or out-of-order sessions.
+ */
+export function createSessionAccumulator() {
+  return {
+    ordered: true,
+    first: null,
+    last: null,
+    lastTimestampMs: null,
+    activeSeconds: 0,
+    turnStartMs: null,
+    turnEndMs: null,
+    waitingForFirstResponse: false,
+    messageCount: 0,
+    userMessageCount: 0,
+    userPromptHours: new Array(24).fill(0),
+  };
+}
+
+function commitTurn(accumulator) {
+  const { turnStartMs, turnEndMs } = accumulator;
+  if (turnStartMs !== null && turnEndMs !== null && turnEndMs > turnStartMs) {
+    accumulator.activeSeconds += Math.round((turnEndMs - turnStartMs) / 1000);
+  }
+}
+
+export function accumulateSessionEvent(accumulator, event) {
+  const timestampMs = event.timestamp.getTime();
+  if (accumulator.lastTimestampMs !== null && timestampMs < accumulator.lastTimestampMs) {
+    accumulator.ordered = false;
+  }
+  if (accumulator.first === null) accumulator.first = event;
+  accumulator.last = event;
+  accumulator.lastTimestampMs = timestampMs;
+  accumulator.messageCount++;
+
+  if (event.role === 'user') {
+    commitTurn(accumulator);
+    accumulator.turnStartMs = null;
+    accumulator.turnEndMs = null;
+    accumulator.waitingForFirstResponse = true;
+    accumulator.userMessageCount++;
+    accumulator.userPromptHours[event.timestamp.getUTCHours()]++;
+  } else if (accumulator.waitingForFirstResponse) {
+    accumulator.turnStartMs = timestampMs;
+    accumulator.turnEndMs = timestampMs;
+    accumulator.waitingForFirstResponse = false;
+  } else if (accumulator.turnStartMs !== null) {
+    accumulator.turnEndMs = timestampMs;
+  }
+}
+
+export function sessionAccumulatorIsOrdered(accumulator) {
+  return accumulator.ordered;
+}
+
+export function finalizeSessionAccumulator(accumulator, sessionId, projectOverride) {
+  if (accumulator.first === null || accumulator.last === null) return null;
+  if (!accumulator.ordered) {
+    throw new TypeError('Session accumulator received out-of-order events');
+  }
+
+  let activeSeconds = accumulator.activeSeconds;
+  const { turnStartMs, turnEndMs } = accumulator;
+  if (turnStartMs !== null && turnEndMs !== null && turnEndMs > turnStartMs) {
+    activeSeconds += Math.round((turnEndMs - turnStartMs) / 1000);
+  }
+
+  const first = accumulator.first;
+  const last = accumulator.last;
+  const sessionHash = createHash('sha256').update(sessionId).digest('hex').slice(0, 16);
+  return {
+    source: first.source,
+    project: projectOverride || first.project || 'unknown',
+    sessionHash,
+    firstMessageAt: first.timestamp.toISOString(),
+    lastMessageAt: last.timestamp.toISOString(),
+    durationSeconds: Math.round((last.timestamp - first.timestamp) / 1000),
+    activeSeconds,
+    messageCount: accumulator.messageCount,
+    userMessageCount: accumulator.userMessageCount,
+    userPromptHours: accumulator.userPromptHours,
+  };
+}
+
+/**
  * Extract session metadata from timing events.
  * Each event: { sessionId, source, project, timestamp: Date, role: 'user'|'assistant' }
  *
@@ -90,68 +177,18 @@ export function aggregateToBuckets(entries) {
  */
 export function extractSessions(events) {
   const groups = new Map();
-  for (const e of events) {
-    if (!groups.has(e.sessionId)) groups.set(e.sessionId, []);
-    groups.get(e.sessionId).push(e);
+  for (const event of events) {
+    if (!groups.has(event.sessionId)) groups.set(event.sessionId, []);
+    groups.get(event.sessionId).push(event);
   }
 
   const sessions = [];
   for (const [sessionId, sessionEvents] of groups) {
     sessionEvents.sort((a, b) => a.timestamp - b.timestamp);
-
-    const first = sessionEvents[0];
-    const last = sessionEvents[sessionEvents.length - 1];
-    const durationSeconds = Math.round((last.timestamp - first.timestamp) / 1000);
-
-    let activeSeconds = 0;
-    let turnStart = null;
-    let turnEnd = null;
-    let waitingForFirstResponse = false;
-
-    for (const event of sessionEvents) {
-      if (event.role === 'user') {
-        if (turnStart !== null && turnEnd !== null && turnEnd > turnStart) {
-          activeSeconds += Math.round((turnEnd - turnStart) / 1000);
-        }
-        turnStart = null;
-        turnEnd = null;
-        waitingForFirstResponse = true;
-      } else if (waitingForFirstResponse) {
-        turnStart = event.timestamp;
-        turnEnd = event.timestamp;
-        waitingForFirstResponse = false;
-      } else if (turnStart !== null) {
-        turnEnd = event.timestamp;
-      }
-    }
-    if (turnStart !== null && turnEnd !== null && turnEnd > turnStart) {
-      activeSeconds += Math.round((turnEnd - turnStart) / 1000);
-    }
-
-    const userPromptHours = new Array(24).fill(0);
-    let userMessageCount = 0;
-    for (const event of sessionEvents) {
-      if (event.role === 'user') {
-        userMessageCount++;
-        userPromptHours[event.timestamp.getUTCHours()]++;
-      }
-    }
-
-    const sessionHash = createHash('sha256').update(sessionId).digest('hex').slice(0, 16);
-
-    sessions.push({
-      source: first.source,
-      project: first.project || 'unknown',
-      sessionHash,
-      firstMessageAt: first.timestamp.toISOString(),
-      lastMessageAt: last.timestamp.toISOString(),
-      durationSeconds,
-      activeSeconds,
-      messageCount: sessionEvents.length,
-      userMessageCount,
-      userPromptHours,
-    });
+    const accumulator = createSessionAccumulator();
+    for (const event of sessionEvents) accumulateSessionEvent(accumulator, event);
+    const session = finalizeSessionAccumulator(accumulator, sessionId);
+    if (session) sessions.push(session);
   }
-
   return sessions;
 }

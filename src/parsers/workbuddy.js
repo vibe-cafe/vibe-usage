@@ -62,8 +62,11 @@ function findJsonlFiles(dir, ctx) {
   const files = [];
   for (const child of children) {
     const filePath = join(dir, child.name);
-    if (child.isDirectory()) files.push(...findJsonlFiles(filePath, ctx));
-    else if (child.isFile() && child.name.endsWith('.jsonl')) files.push(filePath);
+    if (child.isDirectory()) {
+      for (const nested of findJsonlFiles(filePath, ctx)) files.push(nested);
+    } else if (child.isFile() && child.name.endsWith('.jsonl')) {
+      files.push(filePath);
+    }
   }
   return files;
 }

@@ -1,7 +1,14 @@
 import { createReadStream, readdirSync, statSync } from 'node:fs';
 import { createInterface } from 'node:readline';
 import { join, basename, sep } from 'node:path';
-import { aggregateToBuckets, extractSessions } from './aggregate.js';
+import {
+  accumulateSessionEvent,
+  aggregateToBuckets,
+  createSessionAccumulator,
+  extractSessions,
+  finalizeSessionAccumulator,
+  sessionAccumulatorIsOrdered,
+} from './aggregate.js';
 import { projectFromCwd, toCount } from './fs-utils.js';
 import { getClaudeRoots } from '../claude-roots.js';
 
@@ -28,7 +35,7 @@ function findJsonlFiles(dir, ctx) {
   for (const entry of entries) {
     const fullPath = join(dir, entry.name);
     if (entry.isDirectory()) {
-      results.push(...findJsonlFiles(fullPath, ctx));
+      for (const nested of findJsonlFiles(fullPath, ctx)) results.push(nested);
     } else if (entry.name.endsWith('.jsonl')) {
       results.push(fullPath);
     }
@@ -155,10 +162,46 @@ function timingEvent(obj, sessionId, project) {
     role: obj.type === 'user' ? 'user' : 'assistant',
   };
 }
+async function collectTimingEvents(candidate, projectForObject) {
+  const events = [];
+  await readJsonl(candidate, (obj) => {
+    const event = timingEvent(
+      obj,
+      candidate.sessionId,
+      projectForObject(obj),
+    );
+    if (event) events.push(event);
+  });
+  return events;
+}
+
+async function finalizeCandidateSession(
+  candidate,
+  accumulator,
+  projectForObject,
+  projectOverride,
+) {
+  if (sessionAccumulatorIsOrdered(accumulator)) {
+    return finalizeSessionAccumulator(
+      accumulator,
+      candidate.sessionId,
+      projectOverride,
+    );
+  }
+
+  // JSONL is normally append-ordered. Preserve the old sort semantics for an
+  // unusual copied/rewritten file without retaining every event on the common
+  // path: re-read only that candidate and let extractSessions() sort it.
+  const events = await collectTimingEvents(candidate, projectForObject);
+  return extractSessions(events)[0] || null;
+}
 
 async function scanProjectCandidate(candidate) {
-  const entries = [];
-  const events = [];
+  const usageEntries = {
+    entriesByKey: new Map(),
+    anonymousEntries: [],
+  };
+  const sessionAccumulator = createSessionAccumulator();
   let lastModel = null;
   let sessionProject = candidate.fallbackProject;
   let foundSessionCwd = false;
@@ -171,7 +214,7 @@ async function scanProjectCandidate(candidate) {
       foundSessionCwd = true;
     }
     const event = timingEvent(obj, candidate.sessionId, sessionProject);
-    if (event) events.push(event);
+    if (event) accumulateSessionEvent(sessionAccumulator, event);
 
     if (obj.type !== 'assistant' || !obj.message?.usage || !obj.timestamp) return;
     const timestamp = new Date(obj.timestamp);
@@ -194,7 +237,7 @@ async function scanProjectCandidate(candidate) {
     // inflate the CLI's bucket count with rows the server will discard anyway.
     if (usageScore === 0) return;
 
-    entries.push({
+    mergeUsageEntry(usageEntries, {
       dedupeKey: usageDedupeKey(obj),
       usageScore,
       source: 'claude-code',
@@ -210,22 +253,34 @@ async function scanProjectCandidate(candidate) {
 
   // A cwd can appear after initial metadata/messages. Normalize the completed
   // session in one place so early records receive the same project label.
-  for (const entry of entries) entry.project = sessionProject;
-  for (const event of events) event.project = sessionProject;
-  return { entries, events };
+  for (const entry of usageEntries.anonymousEntries) entry.project = sessionProject;
+  for (const entry of usageEntries.entriesByKey.values()) entry.project = sessionProject;
+  const session = await finalizeCandidateSession(
+    candidate,
+    sessionAccumulator,
+    () => sessionProject,
+    sessionProject,
+  );
+  return { usageEntries, session };
 }
 
 async function scanTranscriptCandidate(candidate) {
-  const events = [];
+  const sessionAccumulator = createSessionAccumulator();
+  const projectForObject = (obj) => projectFromCwd(obj.cwd, 'unknown');
   await readJsonl(candidate, (obj) => {
     const event = timingEvent(
       obj,
       candidate.sessionId,
-      projectFromCwd(obj.cwd, 'unknown'),
+      projectForObject(obj),
     );
-    if (event) events.push(event);
+    if (event) accumulateSessionEvent(sessionAccumulator, event);
   });
-  return { entries: [], events };
+  const session = await finalizeCandidateSession(
+    candidate,
+    sessionAccumulator,
+    projectForObject,
+  );
+  return { session };
 }
 
 async function scanBestCandidate(candidates, scanner, ctx) {
@@ -266,11 +321,21 @@ function mergeUsageEntry(ctx, entry) {
   }
 }
 
+function mergeUsageEntries(target, source) {
+  for (const entry of source.anonymousEntries) mergeUsageEntry(target, entry);
+  for (const entry of source.entriesByKey.values()) mergeUsageEntry(target, entry);
+}
+
+function* iterateUsageEntries(ctx) {
+  for (const entry of ctx.anonymousEntries) yield entry;
+  for (const entry of ctx.entriesByKey.values()) yield entry;
+}
+
 export async function parse() {
   const ctx = {
     entriesByKey: new Map(),
     anonymousEntries: [],
-    sessionEvents: [],
+    sessions: [],
     warnings: [],
     incomplete: false,
   };
@@ -284,25 +349,20 @@ export async function parse() {
     const parsed = await scanBestCandidate(candidates, scanProjectCandidate, ctx);
     if (!parsed) continue;
     projectSessionIds.add(sessionId);
-    ctx.sessionEvents.push(...parsed.events);
-    for (const entry of parsed.entries) mergeUsageEntry(ctx, entry);
+    if (parsed.session) ctx.sessions.push(parsed.session);
+    mergeUsageEntries(ctx, parsed.usageEntries);
   }
 
   const transcriptGroups = collectCandidates(roots, 'transcripts', ctx);
   for (const [sessionId, candidates] of transcriptGroups) {
     if (projectSessionIds.has(sessionId)) continue;
     const parsed = await scanBestCandidate(candidates, scanTranscriptCandidate, ctx);
-    if (parsed) ctx.sessionEvents.push(...parsed.events);
+    if (parsed?.session) ctx.sessions.push(parsed.session);
   }
 
-  const entries = [
-    ...ctx.anonymousEntries,
-    ...ctx.entriesByKey.values(),
-  ].map(({ dedupeKey: _dedupeKey, usageScore: _usageScore, ...entry }) => entry);
-
   return {
-    buckets: aggregateToBuckets(entries),
-    sessions: extractSessions(ctx.sessionEvents),
+    buckets: aggregateToBuckets(iterateUsageEntries(ctx)),
+    sessions: ctx.sessions,
     ...(ctx.incomplete ? { skipped: true } : {}),
     ...(ctx.warnings.length > 0 ? { warnings: ctx.warnings } : {}),
   };

@@ -535,7 +535,7 @@ export async function parse() {
       model.parentSessionId == null ? null : perSession.get(model.parentSessionId);
     const skip = parent ? replaySkipCount(model, parent.model) : 0;
     const { entries: fileEntries, events: fileEvents } = modelToResult(model, skip);
-    entries.push(...fileEntries);
+    for (const entry of fileEntries) entries.push(entry);
     for (const event of fileEvents) {
       if (!eventsBySession.has(event.sessionId)) eventsBySession.set(event.sessionId, []);
       eventsBySession.get(event.sessionId).push(event);
@@ -547,7 +547,7 @@ export async function parse() {
   const events = [];
   for (const sessionEvents of eventsBySession.values()) {
     if (sessionEvents.some((event) => event.role === 'user')) {
-      events.push(...sessionEvents);
+      for (const event of sessionEvents) events.push(event);
     }
   }
 

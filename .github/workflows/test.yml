@@ -12,8 +12,8 @@ jobs:
       matrix:
         os: [ubuntu-latest, macos-latest]
         # 20 = engines floor (sqlite.js falls back to the sqlite3 CLI there),
-        # 22 = first version with built-in node:sqlite.
-        node: [20, 22]
+        # 22 = first version with built-in node:sqlite, 24 = current user runtime.
+        node: [20, 22, 24]
     runs-on: ${{ matrix.os }}
     steps:
       - uses: actions/checkout@v4

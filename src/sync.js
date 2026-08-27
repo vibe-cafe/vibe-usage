@@ -181,8 +181,8 @@ export async function runSync({
     // timeout) to keep daemon logs quiet. Its empty result is not proof that
     // its prior data disappeared, so it must not be pruned this run.
     if (!skipped) okSources.add(source);
-    if (buckets.length > 0) allBuckets.push(...buckets);
-    if (sessions.length > 0) allSessions.push(...sessions);
+    for (const bucket of buckets) allBuckets.push(bucket);
+    for (const session of sessions) allSessions.push(session);
     if (buckets.length > 0 || sessions.length > 0) {
       parserResults.push({ source, buckets: buckets.length, sessions: sessions.length });
     }

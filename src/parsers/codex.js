@@ -44,7 +44,7 @@ function findJsonlFiles(dir) {
     for (const entry of readdirSync(dir, { withFileTypes: true })) {
       const fullPath = join(dir, entry.name);
       if (entry.isDirectory()) {
-        results.push(...findJsonlFiles(fullPath));
+        for (const nested of findJsonlFiles(fullPath)) results.push(nested);
       } else if (entry.name.endsWith('.jsonl')) {
         results.push(fullPath);
       }
@@ -792,7 +792,7 @@ function mergeFileResults(results) {
         reasoningOutputTokens: bucket.reasoningOutputTokens,
       });
     }
-    sessions.push(...(result.sessions || []));
+    for (const session of result.sessions || []) sessions.push(session);
   }
   return { buckets: aggregateToBuckets(entries), sessions };
 }

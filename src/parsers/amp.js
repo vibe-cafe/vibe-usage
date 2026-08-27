@@ -17,7 +17,7 @@ function findThreadFiles(dir) {
     for (const entry of readdirSync(dir, { withFileTypes: true })) {
       const fullPath = join(dir, entry.name);
       if (entry.isDirectory()) {
-        results.push(...findThreadFiles(fullPath));
+        for (const nested of findThreadFiles(fullPath)) results.push(nested);
       } else if (entry.isFile() && entry.name.startsWith('T-') && entry.name.endsWith('.json')) {
         results.push(fullPath);
       }

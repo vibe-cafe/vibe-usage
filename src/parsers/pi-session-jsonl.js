@@ -23,8 +23,11 @@ function findJsonlFiles(dir, includeFile, ctx) {
   const files = [];
   for (const child of children) {
     const filePath = join(dir, child.name);
-    if (child.isDirectory()) files.push(...findJsonlFiles(filePath, includeFile, ctx));
-    else if (child.name.endsWith('.jsonl') && includeFile(filePath)) files.push(filePath);
+    if (child.isDirectory()) {
+      for (const nested of findJsonlFiles(filePath, includeFile, ctx)) files.push(nested);
+    } else if (child.name.endsWith('.jsonl') && includeFile(filePath)) {
+      files.push(filePath);
+    }
   }
   return files;
 }

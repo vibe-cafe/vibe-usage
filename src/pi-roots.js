@@ -63,7 +63,9 @@ export function getOmpSessionDirs() {
   const configName = process.env.PI_CONFIG_DIR?.trim() || '.omp';
   const configRoot = join(homedir(), configName);
   dirs.push(join(configRoot, 'agent', 'sessions'));
-  dirs.push(...profileSessionDirs(join(configRoot, 'profiles'), true));
+  for (const dir of profileSessionDirs(join(configRoot, 'profiles'), true)) {
+    dirs.push(dir);
+  }
 
   const agentOverride = process.env.PI_CODING_AGENT_DIR?.trim();
   if (agentOverride) {
@@ -78,7 +80,9 @@ export function getOmpSessionDirs() {
     if (xdgDataHome) {
       const xdgRoot = join(expandHome(xdgDataHome), 'omp');
       dirs.push(join(xdgRoot, 'sessions'));
-      dirs.push(...profileSessionDirs(join(xdgRoot, 'profiles'), false));
+      for (const dir of profileSessionDirs(join(xdgRoot, 'profiles'), false)) {
+        dirs.push(dir);
+      }
     }
   }
 

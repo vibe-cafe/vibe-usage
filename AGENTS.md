@@ -197,7 +197,7 @@ Codex archived sessions (`codex.js`, `tools.js`):
 ## Development & Testing
 
 ```bash
-# Run the test suite (node:test; CI runs it on Node 20/22 × ubuntu/macos via .github/workflows/test.yml)
+# Run the test suite (node:test; CI runs it on Node 20/22/24 × ubuntu/macos via .github/workflows/test.yml)
 npm test
 
 # Dev mode (separate config, custom API URL)

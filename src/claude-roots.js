@@ -128,7 +128,9 @@ export function getClaudeRoots({ onWarning = () => {} } = {}) {
       // The default/configured roots remain usable if home discovery fails.
     }
 
-    roots.push(...findClaudeDesktopRoots(getClaudeDesktopDataDirs(), onWarning));
+    for (const root of findClaudeDesktopRoots(getClaudeDesktopDataDirs(), onWarning)) {
+      roots.push(root);
+    }
   }
 
   const seen = new Set();

@@ -314,3 +314,51 @@ test('Claude parser still de-duplicates by uuid when the call ids are absent', a
     rmSync(root, { recursive: true, force: true });
   }
 });
+
+test('Claude parser handles a resumed session with 200k timing events', { timeout: 30_000 }, async () => {
+  const root = mkdtempSync(join(tmpdir(), 'vibe-usage-claude-large-session-test-'));
+  const dir = join(root, 'projects', '-Users-dev-long-running');
+  const eventCount = 200_000;
+  try {
+    mkdirSync(dir, { recursive: true });
+    const line = JSON.stringify(record({
+      type: 'user',
+      timestamp: '2026-08-23T10:00:00.000Z',
+      cwd: '/Users/dev/long-running',
+    })) + '\n';
+    writeFileSync(join(dir, 'large-session.jsonl'), line.repeat(eventCount));
+
+    const result = await withClaudeRoots([root], () => parse());
+    assert.deepEqual(result.buckets, []);
+    assert.equal(result.sessions.length, 1);
+    assert.equal(result.sessions[0].messageCount, eventCount);
+    assert.equal(result.sessions[0].userMessageCount, eventCount);
+    assert.equal(result.sessions[0].userPromptHours[10], eventCount);
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test('Claude streaming session rollup preserves out-of-order timestamp semantics', async () => {
+  const root = mkdtempSync(join(tmpdir(), 'vibe-usage-claude-order-test-'));
+  try {
+    writeSession(root, '-Users-dev-proj', 'out-of-order-session', [
+      record({ type: 'assistant', timestamp: '2026-08-23T10:05:00.000Z' }),
+      record({ type: 'user', timestamp: '2026-08-23T10:00:00.000Z' }),
+      record({ type: 'assistant', timestamp: '2026-08-23T10:02:00.000Z' }),
+      record({ type: 'user', timestamp: '2026-08-23T10:10:00.000Z' }),
+    ]);
+
+    const result = await withClaudeRoots([root], () => parse());
+    assert.deepEqual(result.buckets, []);
+    assert.equal(result.sessions.length, 1);
+    assert.equal(result.sessions[0].firstMessageAt, '2026-08-23T10:00:00.000Z');
+    assert.equal(result.sessions[0].lastMessageAt, '2026-08-23T10:10:00.000Z');
+    assert.equal(result.sessions[0].durationSeconds, 600);
+    assert.equal(result.sessions[0].activeSeconds, 180);
+    assert.equal(result.sessions[0].messageCount, 4);
+    assert.equal(result.sessions[0].userMessageCount, 2);
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+});

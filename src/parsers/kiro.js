@@ -326,7 +326,7 @@ export function conversationsToEstimateEntries(conversations) {
     }
   }
   for (const conversation of byId.values()) {
-    entries.push(...conversationToEntries(conversation));
+    for (const entry of conversationToEntries(conversation)) entries.push(entry);
   }
   return entries;
 }
@@ -557,7 +557,7 @@ async function readCliSessionStreamEntries() {
   const entries = [];
   for (const file of files) {
     try {
-      entries.push(...await readCliSessionEntries(dir, file));
+      for (const entry of await readCliSessionEntries(dir, file)) entries.push(entry);
     } catch {
       // skip unreadable / concurrently rotated session
     }
@@ -677,7 +677,7 @@ async function readUsageSnapshots(userPath) {
   const snapshots = [];
   for (const file of files) {
     try {
-      snapshots.push(...await readLogSnapshots(file));
+      for (const snapshot of await readLogSnapshots(file)) snapshots.push(snapshot);
     } catch {
       // skip unreadable / concurrently rotated logs
     }

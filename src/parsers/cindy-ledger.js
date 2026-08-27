@@ -75,9 +75,10 @@ export function readCindyHarnessUsage(agentKind) {
   const rows = [];
   for (const dbPath of dbPaths) {
     try {
-      rows.push(...queryDbJsonSnapshot(dbPath, CINDY_USAGE_SQL, {
+      const dbRows = queryDbJsonSnapshot(dbPath, CINDY_USAGE_SQL, {
         tempPrefix: 'vibe-usage-cindy-',
-      }));
+      });
+      for (const row of dbRows) rows.push(row);
     } catch (error) {
       if (isSqliteUnavailableError(error)) throw sqliteUnavailableError('Cindy');
       // Cindy versions before the daily ledger was introduced have no usage
