@@ -14,6 +14,7 @@ import {
   readDbWorkspaceUri,
   resolveUsageTimestamp,
 } from '../src/parsers/antigravity-db.js';
+import { parse } from '../src/parsers/antigravity.js';
 
 // ── Minimal protobuf encoder (mirrors the wire format the decoder reads) ──
 function varint(n) {
@@ -241,6 +242,72 @@ test('Gemini 3.7 CLI usage without blob createdAt is timestamped from steps.idx'
     const ts = resolveUsageTimestamp(records[0], stepTs);
     assert.equal(ts.getTime(), 1787350732 * 1000);
   } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test('parse merges an explicit Antigravity home without changing the default roots', async (t) => {
+  let DatabaseSync;
+  try {
+    ({ DatabaseSync } = await import('node:sqlite'));
+  } catch {
+    t.skip('node:sqlite is unavailable on this Node version');
+    return;
+  }
+
+  const root = mkdtempSync(join(tmpdir(), 'vibe-usage-antigravity-extra-root-'));
+  const emptyDefault = join(root, 'default-conversations');
+  const extraHome = join(root, 'isolated-home');
+  const conversationsDir = join(extraHome, '.gemini', 'antigravity-cli', 'conversations');
+  mkdirSync(emptyDefault, { recursive: true });
+  mkdirSync(conversationsDir, { recursive: true });
+  const db = new DatabaseSync(join(conversationsDir, 'isolated-cascade.db'));
+  try {
+    db.exec(`
+      CREATE TABLE gen_metadata (idx INTEGER, data BLOB);
+      CREATE TABLE steps (idx INTEGER, metadata BLOB);
+    `);
+    db.prepare('INSERT INTO gen_metadata (idx, data) VALUES (?, ?)').run(1, buildBlob({
+      input: 123, output: 45, cache: 10, thinking: 5,
+      responseId: 'ISOLATED_RESPONSE', seconds: 1783484000,
+      responseModel: 'gemini-default', displayName: 'Gemini Isolated',
+    }));
+    db.prepare('INSERT INTO steps (idx, metadata) VALUES (?, ?)').run(1, buildStep({ source: 4, seconds: 1783484000 }));
+    db.prepare('INSERT INTO steps (idx, metadata) VALUES (?, ?)').run(2, buildStep({ source: 2, seconds: 1783484002 }));
+  } finally {
+    db.close();
+  }
+
+  const previous = process.env.VIBE_USAGE_ANTIGRAVITY_DIRS;
+  process.env.VIBE_USAGE_ANTIGRAVITY_DIRS = emptyDefault;
+  try {
+    const result = await parse({ extraRoots: [extraHome] });
+    assert.equal(result.sessions.length, 1);
+    assert.equal(result.buckets.reduce((sum, bucket) => sum + bucket.inputTokens, 0), 123);
+    assert.equal(result.buckets.reduce((sum, bucket) => sum + bucket.outputTokens, 0), 45);
+    assert.equal(result.buckets.reduce((sum, bucket) => sum + bucket.cachedInputTokens, 0), 10);
+    assert.equal(result.buckets.reduce((sum, bucket) => sum + bucket.reasoningOutputTokens, 0), 5);
+  } finally {
+    if (previous === undefined) delete process.env.VIBE_USAGE_ANTIGRAVITY_DIRS;
+    else process.env.VIBE_USAGE_ANTIGRAVITY_DIRS = previous;
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test('missing configured Antigravity home skips the source to protect upload state', async () => {
+  const root = mkdtempSync(join(tmpdir(), 'vibe-usage-antigravity-missing-'));
+  const emptyDefault = join(root, 'default-conversations');
+  mkdirSync(emptyDefault, { recursive: true });
+  const previous = process.env.VIBE_USAGE_ANTIGRAVITY_DIRS;
+  process.env.VIBE_USAGE_ANTIGRAVITY_DIRS = emptyDefault;
+  try {
+    const result = await parse({ extraRoots: [join(root, 'missing')] });
+    assert.equal(result.skipped, true);
+    assert.deepEqual(result.buckets, []);
+    assert.match(result.warnings[0], /额外根目录不可用/);
+  } finally {
+    if (previous === undefined) delete process.env.VIBE_USAGE_ANTIGRAVITY_DIRS;
+    else process.env.VIBE_USAGE_ANTIGRAVITY_DIRS = previous;
     rmSync(root, { recursive: true, force: true });
   }
 });

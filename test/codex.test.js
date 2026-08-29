@@ -677,6 +677,59 @@ test('missing configured extra Codex home skips the source to protect upload sta
   assert.match(result.warnings[0], /额外 Codex Home/);
 });
 
+test('configured Codex container parses every discovered Multica task home', async () => {
+  const root = mkdtempSync(join(tmpdir(), 'vibe-usage-codex-container-parse-'));
+  const primary = join(root, 'primary');
+  const container = join(root, 'container');
+  const firstHome = join(container, 'workspace-a', 'task-a', 'codex-home');
+  const secondHome = join(container, 'workspace-b', 'task-b', 'codex-home');
+  const timestamp = '2026-07-10T08:00:00.000Z';
+  const writeRollout = (home, id, input) => {
+    const dir = join(home, 'sessions', '2026', '07', '10');
+    mkdirSync(dir, { recursive: true });
+    writeFileSync(join(dir, `${id}.jsonl`), [
+      sessionMeta(timestamp, id),
+      taskStarted(timestamp),
+      tokenCount(timestamp, usage(input, 0, 1, 0), input + 1),
+    ].map(JSON.stringify).join('\n') + '\n');
+  };
+  writeRollout(firstHome, 'isolated-a', 10);
+  writeRollout(secondHome, 'isolated-b', 20);
+
+  const previousHome = process.env.CODEX_HOME;
+  const previousCache = process.env.VIBE_USAGE_CACHE_DIR;
+  process.env.CODEX_HOME = primary;
+  process.env.VIBE_USAGE_CACHE_DIR = join(root, 'cache');
+  try {
+    const result = await parse({ extraRoots: [container] });
+    assert.equal(result.sessions.length, 2);
+    assert.deepEqual(sumBuckets(result.buckets), {
+      input: 30,
+      output: 2,
+      cached: 0,
+      reasoning: 0,
+    });
+  } finally {
+    if (previousHome === undefined) delete process.env.CODEX_HOME;
+    else process.env.CODEX_HOME = previousHome;
+    if (previousCache === undefined) delete process.env.VIBE_USAGE_CACHE_DIR;
+    else process.env.VIBE_USAGE_CACHE_DIR = previousCache;
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test('configured Codex container with no task homes skips the source', async () => {
+  const root = mkdtempSync(join(tmpdir(), 'vibe-usage-codex-empty-container-'));
+  try {
+    const result = await parse({ extraRoots: [root] });
+    assert.equal(result.skipped, true);
+    assert.deepEqual(result.buckets, []);
+    assert.match(result.warnings[0], /额外根目录不可用/);
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
 test('repeated same-id session metadata remains part of the logical session', async () => {
   const t = '2026-07-10T08:00:00.000Z';
   const later = '2026-07-10T09:00:00.000Z';

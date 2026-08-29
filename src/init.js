@@ -81,10 +81,14 @@ export async function runInit(options = {}) {
     apiUrl,
     hostname: host,
     ...(existing?.codexExtraHome ? { codexExtraHome: existing.codexExtraHome } : {}),
+    ...(existing?.extraRoots ? { extraRoots: existing.extraRoots } : {}),
   };
   saveConfig(config);
 
-  const tools = detectInstalledTools({ codexExtraHome: config.codexExtraHome });
+  const tools = detectInstalledTools({
+    codexExtraHome: config.codexExtraHome,
+    extraRoots: config.extraRoots,
+  });
   if (tools.length > 0) {
     console.log(success(`检测到 ${tools.length} 款工具: ${dim(tools.map(t => t.name).join(' · '))}`));
   } else {

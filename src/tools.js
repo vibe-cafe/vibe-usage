@@ -1,9 +1,15 @@
 import { existsSync, readdirSync, statSync } from 'node:fs';
-import { isAbsolute, join, posix, resolve, win32 } from 'node:path';
+import { dirname, isAbsolute, join, posix, resolve, win32 } from 'node:path';
 import { homedir } from 'node:os';
 import { findClaudeCodeDataDirs } from './claude-roots.js';
 import { findCindyDataDirs, getCindyDataRoots } from './cindy-roots.js';
 import { codexSessionDirs, resolveCodexHomes } from './codex-roots.js';
+import {
+  antigravityConversationDirs,
+  discoverCodexHomes,
+  extraRootList,
+  grokSessionsDir,
+} from './extra-roots.js';
 import { findClineDataDirs } from './cline-roots.js';
 import { findCraftDataDirs } from './craft-roots.js';
 import { findOmpDataDirs, findPiDataDirs } from './pi-roots.js';
@@ -106,8 +112,9 @@ function findOpenclawDataDirs() {
 // Codex keeps live sessions in ~/.codex/sessions and moves completed ones to
 // ~/.codex/archived_sessions. Detect Codex if either dir exists, so a user
 // whose sessions have all been archived is still recognized.
-export function findCodexDataDirs(codexExtraHome) {
-  return resolveCodexHomes(codexExtraHome)
+export function findCodexDataDirs(codexExtraHome, extraRoots = []) {
+  const configuredHomes = extraRoots.flatMap(root => discoverCodexHomes(root).homes);
+  return [...new Set([...resolveCodexHomes(codexExtraHome), ...configuredHomes])]
     .flatMap(codexSessionDirs)
     .filter(existsSync);
 }
@@ -154,11 +161,12 @@ export function getMimocodeDbPath(env = process.env) {
   return isAbsolute(env.MIMOCODE_DB) ? env.MIMOCODE_DB : join(dataDir, env.MIMOCODE_DB);
 }
 
-function findAntigravityDataDirs() {
-  return [
+export function findAntigravityDataDirs(extraRoots = []) {
+  return [...new Set([
     join(homedir(), '.gemini', 'antigravity'),
     join(homedir(), '.gemini', 'antigravity-cli'),
-  ].filter(existsSync);
+    ...extraRoots.flatMap(root => antigravityConversationDirs(root).map(dirname)),
+  ])].filter(existsSync);
 }
 
 export function findTraeCliDataDirs() {
@@ -193,10 +201,13 @@ export function getGrokSessionsDir() {
 }
 
 // Detect Grok when sessions/ exists under GROK_HOME (or the test override).
-export function findGrokDataDirs() {
+export function findGrokDataDirs(extraRoots = []) {
   const testDir = process.env.VIBE_USAGE_GROK_SESSIONS?.trim();
   if (testDir) return [testDir].filter(existsSync);
-  return [join(getGrokHome(), 'sessions')].filter(existsSync);
+  return [...new Set([
+    join(getGrokHome(), 'sessions'),
+    ...extraRoots.map(grokSessionsDir),
+  ])].filter(existsSync);
 }
 
 export function getDimAgentDbPath() {
@@ -240,13 +251,15 @@ export const TOOLS = [
     name: 'Codex CLI',
     id: 'codex',
     dataDir: join(homedir(), '.codex', 'sessions'),
-    detectDataDirs: ({ codexExtraHome } = {}) => findCodexDataDirs(codexExtraHome),
+    detectDataDirs: ({ codexExtraHome, extraRoots } = {}) => (
+      findCodexDataDirs(codexExtraHome, extraRootList(extraRoots?.codex))
+    ),
   },
   {
     name: 'Grok',
     id: 'grok',
     dataDir: join(homedir(), '.grok', 'sessions'),
-    detectDataDirs: findGrokDataDirs,
+    detectDataDirs: ({ extraRoots } = {}) => findGrokDataDirs(extraRootList(extraRoots?.grok)),
   },
   {
     name: 'GitHub Copilot CLI',
@@ -337,7 +350,9 @@ export const TOOLS = [
     name: 'Antigravity',
     id: 'antigravity',
     dataDir: join(homedir(), '.gemini', 'antigravity'),
-    detectDataDirs: findAntigravityDataDirs,
+    detectDataDirs: ({ extraRoots } = {}) => (
+      findAntigravityDataDirs(extraRootList(extraRoots?.antigravity))
+    ),
   },
   {
     name: 'Trae CLI',

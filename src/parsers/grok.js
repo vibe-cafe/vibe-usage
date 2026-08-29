@@ -1,7 +1,8 @@
-import { createReadStream, existsSync, readdirSync, readFileSync } from 'node:fs';
+import { createReadStream, existsSync, readdirSync, readFileSync, statSync } from 'node:fs';
 import { createInterface } from 'node:readline';
 import { join } from 'node:path';
 import { findGrokDataDirs, getGrokSessionsDir } from '../tools.js';
+import { grokSessionsDir, normalizeExtraRoot } from '../extra-roots.js';
 import { aggregateToBuckets, extractSessions } from './aggregate.js';
 import { readJsonSafe, projectFromPath } from './fs-utils.js';
 
@@ -194,8 +195,23 @@ function listSessionDirs(sessionsDir) {
  * Parse all Grok sessions under the configured sessions root(s).
  * @returns {Promise<{ buckets: object[], sessions: object[] }>}
  */
-export async function parse() {
-  const sessionRoots = findGrokDataDirs();
+export async function parse({ extraRoots = [] } = {}) {
+  if (!process.env.VIBE_USAGE_GROK_SESSIONS?.trim()) {
+    for (const root of extraRoots) {
+      const sessionsDir = grokSessionsDir(root);
+      try {
+        if (!statSync(sessionsDir).isDirectory()) throw new Error('not a directory');
+      } catch {
+        return {
+          buckets: [],
+          sessions: [],
+          skipped: true,
+          warnings: [`grok: 额外根目录不可用，已跳过本次 Grok 同步: ${normalizeExtraRoot(root)}`],
+        };
+      }
+    }
+  }
+  const sessionRoots = findGrokDataDirs(extraRoots);
   // findGrokDataDirs returns sessions dirs; also allow empty → try default once
   const roots = sessionRoots.length > 0 ? sessionRoots : [getGrokSessionsDir()].filter(existsSync);
   if (roots.length === 0) return { buckets: [], sessions: [] };
@@ -203,35 +219,89 @@ export async function parse() {
   const entries = [];
   const sessionEvents = [];
 
+  const candidates = [];
   for (const sessionsDir of roots) {
-    for (const { sessionId, sessionPath, projectFallback } of listSessionDirs(sessionsDir)) {
-      const summary = readJsonSafe(join(sessionPath, 'summary.json')) || {};
-      const cwd = summary.info?.cwd || summary.git_root_dir || null;
-      const project = cwd ? projectFromPath(cwd) : projectFallback;
-      const fallbackModel = summary.current_model_id || 'unknown';
+    for (const session of listSessionDirs(sessionsDir)) {
+      candidates.push(session);
+    }
+  }
 
-      // Prefer updates.jsonl turn_completed for exact usage + message timings.
-      let sawUserOrAssistant = false;
-      await forEachJsonlLine(join(sessionPath, 'updates.jsonl'), (obj) => {
-        const update = obj?.params?.update;
-        if (!update || typeof update !== 'object') return;
-
-        const kind = update.sessionUpdate;
-        const timestamp = toDate(obj.timestamp);
-
-        if (kind === 'turn_completed' && timestamp) {
-          emitTurnUsage(entries, {
-            usage: update.usage,
-            project,
-            timestamp,
-            fallbackModel,
-          });
+  let sessionsToParse = candidates;
+  if (roots.length > 1) {
+    const selectedSessions = new Map();
+    for (const session of candidates) {
+      const fileSize = (name) => {
+        try {
+          return statSync(join(session.sessionPath, name)).size;
+        } catch {
+          return 0;
         }
+      };
+      const score = [fileSize('updates.jsonl'), fileSize('events.jsonl'), fileSize('summary.json')];
+      const previous = selectedSessions.get(session.sessionId);
+      const moreComplete = !previous || score.some((value, index) => (
+        value !== previous.score[index] && value > previous.score[index]
+        && score.slice(0, index).every((prior, priorIndex) => prior === previous.score[priorIndex])
+      ));
+      if (moreComplete) selectedSessions.set(session.sessionId, { ...session, score });
+    }
+    sessionsToParse = [...selectedSessions.values()];
+  }
 
+  for (const { sessionId, sessionPath, projectFallback } of sessionsToParse) {
+    const summary = readJsonSafe(join(sessionPath, 'summary.json')) || {};
+    const cwd = summary.info?.cwd || summary.git_root_dir || null;
+    const project = cwd ? projectFromPath(cwd) : projectFallback;
+    const fallbackModel = summary.current_model_id || 'unknown';
+
+    // Prefer updates.jsonl turn_completed for exact usage + message timings.
+    let sawUserOrAssistant = false;
+    await forEachJsonlLine(join(sessionPath, 'updates.jsonl'), (obj) => {
+      const update = obj?.params?.update;
+      if (!update || typeof update !== 'object') return;
+
+      const kind = update.sessionUpdate;
+      const timestamp = toDate(obj.timestamp);
+
+      if (kind === 'turn_completed' && timestamp) {
+        emitTurnUsage(entries, {
+          usage: update.usage,
+          project,
+          timestamp,
+          fallbackModel,
+        });
+      }
+
+      if (!timestamp) return;
+
+      if (kind === 'user_message_chunk') {
+        sawUserOrAssistant = true;
+        sessionEvents.push({
+          sessionId,
+          source: SOURCE,
+          project,
+          timestamp,
+          role: 'user',
+        });
+      } else if (kind === 'agent_message_chunk' || kind === 'turn_completed') {
+        sawUserOrAssistant = true;
+        sessionEvents.push({
+          sessionId,
+          source: SOURCE,
+          project,
+          timestamp,
+          role: 'assistant',
+        });
+      }
+    });
+
+    // Fallback timing from events.jsonl when updates lack message chunks
+    // (short/aborted sessions, older builds).
+    if (!sawUserOrAssistant) {
+      await forEachJsonlLine(join(sessionPath, 'events.jsonl'), (obj) => {
+        const timestamp = toDate(obj.ts || obj.timestamp);
         if (!timestamp) return;
-
-        if (kind === 'user_message_chunk') {
-          sawUserOrAssistant = true;
+        if (obj.type === 'turn_started') {
           sessionEvents.push({
             sessionId,
             source: SOURCE,
@@ -239,8 +309,7 @@ export async function parse() {
             timestamp,
             role: 'user',
           });
-        } else if (kind === 'agent_message_chunk' || kind === 'turn_completed') {
-          sawUserOrAssistant = true;
+        } else if (obj.type === 'turn_ended' || obj.type === 'first_token') {
           sessionEvents.push({
             sessionId,
             source: SOURCE,
@@ -250,56 +319,30 @@ export async function parse() {
           });
         }
       });
+    }
 
-      // Fallback timing from events.jsonl when updates lack message chunks
-      // (short/aborted sessions, older builds).
-      if (!sawUserOrAssistant) {
-        await forEachJsonlLine(join(sessionPath, 'events.jsonl'), (obj) => {
-          const timestamp = toDate(obj.ts || obj.timestamp);
-          if (!timestamp) return;
-          if (obj.type === 'turn_started') {
-            sessionEvents.push({
-              sessionId,
-              source: SOURCE,
-              project,
-              timestamp,
-              role: 'user',
-            });
-          } else if (obj.type === 'turn_ended' || obj.type === 'first_token') {
-            sessionEvents.push({
-              sessionId,
-              source: SOURCE,
-              project,
-              timestamp,
-              role: 'assistant',
-            });
-          }
+    // Last-resort session envelope from summary timestamps so a session with
+    // no parseable turns still appears once usage lands later.
+    if (sessionEvents.every((e) => e.sessionId !== sessionId)) {
+      const created = toDate(summary.created_at || summary.info?.created_at);
+      const updated = toDate(summary.updated_at || summary.last_active_at);
+      if (created) {
+        sessionEvents.push({
+          sessionId,
+          source: SOURCE,
+          project,
+          timestamp: created,
+          role: 'user',
         });
       }
-
-      // Last-resort session envelope from summary timestamps so a session with
-      // no parseable turns still appears once usage lands later.
-      if (sessionEvents.every((e) => e.sessionId !== sessionId)) {
-        const created = toDate(summary.created_at || summary.info?.created_at);
-        const updated = toDate(summary.updated_at || summary.last_active_at);
-        if (created) {
-          sessionEvents.push({
-            sessionId,
-            source: SOURCE,
-            project,
-            timestamp: created,
-            role: 'user',
-          });
-        }
-        if (updated && (!created || updated.getTime() !== created.getTime())) {
-          sessionEvents.push({
-            sessionId,
-            source: SOURCE,
-            project,
-            timestamp: updated,
-            role: 'assistant',
-          });
-        }
+      if (updated && (!created || updated.getTime() !== created.getTime())) {
+        sessionEvents.push({
+          sessionId,
+          source: SOURCE,
+          project,
+          timestamp: updated,
+          role: 'assistant',
+        });
       }
     }
   }

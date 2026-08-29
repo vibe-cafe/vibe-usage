@@ -17,6 +17,7 @@ import {
   resolveCodexHomes,
   validateExtraCodexHome,
 } from '../codex-roots.js';
+import { discoverCodexHomes } from '../extra-roots.js';
 import {
   codexCacheEnabled,
   fileSignature,
@@ -797,7 +798,7 @@ function mergeFileResults(results) {
   return { buckets: aggregateToBuckets(entries), sessions };
 }
 
-async function parseNativeCodex({ codexExtraHome } = {}) {
+async function parseNativeCodex({ codexExtraHome, extraRoots = [] } = {}) {
   if (codexExtraHome?.trim()) {
     const validation = validateExtraCodexHome(codexExtraHome);
     if (!validation.ok) {
@@ -810,7 +811,24 @@ async function parseNativeCodex({ codexExtraHome } = {}) {
     }
   }
 
-  const codexHomes = resolveCodexHomes(codexExtraHome);
+  const configuredHomes = [];
+  for (const root of extraRoots) {
+    const discovered = discoverCodexHomes(root);
+    if (!discovered.readable || discovered.homes.length === 0) {
+      return {
+        buckets: [],
+        sessions: [],
+        skipped: true,
+        warnings: [`codex: 额外根目录不可用，已跳过本次 Codex 同步: ${discovered.root}`],
+      };
+    }
+    configuredHomes.push(...discovered.homes);
+  }
+
+  const codexHomes = [...new Set([
+    ...resolveCodexHomes(codexExtraHome),
+    ...configuredHomes,
+  ])];
   const dirs = codexHomes.flatMap(codexHome => (
     codexSessionDirs(codexHome).map(dir => ({ codexHome, dir }))
   ));

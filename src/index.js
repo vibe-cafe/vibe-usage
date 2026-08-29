@@ -2,6 +2,12 @@ import { loadConfig, saveConfig, getConfigPath } from './config.js';
 import { detectInstalledTools, TOOLS } from './tools.js';
 import { existsSync } from 'node:fs';
 import { validateExtraCodexHome } from './codex-roots.js';
+import {
+  EXTRA_ROOT_SOURCES,
+  extraRootList,
+  normalizeExtraRoot,
+  validateExtraRoot,
+} from './extra-roots.js';
 import { failure, smallHeader } from './output.js';
 
 function printSmallHeader() {
@@ -24,10 +30,18 @@ async function showStatus() {
     if (config.codexExtraHome) {
       console.log(`  Extra Codex Home: ${config.codexExtraHome}`);
     }
+    for (const source of EXTRA_ROOT_SOURCES) {
+      for (const root of extraRootList(config.extraRoots?.[source])) {
+        console.log(`  Extra ${source} Root: ${root}`);
+      }
+    }
   }
 
   console.log('\n  Detected tools:');
-  const toolOptions = { codexExtraHome: config?.codexExtraHome };
+  const toolOptions = {
+    codexExtraHome: config?.codexExtraHome,
+    extraRoots: config?.extraRoots,
+  };
   const detected = detectInstalledTools(toolOptions);
   if (detected.length === 0) {
     console.log('    (none)\n');
@@ -103,9 +117,59 @@ function handleConfig(args) {
       }
       break;
     }
+    case 'add-root': {
+      const source = args[1];
+      const value = args[2];
+      if (!source || value === undefined) {
+        console.error('Usage: vibe-usage config add-root <codex|grok|antigravity> <path>');
+        process.exit(1);
+      }
+      const validation = validateExtraRoot(source, value);
+      if (!validation.ok) {
+        console.error(failure(`额外 ${source} 根目录无效（${validation.reason}）: ${validation.path}`));
+        process.exit(1);
+      }
+      const config = loadConfig() || {};
+      if (!config.extraRoots || typeof config.extraRoots !== 'object' || Array.isArray(config.extraRoots)) {
+        config.extraRoots = {};
+      }
+      const roots = extraRootList(config.extraRoots[source]);
+      config.extraRoots[source] = [...new Set([...roots, validation.path])];
+      saveConfig(config);
+      break;
+    }
+    case 'remove-root': {
+      const source = args[1];
+      const value = args[2];
+      if (!EXTRA_ROOT_SOURCES.includes(source) || value === undefined) {
+        console.error('Usage: vibe-usage config remove-root <codex|grok|antigravity> <path>');
+        process.exit(1);
+      }
+      const config = loadConfig() || {};
+      const path = normalizeExtraRoot(value);
+      const roots = extraRootList(config.extraRoots?.[source])
+        .filter(root => normalizeExtraRoot(root) !== path);
+      if (config.extraRoots && typeof config.extraRoots === 'object' && !Array.isArray(config.extraRoots)) {
+        if (roots.length > 0) config.extraRoots[source] = roots;
+        else delete config.extraRoots[source];
+        if (Object.keys(config.extraRoots).length === 0) delete config.extraRoots;
+      }
+      saveConfig(config);
+      break;
+    }
+    case 'roots': {
+      const config = loadConfig();
+      const roots = config?.extraRoots;
+      console.log(JSON.stringify(
+        roots && typeof roots === 'object' && !Array.isArray(roots) ? roots : {},
+        null,
+        2,
+      ));
+      break;
+    }
     default:
       console.error(`Unknown config subcommand: ${sub || '(none)'}`);
-      console.error('Usage: vibe-usage config <get|set|show>');
+      console.error('Usage: vibe-usage config <get|set|show|add-root|remove-root|roots>');
       process.exit(1);
   }
 }
@@ -233,6 +297,9 @@ export async function run(rawArgs) {
     npx @vibe-cafe/vibe-usage config get <key>   Get a config value
     npx @vibe-cafe/vibe-usage config set <key> <value>  Set a config value
     npx @vibe-cafe/vibe-usage config set codexExtraHome <path>  Persist another Codex Home
+    npx @vibe-cafe/vibe-usage config add-root <tool> <path>  Add a Codex, Grok, or Antigravity data root
+    npx @vibe-cafe/vibe-usage config remove-root <tool> <path>  Remove an added data root
+    npx @vibe-cafe/vibe-usage config roots  Show added data roots as JSON
     npx @vibe-cafe/vibe-usage help         Show this help
 `);
       break;

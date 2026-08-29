@@ -54,8 +54,8 @@ npx @vibe-cafe/vibe-usage status       # Show config & detected tools
 | Alma | Electron app-data `alma/chat_threads.db` (macOS: `~/Library/Application Support/alma/chat_threads.db`; fixture/relocation override: `VIBE_USAGE_ALMA_DB`). Reads the `usage_records` ledger plus workspace names without selecting chat bodies, message metadata, provider credentials, or full workspace paths. Provider-prefixed model identifiers are normalized to their final model segment. Cache writes are included in input usage. The ledger contains assistant responses only, so Alma emits token buckets without session timing. |
 | Claude Code + Claude Desktop Code/Cowork | Claude Code data in `~/.claude/projects/` (tokens + sessions) and `~/.claude/transcripts/` (sessions only), plus Claude Desktop Cowork's per-session `.claude/projects/` directories. Also scans `$CLAUDE_CONFIG_DIR` and data-bearing `~/.claude-*` profiles. All variants use the existing `claude-code` source; the parser selects the most complete copy of each session so shared/copied transcripts are not counted twice. Logs are streamed and cache creation tokens are included in input usage. |
 | Cindy | Per-owner SQLite ledgers in the two regional Electron user-data roots: macOS `~/Library/Application Support/{CindyGlobal,Cindy}/cindy-*.db`, Windows `%APPDATA%\{CindyGlobal,Cindy}\cindy-*.db`, Linux `${XDG_CONFIG_HOME:-~/.config}/{CindyGlobal,Cindy}/cindy-*.db` (fixture/relocation override: `VIBE_USAGE_CINDY_DIRS`). Cindy-launched Claude Code already writes ordinary `~/.claude` transcripts, so it remains attributed to **Claude Code** and is not read again. Cindy's otherwise-private Codex and Pi daily/model ledger rows augment the existing **Codex** and **pi** sources. Currency rows are summed and cache creation joins input; chat messages, credentials, costs, and owner ids are never selected. The ledger adds token buckets only, without project or session timing. |
-| Codex CLI | `$CODEX_HOME/sessions/` and `$CODEX_HOME/archived_sessions/` (default `~/.codex`), plus an optional temporary `--extra-codex-home` or manually persisted `codexExtraHome`; a versioned local index avoids re-reading unchanged rollouts and reads only safe append tails for ordinary sessions, while fork/sub-agent replay matching, duplicate suppression, and live/archive/cross-root deduplication retain their existing semantics |
-| Grok | `$GROK_HOME/sessions/<encoded-cwd>/<session-id>/` (default `~/.grok`); token usage from `updates.jsonl` `turn_completed.usage` (per-model `modelUsage`, cache reads, reasoning); project from `summary.json` cwd; honors `GROK_HOME` |
+| Codex CLI | `$CODEX_HOME/sessions/` and `$CODEX_HOME/archived_sessions/` (default `~/.codex`), plus an optional temporary `--extra-codex-home`, legacy `codexExtraHome`, or explicitly added Codex/Multica roots; a versioned local index avoids re-reading unchanged rollouts and reads only safe append tails for ordinary sessions, while fork/sub-agent replay matching, duplicate suppression, and live/archive/cross-root deduplication retain their existing semantics |
+| Grok | `$GROK_HOME/sessions/<encoded-cwd>/<session-id>/` (default `~/.grok`) plus explicitly added Grok Homes; token usage from `updates.jsonl` `turn_completed.usage` (per-model `modelUsage`, cache reads, reasoning); project from `summary.json` cwd; copied sessions keep the more complete local record |
 | GitHub Copilot CLI | `~/.copilot/session-state/*/events.jsonl` |
 | CraftAgent | `~/.craft-agent/workspaces/*/sessions/*/.pi-sessions/*.jsonl`; honors `$CRAFT_AGENT_DIR` / `$CRAFTAGENT_DIR`; cache writes are included in input usage |
 | Cursor | `state.vscdb` (SQLite, reads `cursorAuth/accessToken`, fetches CSV from `cursor.com`); cloud data is stamped with a fixed `cursor-cloud` hostname so multi-machine setups don't double-count |
@@ -76,7 +76,7 @@ npx @vibe-cafe/vibe-usage status       # Show config & detected tools
 | Cline | Standalone `~/.cline/` plus `<host>/User/globalStorage/saoudrizwan.claude-dev/` across VSCode-fork hosts; migrated copies are deduplicated and empty leftover extension stores no longer count as installed |
 | Roo Code | `<host>/User/globalStorage/rooveterinaryinc.roo-cline/{tasks/_index.json,tasks/<id>/{history_item,ui_messages}.json}` (walks all VSCode-fork hosts) |
 | Trae CLI | macOS: `~/Library/Caches/trae-cli/sessions/`; Windows: `%LOCALAPPDATA%/trae-cli/cache/sessions/`; Linux: `~/.cache/trae-cli/sessions/` (CLI telemetry only; Trae IDE/Trae Work chats are not supported). Token usage is summed per unique LLM call (`model.stream.eino`, plus `model.generate` failovers); nested duplicate spans that share a session `traceID` are not max-merged. `traces.jsonl` / `events.jsonl` are streamed line-by-line so a multi-hundred-MB events file cannot hit Node's string-length limit. |
-| Antigravity | App 2.0 `~/.gemini/antigravity/conversations/*.db` and `agy` CLI `~/.gemini/antigravity-cli/conversations/*.db` are parsed offline (tokens, real model display name when present, project, sessions). Gemini 3.7 CLI blobs omit `chatStartMetadata.createdAt` and `modelDisplayName`; usage still comes from `gen_metadata`, timestamps fall back to `steps.metadata` at the same idx, and the model name falls back to `responseModel`. Legacy App `.pb` history falls back to Connect RPC while the language server is running |
+| Antigravity | App 2.0 `~/.gemini/antigravity/conversations/*.db` and `agy` CLI `~/.gemini/antigravity-cli/conversations/*.db`, plus the same paths below explicitly added alternate Homes, are parsed offline (tokens, real model display name when present, project, sessions). Gemini 3.7 CLI blobs omit `chatStartMetadata.createdAt` and `modelDisplayName`; usage still comes from `gen_metadata`, timestamps fall back to `steps.metadata` at the same idx, and the model name falls back to `responseModel`. Legacy App `.pb` history falls back to Connect RPC only for the primary App store while the language server is running |
 | WorkBuddy | Current releases: `~/.workbuddy-ai/projects/**/*.jsonl`; legacy releases: `~/.workbuddy/projects/**/*.jsonl` (fixture/relocation override: `VIBE_USAGE_WORKBUDDY_DIRS`). Reads usage-bearing completed assistant and `function_call` records, using the routed model identifier exposed as `providerData.requestModelId`. Splits cache reads and reasoning from inclusive input/output totals, deduplicates copied record IDs, and extracts local session timing without uploading message content. |
 | ZCode | `~/.zcode/cli/db/db.sqlite` (SQLite; reads the `message` table for per-message tokens, model, and project `cwd`/`root`, joined to `session.directory`) |
 
@@ -157,12 +157,32 @@ Config stored at `~/.vibe-usage/config.json` (dev: `config.dev.json`).
 | `apiUrl` | Server URL (default: `https://vibecafe.ai`) |
 | `hostname` | Stable device name for usage tracking (set at init, reused across syncs) |
 | `codexExtraHome` | Optional additional Codex Home scanned together with `$CODEX_HOME` / `~/.codex` |
+| `extraRoots` | Tool-specific additional roots managed by the commands below; currently supports `codex`, `grok`, and `antigravity` |
 
 The `hostname` is captured once during `init` and reused for all future syncs. This prevents macOS mDNS hostname changes (e.g., `MacBook-Pro` → `MacBook-Pro-2`) from creating duplicate device entries. To change it manually:
 
 ```bash
 npx @vibe-cafe/vibe-usage config set hostname my-device-name
 ```
+
+Add isolated runtime data without editing JSON by hand:
+
+```bash
+# Codex accepts either one direct Codex Home or a Multica container whose
+# <workspace>/<task>/codex-home directories are at most three levels below it.
+npx @vibe-cafe/vibe-usage config add-root codex /path/to/multica-container
+
+# Grok expects a Grok Home containing sessions/.
+npx @vibe-cafe/vibe-usage config add-root grok /path/to/grok-home
+
+# Antigravity expects an alternate HOME containing .gemini/antigravity*/conversations/.
+npx @vibe-cafe/vibe-usage config add-root antigravity /path/to/alternate-home
+
+npx @vibe-cafe/vibe-usage config roots
+npx @vibe-cafe/vibe-usage config remove-root grok /path/to/grok-home
+```
+
+Default roots are always scanned and existing `codexExtraHome` configurations remain valid. Additional roots are only scanned after they are explicitly added. If a configured root later becomes unavailable, that tool is skipped for the current sync so its incremental upload state is not pruned.
 
 ## Daemon Mode
 
