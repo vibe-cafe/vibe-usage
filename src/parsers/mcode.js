@@ -25,16 +25,24 @@ const TOKEN_COLUMNS = [
   'cache_write_tokens',
 ];
 
-const TOKEN_SQL = `SELECT ${TOKEN_COLUMNS.join(', ')}
-FROM local_runtime_token_usage`;
-
 // `local_runtime_sessions` carries both `workspace_dir` (per-session scratch
 // dir, always present) and `project_workspace_dir` (the project root when one
 // is known). We pick the project column first, then the workspace, then
 // fall back to "unknown". Never read `record_json` / `extra_data_json`.
 const SESSION_COLUMNS = ['session_id', 'workspace_dir', 'project_workspace_dir'];
-const SESSION_SQL = `SELECT ${SESSION_COLUMNS.join(', ')}
-FROM local_runtime_sessions`;
+
+// Keep token rows and their project metadata in one SQLite statement. Separate
+// reads can observe different WAL snapshots while mcode is writing, causing a
+// token row to be uploaded once as "unknown" and again under its real project.
+const USAGE_SQL = `
+  SELECT
+    ${TOKEN_COLUMNS.map(column => `token.${column}`).join(', ')},
+    session.workspace_dir,
+    session.project_workspace_dir
+  FROM local_runtime_token_usage AS token
+  LEFT JOIN local_runtime_sessions AS session
+    ON session.session_id = token.session_id
+`;
 
 /**
  * Resolve the mcode runtime-state SQLite database. Mirrors the precedence used
@@ -100,29 +108,10 @@ export async function parse() {
     return { buckets: [], sessions: [], skipped: true };
   }
 
-  // Build the session_id → project map first; tokens reference the same
-  // session_id and we want a stable project for every row, including the
-  // ones whose session has been pruned from local_runtime_sessions.
-  const projectBySession = new Map();
+  // Read tokens and session project metadata from one statement/snapshot.
+  let usageRows;
   try {
-    const sessionRows = queryDbJsonSnapshotOnLock(dbPath, SESSION_SQL, {
-      tempPrefix: 'vibe-usage-mcode',
-    });
-    for (const row of sessionRows) {
-      const sid = row.session_id != null ? String(row.session_id) : '';
-      if (!sid) continue;
-      const projectPath = row.project_workspace_dir || row.workspace_dir;
-      const project = projectPath ? projectFromPath(String(projectPath)) : 'unknown';
-      projectBySession.set(sid, project);
-    }
-  } catch (err) {
-    if (isSqliteUnavailableError(err)) throw sqliteUnavailableError('mcode');
-    return { buckets: [], sessions: [], skipped: true };
-  }
-
-  let tokenRows;
-  try {
-    tokenRows = queryDbJsonSnapshotOnLock(dbPath, TOKEN_SQL, {
+    usageRows = queryDbJsonSnapshotOnLock(dbPath, USAGE_SQL, {
       tempPrefix: 'vibe-usage-mcode',
     });
   } catch (err) {
@@ -132,7 +121,7 @@ export async function parse() {
 
   const entries = [];
 
-  for (const row of tokenRows) {
+  for (const row of usageRows) {
     const sessionId = row.session_id != null ? String(row.session_id) : '';
     if (!sessionId) continue;
     const ts = tsToDate(row.ts);
@@ -162,7 +151,8 @@ export async function parse() {
       continue;
     }
 
-    const project = projectBySession.get(sessionId) || 'unknown';
+    const projectPath = row.project_workspace_dir || row.workspace_dir;
+    const project = projectPath ? projectFromPath(String(projectPath)) : 'unknown';
     const model = row.model != null && String(row.model).trim()
       ? String(row.model).trim()
       : 'unknown';
@@ -177,7 +167,6 @@ export async function parse() {
       cachedInputTokens,
       reasoningOutputTokens,
     });
-
   }
 
   return {

@@ -40,3 +40,18 @@ test('launchd service preserves and XML-escapes MiMoCode database path overrides
   assert.match(plist, /<key>XDG_DATA_HOME<\/key>/);
   assert.match(plist, /<string>\/tmp\/xdg&amp;a&lt;b&gt;<\/string>/);
 });
+
+test('systemd service preserves mcode home override', () => {
+  const unit = generateSystemdUnit('/usr/bin/node', '/opt/vibe-usage/bin.js', undefined, {
+    MCODE_HOME: '/tmp/mcode "home"',
+  });
+  assert.match(unit, /Environment="MCODE_HOME=\/tmp\/mcode \\"home\\""/);
+});
+
+test('launchd service preserves and XML-escapes mcode home override', () => {
+  const plist = generateLaunchdPlist('/usr/bin/node', '/opt/vibe-usage/bin.js', undefined, {
+    MCODE_HOME: '/tmp/mcode&a<b>',
+  });
+  assert.match(plist, /<key>MCODE_HOME<\/key>/);
+  assert.match(plist, /<string>\/tmp\/mcode&amp;a&lt;b&gt;<\/string>/);
+});

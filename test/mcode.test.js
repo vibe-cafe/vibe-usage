@@ -109,4 +109,5 @@ test('mcode query contains only the approved columns', async () => {
   const source = await import('node:fs/promises').then(fs => fs.readFile(new URL('../src/parsers/mcode.js', import.meta.url), 'utf8'));
   assert.doesNotMatch(source, /SELECT\s+\*/i);
   assert.doesNotMatch(source, /SELECT[^;]*(?:raw|data_json|record_json|extra_data_json)/is);
+  assert.match(source, /LEFT JOIN local_runtime_sessions/);
 });

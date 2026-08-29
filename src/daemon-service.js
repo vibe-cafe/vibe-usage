@@ -56,7 +56,7 @@ function escapeXml(value) {
     .replace(/'/g, '&apos;');
 }
 
-const PRESERVED_SERVICE_ENV = ['MIMOCODE_HOME', 'MIMOCODE_DB', 'XDG_DATA_HOME'];
+const PRESERVED_SERVICE_ENV = ['MCODE_HOME', 'MIMOCODE_HOME', 'MIMOCODE_DB', 'XDG_DATA_HOME'];
 
 function serviceEnvironment(claudeConfigDir, env) {
   const values = {
