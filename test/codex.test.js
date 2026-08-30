@@ -617,7 +617,7 @@ test('cumulative-only fallback remains session-wide across model switches', asyn
   assert.deepEqual(sumBuckets(buckets), { input: 150, output: 20, cached: 0, reasoning: 0 });
 });
 
-test('Codex service tier and plan metadata distinguish subscription from API usage', async () => {
+test('Codex service tier changes model key while account plan is ignored', async () => {
   const t = '2026-09-01T08:00:00.000Z';
   const { buckets } = await parseFixture({
     'rollout-subscription.jsonl': [
@@ -635,7 +635,7 @@ test('Codex service tier and plan metadata distinguish subscription from API usa
     ],
     'rollout-api.jsonl': [
       sessionMeta(t, 'api-1'),
-      threadSettingsApplied(t, 'gpt-5.6-sol', 'priority'),
+      threadSettingsApplied(t, 'gpt-5.6-sol', 'fast'),
       tokenCountInfo(t, {
         total_token_usage: usage(30, 0, 3, 0),
         last_token_usage: usage(30, 0, 3, 0),
@@ -648,13 +648,12 @@ test('Codex service tier and plan metadata distinguish subscription from API usa
     { input: bucket.inputTokens, output: bucket.outputTokens },
   ]));
   assert.deepEqual(byModel, {
-    'gpt-5.6-sol-fast#billing=subscription': { input: 100, output: 10 },
-    'gpt-5.6-sol#billing=subscription': { input: 50, output: 5 },
-    'gpt-5.6-sol-priority#billing=api': { input: 30, output: 3 },
+    'gpt-5.6-sol-fast': { input: 130, output: 13 },
+    'gpt-5.6-sol': { input: 50, output: 5 },
   });
 });
 
-test('pre-cutover Codex usage keeps its legacy model key to prevent re-upload duplicates', async () => {
+test('pre-cutover Codex service tier keeps its legacy model key to prevent re-upload duplicates', async () => {
   const t = '2026-08-30T23:59:00.000Z';
   const { buckets } = await parseFixture({
     'rollout-legacy.jsonl': [
@@ -889,7 +888,7 @@ test('an appended rollout invalidates only that file while unchanged files stay 
   }
 });
 
-test('appended Codex usage retains model tier and billing state from the tail cache', async () => {
+test('appended Codex usage retains model tier state from the tail cache', async () => {
   const t = '2026-09-01T08:00:00.000Z';
   const fixture = createPersistentFixture({
     'rollout-a.jsonl': [
@@ -915,7 +914,7 @@ test('appended Codex usage retains model tier and billing state from the tail ca
       const changed = await parse();
       assert.equal(changed.cache.tailHits, 1);
       assert.equal(changed.buckets.length, 1);
-      assert.equal(changed.buckets[0].model, 'gpt-5.6-sol-fast#billing=subscription');
+      assert.equal(changed.buckets[0].model, 'gpt-5.6-sol-fast');
       assert.deepEqual(sumBuckets(changed.buckets), { input: 15, output: 3, cached: 0, reasoning: 0 });
     });
   } finally {

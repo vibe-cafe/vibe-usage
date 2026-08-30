@@ -26,12 +26,10 @@ import {
   saveCodexFileTail,
 } from './codex-cache.js';
 
-const CODEX_API_BILLING_MARKER = '#billing=api';
-const CODEX_SUBSCRIPTION_BILLING_MARKER = '#billing=subscription';
 // Changing a model id changes its server-side bucket key. Keep pre-release
 // history byte-for-byte stable so upgrading cannot re-upload the same tokens
-// under decorated keys and double-count them.
-const CODEX_BILLING_ATTRIBUTION_START_MS = Date.parse('2026-08-31T00:00:00.000Z');
+// under tier-decorated keys and double-count them.
+const CODEX_SERVICE_TIER_ATTRIBUTION_START_MS = Date.parse('2026-08-31T00:00:00.000Z');
 
 function normalizeCodexServiceTier(value) {
   if (typeof value !== 'string') return null;
@@ -41,22 +39,16 @@ function normalizeCodexServiceTier(value) {
   return null;
 }
 
-function hasSubscriptionPlan(planType) {
-  return typeof planType === 'string'
-    && planType.trim() !== ''
-    && planType.toLowerCase() !== 'unknown';
-}
-
-function decorateCodexModel(model, serviceTier, subscriptionBilling, timestampMs) {
-  let decorated = model || 'unknown';
-  if (decorated === 'unknown' || timestampMs < CODEX_BILLING_ATTRIBUTION_START_MS) {
-    return decorated;
+function decorateCodexModel(model, serviceTier, timestampMs) {
+  const rawModel = model || 'unknown';
+  if (
+    rawModel === 'unknown'
+    || !serviceTier
+    || timestampMs < CODEX_SERVICE_TIER_ATTRIBUTION_START_MS
+  ) {
+    return rawModel;
   }
-  if (serviceTier) decorated += `-${serviceTier}`;
-  decorated += subscriptionBilling
-    ? CODEX_SUBSCRIPTION_BILLING_MARKER
-    : CODEX_API_BILLING_MARKER;
-  return decorated;
+  return `${rawModel}-${serviceTier}`;
 }
 
 // Codex stores live sessions in $CODEX_HOME/sessions (default ~/.codex) and,
@@ -634,7 +626,6 @@ async function parseSessionFile(filePath, snapshotSize, fm, boundary, {
 
   let turnContextModel = previousTail?.turnContextModel || 'unknown';
   let serviceTier = previousTail?.serviceTier || null;
-  let subscriptionBilling = previousTail?.subscriptionBilling || false;
   let prevTotal = previousTail?.prevTotal || null;
   let prevCumulativeTotal = previousTail?.prevCumulativeTotal ?? null;
   const start = previousTail?.parsedBytes || 0;
@@ -708,10 +699,6 @@ async function parseSessionFile(filePath, snapshotSize, fm, boundary, {
       const isReplayedHistory = inReplayBlock;
       rawTokenSeen++;
 
-      if (hasSubscriptionPlan(payload.rate_limits?.plan_type)) {
-        subscriptionBilling = true;
-      }
-
       const info = payload.info;
       if (!info) continue;
 
@@ -761,12 +748,7 @@ async function parseSessionFile(filePath, snapshotSize, fm, boundary, {
       if (!timestamp || isNaN(timestamp.getTime())) continue;
 
       const rawModel = info.model || payload.model || turnContextModel || 'unknown';
-      const model = decorateCodexModel(
-        rawModel,
-        serviceTier,
-        subscriptionBilling,
-        timestamp.getTime()
-      );
+      const model = decorateCodexModel(rawModel, serviceTier, timestamp.getTime());
 
         // OpenAI API: input_tokens INCLUDES cached, output_tokens INCLUDES reasoning.
         // Normalize to Anthropic-style semantics where each field is non-overlapping.
@@ -822,7 +804,6 @@ async function parseSessionFile(filePath, snapshotSize, fm, boundary, {
       firstSessionMetaSeen,
       turnContextModel,
       serviceTier,
-      subscriptionBilling,
       prevTotal,
       prevCumulativeTotal,
       buckets,
