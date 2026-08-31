@@ -40,7 +40,7 @@ vibe-usage/
 │   │   ├── alma.js            # SQLite usage ledger; buckets only, no chat reads
 │   │   ├── workbuddy.js       # Streaming JSONL; actual routed-model usage + sessions
 │   │   └── zcode.js           # SQLite (via sqlite.js), reads message table
-│   ├── pi-roots.js            # Pi/OMP default, profile, XDG, and override discovery
+│   ├── pi-roots.js            # Pi/OMP default, Pi-configured (env + settings.json), profile, XDG, and override discovery
 │   ├── cline-roots.js         # Standalone + VSCode-host Cline discovery
 │   ├── cindy-roots.js          # Cindy Global/CN Electron roots + per-owner DB discovery
 │   ├── craft-roots.js         # CraftAgent root resolution and detection
