@@ -40,3 +40,18 @@ test('launchd service preserves and XML-escapes MiMoCode database path overrides
   assert.match(plist, /<key>XDG_DATA_HOME<\/key>/);
   assert.match(plist, /<string>\/tmp\/xdg&amp;a&lt;b&gt;<\/string>/);
 });
+
+test('services preserve Pi store relocation variables', () => {
+  const env = {
+    PI_CODING_AGENT_DIR: '/tmp/pi "agent"',
+    PI_CODING_AGENT_SESSION_DIR: '/tmp/pi&a<b>/sessions',
+  };
+  const unit = generateSystemdUnit('/usr/bin/node', '/opt/vibe-usage/bin.js', undefined, env);
+  assert.match(unit, /Environment="PI_CODING_AGENT_DIR=\/tmp\/pi \\"agent\\""/);
+  assert.match(unit, /Environment="PI_CODING_AGENT_SESSION_DIR=\/tmp\/pi&a<b>\/sessions"/);
+
+  const plist = generateLaunchdPlist('/usr/bin/node', '/opt/vibe-usage/bin.js', undefined, env);
+  assert.match(plist, /<key>PI_CODING_AGENT_DIR<\/key>/);
+  assert.match(plist, /<key>PI_CODING_AGENT_SESSION_DIR<\/key>/);
+  assert.match(plist, /<string>\/tmp\/pi&amp;a&lt;b&gt;\/sessions<\/string>/);
+});
