@@ -10,6 +10,7 @@ import {
   validateExtraCodexHome,
 } from '../src/codex-roots.js';
 import { findCodexDataDirs } from '../src/tools.js';
+import { discoverCodexHomes, validateExtraRoot } from '../src/extra-roots.js';
 
 function withCodexHome(value, fn) {
   const previous = process.env.CODEX_HOME;
@@ -75,6 +76,20 @@ test('findCodexDataDirs detects sessions present only in the extra root', () => 
     withCodexHome(primary, () => {
       assert.deepEqual(findCodexDataDirs(extra), [join(extra, 'sessions')]);
     });
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test('Codex extra root discovers bounded Multica task homes without entering deeper workdirs', () => {
+  const root = mkdtempSync(join(tmpdir(), 'vibe-usage-codex-container-'));
+  const taskHome = join(root, 'workspace-a', 'task-a', 'codex-home');
+  const tooDeep = join(root, 'workspace-b', 'task-b', 'workdir', 'codex-home');
+  mkdirSync(join(taskHome, 'sessions'), { recursive: true });
+  mkdirSync(join(tooDeep, 'sessions'), { recursive: true });
+  try {
+    assert.deepEqual(discoverCodexHomes(root).homes, [taskHome]);
+    assert.equal(validateExtraRoot('codex', root).ok, true);
   } finally {
     rmSync(root, { recursive: true, force: true });
   }

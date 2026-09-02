@@ -1,7 +1,8 @@
-import { createReadStream, existsSync, readdirSync, readFileSync } from 'node:fs';
+import { createReadStream, existsSync, readdirSync, readFileSync, statSync } from 'node:fs';
 import { createInterface } from 'node:readline';
 import { join } from 'node:path';
 import { findGrokDataDirs, getGrokSessionsDir } from '../tools.js';
+import { grokSessionsDir, normalizeExtraRoot } from '../extra-roots.js';
 import { aggregateToBuckets, extractSessions } from './aggregate.js';
 import { readJsonSafe, projectFromPath } from './fs-utils.js';
 
@@ -25,14 +26,14 @@ const SOURCE = 'grok';
  */
 
 /** Decode a sessions group dirname; fall back to basename after decode. */
-function projectFromGroupDir(groupName, groupPath) {
+function projectFromGroupDir(groupName, groupPath, strict = false) {
   const cwdFile = join(groupPath, '.cwd');
   if (existsSync(cwdFile)) {
     try {
       const raw = readFileSync(cwdFile, 'utf-8').trim();
       if (raw) return projectFromPath(raw);
-    } catch {
-      // ignore
+    } catch (err) {
+      if (strict) throw err;
     }
   }
   try {
@@ -115,12 +116,13 @@ function emitTurnUsage(entries, { usage, project, timestamp, fallbackModel }) {
   });
 }
 
-async function forEachJsonlLine(filePath, onLine) {
+async function forEachJsonlLine(filePath, onLine, strict = false) {
   if (!existsSync(filePath)) return;
   let stream;
   try {
     stream = createReadStream(filePath, { encoding: 'utf-8' });
-  } catch {
+  } catch (err) {
+    if (strict) throw err;
     return;
   }
 
@@ -137,7 +139,8 @@ async function forEachJsonlLine(filePath, onLine) {
       }
       onLine(obj);
     }
-  } catch {
+  } catch (err) {
+    if (strict) throw err;
     // unreadable / truncated mid-write — keep what we have
   } finally {
     rl.close();
@@ -145,14 +148,18 @@ async function forEachJsonlLine(filePath, onLine) {
   }
 }
 
-function listSessionDirs(sessionsDir) {
+function listSessionDirs(sessionsDir, strict = false) {
   const results = [];
-  if (!existsSync(sessionsDir)) return results;
+  if (!existsSync(sessionsDir)) {
+    if (strict) throw new Error(`missing sessions directory: ${sessionsDir}`);
+    return results;
+  }
 
   let groups;
   try {
     groups = readdirSync(sessionsDir, { withFileTypes: true });
-  } catch {
+  } catch (err) {
+    if (strict) throw err;
     return results;
   }
 
@@ -163,11 +170,12 @@ function listSessionDirs(sessionsDir) {
     let children;
     try {
       children = readdirSync(groupPath, { withFileTypes: true });
-    } catch {
+    } catch (err) {
+      if (strict) throw err;
       continue;
     }
 
-    const projectFallback = projectFromGroupDir(group.name, groupPath);
+    const projectFallback = projectFromGroupDir(group.name, groupPath, strict);
 
     for (const child of children) {
       if (!child.isDirectory()) continue;
@@ -194,8 +202,29 @@ function listSessionDirs(sessionsDir) {
  * Parse all Grok sessions under the configured sessions root(s).
  * @returns {Promise<{ buckets: object[], sessions: object[] }>}
  */
-export async function parse() {
-  const sessionRoots = findGrokDataDirs();
+export async function parse({ extraRoots = [] } = {}) {
+  if (!process.env.VIBE_USAGE_GROK_SESSIONS?.trim()) {
+    for (const root of extraRoots) {
+      const sessionsDir = grokSessionsDir(root);
+      try {
+        if (!statSync(sessionsDir).isDirectory()) throw new Error('not a directory');
+      } catch {
+        return {
+          buckets: [],
+          sessions: [],
+          skipped: true,
+          warnings: [`grok: 额外根目录不可用，已跳过本次 Grok 同步: ${normalizeExtraRoot(root)}`],
+        };
+      }
+    }
+  }
+  const strictRoots = process.env.VIBE_USAGE_GROK_SESSIONS?.trim()
+    ? new Set()
+    : new Set(extraRoots.map(grokSessionsDir));
+  const sessionRoots = findGrokDataDirs(extraRoots);
+  for (const configuredRoot of strictRoots) {
+    if (!sessionRoots.includes(configuredRoot)) sessionRoots.push(configuredRoot);
+  }
   // findGrokDataDirs returns sessions dirs; also allow empty → try default once
   const roots = sessionRoots.length > 0 ? sessionRoots : [getGrokSessionsDir()].filter(existsSync);
   if (roots.length === 0) return { buckets: [], sessions: [] };
@@ -203,9 +232,58 @@ export async function parse() {
   const entries = [];
   const sessionEvents = [];
 
+  const candidates = [];
   for (const sessionsDir of roots) {
-    for (const { sessionId, sessionPath, projectFallback } of listSessionDirs(sessionsDir)) {
-      const summary = readJsonSafe(join(sessionPath, 'summary.json')) || {};
+    const strict = strictRoots.has(sessionsDir);
+    try {
+      for (const session of listSessionDirs(sessionsDir, strict)) {
+        candidates.push({ ...session, strict, configuredRoot: sessionsDir });
+      }
+    } catch {
+      return {
+        buckets: [], sessions: [], skipped: true,
+        warnings: [`grok: 额外根目录读取失败，已保留上次同步数据: ${sessionsDir}`],
+      };
+    }
+  }
+
+  let sessionsToParse = candidates;
+  if (roots.length > 1) {
+    const selectedSessions = new Map();
+    for (const session of candidates) {
+      const fileSize = (name) => {
+        try {
+          return statSync(join(session.sessionPath, name)).size;
+        } catch {
+          return 0;
+        }
+      };
+      const score = [fileSize('updates.jsonl'), fileSize('events.jsonl'), fileSize('summary.json')];
+      const previous = selectedSessions.get(session.sessionId);
+      const moreComplete = !previous || score.some((value, index) => (
+        value !== previous.score[index] && value > previous.score[index]
+        && score.slice(0, index).every((prior, priorIndex) => prior === previous.score[priorIndex])
+      ));
+      if (moreComplete) selectedSessions.set(session.sessionId, { ...session, score });
+    }
+    sessionsToParse = [...selectedSessions.values()];
+  }
+
+  for (const {
+    sessionId,
+    sessionPath,
+    projectFallback,
+    strict,
+    configuredRoot,
+  } of sessionsToParse) {
+    try {
+      const summaryPath = join(sessionPath, 'summary.json');
+      let summary;
+      if (strict && existsSync(summaryPath)) {
+        summary = JSON.parse(readFileSync(summaryPath, 'utf-8'));
+      } else {
+        summary = readJsonSafe(summaryPath) || {};
+      }
       const cwd = summary.info?.cwd || summary.git_root_dir || null;
       const project = cwd ? projectFromPath(cwd) : projectFallback;
       const fallbackModel = summary.current_model_id || 'unknown';
@@ -249,7 +327,7 @@ export async function parse() {
             role: 'assistant',
           });
         }
-      });
+      }, strict);
 
       // Fallback timing from events.jsonl when updates lack message chunks
       // (short/aborted sessions, older builds).
@@ -274,7 +352,7 @@ export async function parse() {
               role: 'assistant',
             });
           }
-        });
+        }, strict);
       }
 
       // Last-resort session envelope from summary timestamps so a session with
@@ -301,6 +379,12 @@ export async function parse() {
           });
         }
       }
+    } catch (err) {
+      if (!strict) throw err;
+      return {
+        buckets: [], sessions: [], skipped: true,
+        warnings: [`grok: 额外根目录读取失败，已保留上次同步数据: ${configuredRoot}`],
+      };
     }
   }
 

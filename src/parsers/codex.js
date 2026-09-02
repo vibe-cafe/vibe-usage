@@ -17,6 +17,7 @@ import {
   resolveCodexHomes,
   validateExtraCodexHome,
 } from '../codex-roots.js';
+import { discoverCodexHomes } from '../extra-roots.js';
 import {
   codexCacheEnabled,
   fileSignature,
@@ -62,20 +63,22 @@ function decorateCodexModel(model, serviceTier, timestampMs) {
  * Recursively find all .jsonl files under a directory.
  * Codex CLI stores sessions as: ~/.codex/sessions/YYYY/MM/DD/rollout-*.jsonl
  */
-function findJsonlFiles(dir) {
+function findJsonlFiles(dir, strict = false) {
   const results = [];
   if (!existsSync(dir)) return results;
   try {
     for (const entry of readdirSync(dir, { withFileTypes: true })) {
       const fullPath = join(dir, entry.name);
       if (entry.isDirectory()) {
-        for (const nested of findJsonlFiles(fullPath)) results.push(nested);
+        for (const nested of findJsonlFiles(fullPath, strict)) results.push(nested);
       } else if (entry.name.endsWith('.jsonl')) {
         results.push(fullPath);
       }
     }
-  } catch {
-    // ignore unreadable directories
+  } catch (err) {
+    if (strict && err?.code !== 'ENOENT') throw err;
+    // Default roots are best-effort; configured roots must never look empty
+    // merely because a directory became unreadable between syncs.
   }
   return results;
 }
@@ -837,7 +840,8 @@ function mergeFileResults(results) {
   return { buckets: aggregateToBuckets(entries), sessions };
 }
 
-async function parseNativeCodex({ codexExtraHome } = {}) {
+async function parseNativeCodex({ codexExtraHome, extraRoots = [] } = {}) {
+  let extraCodexHomePath = null;
   if (codexExtraHome?.trim()) {
     const validation = validateExtraCodexHome(codexExtraHome);
     if (!validation.ok) {
@@ -848,11 +852,31 @@ async function parseNativeCodex({ codexExtraHome } = {}) {
         warnings: [`codex: 额外 Codex Home 不可用，已跳过本次 Codex 同步: ${validation.path}`],
       };
     }
+    extraCodexHomePath = validation.path;
   }
 
-  const codexHomes = resolveCodexHomes(codexExtraHome);
+  const configuredHomes = [];
+  for (const root of extraRoots) {
+    const discovered = discoverCodexHomes(root);
+    if (!discovered.readable || discovered.homes.length === 0) {
+      return {
+        buckets: [],
+        sessions: [],
+        skipped: true,
+        warnings: [`codex: 额外根目录不可用，已跳过本次 Codex 同步: ${discovered.root}`],
+      };
+    }
+    configuredHomes.push(...discovered.homes);
+  }
+
+  const strictHomes = new Set(configuredHomes);
+  if (extraCodexHomePath) strictHomes.add(extraCodexHomePath);
+  const codexHomes = [...new Set([
+    ...resolveCodexHomes(codexExtraHome),
+    ...configuredHomes,
+  ])];
   const dirs = codexHomes.flatMap(codexHome => (
-    codexSessionDirs(codexHome).map(dir => ({ codexHome, dir }))
+    codexSessionDirs(codexHome).map(dir => ({ codexHome, dir, strict: strictHomes.has(codexHome) }))
   ));
   if (!dirs.some(({ dir }) => existsSync(dir))) return { buckets: [], sessions: [] };
 
@@ -868,8 +892,17 @@ async function parseNativeCodex({ codexExtraHome } = {}) {
     audited: 0,
   };
   const files = [];
-  for (const { codexHome, dir } of dirs) {
-    for (const filePath of findJsonlFiles(dir)) {
+  for (const { codexHome, dir, strict } of dirs) {
+    let filePaths;
+    try {
+      filePaths = findJsonlFiles(dir, strict);
+    } catch {
+      return {
+        buckets: [], sessions: [], skipped: true,
+        warnings: [`codex: 额外根目录读取失败，已保留上次同步数据: ${codexHome}`],
+      };
+    }
+    for (const filePath of filePaths) {
       try {
         const stat = statSync(filePath);
         if (stat.size <= 0) continue;
@@ -880,6 +913,7 @@ async function parseNativeCodex({ codexExtraHome } = {}) {
         const file = {
           codexHome,
           filePath,
+          strict,
           snapshotSize: stat.size,
           signature,
           cache,
@@ -890,9 +924,14 @@ async function parseNativeCodex({ codexExtraHome } = {}) {
         };
         if (!cache && priorCache) file.appendTail = tailStateFor(file);
         files.push(file);
-      } catch {
+      } catch (err) {
         // The file may move to archived_sessions between discovery and stat.
-        // Its archived copy will be picked up on the next sync.
+        if (strict && err?.code !== 'ENOENT') {
+          return {
+            buckets: [], sessions: [], skipped: true,
+            warnings: [`codex: 额外根目录读取失败，已保留上次同步数据: ${codexHome}`],
+          };
+        }
       }
     }
   }
@@ -928,6 +967,12 @@ async function parseNativeCodex({ codexExtraHome } = {}) {
         cacheStats.filesRead++;
         updateFileCache(file, { header: file.header });
       } catch {
+        if (file.strict) {
+          return {
+            buckets: [], sessions: [], skipped: true,
+            warnings: [`codex: 额外根目录读取失败，已保留上次同步数据: ${file.codexHome}`],
+          };
+        }
         continue;
       }
     }
@@ -981,6 +1026,12 @@ async function parseNativeCodex({ codexExtraHome } = {}) {
         cacheStats.filesRead++;
         updateFileCache(file, { index: meta });
       } catch {
+        if (file.strict) {
+          return {
+            buckets: [], sessions: [], skipped: true,
+            warnings: [`codex: 额外根目录读取失败，已保留上次同步数据: ${file.codexHome}`],
+          };
+        }
         continue;
       }
     }

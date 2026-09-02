@@ -1,7 +1,8 @@
 import { execSync } from 'node:child_process';
-import { readdirSync } from 'node:fs';
-import { join } from 'node:path';
+import { readdirSync, statSync } from 'node:fs';
+import { delimiter, join } from 'node:path';
 import { homedir } from 'node:os';
+import { antigravityConversationDirs, normalizeExtraRoot } from '../extra-roots.js';
 import { aggregateToBuckets, extractSessions } from './aggregate.js';
 import { listDbCascades, readDbUsageRecords, readDbWorkspaceUri, readDbSessionEvents, readDbStepTimestamps, resolveUsageTimestamp } from './antigravity-db.js';
 
@@ -295,10 +296,10 @@ function projectFromUri(uri) {
  * List cascade IDs backed by a legacy `.pb` file (App history). `.db` cascades
  * are handled separately via offline parsing.
  */
-function listPbCascades() {
+function listPbCascades(conversationsDir = CONVERSATIONS_DIR) {
   try {
     const out = [];
-    for (const f of readdirSync(CONVERSATIONS_DIR)) {
+    for (const f of readdirSync(conversationsDir)) {
       if (f.endsWith('.pb')) out.push(f.slice(0, -3));
     }
     return out;
@@ -316,19 +317,88 @@ function modelFromRecord(rec) {
   return 'unknown';
 }
 
-export async function parse() {
+export async function parse({ extraRoots = [] } = {}) {
   const entries = [];
   const sessionEvents = [];
   const seenResponseIds = new Set();
 
+  const extraDirs = [];
+  for (const root of extraRoots) {
+    const dirs = antigravityConversationDirs(root);
+    let found = false;
+    for (const dir of dirs) {
+      try {
+        readdirSync(dir);
+        extraDirs.push(dir);
+        found = true;
+      } catch (err) {
+        if (err?.code === 'ENOENT') continue;
+        return {
+          buckets: [],
+          sessions: [],
+          skipped: true,
+          warnings: [`antigravity: 额外根目录读取失败，已保留上次同步数据: ${normalizeExtraRoot(root)}`],
+        };
+      }
+    }
+    if (!found) {
+      return {
+        buckets: [],
+        sessions: [],
+        skipped: true,
+        warnings: [`antigravity: 额外根目录不可用，已跳过本次 Antigravity 同步: ${normalizeExtraRoot(root)}`],
+      };
+    }
+  }
+
   // ── Path 1: offline .db parsing (App 2.0 + agy CLI, no process needed) ──
   const dbHandled = new Set();
-  for (const dir of [CONVERSATIONS_DIR, CLI_CONVERSATIONS_DIR]) {
-    for (const cascadeId of listDbCascades(dir)) {
-      const records = readDbUsageRecords(dir, cascadeId);
+  const fixtureDirs = process.env.VIBE_USAGE_ANTIGRAVITY_DIRS?.trim();
+  const defaultDirs = fixtureDirs
+    ? fixtureDirs.split(delimiter).filter(Boolean)
+    : [CONVERSATIONS_DIR, CLI_CONVERSATIONS_DIR];
+  const strictDirs = new Set(extraDirs);
+  const conversationDirs = [...new Set([...defaultDirs, ...extraDirs])];
+  const candidates = [];
+  for (const dir of conversationDirs) {
+    const strict = strictDirs.has(dir);
+    try {
+      for (const cascadeId of listDbCascades(dir, { strict })) {
+        candidates.push({ dir, cascadeId, strict });
+      }
+    } catch {
+      return {
+        buckets: [], sessions: [], skipped: true,
+        warnings: [`antigravity: 额外根目录读取失败，已保留上次同步数据: ${dir}`],
+      };
+    }
+  }
+  const configuredCascadeIds = new Set(
+    candidates.filter(candidate => candidate.strict).map(candidate => candidate.cascadeId),
+  );
+  const selectedConfiguredCopies = new Map();
+  for (const candidate of candidates) {
+    if (!configuredCascadeIds.has(candidate.cascadeId)) continue;
+    let size = 0;
+    try {
+      size = statSync(join(candidate.dir, `${candidate.cascadeId}.db`)).size;
+    } catch {
+      // The DB may move between discovery and stat; the read below will fail
+      // open in the existing offline reader.
+    }
+    const previous = selectedConfiguredCopies.get(candidate.cascadeId);
+    if (!previous || size > previous.size) selectedConfiguredCopies.set(candidate.cascadeId, { ...candidate, size });
+  }
+
+  for (const { dir, cascadeId, strict } of candidates) {
+    const selected = selectedConfiguredCopies.get(cascadeId);
+    if (selected && selected.dir !== dir) continue;
+    try {
+      const options = { strict };
+      const records = readDbUsageRecords(dir, cascadeId, options);
       const project = projectFromUri(readDbWorkspaceUri(dir, cascadeId)) || 'unknown';
       const stepTimestampsByIdx = records.some((rec) => !rec.timestamp || isNaN(rec.timestamp.getTime()))
-        ? readDbStepTimestamps(dir, cascadeId)
+        ? readDbStepTimestamps(dir, cascadeId, options)
         : new Map();
 
       if (records.length > 0) {
@@ -355,7 +425,7 @@ export async function parse() {
       }
 
       // Session timing from steps (independent of token usage presence).
-      for (const ev of readDbSessionEvents(dir, cascadeId)) {
+      for (const ev of readDbSessionEvents(dir, cascadeId, options)) {
         sessionEvents.push({
           sessionId: cascadeId,
           source: SOURCE,
@@ -364,11 +434,18 @@ export async function parse() {
           role: ev.role,
         });
       }
+    } catch (err) {
+      if (!strict) throw err;
+      return {
+        buckets: [], sessions: [], skipped: true,
+        warnings: [`antigravity: 额外根目录读取失败，已保留上次同步数据: ${dir}`],
+      };
     }
   }
 
   // ── Path 2: RPC fallback, only for legacy .pb cascades not already parsed ──
-  const pbCascades = listPbCascades().filter((id) => !dbHandled.has(id));
+  const pbDir = defaultDirs[0] || CONVERSATIONS_DIR;
+  const pbCascades = listPbCascades(pbDir).filter((id) => !dbHandled.has(id));
   if (pbCascades.length > 0) {
     const server = findLanguageServer();
     const ports = server ? findListeningPorts(server.pid) : [];

@@ -9,6 +9,7 @@ import { createSyncClient, forBatch } from './client-meta.js';
 import { parsers } from './parsers/index.js';
 import { aggregateToBuckets } from './parsers/aggregate.js';
 import { normalizeParserResult } from './parsers/contract.js';
+import { extraRootList } from './extra-roots.js';
 import { success, failure, warn, arrow, link, dim } from './output.js';
 
 const BATCH_SIZE = 100;
@@ -153,9 +154,12 @@ export async function runSync({
     PARSER_CONCURRENCY,
     async ([source, parse]) => {
       try {
-        const result = source === 'codex'
-          ? await parse({ codexExtraHome: resolveCodexExtraHome(config.codexExtraHome, codexExtraHome) })
-          : await parse();
+        const result = await parse({
+          extraRoots: extraRootList(config.extraRoots?.[source]),
+          ...(source === 'codex' ? {
+            codexExtraHome: resolveCodexExtraHome(config.codexExtraHome, codexExtraHome),
+          } : {}),
+        });
         return { source, result };
       } catch (err) {
         return { source, error: err };

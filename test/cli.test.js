@@ -164,3 +164,53 @@ test('status displays the persisted extra Codex home and detects Codex there', (
     rmSync(root, { recursive: true, force: true });
   }
 });
+
+test('config add-root, roots, and remove-root manage tool-specific roots without touching legacy config', () => {
+  const root = mkdtempSync(join(tmpdir(), 'vibe-usage-cli-roots-'));
+  const configDir = join(root, 'config');
+  const grokHome = join(root, 'grok-home');
+  mkdirSync(join(grokHome, 'sessions'), { recursive: true });
+  mkdirSync(configDir, { recursive: true });
+  writeFileSync(join(configDir, 'config.json'), JSON.stringify({ codexExtraHome: '/legacy/codex' }));
+  const env = { VIBE_USAGE_CONFIG_DIR: configDir };
+  try {
+    const add = runWithEnv(['config', 'add-root', 'grok', grokHome], env);
+    assert.equal(add.status, 0, add.stderr);
+    const duplicate = runWithEnv(['config', 'add-root', 'grok', grokHome], env);
+    assert.equal(duplicate.status, 0, duplicate.stderr);
+    const listed = runWithEnv(['config', 'roots'], env);
+    assert.equal(listed.status, 0, listed.stderr);
+    assert.deepEqual(JSON.parse(listed.stdout), { grok: [grokHome] });
+    let config = JSON.parse(readFileSync(join(configDir, 'config.json'), 'utf8'));
+    assert.equal(config.codexExtraHome, '/legacy/codex');
+
+    const remove = runWithEnv(['config', 'remove-root', 'grok', grokHome], env);
+    assert.equal(remove.status, 0, remove.stderr);
+    config = JSON.parse(readFileSync(join(configDir, 'config.json'), 'utf8'));
+    assert.equal(config.extraRoots, undefined);
+    assert.equal(config.codexExtraHome, '/legacy/codex');
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test('config add-root rejects unsupported tools and invalid layouts', () => {
+  const root = mkdtempSync(join(tmpdir(), 'vibe-usage-cli-invalid-root-'));
+  try {
+    const unsupported = runWithEnv(
+      ['config', 'add-root', 'cursor', root],
+      { VIBE_USAGE_CONFIG_DIR: join(root, 'config') },
+    );
+    assert.equal(unsupported.status, 1);
+    assert.match(unsupported.stderr, /不支持的工具/);
+
+    const invalid = runWithEnv(
+      ['config', 'add-root', 'grok', root],
+      { VIBE_USAGE_CONFIG_DIR: join(root, 'config') },
+    );
+    assert.equal(invalid.status, 1);
+    assert.match(invalid.stderr, /需要包含 sessions/);
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+});

@@ -181,3 +181,90 @@ test('parse falls back to events.jsonl timing and group .cwd project', async () 
     rmSync(root, { recursive: true, force: true });
   }
 });
+
+test('parse merges configured Grok homes and keeps the more complete copy of a session', async () => {
+  const root = mkdtempSync(join(tmpdir(), 'vibe-usage-grok-multi-root-'));
+  const primaryHome = join(root, 'primary');
+  const extraHome = join(root, 'extra');
+
+  const writeSession = (home, sessionId, turns) => {
+    const sessionPath = join(home, 'sessions', 'project', sessionId);
+    mkdirSync(sessionPath, { recursive: true });
+    writeFileSync(join(sessionPath, 'summary.json'), JSON.stringify({
+      info: { id: sessionId, cwd: '/work/project' },
+      current_model_id: 'grok-test',
+    }));
+    const lines = [];
+    for (let index = 0; index < turns; index += 1) {
+      lines.push(JSON.stringify({
+        timestamp: 1784168190 + index * 10,
+        params: { update: { sessionUpdate: 'user_message_chunk' } },
+      }));
+      lines.push(JSON.stringify({
+        timestamp: 1784168195 + index * 10,
+        params: { update: {
+          sessionUpdate: 'turn_completed',
+          usage: { inputTokens: 10, outputTokens: 2 },
+        } },
+      }));
+    }
+    writeFileSync(join(sessionPath, 'updates.jsonl'), `${lines.join('\n')}\n`);
+  };
+
+  writeSession(primaryHome, 'copied-session', 1);
+  writeSession(primaryHome, 'primary-only', 1);
+  writeSession(extraHome, 'copied-session', 2);
+  writeSession(extraHome, 'extra-only', 1);
+
+  const previousHome = process.env.GROK_HOME;
+  const previousFixture = process.env.VIBE_USAGE_GROK_SESSIONS;
+  process.env.GROK_HOME = primaryHome;
+  delete process.env.VIBE_USAGE_GROK_SESSIONS;
+  try {
+    const result = await parse({ extraRoots: [extraHome] });
+    assert.equal(result.sessions.length, 3);
+    assert.equal(result.buckets.reduce((sum, bucket) => sum + bucket.inputTokens, 0), 40);
+    assert.equal(result.buckets.reduce((sum, bucket) => sum + bucket.outputTokens, 0), 8);
+  } finally {
+    if (previousHome === undefined) delete process.env.GROK_HOME;
+    else process.env.GROK_HOME = previousHome;
+    if (previousFixture === undefined) delete process.env.VIBE_USAGE_GROK_SESSIONS;
+    else process.env.VIBE_USAGE_GROK_SESSIONS = previousFixture;
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test('missing configured Grok home skips the source to protect upload state', async () => {
+  const missing = join(tmpdir(), 'vibe-usage-grok-missing-root');
+  const result = await parse({ extraRoots: [missing] });
+  assert.equal(result.skipped, true);
+  assert.deepEqual(result.buckets, []);
+  assert.match(result.warnings[0], /额外根目录不可用/);
+});
+
+test('parse failure inside a configured Grok home skips the source', async () => {
+  const root = mkdtempSync(join(tmpdir(), 'vibe-usage-grok-invalid-root-'));
+  const primaryHome = join(root, 'primary');
+  const extraHome = join(root, 'extra');
+  const sessionPath = join(extraHome, 'sessions', 'project', 'broken-session');
+  mkdirSync(sessionPath, { recursive: true });
+  writeFileSync(join(sessionPath, 'summary.json'), '{not-json');
+  writeFileSync(join(sessionPath, 'updates.jsonl'), '');
+
+  const previousHome = process.env.GROK_HOME;
+  const previousFixture = process.env.VIBE_USAGE_GROK_SESSIONS;
+  process.env.GROK_HOME = primaryHome;
+  delete process.env.VIBE_USAGE_GROK_SESSIONS;
+  try {
+    const result = await parse({ extraRoots: [extraHome] });
+    assert.equal(result.skipped, true);
+    assert.deepEqual(result.buckets, []);
+    assert.match(result.warnings[0], /额外根目录读取失败/);
+  } finally {
+    if (previousHome === undefined) delete process.env.GROK_HOME;
+    else process.env.GROK_HOME = previousHome;
+    if (previousFixture === undefined) delete process.env.VIBE_USAGE_GROK_SESSIONS;
+    else process.env.VIBE_USAGE_GROK_SESSIONS = previousFixture;
+    rmSync(root, { recursive: true, force: true });
+  }
+});
