@@ -12,6 +12,7 @@ import {
   resolveCachedUploadProjectSetting,
   resolveUploadProjectSetting,
   mapWithConcurrency,
+  shouldSuppressParserWarning,
 } from '../src/sync.js';
 import { normalizeParserResult } from '../src/parsers/contract.js';
 
@@ -67,6 +68,22 @@ test('cached project-upload settings are scoped to the confirming API', () => {
 test('temporary extra Codex home overrides persisted config only for this run', () => {
   assert.equal(resolveCodexExtraHome('/persisted/.codex', '/temporary/.codex'), '/temporary/.codex');
   assert.equal(resolveCodexExtraHome('/persisted/.codex', undefined), '/persisted/.codex');
+});
+
+test('shouldSuppressParserWarning hides only Cursor transient fetch skips in quiet mode', () => {
+  assert.equal(
+    shouldSuppressParserWarning('cursor', 'cursor: Cursor usage export skipped (timeout)', true),
+    true,
+  );
+  assert.equal(
+    shouldSuppressParserWarning('cursor', 'cursor: Cursor usage export skipped (timeout)', false),
+    false,
+  );
+  assert.equal(shouldSuppressParserWarning('dsh', 'dsh: cannot read session-8', true), false);
+  assert.equal(
+    shouldSuppressParserWarning('cursor', 'cursor: cannot read usage database (locked)', true),
+    false,
+  );
 });
 
 test('mapWithConcurrency preserves order and bounds in-flight work', async () => {
