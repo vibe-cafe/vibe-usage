@@ -35,7 +35,7 @@ npx @vibe-cafe/vibe-usage sync --extra-codex-home /path/to/.codex  # Add another
 npx @vibe-cafe/vibe-usage summary       # Print last 7 days as markdown (cost / tokens / by model / by project)
 npx @vibe-cafe/vibe-usage summary --days N  # Same, over the last N days (1-90)
 npx @vibe-cafe/vibe-usage daemon       # Continuous sync (every 30m, foreground)
-npx @vibe-cafe/vibe-usage daemon install    # Install background service (systemd/launchd)
+npx @vibe-cafe/vibe-usage daemon install    # Install background service (systemd/launchd/Task Scheduler)
 npx @vibe-cafe/vibe-usage daemon uninstall  # Remove background service
 npx @vibe-cafe/vibe-usage daemon status     # Show background service status
 npx @vibe-cafe/vibe-usage daemon stop       # Stop background service
@@ -174,7 +174,7 @@ Install as a system service for automatic background syncing:
 npx @vibe-cafe/vibe-usage daemon install
 ```
 
-This creates a user-level service (systemd on Linux, launchd on macOS) that syncs every 30 minutes and starts automatically on login. Manage with:
+This creates a user-level service (systemd on Linux, launchd on macOS, Task Scheduler on Windows — no admin rights needed) that syncs every 30 minutes and starts automatically on login. Manage with:
 
 ```bash
 npx @vibe-cafe/vibe-usage daemon status
