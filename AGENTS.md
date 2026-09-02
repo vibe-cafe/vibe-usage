@@ -41,7 +41,7 @@ vibe-usage/
 │   │   ├── mcode.js           # MiniMax Code runtime-state SQLite ledger (allow-listed token fields only)
 │   │   ├── workbuddy.js       # Streaming JSONL; actual routed-model usage + sessions
 │   │   └── zcode.js           # SQLite (via sqlite.js), reads message table
-│   ├── pi-roots.js            # Pi/OMP default, profile, XDG, and override discovery
+│   ├── pi-roots.js            # Pi/OMP default, Pi-configured (env + settings.json), profile, XDG, and override discovery
 │   ├── cline-roots.js         # Standalone + VSCode-host Cline discovery
 │   ├── cindy-roots.js          # Cindy Global/CN Electron roots + per-owner DB discovery
 │   ├── craft-roots.js         # CraftAgent root resolution and detection
@@ -106,6 +106,7 @@ passing this gate.
 - **Zero dependencies** — only Node built-ins (fs, path, os, crypto, https, readline, child_process, zlib, `node:sqlite`)
 - **Incremental upload** — parsers emit a complete view of live local data, then `sync.js` diffs each item's content-hash against `~/.vibe-usage/state.json` and uploads only new/changed buckets/sessions — a quiet machine sends zero bytes. State is committed per-batch only after that batch's upload succeeds (failed batch re-sends next run); prune of dead keys (logs the parsers no longer emit) persists unconditionally and is bounded by liveness, never by age — and is scoped to sources whose parser succeeded that run, so a transient failure or an incomplete Codex cache build never evicts that tool's state into a full re-upload. Deleting `state.json` triggers a one-time full re-upload (which is exactly how `reset` re-populates remote data after deleting it).
 - **Hidden-project identity** — parsers aggregate before the backend-provided privacy setting is applied. When the fetched `uploadProject=false`, `sync.js` replaces project names with `unknown` and must re-aggregate buckets before hashing/upload so formerly distinct projects that now share a server key are summed instead of overwriting one another. This is enforcement of backend policy, not a local setting.
+- **Cost-accounting invariant** — parsers report token counts plus only price-changing model dimensions (for example Codex `service_tier`). Never collect, persist, or encode an account funding path such as ChatGPT subscription, API billing, credits, or bundled quota. The backend always estimates `tokens × provider-published model/service-tier rate`; funding never changes that value. v0.10.18's `#billing=api` / `#billing=subscription` experiment violated this invariant and v0.10.19 removed it. Do not reintroduce it as billing accuracy, plan detection, or incremental cost.
 - **Codex parser cache** — unlike the other stateless parsers, Codex keeps versioned, disposable derived data under `~/.vibe-usage/cache/codex/`. This cache is never authoritative: any miss, corruption, unsafe append, parser-algorithm bump, or write failure falls back to raw logs. Keep it separate from `state.json`; `reset` clears upload state but retains the parser cache so it can re-upload without re-reading every rollout.
 - **Stable hostname** — hostname is persisted in config at init; `sync.js` never re-reads `os.hostname()` after first capture. This prevents macOS mDNS hostname drift (e.g., `-2`, `-3` suffixes) from creating duplicate device entries in the DB.
 - **Upload identity** — `client-meta.js` reads the real package version from the shipped `package.json`, creates one `syncId` per `runSync`, and adds batch identity plus runtime/platform/hostname to every ingest request. Direct sync defaults to `surface=cli`, the foreground service passes `surface=daemon`, and desktop apps override via `VIBE_USAGE_SURFACE` / `VIBE_USAGE_SURFACE_VERSION`. Keep the CLI as the only ingest HTTP implementation.
@@ -153,7 +154,7 @@ Parser pattern:
 
 Pi-compatible JSONL parsers (`pi-coding-agent.js`, `craft-agent.js`, `omp.js`):
 - Use `parsePiSessionJsonl()` instead of duplicating filesystem/message parsing.
-- Fold `usage.cacheWrite` into input tokens and keep `cacheRead` separate. OMP/Pi `usage.output` already includes `reasoningTokens`, so subtract reasoning from output before storing it in `reasoningOutputTokens`.
+- Fold `usage.cacheWrite` into input tokens and keep `cacheRead` separate. OMP/Pi `usage.output` already includes reasoning, so subtract reasoning from output before storing it in `reasoningOutputTokens`. Pi's `Usage` type spells that field `reasoning`; the older `reasoningTokens` spelling stays accepted as a fallback.
 - Deduplicate stable message ids across copied/profile stores. Any directory read failure returns `skipped` so incremental state is not pruned.
 
 SQLite-backed parsers (alma, cindy, cursor, dimagent, hermes, kiro, mcode, mimocode, opencode, zcode):

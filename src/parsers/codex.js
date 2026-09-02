@@ -26,6 +26,31 @@ import {
   saveCodexFileTail,
 } from './codex-cache.js';
 
+// Changing a model id changes its server-side bucket key. Keep pre-release
+// history byte-for-byte stable so upgrading cannot re-upload the same tokens
+// under tier-decorated keys and double-count them.
+const CODEX_SERVICE_TIER_ATTRIBUTION_START_MS = Date.parse('2026-08-31T00:00:00.000Z');
+
+function normalizeCodexServiceTier(value) {
+  if (typeof value !== 'string') return null;
+  const tier = value.trim().toLowerCase();
+  if (tier === 'fast' || tier === 'priority') return tier;
+  if (tier === 'flex' || tier === 'batch') return tier;
+  return null;
+}
+
+function decorateCodexModel(model, serviceTier, timestampMs) {
+  const rawModel = model || 'unknown';
+  if (
+    rawModel === 'unknown'
+    || !serviceTier
+    || timestampMs < CODEX_SERVICE_TIER_ATTRIBUTION_START_MS
+  ) {
+    return rawModel;
+  }
+  return `${rawModel}-${serviceTier}`;
+}
+
 // Codex stores live sessions in $CODEX_HOME/sessions (default ~/.codex) and,
 // once a session is "completed", moves its rollout file verbatim into
 // $CODEX_HOME/archived_sessions. A session can be archived between two syncs,
@@ -600,6 +625,7 @@ async function parseSessionFile(filePath, snapshotSize, fm, boundary, {
   const sessionKey = fm.sessionId || filePath;
 
   let turnContextModel = previousTail?.turnContextModel || 'unknown';
+  let serviceTier = previousTail?.serviceTier || null;
   let prevTotal = previousTail?.prevTotal || null;
   let prevCumulativeTotal = previousTail?.prevCumulativeTotal ?? null;
   const start = previousTail?.parsedBytes || 0;
@@ -644,8 +670,11 @@ async function parseSessionFile(filePath, snapshotSize, fm, boundary, {
         }
       }
 
-      if (obj.type === 'turn_context' && obj.payload?.model) {
-        turnContextModel = obj.payload.model;
+      if (obj.type === 'turn_context') {
+        if (obj.payload?.model) turnContextModel = obj.payload.model;
+        if (Object.hasOwn(obj.payload || {}, 'service_tier')) {
+          serviceTier = normalizeCodexServiceTier(obj.payload.service_tier);
+        }
         continue;
       }
 
@@ -653,6 +682,15 @@ async function parseSessionFile(filePath, snapshotSize, fm, boundary, {
 
       const payload = obj.payload;
       if (!payload) continue;
+
+      if (payload.type === 'thread_settings_applied') {
+        const settings = payload.thread_settings;
+        if (settings?.model) turnContextModel = settings.model;
+        if (Object.hasOwn(settings || {}, 'service_tier')) {
+          serviceTier = normalizeCodexServiceTier(settings.service_tier);
+        }
+        continue;
+      }
 
       if (payload.type !== 'token_count') continue;
 
@@ -709,7 +747,8 @@ async function parseSessionFile(filePath, snapshotSize, fm, boundary, {
       const timestamp = obj.timestamp ? new Date(obj.timestamp) : null;
       if (!timestamp || isNaN(timestamp.getTime())) continue;
 
-      const model = info.model || payload.model || turnContextModel || 'unknown';
+      const rawModel = info.model || payload.model || turnContextModel || 'unknown';
+      const model = decorateCodexModel(rawModel, serviceTier, timestamp.getTime());
 
         // OpenAI API: input_tokens INCLUDES cached, output_tokens INCLUDES reasoning.
         // Normalize to Anthropic-style semantics where each field is non-overlapping.
@@ -764,6 +803,7 @@ async function parseSessionFile(filePath, snapshotSize, fm, boundary, {
       rawTokenSeen,
       firstSessionMetaSeen,
       turnContextModel,
+      serviceTier,
       prevTotal,
       prevCumulativeTotal,
       buckets,

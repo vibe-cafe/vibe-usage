@@ -50,7 +50,7 @@ async function withDb(path, fn) {
 
 test('mcode is registered and discovers env overrides', () => {
   assert.equal(typeof parsers.mcode, 'function');
-  assert.equal(TOOLS.find(tool => tool.id === 'mcode')?.name, 'mcode');
+  assert.equal(TOOLS.find(tool => tool.id === 'mcode')?.name, 'MiniMax Code');
   assert.equal(resolveMcodeDbPath({ VIBE_USAGE_MCODE_DB: '/tmp/mcode.db' }), '/tmp/mcode.db');
   assert.equal(resolveMcodeDbPath({ MCODE_HOME: '/tmp/minimax' }), '/tmp/minimax/v2/sqlite/runtime-state.sqlite');
 });

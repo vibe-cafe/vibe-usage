@@ -164,3 +164,124 @@ test('OMP discovers XDG profiles and does not also label its agent store as Pi',
     rmSync(root, { recursive: true, force: true });
   }
 });
+
+function reasoningSession(usage) {
+  return [
+    { type: 'session', id: 'reasoning-1', timestamp: '2026-07-27T13:19:57.000Z', cwd: '/work/project' },
+    {
+      type: 'message',
+      id: 'user-1',
+      timestamp: '2026-07-27T13:20:00.000Z',
+      message: { role: 'user', content: [] },
+    },
+    {
+      type: 'message',
+      id: 'assistant-1',
+      timestamp: '2026-07-27T13:20:05.000Z',
+      message: { role: 'assistant', model: 'test-model', usage },
+    },
+  ].map((line) => JSON.stringify(line)).join('\n') + '\n';
+}
+
+test('Pi reasoning tokens are split out of output using Pi\'s own usage.reasoning field', async () => {
+  const root = mkdtempSync(join(tmpdir(), 'vibe-usage-pi-reasoning-'));
+  const previous = process.env.VIBE_USAGE_PI_SESSION_DIRS;
+  try {
+    const sessions = join(root, 'sessions');
+    mkdirSync(sessions, { recursive: true });
+    writeFileSync(
+      join(sessions, 'pi.jsonl'),
+      reasoningSession({ input: 100, output: 20, cacheRead: 0, cacheWrite: 0, reasoning: 8 }),
+    );
+    process.env.VIBE_USAGE_PI_SESSION_DIRS = sessions;
+
+    const result = await parsePi();
+    assert.equal(result.buckets.length, 1);
+    assert.equal(result.buckets[0].reasoningOutputTokens, 8);
+    assert.equal(result.buckets[0].outputTokens, 12);
+    // Reasoning is a subset of output, so the total must not change.
+    assert.equal(result.buckets[0].totalTokens, 120);
+  } finally {
+    restoreEnv('VIBE_USAGE_PI_SESSION_DIRS', previous);
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test('Pi still reads the legacy reasoningTokens spelling', async () => {
+  const root = mkdtempSync(join(tmpdir(), 'vibe-usage-pi-reasoning-legacy-'));
+  const previous = process.env.VIBE_USAGE_PI_SESSION_DIRS;
+  try {
+    const sessions = join(root, 'sessions');
+    mkdirSync(sessions, { recursive: true });
+    writeFileSync(
+      join(sessions, 'pi.jsonl'),
+      reasoningSession({ input: 100, output: 20, cacheRead: 0, cacheWrite: 0, reasoningTokens: 8 }),
+    );
+    process.env.VIBE_USAGE_PI_SESSION_DIRS = sessions;
+
+    const result = await parsePi();
+    assert.equal(result.buckets[0].reasoningOutputTokens, 8);
+    assert.equal(result.buckets[0].outputTokens, 12);
+  } finally {
+    restoreEnv('VIBE_USAGE_PI_SESSION_DIRS', previous);
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test('Pi discovery honors PI_CODING_AGENT_SESSION_DIR alongside the agent store', () => {
+  const root = mkdtempSync(join(tmpdir(), 'vibe-usage-pi-session-dir-'));
+  const previous = Object.fromEntries([
+    'VIBE_USAGE_PI_SESSION_DIRS',
+    'PI_CODING_AGENT_DIR',
+    'PI_CODING_AGENT_SESSION_DIR',
+  ].map((name) => [name, process.env[name]]));
+  try {
+    delete process.env.VIBE_USAGE_PI_SESSION_DIRS;
+    const agentDir = join(root, 'agent');
+    const agentSessions = join(agentDir, 'sessions');
+    const relocated = join(root, 'relocated');
+    mkdirSync(agentSessions, { recursive: true });
+    mkdirSync(relocated, { recursive: true });
+    process.env.PI_CODING_AGENT_DIR = agentDir;
+    process.env.PI_CODING_AGENT_SESSION_DIR = relocated;
+
+    const dirs = getPiSessionDirs();
+    assert.ok(dirs.includes(agentSessions));
+    assert.ok(dirs.includes(relocated));
+  } finally {
+    for (const [name, value] of Object.entries(previous)) restoreEnv(name, value);
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test('Pi discovery honors sessionDir from settings.json and ignores relative values', () => {
+  const root = mkdtempSync(join(tmpdir(), 'vibe-usage-pi-settings-dir-'));
+  const previous = Object.fromEntries([
+    'VIBE_USAGE_PI_SESSION_DIRS',
+    'PI_CODING_AGENT_DIR',
+    'PI_CODING_AGENT_SESSION_DIR',
+  ].map((name) => [name, process.env[name]]));
+  try {
+    delete process.env.VIBE_USAGE_PI_SESSION_DIRS;
+    delete process.env.PI_CODING_AGENT_SESSION_DIR;
+    const agentDir = join(root, 'agent');
+    const configured = join(root, 'configured');
+    mkdirSync(join(agentDir, 'sessions'), { recursive: true });
+    mkdirSync(configured, { recursive: true });
+    process.env.PI_CODING_AGENT_DIR = agentDir;
+
+    writeFileSync(join(agentDir, 'settings.json'), JSON.stringify({ sessionDir: configured }));
+    assert.ok(getPiSessionDirs().includes(configured));
+
+    // Project-relative values resolve against a cwd the scanner does not have.
+    writeFileSync(join(agentDir, 'settings.json'), JSON.stringify({ sessionDir: '.pi/sessions' }));
+    assert.deepEqual(getPiSessionDirs(), [join(agentDir, 'sessions')]);
+
+    // A malformed settings file must not break discovery.
+    writeFileSync(join(agentDir, 'settings.json'), '{ not json');
+    assert.deepEqual(getPiSessionDirs(), [join(agentDir, 'sessions')]);
+  } finally {
+    for (const [name, value] of Object.entries(previous)) restoreEnv(name, value);
+    rmSync(root, { recursive: true, force: true });
+  }
+});

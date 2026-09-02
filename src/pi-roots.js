@@ -1,5 +1,5 @@
-import { existsSync, readdirSync } from 'node:fs';
-import { delimiter, join } from 'node:path';
+import { existsSync, readdirSync, readFileSync } from 'node:fs';
+import { delimiter, isAbsolute, join } from 'node:path';
 import { homedir } from 'node:os';
 
 function expandHome(value) {
@@ -41,18 +41,41 @@ export function looksLikeOmpAgentDir(agentDir) {
     || existsSync(join(agentDir, 'agent.db'));
 }
 
+// Pi resolves a session directory from `--session-dir`, then
+// PI_CODING_AGENT_SESSION_DIR, then `sessionDir` in settings.json. Only the
+// last two are discoverable after the fact, and both name the sessions
+// directory itself (no `sessions` segment is appended).
+function settingsSessionDir(agentDir) {
+  try {
+    const raw = readFileSync(join(agentDir, 'settings.json'), 'utf-8');
+    const value = JSON.parse(raw)?.sessionDir;
+    if (typeof value !== 'string') return null;
+    const trimmed = value.trim();
+    // Pi also accepts project-relative values. Those resolve against a cwd we
+    // do not have here, so only absolute and ~-anchored paths are scanned.
+    if (!trimmed || !(isAbsolute(trimmed) || trimmed.startsWith('~'))) return null;
+    return expandHome(trimmed);
+  } catch {
+    return null;
+  }
+}
+
 export function getPiSessionDirs() {
   const override = process.env.VIBE_USAGE_PI_SESSION_DIRS?.trim();
   if (override) return uniqueExistingDirs(override.split(delimiter));
 
-  const agentDir = process.env.PI_CODING_AGENT_DIR?.trim();
-  if (agentDir) {
-    const expanded = expandHome(agentDir);
-    // OMP inherits PI_CODING_AGENT_DIR from Pi. Do not parse an identifiable
-    // OMP store again as source=pi-coding-agent.
-    return looksLikeOmpAgentDir(expanded) ? [] : uniqueExistingDirs([join(expanded, 'sessions')]);
-  }
-  return uniqueExistingDirs([join(homedir(), '.pi', 'agent', 'sessions')]);
+  const envAgentDir = process.env.PI_CODING_AGENT_DIR?.trim();
+  const agentDir = envAgentDir ? expandHome(envAgentDir) : join(homedir(), '.pi', 'agent');
+  // OMP inherits PI_CODING_AGENT_DIR from Pi. Do not parse an identifiable
+  // OMP store again as source=pi-coding-agent.
+  if (envAgentDir && looksLikeOmpAgentDir(agentDir)) return [];
+
+  const dirs = [join(agentDir, 'sessions')];
+  const envSessionDir = process.env.PI_CODING_AGENT_SESSION_DIR?.trim();
+  if (envSessionDir) dirs.push(expandHome(envSessionDir));
+  const configured = settingsSessionDir(agentDir);
+  if (configured) dirs.push(configured);
+  return uniqueExistingDirs(dirs);
 }
 
 export function getOmpSessionDirs() {

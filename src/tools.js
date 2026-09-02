@@ -143,7 +143,6 @@ export function findDshDataDirs() {
   return [getDshSessionsDir()].filter(existsSync);
 }
 
-
 /** mcode runtime database: VIBE_USAGE_MCODE_DB wins, then MCODE_HOME, then ~/.minimax. */
 export function getMcodeDbPath(env = process.env, home = homedir()) {
   const override = env.VIBE_USAGE_MCODE_DB?.trim();
@@ -324,7 +323,7 @@ export const TOOLS = [
     detectDataDirs: findKimiCodeDataDirs,
   },
   {
-    name: 'mcode',
+    name: 'MiniMax Code',
     id: 'mcode',
     dataDir: join(homedir(), '.minimax', 'v2', 'sqlite', 'runtime-state.sqlite'),
     detectDataDirs: () => [getMcodeDbPath()].filter(existsSync),

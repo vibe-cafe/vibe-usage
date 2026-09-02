@@ -99,7 +99,10 @@ export async function parsePiSessionJsonl({
         if (message.role !== 'assistant' || !message.usage) continue;
         const usage = message.usage;
         const inputTokens = toCount(usage.input) + toCount(usage.cacheWrite);
-        const reasoningOutputTokens = toCount(usage.reasoningTokens);
+        // Pi's Usage type names this field `reasoning` (a documented subset of
+        // `output`); older/adjacent stores wrote `reasoningTokens`. Reading only
+        // the latter left every Pi reasoning token inside outputTokens.
+        const reasoningOutputTokens = toCount(usage.reasoning ?? usage.reasoningTokens);
         // OMP/Pi usage.output includes reasoning; the shared bucket contract
         // stores non-reasoning output and reasoning separately.
         const outputTokens = Math.max(0, toCount(usage.output) - reasoningOutputTokens);

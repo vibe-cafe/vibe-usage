@@ -68,7 +68,19 @@ function decodeJwtSub(token) {
   }
 }
 
-const FETCH_TIMEOUT_MS = 10_000;
+// Under full sync many parsers hammer disk concurrently; cursor.com's CSV
+// export can still succeed but take >10s. A short timeout caused silent skips.
+const DEFAULT_FETCH_TIMEOUT_MS = 30_000;
+const MAX_FETCH_TIMEOUT_MS = 2_147_483_647;
+
+export function resolveCursorFetchTimeout(value) {
+  const timeout = Number(value);
+  return Number.isInteger(timeout) && timeout > 0 && timeout <= MAX_FETCH_TIMEOUT_MS
+    ? timeout
+    : DEFAULT_FETCH_TIMEOUT_MS;
+}
+
+const FETCH_TIMEOUT_MS = resolveCursorFetchTimeout(process.env.VIBE_USAGE_CURSOR_FETCH_TIMEOUT_MS);
 
 async function fetchUsageCsv(token) {
   const url = `${(process.env.CURSOR_WEB_BASE_URL?.trim() || 'https://cursor.com').replace(/\/+$/, '')}/api/dashboard/export-usage-events-csv?strategy=tokens`;
@@ -190,7 +202,14 @@ export async function parse() {
     // Auth failure → bubble up so user sees they need to re-login in Cursor.
     // Tell sync.js this was not a successful empty snapshot so it preserves
     // Cursor's incremental state instead of pruning it as dead history.
-    if (err && err.skip) return { buckets: [], sessions: [], skipped: true };
+    if (err && err.skip) {
+      return {
+        buckets: [],
+        sessions: [],
+        skipped: true,
+        warnings: [`cursor: ${err.message}`],
+      };
+    }
     throw err;
   }
   const rows = parseCsv(csv);

@@ -56,7 +56,17 @@ function escapeXml(value) {
     .replace(/'/g, '&apos;');
 }
 
-const PRESERVED_SERVICE_ENV = ['MCODE_HOME', 'MIMOCODE_HOME', 'MIMOCODE_DB', 'XDG_DATA_HOME'];
+// Variables that relocate a tool's on-disk store. The service runs from a
+// launchd/systemd unit that inherits nothing, so anything the parsers read for
+// discovery has to be captured into the unit at install time.
+const PRESERVED_SERVICE_ENV = [
+  'MCODE_HOME',
+  'MIMOCODE_HOME',
+  'MIMOCODE_DB',
+  'XDG_DATA_HOME',
+  'PI_CODING_AGENT_DIR',
+  'PI_CODING_AGENT_SESSION_DIR',
+];
 
 function serviceEnvironment(claudeConfigDir, env) {
   const values = {
