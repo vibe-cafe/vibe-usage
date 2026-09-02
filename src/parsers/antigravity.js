@@ -325,14 +325,23 @@ export async function parse({ extraRoots = [] } = {}) {
   const extraDirs = [];
   for (const root of extraRoots) {
     const dirs = antigravityConversationDirs(root);
-    if (!dirs.some(dir => {
+    let found = false;
+    for (const dir of dirs) {
       try {
         readdirSync(dir);
-        return true;
-      } catch {
-        return false;
+        extraDirs.push(dir);
+        found = true;
+      } catch (err) {
+        if (err?.code === 'ENOENT') continue;
+        return {
+          buckets: [],
+          sessions: [],
+          skipped: true,
+          warnings: [`antigravity: 额外根目录读取失败，已保留上次同步数据: ${normalizeExtraRoot(root)}`],
+        };
       }
-    })) {
+    }
+    if (!found) {
       return {
         buckets: [],
         sessions: [],
@@ -340,7 +349,6 @@ export async function parse({ extraRoots = [] } = {}) {
         warnings: [`antigravity: 额外根目录不可用，已跳过本次 Antigravity 同步: ${normalizeExtraRoot(root)}`],
       };
     }
-    extraDirs.push(...dirs);
   }
 
   // ── Path 1: offline .db parsing (App 2.0 + agy CLI, no process needed) ──
@@ -349,13 +357,24 @@ export async function parse({ extraRoots = [] } = {}) {
   const defaultDirs = fixtureDirs
     ? fixtureDirs.split(delimiter).filter(Boolean)
     : [CONVERSATIONS_DIR, CLI_CONVERSATIONS_DIR];
-  const defaultDirCount = defaultDirs.length;
+  const strictDirs = new Set(extraDirs);
   const conversationDirs = [...new Set([...defaultDirs, ...extraDirs])];
-  const candidates = conversationDirs.flatMap((dir, dirIndex) => (
-    listDbCascades(dir).map(cascadeId => ({ dir, dirIndex, cascadeId }))
-  ));
+  const candidates = [];
+  for (const dir of conversationDirs) {
+    const strict = strictDirs.has(dir);
+    try {
+      for (const cascadeId of listDbCascades(dir, { strict })) {
+        candidates.push({ dir, cascadeId, strict });
+      }
+    } catch {
+      return {
+        buckets: [], sessions: [], skipped: true,
+        warnings: [`antigravity: 额外根目录读取失败，已保留上次同步数据: ${dir}`],
+      };
+    }
+  }
   const configuredCascadeIds = new Set(
-    candidates.filter(candidate => candidate.dirIndex >= defaultDirCount).map(candidate => candidate.cascadeId),
+    candidates.filter(candidate => candidate.strict).map(candidate => candidate.cascadeId),
   );
   const selectedConfiguredCopies = new Map();
   for (const candidate of candidates) {
@@ -371,47 +390,56 @@ export async function parse({ extraRoots = [] } = {}) {
     if (!previous || size > previous.size) selectedConfiguredCopies.set(candidate.cascadeId, { ...candidate, size });
   }
 
-  for (const { dir, cascadeId } of candidates) {
+  for (const { dir, cascadeId, strict } of candidates) {
     const selected = selectedConfiguredCopies.get(cascadeId);
     if (selected && selected.dir !== dir) continue;
-    const records = readDbUsageRecords(dir, cascadeId);
-    const project = projectFromUri(readDbWorkspaceUri(dir, cascadeId)) || 'unknown';
-    const stepTimestampsByIdx = records.some((rec) => !rec.timestamp || isNaN(rec.timestamp.getTime()))
-      ? readDbStepTimestamps(dir, cascadeId)
-      : new Map();
+    try {
+      const options = { strict };
+      const records = readDbUsageRecords(dir, cascadeId, options);
+      const project = projectFromUri(readDbWorkspaceUri(dir, cascadeId)) || 'unknown';
+      const stepTimestampsByIdx = records.some((rec) => !rec.timestamp || isNaN(rec.timestamp.getTime()))
+        ? readDbStepTimestamps(dir, cascadeId, options)
+        : new Map();
 
-    if (records.length > 0) {
-      dbHandled.add(cascadeId);
-      for (const rec of records) {
-        if (rec.responseId && seenResponseIds.has(rec.responseId)) continue;
-        if (rec.responseId) seenResponseIds.add(rec.responseId);
-        // Gemini 3.7 CLI blobs dropped chatStartMetadata.createdAt (9.4.1)
-        // and modelDisplayName (21). Usage is still in field 4; clock is
-        // recovered from steps.metadata at the same idx.
-        const timestamp = resolveUsageTimestamp(rec, stepTimestampsByIdx);
-        if (!timestamp || isNaN(timestamp.getTime())) continue;
-        entries.push({
+      if (records.length > 0) {
+        dbHandled.add(cascadeId);
+        for (const rec of records) {
+          if (rec.responseId && seenResponseIds.has(rec.responseId)) continue;
+          if (rec.responseId) seenResponseIds.add(rec.responseId);
+          // Gemini 3.7 CLI blobs dropped chatStartMetadata.createdAt (9.4.1)
+          // and modelDisplayName (21). Usage is still in field 4; clock is
+          // recovered from steps.metadata at the same idx.
+          const timestamp = resolveUsageTimestamp(rec, stepTimestampsByIdx);
+          if (!timestamp || isNaN(timestamp.getTime())) continue;
+          entries.push({
+            source: SOURCE,
+            model: modelFromRecord(rec),
+            project,
+            timestamp,
+            inputTokens: toSafeNumber(rec.inputTokens),
+            outputTokens: toSafeNumber(rec.outputTokens),
+            cachedInputTokens: toSafeNumber(rec.cacheReadTokens),
+            reasoningOutputTokens: toSafeNumber(rec.thinkingOutputTokens),
+          });
+        }
+      }
+
+      // Session timing from steps (independent of token usage presence).
+      for (const ev of readDbSessionEvents(dir, cascadeId, options)) {
+        sessionEvents.push({
+          sessionId: cascadeId,
           source: SOURCE,
-          model: modelFromRecord(rec),
           project,
-          timestamp,
-          inputTokens: toSafeNumber(rec.inputTokens),
-          outputTokens: toSafeNumber(rec.outputTokens),
-          cachedInputTokens: toSafeNumber(rec.cacheReadTokens),
-          reasoningOutputTokens: toSafeNumber(rec.thinkingOutputTokens),
+          timestamp: ev.timestamp,
+          role: ev.role,
         });
       }
-    }
-
-    // Session timing from steps (independent of token usage presence).
-    for (const ev of readDbSessionEvents(dir, cascadeId)) {
-      sessionEvents.push({
-        sessionId: cascadeId,
-        source: SOURCE,
-        project,
-        timestamp: ev.timestamp,
-        role: ev.role,
-      });
+    } catch (err) {
+      if (!strict) throw err;
+      return {
+        buckets: [], sessions: [], skipped: true,
+        warnings: [`antigravity: 额外根目录读取失败，已保留上次同步数据: ${dir}`],
+      };
     }
   }
 

@@ -1,6 +1,6 @@
 import { test } from 'node:test';
 import assert from 'node:assert';
-import { mkdirSync, mkdtempSync, rmSync } from 'node:fs';
+import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import {
@@ -305,6 +305,29 @@ test('missing configured Antigravity home skips the source to protect upload sta
     assert.equal(result.skipped, true);
     assert.deepEqual(result.buckets, []);
     assert.match(result.warnings[0], /额外根目录不可用/);
+  } finally {
+    if (previous === undefined) delete process.env.VIBE_USAGE_ANTIGRAVITY_DIRS;
+    else process.env.VIBE_USAGE_ANTIGRAVITY_DIRS = previous;
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test('database failure inside a configured Antigravity home skips the source', async () => {
+  const root = mkdtempSync(join(tmpdir(), 'vibe-usage-antigravity-invalid-'));
+  const emptyDefault = join(root, 'default-conversations');
+  const extraHome = join(root, 'isolated-home');
+  const conversationsDir = join(extraHome, '.gemini', 'antigravity-cli', 'conversations');
+  mkdirSync(emptyDefault, { recursive: true });
+  mkdirSync(conversationsDir, { recursive: true });
+  writeFileSync(join(conversationsDir, 'broken.db'), 'not a sqlite database');
+
+  const previous = process.env.VIBE_USAGE_ANTIGRAVITY_DIRS;
+  process.env.VIBE_USAGE_ANTIGRAVITY_DIRS = emptyDefault;
+  try {
+    const result = await parse({ extraRoots: [extraHome] });
+    assert.equal(result.skipped, true);
+    assert.deepEqual(result.buckets, []);
+    assert.match(result.warnings[0], /额外根目录读取失败/);
   } finally {
     if (previous === undefined) delete process.env.VIBE_USAGE_ANTIGRAVITY_DIRS;
     else process.env.VIBE_USAGE_ANTIGRAVITY_DIRS = previous;

@@ -1,6 +1,6 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { appendFileSync, mkdirSync, mkdtempSync, readdirSync, rmSync, writeFileSync } from 'node:fs';
+import { appendFileSync, chmodSync, mkdirSync, mkdtempSync, readdirSync, rmSync, writeFileSync } from 'node:fs';
 import { join } from 'node:path';
 import { tmpdir } from 'node:os';
 import { parse } from '../src/parsers/codex.js';
@@ -798,6 +798,38 @@ test('configured Codex container with no task homes skips the source', async () 
     assert.deepEqual(result.buckets, []);
     assert.match(result.warnings[0], /额外根目录不可用/);
   } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test('unreadable directory inside a configured Codex home skips the source', {
+  skip: process.platform === 'win32',
+}, async () => {
+  const root = mkdtempSync(join(tmpdir(), 'vibe-usage-codex-unreadable-container-'));
+  const primary = join(root, 'primary');
+  const container = join(root, 'container');
+  const home = join(container, 'workspace-a', 'task-a', 'codex-home');
+  const sessionsDir = join(home, 'sessions');
+  const blockedDir = join(sessionsDir, 'blocked');
+  mkdirSync(blockedDir, { recursive: true });
+  writeFileSync(join(sessionsDir, 'visible.jsonl'), '');
+
+  const previousHome = process.env.CODEX_HOME;
+  const previousCache = process.env.VIBE_USAGE_CACHE_DIR;
+  process.env.CODEX_HOME = primary;
+  process.env.VIBE_USAGE_CACHE_DIR = join(root, 'cache');
+  chmodSync(blockedDir, 0o000);
+  try {
+    const result = await parse({ extraRoots: [container] });
+    assert.equal(result.skipped, true);
+    assert.deepEqual(result.buckets, []);
+    assert.match(result.warnings[0], /额外根目录读取失败/);
+  } finally {
+    chmodSync(blockedDir, 0o700);
+    if (previousHome === undefined) delete process.env.CODEX_HOME;
+    else process.env.CODEX_HOME = previousHome;
+    if (previousCache === undefined) delete process.env.VIBE_USAGE_CACHE_DIR;
+    else process.env.VIBE_USAGE_CACHE_DIR = previousCache;
     rmSync(root, { recursive: true, force: true });
   }
 });

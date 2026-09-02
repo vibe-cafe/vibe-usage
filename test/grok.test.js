@@ -241,3 +241,30 @@ test('missing configured Grok home skips the source to protect upload state', as
   assert.deepEqual(result.buckets, []);
   assert.match(result.warnings[0], /额外根目录不可用/);
 });
+
+test('parse failure inside a configured Grok home skips the source', async () => {
+  const root = mkdtempSync(join(tmpdir(), 'vibe-usage-grok-invalid-root-'));
+  const primaryHome = join(root, 'primary');
+  const extraHome = join(root, 'extra');
+  const sessionPath = join(extraHome, 'sessions', 'project', 'broken-session');
+  mkdirSync(sessionPath, { recursive: true });
+  writeFileSync(join(sessionPath, 'summary.json'), '{not-json');
+  writeFileSync(join(sessionPath, 'updates.jsonl'), '');
+
+  const previousHome = process.env.GROK_HOME;
+  const previousFixture = process.env.VIBE_USAGE_GROK_SESSIONS;
+  process.env.GROK_HOME = primaryHome;
+  delete process.env.VIBE_USAGE_GROK_SESSIONS;
+  try {
+    const result = await parse({ extraRoots: [extraHome] });
+    assert.equal(result.skipped, true);
+    assert.deepEqual(result.buckets, []);
+    assert.match(result.warnings[0], /额外根目录读取失败/);
+  } finally {
+    if (previousHome === undefined) delete process.env.GROK_HOME;
+    else process.env.GROK_HOME = previousHome;
+    if (previousFixture === undefined) delete process.env.VIBE_USAGE_GROK_SESSIONS;
+    else process.env.VIBE_USAGE_GROK_SESSIONS = previousFixture;
+    rmSync(root, { recursive: true, force: true });
+  }
+});

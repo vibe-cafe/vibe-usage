@@ -200,14 +200,15 @@ function queryCascadeDb(conversationsDir, cascadeId, sql) {
 }
 
 /** List cascade IDs backed by a `.db` file in a conversations directory. */
-export function listDbCascades(conversationsDir) {
+export function listDbCascades(conversationsDir, { strict = false } = {}) {
   try {
     const out = [];
     for (const f of readdirSync(conversationsDir)) {
       if (f.endsWith('.db') && f !== 'db.sqlite') out.push(f.slice(0, -3));
     }
     return out;
-  } catch {
+  } catch (err) {
+    if (strict) throw err;
     return [];
   }
 }
@@ -217,12 +218,12 @@ export function listDbCascades(conversationsDir) {
  * records. blob is fetched as hex text so it round-trips through both the
  * node:sqlite and sqlite3-CLI backends uniformly.
  */
-export function readDbUsageRecords(conversationsDir, cascadeId) {
+export function readDbUsageRecords(conversationsDir, cascadeId, { strict = false } = {}) {
   let rows;
   try {
     rows = queryCascadeDb(conversationsDir, cascadeId, 'SELECT idx, hex(data) AS h FROM gen_metadata ORDER BY idx');
   } catch (err) {
-    if (isSqliteUnavailableError(err)) throw err;
+    if (isSqliteUnavailableError(err) || strict) throw err;
     return [];
   }
   const records = [];
@@ -247,7 +248,7 @@ export function readDbUsageRecords(conversationsDir, cascadeId) {
  * system/tool steps that parseStepMetadata skips. Used to timestamp 3.7
  * gen_metadata rows that no longer embed chatStartMetadata.
  */
-export function readDbStepTimestamps(conversationsDir, cascadeId) {
+export function readDbStepTimestamps(conversationsDir, cascadeId, { strict = false } = {}) {
   let rows;
   try {
     rows = queryCascadeDb(
@@ -256,7 +257,7 @@ export function readDbStepTimestamps(conversationsDir, cascadeId) {
       'SELECT idx, hex(metadata) AS h FROM steps WHERE metadata IS NOT NULL ORDER BY idx',
     );
   } catch (err) {
-    if (isSqliteUnavailableError(err)) throw err;
+    if (isSqliteUnavailableError(err) || strict) throw err;
     return new Map();
   }
   const byIdx = new Map();
@@ -331,7 +332,7 @@ export function parseStepMetadata(buf) {
  * Read session timing events (user/assistant turns) for a cascade from the
  * steps table, chronological by idx.
  */
-export function readDbSessionEvents(conversationsDir, cascadeId) {
+export function readDbSessionEvents(conversationsDir, cascadeId, { strict = false } = {}) {
   let rows;
   try {
     rows = queryCascadeDb(
@@ -340,7 +341,7 @@ export function readDbSessionEvents(conversationsDir, cascadeId) {
       'SELECT hex(metadata) AS h FROM steps WHERE metadata IS NOT NULL ORDER BY idx',
     );
   } catch (err) {
-    if (isSqliteUnavailableError(err)) throw err;
+    if (isSqliteUnavailableError(err) || strict) throw err;
     return [];
   }
   const events = [];
