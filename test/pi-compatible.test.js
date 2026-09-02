@@ -7,7 +7,7 @@ import { parse as parseCraftAgent } from '../src/parsers/craft-agent.js';
 import { parse as parseOmp } from '../src/parsers/omp.js';
 import { parse as parsePi } from '../src/parsers/pi-coding-agent.js';
 import { getOmpSessionDirs, getPiSessionDirs } from '../src/pi-roots.js';
-import { validateExtraRoot } from '../src/extra-roots.js';
+import { validateExtraRoot, piSessionsDir } from '../src/extra-roots.js';
 
 const previousCindyDirs = process.env.VIBE_USAGE_CINDY_DIRS;
 process.env.VIBE_USAGE_CINDY_DIRS = join(tmpdir(), 'vibe-usage-cindy-disabled');
@@ -21,6 +21,8 @@ function restoreEnv(name, value) {
   else process.env[name] = value;
 }
 
+// Mirrors a real Pi store: the header carries a full SessionHeader
+// (version/id/timestamp/cwd) and message records carry id/parentId/timestamp.
 function sessionLines({
   sessionId = 'session-1',
   cwd = '/work/project',
@@ -35,16 +37,18 @@ function sessionLines({
       updatedAt: '2026-07-27T13:19:56.000Z',
       pad: '',
     }] : []),
-    { type: 'session', id: sessionId, timestamp: '2026-07-27T13:19:57.000Z', cwd },
+    { type: 'session', version: 3, id: sessionId, timestamp: '2026-07-27T13:19:57.000Z', cwd },
     {
       type: 'message',
       id: 'user-1',
+      parentId: sessionId,
       timestamp: '2026-07-27T13:20:00.000Z',
       message: { role: 'user', content: [] },
     },
     {
       type: 'message',
       id: 'assistant-1',
+      parentId: 'user-1',
       timestamp: '2026-07-27T13:20:05.000Z',
       message: {
         role: 'assistant',
@@ -310,7 +314,7 @@ test('Pi scans an explicitly configured extra session root that discovery cannot
 // contain usage records with no `obj.id`, which record-level dedup cannot see.
 function anonymousSessionLines({ sessionId = 'anonymous-1', input = 10 } = {}) {
   return [
-    { type: 'session', id: sessionId, timestamp: '2026-07-27T13:19:57.000Z', cwd: '/work/project' },
+    { type: 'session', version: 3, id: sessionId, timestamp: '2026-07-27T13:19:57.000Z', cwd: '/work/project' },
     {
       type: 'message',
       timestamp: '2026-07-27T13:20:05.000Z',
@@ -374,6 +378,127 @@ test('Pi extra-root validation requires real Pi session files, not just .jsonl',
     writeFileSync(join(nested, 'session-1.jsonl'), sessionLines({ sessionId: 'session-1' }));
     assert.equal(validateExtraRoot('pi-coding-agent', join(root, 'container')).ok, true);
   } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test('Pi extra-root validation rejects malformed Pi lookalikes that parse to zero', async () => {
+  const root = mkdtempSync(join(tmpdir(), 'vibe-usage-pi-extra-root-malformed-'));
+  const previous = Object.fromEntries([
+    'VIBE_USAGE_PI_SESSION_DIRS',
+    'PI_CODING_AGENT_DIR',
+    'PI_CODING_AGENT_SESSION_DIR',
+  ].map((name) => [name, process.env[name]]));
+  try {
+    delete process.env.VIBE_USAGE_PI_SESSION_DIRS;
+    delete process.env.PI_CODING_AGENT_SESSION_DIR;
+    process.env.PI_CODING_AGENT_DIR = join(root, 'no-default-store');
+
+    // Matching on the `type` name alone accepted both of these. Pi's session
+    // format requires a full SessionHeader, and a message record carries
+    // id/parentId/timestamp plus a role the parser consumes — so each of these
+    // would have been stored as a valid root that forever syncs zero.
+    const samples = {
+      'header-without-fields': '{"type":"session"}\n',
+      'message-without-fields': '{"type":"message","message":{}}\n',
+      // A role the parser produces neither usage nor an event for.
+      'unsupported-role': JSON.stringify({
+        type: 'message',
+        id: 'm1',
+        parentId: 's1',
+        timestamp: '2026-07-27T13:20:05.000Z',
+        message: { role: 'system', content: [] },
+      }) + '\n',
+    };
+    for (const [name, body] of Object.entries(samples)) {
+      const dir = join(root, name);
+      mkdirSync(dir, { recursive: true });
+      writeFileSync(join(dir, 'store.jsonl'), body);
+      assert.equal(validateExtraRoot('pi-coding-agent', dir).ok, false, name);
+      // Confirm the rejection matches reality: the parser reads nothing here.
+      const result = await parsePi({ extraRoots: [dir] });
+      assert.deepEqual(result.buckets, [], name);
+    }
+
+    // A complete header still validates, and so does a header-less store whose
+    // message records carry the base fields (an appended-to third-party store).
+    const headerless = join(root, 'headerless');
+    mkdirSync(headerless, { recursive: true });
+    writeFileSync(join(headerless, 'store.jsonl'), JSON.stringify({
+      type: 'message',
+      id: 'assistant-1',
+      parentId: 'user-1',
+      timestamp: '2026-07-27T13:20:05.000Z',
+      message: {
+        role: 'assistant',
+        model: 'test-model',
+        usage: { input: 10, output: 0, cacheRead: 0, cacheWrite: 0 },
+      },
+    }) + '\n');
+    assert.equal(validateExtraRoot('pi-coding-agent', headerless).ok, true);
+    const parsed = await parsePi({ extraRoots: [headerless] });
+    assert.equal(parsed.buckets.length, 1);
+    assert.equal(parsed.buckets[0].inputTokens, 10);
+  } finally {
+    for (const [name, value] of Object.entries(previous)) restoreEnv(name, value);
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test('Pi keeps scanning a bare store when an unrelated sessions/ child appears', async () => {
+  const root = mkdtempSync(join(tmpdir(), 'vibe-usage-pi-extra-root-bare-'));
+  const previous = Object.fromEntries([
+    'VIBE_USAGE_PI_SESSION_DIRS',
+    'PI_CODING_AGENT_DIR',
+    'PI_CODING_AGENT_SESSION_DIR',
+  ].map((name) => [name, process.env[name]]));
+  try {
+    delete process.env.VIBE_USAGE_PI_SESSION_DIRS;
+    delete process.env.PI_CODING_AGENT_SESSION_DIR;
+    process.env.PI_CODING_AGENT_DIR = join(root, 'no-default-store');
+
+    // The shape `pi --session <file>` writes: session files in the root itself.
+    const store = join(root, 'store');
+    mkdirSync(store, { recursive: true });
+    writeFileSync(join(store, 's1.jsonl'), anonymousSessionLines({ input: 10 }));
+    assert.equal(piSessionsDir(store), store);
+    const before = await parsePi({ extraRoots: [store] });
+    assert.equal(before.buckets[0].inputTokens, 10);
+
+    // Preferring a readable `sessions/` by name alone meant this bare mkdir
+    // silently redirected the scan to an empty directory: a successful sync
+    // reporting zero, which prunes the source's already-uploaded state.
+    mkdirSync(join(store, 'sessions'));
+    assert.equal(piSessionsDir(store), store);
+    const after = await parsePi({ extraRoots: [store] });
+    assert.equal(after.skipped, undefined);
+    assert.equal(after.buckets[0].inputTokens, 10);
+
+    // The same name-only preference rejected a mixed store outright, even
+    // though its root plainly holds sessions. Canonical-path dedup in the
+    // parser keeps the recursive read from counting the nested file twice.
+    const mixed = join(root, 'mixed');
+    const mixedNested = join(mixed, 'sessions');
+    mkdirSync(mixedNested, { recursive: true });
+    writeFileSync(join(mixed, 'root.jsonl'), anonymousSessionLines({ sessionId: 'r', input: 10 }));
+    writeFileSync(join(mixedNested, 'nested.jsonl'), anonymousSessionLines({ sessionId: 'n', input: 7 }));
+    assert.equal(validateExtraRoot('pi-coding-agent', mixed).ok, true);
+    assert.equal(piSessionsDir(mixed), mixed);
+    const mixedResult = await parsePi({ extraRoots: [mixed] });
+    assert.equal(mixedResult.skipped, undefined);
+    assert.equal(
+      mixedResult.buckets.reduce((sum, { inputTokens }) => sum + inputTokens, 0),
+      17,
+    );
+
+    // An agent home is still resolved to its confirmed sessions/ child.
+    const agentDir = join(root, 'agent');
+    const agentSessions = join(agentDir, 'sessions');
+    mkdirSync(agentSessions, { recursive: true });
+    writeFileSync(join(agentSessions, 's1.jsonl'), sessionLines({ sessionId: 'agent-1' }));
+    assert.equal(piSessionsDir(agentDir), agentSessions);
+  } finally {
+    for (const [name, value] of Object.entries(previous)) restoreEnv(name, value);
     rmSync(root, { recursive: true, force: true });
   }
 });

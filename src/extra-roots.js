@@ -86,7 +86,15 @@ export function antigravityConversationDirs(value) {
 // `pi --session <file>` writes bare session trees with no agent home above
 // them. Accept either shape, but resolve to exactly one directory per root:
 // the parser walks nested directories, so returning both a root and its
-// `sessions/` child would read every file twice.
+// `sessions/` child would read every file twice. Canonical-path dedup in the
+// parser makes the overlap harmless even for a mixed root that holds sessions
+// directly *and* under `sessions/`.
+//
+// Every candidate is confirmed by content, never by name alone. A readable but
+// unconfirmed `sessions/` child used to win unconditionally, so creating an
+// empty `<root>/sessions` was enough to redirect the scan away from a bare
+// store's own files — a successful sync reporting zero, which then pruned the
+// source's incremental state.
 //
 // The shape is re-resolved on every run rather than remembered from add-root
 // time, and an unresolvable root returns null instead of falling back to the
@@ -95,19 +103,57 @@ export function antigravityConversationDirs(value) {
 // zero this feature exists to prevent.
 export function piSessionsDir(value) {
   const root = normalizeExtraRoot(value);
+  if (!isReadableDirectory(root)) return null;
+  // A bare store is identified by the session files it holds directly, and
+  // outranks any `sessions/` child: those files are what the user configured.
+  if (hasPiSessionJsonl(root, 0)) return root;
   const nested = join(root, 'sessions');
-  if (isReadableDirectory(nested)) return nested;
-  if (isReadableDirectory(root) && hasPiSessionJsonl(root)) return root;
+  // Agent-home shape: take the child only once its content confirms it.
+  if (isReadableDirectory(nested) && hasPiSessionJsonl(nested)) return nested;
+  // A configured container holding per-task stores somewhere below it.
+  if (hasPiSessionJsonl(root)) return root;
   return null;
 }
 
 const PI_PROBE_BYTES = 16 * 1024;
 const PI_PROBE_LINES = 10;
+// Roles the Pi parser turns into events; anything else contributes nothing.
+const PI_MESSAGE_ROLES = new Set(['user', 'assistant', 'toolResult']);
+
+function isNonEmptyString(value) {
+  return typeof value === 'string' && value.trim() !== '';
+}
+
+// Pi's session format opens a store with a full SessionHeader. `version` is
+// written as both a number and a string across real stores, so only its
+// presence is required.
+function isPiSessionHeader(obj) {
+  return obj.type === 'session'
+    && obj.version !== undefined
+    && obj.version !== null
+    && isNonEmptyString(obj.id)
+    && isNonEmptyString(obj.timestamp)
+    && typeof obj.cwd === 'string';
+}
+
+// A store an external harness appends to may carry no header inside the probed
+// prefix, so a message record alone can confirm the directory — but only a
+// complete one. Matching on `type` and an object-valued `message` accepted
+// `{"type":"message","message":{}}`, which the parser reads to exactly zero.
+function isPiSessionMessage(obj) {
+  return obj.type === 'message'
+    && isNonEmptyString(obj.id)
+    && 'parentId' in obj
+    && isNonEmptyString(obj.timestamp)
+    && Boolean(obj.message)
+    && typeof obj.message === 'object'
+    && PI_MESSAGE_ROLES.has(obj.message.role);
+}
 
 // A `.jsonl` extension proves nothing: an unrelated log would validate an
 // entirely wrong directory, which the parser then ignores without complaining.
-// Probe a bounded prefix for a record the Pi parser actually consumes — a
-// `session` header, or a `message` entry for an appended-to store.
+// Neither does a bare `type` name — validation has to require the fields the
+// parser reads, or a malformed lookalike is accepted and still syncs zero.
 function looksLikePiSessionFile(filePath) {
   let text;
   let fd;
@@ -139,8 +185,7 @@ function looksLikePiSessionFile(filePath) {
       continue;
     }
     if (!obj || typeof obj !== 'object') continue;
-    if (obj.type === 'session') return true;
-    if (obj.type === 'message' && obj.message && typeof obj.message === 'object') return true;
+    if (isPiSessionHeader(obj) || isPiSessionMessage(obj)) return true;
   }
   return false;
 }
@@ -182,9 +227,10 @@ export function validateExtraRoot(source, value) {
     };
   }
   if (source === 'pi-coding-agent') {
-    const sessionsDir = piSessionsDir(path);
+    // piSessionsDir only returns a directory it has already confirmed by
+    // content, so there is nothing left to re-check here.
     return {
-      ok: sessionsDir !== null && hasPiSessionJsonl(sessionsDir),
+      ok: piSessionsDir(path) !== null,
       path,
       reason: '需要是直接包含 Pi 会话 .jsonl 的目录，或包含 sessions/ 的 Pi agent 目录',
     };

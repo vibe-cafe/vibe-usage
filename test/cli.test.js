@@ -202,6 +202,7 @@ test('config add-root accepts a Pi session store and reports it in status', () =
   mkdirSync(piStore, { recursive: true });
   writeFileSync(join(piStore, 'session-1.jsonl'), `${JSON.stringify({
     type: 'session',
+    version: 3,
     id: 'session-1',
     timestamp: '2026-09-01T00:00:00.000Z',
     cwd: '/work/harness',
