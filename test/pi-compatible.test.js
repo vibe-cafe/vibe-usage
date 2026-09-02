@@ -1,6 +1,6 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from 'node:fs';
+import { chmodSync, mkdirSync, mkdtempSync, rmSync, writeFileSync } from 'node:fs';
 import { delimiter, join } from 'node:path';
 import { tmpdir } from 'node:os';
 import { parse as parseCraftAgent } from '../src/parsers/craft-agent.js';
@@ -536,6 +536,84 @@ test('Pi scans a whole container even when one task store is named sessions/', a
       17,
     );
   } finally {
+    for (const [name, value] of Object.entries(previous)) restoreEnv(name, value);
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
+// Readability failures inside a supported container shape used to be reported
+// as "this subtree holds no sessions", which re-ran the container-vs-agent-home
+// decision on false evidence.
+test('Pi skips a container whose sibling store is temporarily unreadable', {
+  skip: process.platform === 'win32',
+}, async () => {
+  const root = mkdtempSync(join(tmpdir(), 'vibe-usage-pi-extra-root-unreadable-'));
+  const previous = Object.fromEntries([
+    'VIBE_USAGE_PI_SESSION_DIRS',
+    'PI_CODING_AGENT_DIR',
+    'PI_CODING_AGENT_SESSION_DIR',
+  ].map((name) => [name, process.env[name]]));
+  const blocked = [];
+  try {
+    delete process.env.VIBE_USAGE_PI_SESSION_DIRS;
+    delete process.env.PI_CODING_AGENT_SESSION_DIR;
+    process.env.PI_CODING_AGENT_DIR = join(root, 'no-default-store');
+
+    const container = join(root, 'container');
+    const task = join(container, 'task-a');
+    const named = join(container, 'sessions');
+    mkdirSync(task, { recursive: true });
+    mkdirSync(named, { recursive: true });
+    writeFileSync(join(task, 'task.jsonl'), anonymousSessionLines({ sessionId: 'task-a', input: 10 }));
+    writeFileSync(join(named, 'named.jsonl'), anonymousSessionLines({ sessionId: 'named', input: 7 }));
+
+    assert.equal(piSessionsDir(container), container);
+    const before = await parsePi({ extraRoots: [container] });
+    assert.equal(before.skipped, undefined);
+    assert.equal(before.buckets.reduce((sum, { inputTokens }) => sum + inputTokens, 0), 17);
+
+    // Only the sibling store loses read permission; the container and its
+    // `sessions/` child stay readable. Reading that failure as "task-a holds no
+    // sessions" narrowed the scan to `sessions/` and reported 7 as a success,
+    // dropping the other 10 and pruning its already-uploaded state.
+    chmodSync(task, 0o000);
+    blocked.push(task);
+    assert.equal(piSessionsDir(container), null);
+    const during = await parsePi({ extraRoots: [container] });
+    assert.equal(during.skipped, true);
+    assert.deepEqual(during.buckets, []);
+    assert.deepEqual(during.sessions, []);
+    assert.match(during.warnings.join('\n'), /额外根目录不可用/);
+
+    // The same evidence at file level: an unreadable store file next to a
+    // confirmed `sessions/` child must not resolve to that child either.
+    const mixed = join(root, 'mixed');
+    const mixedNested = join(mixed, 'sessions');
+    mkdirSync(mixedNested, { recursive: true });
+    writeFileSync(join(mixedNested, 'nested.jsonl'), anonymousSessionLines({ sessionId: 'n', input: 7 }));
+    const blockedFile = join(mixed, 'root.jsonl');
+    writeFileSync(blockedFile, anonymousSessionLines({ sessionId: 'r', input: 10 }));
+    chmodSync(blockedFile, 0o000);
+    blocked.push(blockedFile);
+    assert.equal(piSessionsDir(mixed), null);
+    const mixedResult = await parsePi({ extraRoots: [mixed] });
+    assert.equal(mixedResult.skipped, true);
+    assert.deepEqual(mixedResult.buckets, []);
+
+    // Both roots resolve again once the permission is restored, so a transient
+    // failure costs one sync instead of the source's history.
+    for (const path of blocked.splice(0)) chmodSync(path, 0o700);
+    assert.equal(piSessionsDir(container), container);
+    assert.equal(piSessionsDir(mixed), mixed);
+    const after = await parsePi({ extraRoots: [container] });
+    assert.equal(after.skipped, undefined);
+    assert.equal(after.buckets.reduce((sum, { inputTokens }) => sum + inputTokens, 0), 17);
+  } finally {
+    for (const path of blocked) {
+      try {
+        chmodSync(path, 0o700);
+      } catch { /* already restored */ }
+    }
     for (const [name, value] of Object.entries(previous)) restoreEnv(name, value);
     rmSync(root, { recursive: true, force: true });
   }
