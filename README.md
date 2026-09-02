@@ -35,7 +35,7 @@ npx @vibe-cafe/vibe-usage sync --extra-codex-home /path/to/.codex  # Add another
 npx @vibe-cafe/vibe-usage summary       # Print last 7 days as markdown (cost / tokens / by model / by project)
 npx @vibe-cafe/vibe-usage summary --days N  # Same, over the last N days (1-90)
 npx @vibe-cafe/vibe-usage daemon       # Continuous sync (every 30m, foreground)
-npx @vibe-cafe/vibe-usage daemon install    # Install background service (systemd/launchd)
+npx @vibe-cafe/vibe-usage daemon install    # Install background service (systemd/launchd/Task Scheduler)
 npx @vibe-cafe/vibe-usage daemon uninstall  # Remove background service
 npx @vibe-cafe/vibe-usage daemon status     # Show background service status
 npx @vibe-cafe/vibe-usage daemon stop       # Stop background service
@@ -64,9 +64,10 @@ npx @vibe-cafe/vibe-usage status       # Show config & detected tools
 | OpenCode | `~/.local/share/opencode/opencode.db` (SQLite, `json_extract` query) |
 | OpenClaw | `~/.openclaw/agents/`, `~/.openclaw-<profile>/agents/` (profile deployments); cache-creation/cache-write tokens are included in input usage |
 | Oh My Pi | `~/.omp/agent/sessions/`, `~/.omp/profiles/*/agent/sessions/`, and `$XDG_DATA_HOME/omp/{sessions,profiles/*/sessions}`; recognizes OMP's `$PI_CODING_AGENT_DIR`, current v3 title slots and path/hashed session directories, deduplicates copied records, includes cache writes in input, and splits reasoning from OMP's inclusive output count |
-| pi | `~/.pi/agent/sessions/` or `$PI_CODING_AGENT_DIR/sessions/`; cache writes are included in input usage |
+| pi | `~/.pi/agent/sessions/` or `$PI_CODING_AGENT_DIR/sessions/`, plus the session directory Pi itself was pointed at via `PI_CODING_AGENT_SESSION_DIR` or `sessionDir` in `~/.pi/agent/settings.json` (fixture/relocation override: `VIBE_USAGE_PI_SESSION_DIRS`). Cache writes are included in input usage; reasoning is read from Pi's `usage.reasoning` (legacy `usage.reasoningTokens` still accepted) and split out of the inclusive output total |
 | Qwen Code | `~/.qwen/tmp/` |
 | Kimi Code | Current `~/.kimi-code/sessions/wd_<slug>_<hash>/session_<id>/agents/<agent>/wire.jsonl` (`usage.record` deltas, including retry/compaction scope and cache creation; main/subagent wires form one session), data root resolved via `$KIMI_CODE_HOME` like the CLI itself, with project names from `session_index.jsonl`; legacy `~/.kimi/sessions/` is parsed alongside (`kimi migrate` never carries usage over, so both stores are always merged) |
+| MiniMax Code (mcode) | `$MCODE_HOME/v2/sqlite/runtime-state.sqlite` (default `~/.minimax/v2/sqlite/runtime-state.sqlite`; fixture override: `VIBE_USAGE_MCODE_DB`). Reads only allow-listed token ledger fields and session workspace/project paths, uses basename-only projects, folds cache writes into input, keeps cache reads and reasoning separate, and never selects raw/message JSON payloads. WAL/lock reads use a disposable snapshot; malformed or incompatible databases are skipped to preserve incremental state. |
 | MiMoCode | `$MIMOCODE_HOME/data/mimocode.db`, `$XDG_DATA_HOME/mimocode/mimocode.db`, or `~/.local/share/mimocode/mimocode.db` (SQLite; exact input, output, reasoning, and cache-read tokens from assistant messages; honors `MIMOCODE_DB`; cache-write tokens are included in input usage) |
 | Amp | `~/.local/share/amp/threads/`; cache-creation tokens are included in input usage |
 | Droid | `~/.factory/sessions/` |
@@ -194,7 +195,7 @@ Install as a system service for automatic background syncing:
 npx @vibe-cafe/vibe-usage daemon install
 ```
 
-This creates a user-level service (systemd on Linux, launchd on macOS) that syncs every 30 minutes and starts automatically on login. Manage with:
+This creates a user-level service (systemd on Linux, launchd on macOS, Task Scheduler on Windows — no admin rights needed) that syncs every 30 minutes and starts automatically on login. Manage with:
 
 ```bash
 npx @vibe-cafe/vibe-usage daemon status

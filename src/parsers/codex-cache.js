@@ -14,7 +14,7 @@ import { join } from 'node:path';
 // separate from ~/.vibe-usage/state.json, whose hashes are the authoritative
 // record of successful uploads and must remain backward-compatible.
 export const CODEX_CACHE_SCHEMA_VERSION = 1;
-export const CODEX_PARSER_ALGORITHM_VERSION = 1;
+export const CODEX_PARSER_ALGORITHM_VERSION = 3;
 
 function hash(value, length = 24) {
   return createHash('sha256').update(value).digest('hex').slice(0, length);

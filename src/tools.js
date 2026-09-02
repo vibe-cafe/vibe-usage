@@ -150,6 +150,17 @@ export function findDshDataDirs() {
   return [getDshSessionsDir()].filter(existsSync);
 }
 
+/** mcode runtime database: VIBE_USAGE_MCODE_DB wins, then MCODE_HOME, then ~/.minimax. */
+export function getMcodeDbPath(env = process.env, home = homedir()) {
+  const override = env.VIBE_USAGE_MCODE_DB?.trim();
+  if (override) return isAbsolute(override) ? override : resolve(override);
+  if (env.MCODE_HOME && !isAbsolute(env.MCODE_HOME)) {
+    throw new Error(`MCODE_HOME must be an absolute path, got: ${JSON.stringify(env.MCODE_HOME)}`);
+  }
+  const root = env.MCODE_HOME || join(home, '.minimax');
+  return join(root, 'v2', 'sqlite', 'runtime-state.sqlite');
+}
+
 export function getMimocodeDbPath(env = process.env) {
   if (env.MIMOCODE_HOME && !isAbsolute(env.MIMOCODE_HOME)) {
     throw new Error(`MIMOCODE_HOME must be an absolute path, got: ${JSON.stringify(env.MIMOCODE_HOME)}`);
@@ -323,6 +334,12 @@ export const TOOLS = [
     // path. The parser reads whichever exists (preferring ~/.kimi-code).
     dataDir: join(homedir(), '.kimi-code', 'sessions'),
     detectDataDirs: findKimiCodeDataDirs,
+  },
+  {
+    name: 'MiniMax Code',
+    id: 'mcode',
+    dataDir: join(homedir(), '.minimax', 'v2', 'sqlite', 'runtime-state.sqlite'),
+    detectDataDirs: () => [getMcodeDbPath()].filter(existsSync),
   },
   {
     name: 'MiMoCode',

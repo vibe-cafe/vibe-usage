@@ -21,6 +21,12 @@ function formatBytes(bytes) {
   return `${(bytes / (1024 * 1024)).toFixed(1)}MB`;
 }
 
+/** Hide only Cursor's intentional transient fetch soft-skip in quiet (daemon) syncs. */
+export function shouldSuppressParserWarning(source, message, quiet) {
+  if (!quiet) return false;
+  return source === 'cursor' && message.startsWith('cursor: Cursor usage export skipped (');
+}
+
 export function resolveUploadProjectSetting(settings) {
   if (typeof settings?.uploadProject !== 'boolean') {
     const error = new Error('SETTINGS_UNAVAILABLE');
@@ -179,6 +185,7 @@ export async function runSync({
       parserProgress.push({ source, ...indexing });
     }
     for (const message of warnings) {
+      if (shouldSuppressParserWarning(source, message, quiet)) continue;
       process.stderr.write(`${dim(`  ${message}`)}\n`);
     }
     // A parser may deliberately suppress a transient error (Cursor network

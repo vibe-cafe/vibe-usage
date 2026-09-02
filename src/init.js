@@ -27,7 +27,7 @@ function openBrowser(url) {
 }
 
 function isDaemonPlatform() {
-  return process.platform === 'linux' || process.platform === 'darwin';
+  return process.platform === 'linux' || process.platform === 'darwin' || process.platform === 'win32';
 }
 
 export async function runInit(options = {}) {

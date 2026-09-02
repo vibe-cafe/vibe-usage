@@ -60,8 +60,27 @@ function tokenCount(timestamp, last, cumulativeTotal) {
   };
 }
 
-function tokenCountInfo(timestamp, info) {
-  return { timestamp, type: 'event_msg', payload: { type: 'token_count', info } };
+function tokenCountInfo(timestamp, info, rateLimits) {
+  return {
+    timestamp,
+    type: 'event_msg',
+    payload: {
+      type: 'token_count',
+      info,
+      ...(rateLimits ? { rate_limits: rateLimits } : {}),
+    },
+  };
+}
+
+function threadSettingsApplied(timestamp, model, serviceTier) {
+  return {
+    timestamp,
+    type: 'event_msg',
+    payload: {
+      type: 'thread_settings_applied',
+      thread_settings: { model, service_tier: serviceTier },
+    },
+  };
 }
 
 /** Write fixture rollouts under a temp CODEX_HOME and run the parser. */
@@ -598,6 +617,59 @@ test('cumulative-only fallback remains session-wide across model switches', asyn
   assert.deepEqual(sumBuckets(buckets), { input: 150, output: 20, cached: 0, reasoning: 0 });
 });
 
+test('Codex service tier changes model key while account plan is ignored', async () => {
+  const t = '2026-09-01T08:00:00.000Z';
+  const { buckets } = await parseFixture({
+    'rollout-subscription.jsonl': [
+      sessionMeta(t, 'subscription-1'),
+      threadSettingsApplied(t, 'gpt-5.6-sol', 'fast'),
+      tokenCountInfo(t, {
+        total_token_usage: usage(100, 0, 10, 0),
+        last_token_usage: usage(100, 0, 10, 0),
+      }, { plan_type: 'pro' }),
+      threadSettingsApplied('2026-09-01T08:02:00.000Z', 'gpt-5.6-sol', null),
+      tokenCountInfo('2026-09-01T08:03:00.000Z', {
+        total_token_usage: usage(150, 0, 15, 0),
+        last_token_usage: usage(50, 0, 5, 0),
+      }),
+    ],
+    'rollout-api.jsonl': [
+      sessionMeta(t, 'api-1'),
+      threadSettingsApplied(t, 'gpt-5.6-sol', 'fast'),
+      tokenCountInfo(t, {
+        total_token_usage: usage(30, 0, 3, 0),
+        last_token_usage: usage(30, 0, 3, 0),
+      }),
+    ],
+  });
+
+  const byModel = Object.fromEntries(buckets.map(bucket => [
+    bucket.model,
+    { input: bucket.inputTokens, output: bucket.outputTokens },
+  ]));
+  assert.deepEqual(byModel, {
+    'gpt-5.6-sol-fast': { input: 130, output: 13 },
+    'gpt-5.6-sol': { input: 50, output: 5 },
+  });
+});
+
+test('pre-cutover Codex service tier keeps its legacy model key to prevent re-upload duplicates', async () => {
+  const t = '2026-08-30T23:59:00.000Z';
+  const { buckets } = await parseFixture({
+    'rollout-legacy.jsonl': [
+      sessionMeta(t, 'legacy-1'),
+      threadSettingsApplied(t, 'gpt-5.6-sol', 'fast'),
+      tokenCountInfo(t, {
+        total_token_usage: usage(10, 0, 1, 0),
+        last_token_usage: usage(10, 0, 1, 0),
+      }, { plan_type: 'pro' }),
+    ],
+  });
+
+  assert.equal(buckets.length, 1);
+  assert.equal(buckets[0].model, 'gpt-5.6-sol');
+});
+
 test('same session in live and archived directories uses the more complete copy once', async () => {
   const t = '2026-07-10T08:00:00.000Z';
   const records = [
@@ -862,6 +934,41 @@ test('an appended rollout invalidates only that file while unchanged files stay 
       assert.equal(changed.cache.resultHits, 1);
       assert.equal(changed.cache.tailHits, 1);
       assert.equal(changed.cache.filesRead, 1); // only the appended tail
+    });
+
+  } finally {
+    rmSync(fixture.root, { recursive: true, force: true });
+  }
+});
+
+test('appended Codex usage retains model tier state from the tail cache', async () => {
+  const t = '2026-09-01T08:00:00.000Z';
+  const fixture = createPersistentFixture({
+    'rollout-a.jsonl': [
+      sessionMeta(t, 'tier-cache'),
+      threadSettingsApplied(t, 'gpt-5.6-sol', 'fast'),
+      tokenCountInfo(t, {
+        total_token_usage: usage(10, 0, 1, 0),
+        last_token_usage: usage(10, 0, 1, 0),
+      }, { plan_type: 'plus' }),
+    ],
+  });
+  try {
+    await withCodexEnv(fixture, async () => {
+      await parse();
+      appendFileSync(
+        join(fixture.dir, 'rollout-a.jsonl'),
+        JSON.stringify(tokenCountInfo('2026-09-01T08:05:00.000Z', {
+          total_token_usage: usage(15, 0, 3, 0),
+          last_token_usage: usage(5, 0, 2, 0),
+        })) + '\n'
+      );
+
+      const changed = await parse();
+      assert.equal(changed.cache.tailHits, 1);
+      assert.equal(changed.buckets.length, 1);
+      assert.equal(changed.buckets[0].model, 'gpt-5.6-sol-fast');
+      assert.deepEqual(sumBuckets(changed.buckets), { input: 15, output: 3, cached: 0, reasoning: 0 });
     });
   } finally {
     rmSync(fixture.root, { recursive: true, force: true });

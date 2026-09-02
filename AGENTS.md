@@ -38,9 +38,10 @@ vibe-usage/
 │   │   ├── hermes.js          # SQLite (via sqlite.js), multi-profile
 │   │   ├── trae-cli.js        # Trae CLI JSONL telemetry (not Trae IDE/Work)
 │   │   ├── alma.js            # SQLite usage ledger; buckets only, no chat reads
+│   │   ├── mcode.js           # MiniMax Code runtime-state SQLite ledger (allow-listed token fields only)
 │   │   ├── workbuddy.js       # Streaming JSONL; actual routed-model usage + sessions
 │   │   └── zcode.js           # SQLite (via sqlite.js), reads message table
-│   ├── pi-roots.js            # Pi/OMP default, profile, XDG, and override discovery
+│   ├── pi-roots.js            # Pi/OMP default, Pi-configured (env + settings.json), profile, XDG, and override discovery
 │   ├── cline-roots.js         # Standalone + VSCode-host Cline discovery
 │   ├── cindy-roots.js          # Cindy Global/CN Electron roots + per-owner DB discovery
 │   ├── craft-roots.js         # CraftAgent root resolution and detection
@@ -53,7 +54,7 @@ vibe-usage/
 │   ├── config.js              # ~/.vibe-usage/config.json (dev: config.dev.json)
 │   ├── init.js                # Setup flow (device-flow browser login by default; --manual-key for CI/headless, verify, initial sync, daemon install prompt)
 │   ├── daemon.js              # 30-minute sync loop (foreground)
-│   ├── daemon-service.js      # Background service management (systemd/launchd install/uninstall/status)
+│   ├── daemon-service.js      # Background service management (systemd/launchd/Task Scheduler install/uninstall/status)
 │   ├── reset.js               # Delete remote data + clearState() + re-sync (clearing state is what makes the re-sync re-upload)
 │   ├── skill.js               # Install/remove SKILL.md for AI coding tools
 │   └── output.js              # Terminal output helpers: colors, OSC 8 links, big/small headers
@@ -105,8 +106,10 @@ passing this gate.
 - **Zero dependencies** — only Node built-ins (fs, path, os, crypto, https, readline, child_process, zlib, `node:sqlite`)
 - **Incremental upload** — parsers emit a complete view of live local data, then `sync.js` diffs each item's content-hash against `~/.vibe-usage/state.json` and uploads only new/changed buckets/sessions — a quiet machine sends zero bytes. State is committed per-batch only after that batch's upload succeeds (failed batch re-sends next run); prune of dead keys (logs the parsers no longer emit) persists unconditionally and is bounded by liveness, never by age — and is scoped to sources whose parser succeeded that run, so a transient failure or an incomplete Codex cache build never evicts that tool's state into a full re-upload. Deleting `state.json` triggers a one-time full re-upload (which is exactly how `reset` re-populates remote data after deleting it).
 - **Hidden-project identity** — parsers aggregate before the backend-provided privacy setting is applied. When the fetched `uploadProject=false`, `sync.js` replaces project names with `unknown` and must re-aggregate buckets before hashing/upload so formerly distinct projects that now share a server key are summed instead of overwriting one another. This is enforcement of backend policy, not a local setting.
+- **Cost-accounting invariant** — parsers report token counts plus only price-changing model dimensions (for example Codex `service_tier`). Never collect, persist, or encode an account funding path such as ChatGPT subscription, API billing, credits, or bundled quota. The backend always estimates `tokens × provider-published model/service-tier rate`; funding never changes that value. v0.10.18's `#billing=api` / `#billing=subscription` experiment violated this invariant and v0.10.19 removed it. Do not reintroduce it as billing accuracy, plan detection, or incremental cost.
 - **Codex parser cache** — unlike the other stateless parsers, Codex keeps versioned, disposable derived data under `~/.vibe-usage/cache/codex/`. This cache is never authoritative: any miss, corruption, unsafe append, parser-algorithm bump, or write failure falls back to raw logs. Keep it separate from `state.json`; `reset` clears upload state but retains the parser cache so it can re-upload without re-reading every rollout.
 - **Stable hostname** — hostname is persisted in config at init; `sync.js` never re-reads `os.hostname()` after first capture. This prevents macOS mDNS hostname drift (e.g., `-2`, `-3` suffixes) from creating duplicate device entries in the DB.
+- **Windows daemon via Task Scheduler** — `daemon install` on win32 registers a per-user task through `Register-ScheduledTask -Xml`; `schtasks /create /sc onlogon` requires elevation while a self-scoped LogonTrigger does not. The XML must pin `<ExecutionTimeLimit>PT0S</ExecutionTimeLimit>` or Task Scheduler kills the resident daemon at its default 72h limit, and its declaration must say `encoding="UTF-16"` even though the file is written UTF-8 — the COM parser rejects other declarations regardless of how the string reaches it. Generated `~/.vibe-usage/daemon-task.cmd` re-applies `CLAUDE_CONFIG_DIR` plus the preserved service env (session-only vars are missing from the registry user env a logon task inherits) and appends output to `daemon.log`; `daemon-task.vbs` starts it hidden so logon shows no console window. PowerShell runs with `-NoProfile -NonInteractive -ExecutionPolicy Bypass` and explicit `exit` codes, because `-Command` exits 0 even after non-terminating cmdlet errors, and reads the XML with `-Encoding UTF8` since it is written BOM-less (default decoding on zh-CN systems is ANSI).
 - **Upload identity** — `client-meta.js` reads the real package version from the shipped `package.json`, creates one `syncId` per `runSync`, and adds batch identity plus runtime/platform/hostname to every ingest request. Direct sync defaults to `surface=cli`, the foreground service passes `surface=daemon`, and desktop apps override via `VIBE_USAGE_SURFACE` / `VIBE_USAGE_SURFACE_VERSION`. Keep the CLI as the only ingest HTTP implementation.
 - **No TypeScript** — plain JavaScript throughout
 - **Output style** — user-facing text is Chinese (colored via `output.js` helpers: `success` / `failure` / `warn` / `arrow` / `link`). Dashboard URLs use OSC 8 hyperlinks so terminals that support it (iTerm2, Warp, VSCode, Kitty, Terminal.app 14+) render them as clickable. Raw pass-through from external tools (parser errors, `systemctl` / `launchctl` output, daemon loop timestamps) is kept in English and dimmed so it's visually de-emphasized. `init` prints a big ASCII logo; other commands print a compact one-line header (`bigHeader()` / `smallHeader()` from `output.js`).
@@ -152,15 +155,16 @@ Parser pattern:
 
 Pi-compatible JSONL parsers (`pi-coding-agent.js`, `craft-agent.js`, `omp.js`):
 - Use `parsePiSessionJsonl()` instead of duplicating filesystem/message parsing.
-- Fold `usage.cacheWrite` into input tokens and keep `cacheRead` separate. OMP/Pi `usage.output` already includes `reasoningTokens`, so subtract reasoning from output before storing it in `reasoningOutputTokens`.
+- Fold `usage.cacheWrite` into input tokens and keep `cacheRead` separate. OMP/Pi `usage.output` already includes reasoning, so subtract reasoning from output before storing it in `reasoningOutputTokens`. Pi's `Usage` type spells that field `reasoning`; the older `reasoningTokens` spelling stays accepted as a fallback.
 - Deduplicate stable message ids across copied/profile stores. Any directory read failure returns `skipped` so incremental state is not pruned.
 
-SQLite-backed parsers (alma, cindy, cursor, dimagent, hermes, kiro, mimocode, opencode, zcode):
+SQLite-backed parsers (alma, cindy, cursor, dimagent, hermes, kiro, mcode, mimocode, opencode, zcode):
 - Use `queryDbJson(dbPath, sql)` from `src/parsers/sqlite.js` — never shell out to `sqlite3` directly. It prefers Node's built-in `node:sqlite` (`DatabaseSync`, opened read-only; Node ≥ 22.5, works on Windows with no extra binary) and falls back to the `sqlite3` CLI on older Node.
 - Rows come back as plain objects (`{ column: value }`), same shape as `sqlite3 -json` — INTEGER → number, TEXT → string, JSON via `json_extract` → string.
 - If neither `node:sqlite` nor the CLI is available the helper throws an `ENOENT`-flavored error; catch it and rethrow `'sqlite3 CLI not found. Install sqlite3 (or use Node >= 22.5) to sync X data.'` so the user gets a hint.
 - For DBs the source app holds a write lock on (Cursor, Kiro), use `queryDbJsonSnapshotOnLock()`. Cindy always uses `queryDbJsonSnapshot()` because a clean WAL-mode database may need SQLite to initialize shared-memory metadata; writable access is confined to the disposable DB/WAL/SHM copy, while the source stays untouched.
 - Alma reads only `usage_records` token fields plus workspace names. Its ledger represents assistant responses only, so return buckets with `sessions: []` instead of reading chat records to infer timing.
+- mcode reads only `local_runtime_token_usage` allow-listed token fields and session `workspace_dir` / `project_workspace_dir`; `raw`, message tables, and JSON payload columns are never selected. Its WAL database is read through a disposable snapshot-on-lock path, and schema/read failures return `skipped` to protect incremental state. Fixture overrides: `VIBE_USAGE_MCODE_DB` or `MCODE_HOME`.
 - Cindy reads only `daily_model_usage` across both regional user-data roots and every per-owner DB. Claude Code rows are excluded because Cindy's SDK already writes normal `~/.claude` transcripts; merge Codex/Pi rows into their existing parser/source, sum currency rows, fold `cache_create_tokens` into input, and add no sessions. Never select `messages`, credentials, costs, or owner ids.
 
 Network-fetch parsers (the Cursor exception):
