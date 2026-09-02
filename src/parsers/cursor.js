@@ -70,7 +70,17 @@ function decodeJwtSub(token) {
 
 // Under full sync many parsers hammer disk concurrently; cursor.com's CSV
 // export can still succeed but take >10s. A short timeout caused silent skips.
-const FETCH_TIMEOUT_MS = Number(process.env.VIBE_USAGE_CURSOR_FETCH_TIMEOUT_MS) || 30_000;
+const DEFAULT_FETCH_TIMEOUT_MS = 30_000;
+const MAX_FETCH_TIMEOUT_MS = 2_147_483_647;
+
+export function resolveCursorFetchTimeout(value) {
+  const timeout = Number(value);
+  return Number.isInteger(timeout) && timeout > 0 && timeout <= MAX_FETCH_TIMEOUT_MS
+    ? timeout
+    : DEFAULT_FETCH_TIMEOUT_MS;
+}
+
+const FETCH_TIMEOUT_MS = resolveCursorFetchTimeout(process.env.VIBE_USAGE_CURSOR_FETCH_TIMEOUT_MS);
 
 async function fetchUsageCsv(token) {
   const url = `${(process.env.CURSOR_WEB_BASE_URL?.trim() || 'https://cursor.com').replace(/\/+$/, '')}/api/dashboard/export-usage-events-csv?strategy=tokens`;
