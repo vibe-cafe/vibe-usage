@@ -40,7 +40,7 @@ vibe-usage/
 │   │   ├── alma.js            # SQLite usage ledger; buckets only, no chat reads
 │   │   ├── workbuddy.js       # Streaming JSONL; actual routed-model usage + sessions
 │   │   └── zcode.js           # SQLite (via sqlite.js), reads message table
-│   ├── pi-roots.js            # Pi/OMP default, profile, XDG, and override discovery
+│   ├── pi-roots.js            # Pi/OMP default, Pi-configured (env + settings.json), profile, XDG, and override discovery
 │   ├── cline-roots.js         # Standalone + VSCode-host Cline discovery
 │   ├── cindy-roots.js          # Cindy Global/CN Electron roots + per-owner DB discovery
 │   ├── craft-roots.js         # CraftAgent root resolution and detection
@@ -153,7 +153,7 @@ Parser pattern:
 
 Pi-compatible JSONL parsers (`pi-coding-agent.js`, `craft-agent.js`, `omp.js`):
 - Use `parsePiSessionJsonl()` instead of duplicating filesystem/message parsing.
-- Fold `usage.cacheWrite` into input tokens and keep `cacheRead` separate. OMP/Pi `usage.output` already includes `reasoningTokens`, so subtract reasoning from output before storing it in `reasoningOutputTokens`.
+- Fold `usage.cacheWrite` into input tokens and keep `cacheRead` separate. OMP/Pi `usage.output` already includes reasoning, so subtract reasoning from output before storing it in `reasoningOutputTokens`. Pi's `Usage` type spells that field `reasoning`; the older `reasoningTokens` spelling stays accepted as a fallback.
 - Deduplicate stable message ids across copied/profile stores. Any directory read failure returns `skipped` so incremental state is not pruned.
 
 SQLite-backed parsers (alma, cindy, cursor, dimagent, hermes, kiro, mimocode, opencode, zcode):
