@@ -82,6 +82,7 @@ function escapeXml(value) {
 // launchd/systemd unit that inherits nothing, so anything the parsers read for
 // discovery has to be captured into the unit at install time.
 const PRESERVED_SERVICE_ENV = [
+  'MCODE_HOME',
   'MIMOCODE_HOME',
   'MIMOCODE_DB',
   'XDG_DATA_HOME',

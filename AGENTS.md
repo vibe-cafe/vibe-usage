@@ -38,6 +38,7 @@ vibe-usage/
 │   │   ├── hermes.js          # SQLite (via sqlite.js), multi-profile
 │   │   ├── trae-cli.js        # Trae CLI JSONL telemetry (not Trae IDE/Work)
 │   │   ├── alma.js            # SQLite usage ledger; buckets only, no chat reads
+│   │   ├── mcode.js           # MiniMax Code runtime-state SQLite ledger (allow-listed token fields only)
 │   │   ├── workbuddy.js       # Streaming JSONL; actual routed-model usage + sessions
 │   │   └── zcode.js           # SQLite (via sqlite.js), reads message table
 │   ├── pi-roots.js            # Pi/OMP default, Pi-configured (env + settings.json), profile, XDG, and override discovery
@@ -157,12 +158,13 @@ Pi-compatible JSONL parsers (`pi-coding-agent.js`, `craft-agent.js`, `omp.js`):
 - Fold `usage.cacheWrite` into input tokens and keep `cacheRead` separate. OMP/Pi `usage.output` already includes reasoning, so subtract reasoning from output before storing it in `reasoningOutputTokens`. Pi's `Usage` type spells that field `reasoning`; the older `reasoningTokens` spelling stays accepted as a fallback.
 - Deduplicate stable message ids across copied/profile stores. Any directory read failure returns `skipped` so incremental state is not pruned.
 
-SQLite-backed parsers (alma, cindy, cursor, dimagent, hermes, kiro, mimocode, opencode, zcode):
+SQLite-backed parsers (alma, cindy, cursor, dimagent, hermes, kiro, mcode, mimocode, opencode, zcode):
 - Use `queryDbJson(dbPath, sql)` from `src/parsers/sqlite.js` — never shell out to `sqlite3` directly. It prefers Node's built-in `node:sqlite` (`DatabaseSync`, opened read-only; Node ≥ 22.5, works on Windows with no extra binary) and falls back to the `sqlite3` CLI on older Node.
 - Rows come back as plain objects (`{ column: value }`), same shape as `sqlite3 -json` — INTEGER → number, TEXT → string, JSON via `json_extract` → string.
 - If neither `node:sqlite` nor the CLI is available the helper throws an `ENOENT`-flavored error; catch it and rethrow `'sqlite3 CLI not found. Install sqlite3 (or use Node >= 22.5) to sync X data.'` so the user gets a hint.
 - For DBs the source app holds a write lock on (Cursor, Kiro), use `queryDbJsonSnapshotOnLock()`. Cindy always uses `queryDbJsonSnapshot()` because a clean WAL-mode database may need SQLite to initialize shared-memory metadata; writable access is confined to the disposable DB/WAL/SHM copy, while the source stays untouched.
 - Alma reads only `usage_records` token fields plus workspace names. Its ledger represents assistant responses only, so return buckets with `sessions: []` instead of reading chat records to infer timing.
+- mcode reads only `local_runtime_token_usage` allow-listed token fields and session `workspace_dir` / `project_workspace_dir`; `raw`, message tables, and JSON payload columns are never selected. Its WAL database is read through a disposable snapshot-on-lock path, and schema/read failures return `skipped` to protect incremental state. Fixture overrides: `VIBE_USAGE_MCODE_DB` or `MCODE_HOME`.
 - Cindy reads only `daily_model_usage` across both regional user-data roots and every per-owner DB. Claude Code rows are excluded because Cindy's SDK already writes normal `~/.claude` transcripts; merge Codex/Pi rows into their existing parser/source, sum currency rows, fold `cache_create_tokens` into input, and add no sessions. Never select `messages`, credentials, costs, or owner ids.
 
 Network-fetch parsers (the Cursor exception):
