@@ -161,9 +161,11 @@ test('OMP discovers XDG profiles and does not also label its agent store as Pi',
     assert.ok(ompDirs.includes(overriddenSession));
     assert.deepEqual(getPiSessionDirs(), []);
     // The OMP guard suppresses discovery of an OMP store as Pi; it must not
-    // discard a root the user added explicitly.
+    // discard a root the user added explicitly. The root has to be a real
+    // store: `add-root` never persists a directory holding no Pi sessions.
     const piStore = join(root, 'pi-sessions');
     mkdirSync(piStore, { recursive: true });
+    writeFileSync(join(piStore, 'session-explicit.jsonl'), sessionLines({ sessionId: 'explicit' }));
     assert.deepEqual(getPiSessionDirs([piStore]), [piStore]);
   } finally {
     for (const [name, value] of Object.entries(previous)) restoreEnv(name, value);
@@ -298,6 +300,111 @@ test('Pi scans an explicitly configured extra session root that discovery cannot
     // A Pi agent directory is accepted too, and resolves to its sessions/
     // child only, so the nested walk cannot read the same file twice.
     assert.deepEqual(getPiSessionDirs([agentDir]), [agentSessions]);
+  } finally {
+    for (const [name, value] of Object.entries(previous)) restoreEnv(name, value);
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
+// A store written by a harness that only ever appends (or by an older Pi) can
+// contain usage records with no `obj.id`, which record-level dedup cannot see.
+function anonymousSessionLines({ sessionId = 'anonymous-1', input = 10 } = {}) {
+  return [
+    { type: 'session', id: sessionId, timestamp: '2026-07-27T13:19:57.000Z', cwd: '/work/project' },
+    {
+      type: 'message',
+      timestamp: '2026-07-27T13:20:05.000Z',
+      message: {
+        role: 'assistant',
+        model: 'test-model',
+        usage: { input, output: 0, cacheRead: 0, cacheWrite: 0 },
+      },
+    },
+  ].map((line) => JSON.stringify(line)).join('\n') + '\n';
+}
+
+test('Pi skips a configured agent root whose sessions/ child disappears', async () => {
+  const root = mkdtempSync(join(tmpdir(), 'vibe-usage-pi-extra-root-shape-'));
+  const previous = Object.fromEntries([
+    'VIBE_USAGE_PI_SESSION_DIRS',
+    'PI_CODING_AGENT_DIR',
+    'PI_CODING_AGENT_SESSION_DIR',
+  ].map((name) => [name, process.env[name]]));
+  try {
+    delete process.env.VIBE_USAGE_PI_SESSION_DIRS;
+    delete process.env.PI_CODING_AGENT_SESSION_DIR;
+    process.env.PI_CODING_AGENT_DIR = join(root, 'no-default-store');
+
+    const agentDir = join(root, 'agent');
+    const agentSessions = join(agentDir, 'sessions');
+    mkdirSync(agentSessions, { recursive: true });
+    writeFileSync(join(agentSessions, 'session-1.jsonl'), sessionLines({ sessionId: 'session-1' }));
+    assert.equal(validateExtraRoot('pi-coding-agent', agentDir).ok, true);
+
+    const before = await parsePi({ extraRoots: [agentDir] });
+    assert.equal(before.skipped, undefined);
+    assert.equal(before.buckets.length, 1);
+
+    // Only the nested sessions/ goes away; the configured root itself stays.
+    // Resolving to the root instead would report an empty-but-successful sync
+    // and prune the incremental state for a store that is still configured.
+    rmSync(agentSessions, { recursive: true, force: true });
+    const after = await parsePi({ extraRoots: [agentDir] });
+    assert.equal(after.skipped, true);
+    assert.deepEqual(after.buckets, []);
+    assert.match(after.warnings.join('\n'), /额外根目录不可用/);
+  } finally {
+    for (const [name, value] of Object.entries(previous)) restoreEnv(name, value);
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test('Pi extra-root validation requires real Pi session files, not just .jsonl', () => {
+  const root = mkdtempSync(join(tmpdir(), 'vibe-usage-pi-extra-root-shape-check-'));
+  try {
+    const notPi = join(root, 'unrelated-logs');
+    mkdirSync(notPi, { recursive: true });
+    writeFileSync(join(notPi, 'events.jsonl'), '{"kind":"not-a-pi-session"}\n');
+    // Accepting this would persist a root the parser then ignores in silence,
+    // which is the failure mode extra roots exist to remove.
+    assert.equal(validateExtraRoot('pi-coding-agent', notPi).ok, false);
+
+    const nested = join(root, 'container', 'task-1');
+    mkdirSync(nested, { recursive: true });
+    writeFileSync(join(nested, 'session-1.jsonl'), sessionLines({ sessionId: 'session-1' }));
+    assert.equal(validateExtraRoot('pi-coding-agent', join(root, 'container')).ok, true);
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test('Pi counts an anonymous record once when extra roots overlap', async () => {
+  const root = mkdtempSync(join(tmpdir(), 'vibe-usage-pi-extra-root-overlap-'));
+  const previous = Object.fromEntries([
+    'VIBE_USAGE_PI_SESSION_DIRS',
+    'PI_CODING_AGENT_DIR',
+    'PI_CODING_AGENT_SESSION_DIR',
+  ].map((name) => [name, process.env[name]]));
+  try {
+    delete process.env.VIBE_USAGE_PI_SESSION_DIRS;
+    delete process.env.PI_CODING_AGENT_SESSION_DIR;
+    process.env.PI_CODING_AGENT_DIR = join(root, 'no-default-store');
+
+    const parent = join(root, 'store');
+    const child = join(parent, 'nested');
+    mkdirSync(child, { recursive: true });
+    writeFileSync(join(child, 'session-anonymous.jsonl'), anonymousSessionLines({ input: 10 }));
+    // Both shapes validate on their own, so a user can legitimately end up with
+    // an ancestor and a descendant configured at the same time.
+    assert.equal(validateExtraRoot('pi-coding-agent', parent).ok, true);
+    assert.equal(validateExtraRoot('pi-coding-agent', child).ok, true);
+    assert.deepEqual(getPiSessionDirs([parent, child]), [parent, child]);
+
+    const result = await parsePi({ extraRoots: [parent, child] });
+    assert.equal(result.skipped, undefined);
+    assert.equal(result.buckets.length, 1);
+    assert.equal(result.buckets[0].inputTokens, 10);
+    assert.equal(result.sessions.length, 1);
   } finally {
     for (const [name, value] of Object.entries(previous)) restoreEnv(name, value);
     rmSync(root, { recursive: true, force: true });

@@ -63,8 +63,9 @@ function settingsSessionDir(agentDir) {
 
 export function getPiSessionDirs(extraRoots = []) {
   // Explicitly configured roots are user intent, not a fixture: they are always
-  // scanned, and they never replace the default store.
-  const extraDirs = extraRoots.map(piSessionsDir);
+  // scanned, and they never replace the default store. A root whose shape no
+  // longer resolves drops out here; the parser reports that as skipped.
+  const extraDirs = extraRoots.map(piSessionsDir).filter(dir => dir !== null);
 
   const override = process.env.VIBE_USAGE_PI_SESSION_DIRS?.trim();
   if (override) return uniqueExistingDirs([...override.split(delimiter), ...extraDirs]);

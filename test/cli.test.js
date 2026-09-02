@@ -222,7 +222,16 @@ test('config add-root accepts a Pi session store and reports it in status', () =
 
     const empty = runWithEnv(['config', 'add-root', 'pi-coding-agent', configDir], env);
     assert.equal(empty.status, 1);
-    assert.match(empty.stderr, /需要是直接包含会话 \.jsonl 的目录/);
+    assert.match(empty.stderr, /需要是直接包含 Pi 会话 \.jsonl 的目录/);
+
+    // A same-extension log that is not a Pi session must be rejected too:
+    // accepting it would persist a root the parser then silently ignores.
+    const notPi = join(root, 'unrelated-logs');
+    mkdirSync(notPi, { recursive: true });
+    writeFileSync(join(notPi, 'events.jsonl'), '{"kind":"not-a-pi-session"}\n');
+    const wrong = runWithEnv(['config', 'add-root', 'pi-coding-agent', notPi], env);
+    assert.equal(wrong.status, 1);
+    assert.match(wrong.stderr, /需要是直接包含 Pi 会话 \.jsonl 的目录/);
   } finally {
     rmSync(root, { recursive: true, force: true });
   }
