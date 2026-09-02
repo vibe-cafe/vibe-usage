@@ -175,7 +175,7 @@ export async function runSync({
       parserProgress.push({ source, ...indexing });
     }
     for (const message of warnings) {
-      process.stderr.write(`${dim(`  ${message}`)}\n`);
+      if (!quiet) process.stderr.write(`${dim(`  ${message}`)}\n`);
     }
     // A parser may deliberately suppress a transient error (Cursor network
     // timeout) to keep daemon logs quiet. Its empty result is not proof that
