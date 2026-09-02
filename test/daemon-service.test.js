@@ -6,6 +6,8 @@ import {
   generateWindowsTaskCmd,
   generateWindowsTaskVbs,
   generateWindowsTaskXml,
+  parseWindowsTaskInvocation,
+  windowsDaemonProcessExpression,
 } from '../src/daemon-service.js';
 
 test('systemd service preserves CLAUDE_CONFIG_DIR', () => {
@@ -59,6 +61,25 @@ test('windows task cmd quotes paths, preserves env overrides, and doubles litera
   assert.match(cmd, />> ".*daemon\.log" 2>&1/);
 });
 
+test('windows process matching follows the recorded Bun invocation', () => {
+  const cmd = generateWindowsTaskCmd(
+    'C:\\Tools\\bun.exe',
+    'D:\\app 100%\\bin.js',
+    undefined,
+    {},
+  );
+  const invocation = parseWindowsTaskInvocation(cmd);
+  assert.deepEqual(invocation, {
+    runtimePath: 'C:\\Tools\\bun.exe',
+    binPath: 'D:\\app 100%\\bin.js',
+  });
+
+  const expression = windowsDaemonProcessExpression(invocation);
+  assert.match(expression, /\$_\.ExecutablePath -ieq 'C:\\Tools\\bun\.exe'/);
+  assert.match(expression, /\$_\.CommandLine -like '\*D:\\app 100%\\bin\.js\* daemon\*'/);
+  assert.doesNotMatch(expression, /node\.exe/);
+});
+
 test('windows task cmd omits unset env overrides', () => {
   const cmd = generateWindowsTaskCmd('/usr/bin/node', '/opt/vibe-usage/bin.js', undefined, {});
   assert.doesNotMatch(cmd, /set "CLAUDE_CONFIG_DIR/);
@@ -86,4 +107,19 @@ test('windows task xml pins logon trigger, unlimited runtime, and escapes XML pa
   assert.match(xml, /<ExecutionTimeLimit>PT0S<\/ExecutionTimeLimit>/);
   assert.match(xml, /<Command>C:\\Windows\\System32\\wscript\.exe<\/Command>/);
   assert.match(xml, /<Arguments>"C:\\a&amp;b dir\\daemon-task\.vbs"<\/Arguments>/);
+});
+
+test('services preserve Pi store relocation variables', () => {
+  const env = {
+    PI_CODING_AGENT_DIR: '/tmp/pi "agent"',
+    PI_CODING_AGENT_SESSION_DIR: '/tmp/pi&a<b>/sessions',
+  };
+  const unit = generateSystemdUnit('/usr/bin/node', '/opt/vibe-usage/bin.js', undefined, env);
+  assert.match(unit, /Environment="PI_CODING_AGENT_DIR=\/tmp\/pi \\"agent\\""/);
+  assert.match(unit, /Environment="PI_CODING_AGENT_SESSION_DIR=\/tmp\/pi&a<b>\/sessions"/);
+
+  const plist = generateLaunchdPlist('/usr/bin/node', '/opt/vibe-usage/bin.js', undefined, env);
+  assert.match(plist, /<key>PI_CODING_AGENT_DIR<\/key>/);
+  assert.match(plist, /<key>PI_CODING_AGENT_SESSION_DIR<\/key>/);
+  assert.match(plist, /<string>\/tmp\/pi&amp;a&lt;b&gt;\/sessions<\/string>/);
 });

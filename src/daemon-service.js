@@ -78,7 +78,16 @@ function escapeXml(value) {
     .replace(/'/g, '&apos;');
 }
 
-const PRESERVED_SERVICE_ENV = ['MIMOCODE_HOME', 'MIMOCODE_DB', 'XDG_DATA_HOME'];
+// Variables that relocate a tool's on-disk store. The service runs from a
+// launchd/systemd unit that inherits nothing, so anything the parsers read for
+// discovery has to be captured into the unit at install time.
+const PRESERVED_SERVICE_ENV = [
+  'MIMOCODE_HOME',
+  'MIMOCODE_DB',
+  'XDG_DATA_HOME',
+  'PI_CODING_AGENT_DIR',
+  'PI_CODING_AGENT_SESSION_DIR',
+];
 
 function serviceEnvironment(claudeConfigDir, env) {
   const values = {
@@ -286,33 +295,44 @@ function windowsUserId() {
   return result.ok ? result.output : null;
 }
 
-// The cmd wrapper is the install-time record of the exact node invocation, so
-// process matching only ever hits the task's own daemon — never a foreground
-// `vibe-usage daemon` running from a different checkout. No end anchor: the
-// line continues with the daemon.log redirection.
-function readTaskBinPath(paths) {
+// The cmd wrapper is the install-time record of the exact runtime + CLI
+// invocation. Process matching uses both paths so it works for Node and Bun
+// without touching foreground daemons from another checkout.
+export function parseWindowsTaskInvocation(cmd) {
+  const match = cmd.match(/^"([^"]+)" "([^"]+)" daemon\b/m);
+  if (!match) return null;
+  const unescapeCmdValue = value => value.replace(/%%/g, '%');
+  return {
+    runtimePath: unescapeCmdValue(match[1]),
+    binPath: unescapeCmdValue(match[2]),
+  };
+}
+
+function readTaskInvocation(paths) {
   try {
-    const cmd = readFileSync(paths.cmd, 'utf-8');
-    return cmd.match(/^"[^"]+" "([^"]+)" daemon\b/m)?.[1] || null;
+    return parseWindowsTaskInvocation(readFileSync(paths.cmd, 'utf-8'));
   } catch {
     return null;
   }
 }
 
 // -like treats []*? as wildcards; a literal path containing any of them must be
-// bracket-escaped to still match
+// bracket-escaped to still match.
 function psLikeFragment(value) {
   return value.replace(/[[\]*?]/g, '[$&]');
 }
 
-function daemonProcessKillLines(binPath) {
-  if (!binPath) return [];
-  const pattern = `'*${psLikeFragment(binPath)}* daemon*'`;
-  return [
-    `Get-CimInstance Win32_Process -Filter "Name='node.exe'" |`,
-    `  Where-Object { $_.CommandLine -like ${pattern} } |`,
-    '  ForEach-Object { Stop-Process -Id $_.ProcessId -Force -ErrorAction SilentlyContinue }',
-  ];
+export function windowsDaemonProcessExpression(invocation) {
+  if (!invocation) return null;
+  const binPattern = `'*${psLikeFragment(invocation.binPath)}* daemon*'`;
+  return `Get-CimInstance Win32_Process | Where-Object { $_.ExecutablePath -ieq ${psString(invocation.runtimePath)} -and $_.CommandLine -like ${binPattern} }`;
+}
+
+function daemonProcessKillLines(invocation) {
+  const expression = windowsDaemonProcessExpression(invocation);
+  return expression
+    ? [`${expression} | ForEach-Object { Stop-Process -Id $_.ProcessId -Force -ErrorAction SilentlyContinue }`]
+    : [];
 }
 
 function install() {
@@ -439,7 +459,7 @@ function uninstall() {
     if (taskExists()) {
       const result = runPowerShell(psTry([
         `Stop-ScheduledTask -TaskName ${psString(SERVICE_NAME)} -ErrorAction SilentlyContinue`,
-        ...daemonProcessKillLines(readTaskBinPath(paths)),
+        ...daemonProcessKillLines(readTaskInvocation(paths)),
         `Unregister-ScheduledTask -TaskName ${psString(SERVICE_NAME)} -Confirm:$false`,
       ]));
       if (!result.ok) {
@@ -469,16 +489,16 @@ function status() {
       console.log(dim('  运行 `vibe-usage daemon install` 安装。'));
       return;
     }
-    const binPath = readTaskBinPath(paths);
+    const invocation = readTaskInvocation(paths);
+    const processExpression = windowsDaemonProcessExpression(invocation);
     const scriptLines = [
       `$t = Get-ScheduledTask -TaskName ${psString(SERVICE_NAME)} -ErrorAction SilentlyContinue`,
       'if (-not $t) { exit 1 }',
       'Write-Output ("State=" + $t.State)',
     ];
-    if (binPath) {
-      const pattern = `'*${psLikeFragment(binPath)}* daemon*'`;
+    if (processExpression) {
       scriptLines.push(
-        `$p = Get-CimInstance Win32_Process -Filter "Name='node.exe'" | Where-Object { $_.CommandLine -like ${pattern} } | Select-Object -First 1`,
+        `$p = ${processExpression} | Select-Object -First 1`,
         'if ($p) { Write-Output "DaemonProcess=running" } else { Write-Output "DaemonProcess=stopped" }',
       );
     }
@@ -500,8 +520,8 @@ function status() {
         const idx = line.indexOf('=');
         return idx === -1 ? [line, ''] : [line.slice(0, idx), line.slice(idx + 1)];
       }));
-    // The live node process is the source of truth; the task State can lag
-    const running = binPath
+    // The live runtime process is the source of truth; the task State can lag.
+    const running = processExpression
       ? lines.DaemonProcess === 'running'
       : lines.State === 'Running';
     if (running) {
@@ -575,13 +595,13 @@ function stop() {
     }
     // The logon trigger stays registered, so like launchd's unload the daemon
     // stays stopped until `restart` or the next logon. Stop-ScheduledTask only
-    // terminates the wscript wrapper, so the real node daemon is matched and
+    // terminates the wscript wrapper, so the real runtime daemon is matched and
     // killed explicitly.
     const paths = getServicePaths(plat);
-    const binPath = readTaskBinPath(paths);
+    const invocation = readTaskInvocation(paths);
     const result = runPowerShell(psTry([
       `Stop-ScheduledTask -TaskName ${psString(SERVICE_NAME)} -ErrorAction SilentlyContinue`,
-      ...daemonProcessKillLines(binPath),
+      ...daemonProcessKillLines(invocation),
     ]));
     console.log(result.ok ? success('服务已停止。') : failure(`停止失败: ${result.output}`));
   }
@@ -614,13 +634,13 @@ function restart() {
       return;
     }
     const paths = getServicePaths(plat);
-    const binPath = readTaskBinPath(paths);
+    const invocation = readTaskInvocation(paths);
     const taskName = psString(SERVICE_NAME);
     const result = runPowerShell(psTry([
       `$t = Get-ScheduledTask -TaskName ${taskName}`,
       "if ($t.State -eq 'Running') {",
       `  Stop-ScheduledTask -TaskName ${taskName} -ErrorAction SilentlyContinue`,
-      ...daemonProcessKillLines(binPath),
+      ...daemonProcessKillLines(invocation),
       '  $deadline = (Get-Date).AddSeconds(5)',
       `  while ((Get-ScheduledTask -TaskName ${taskName}).State -eq 'Running' -and (Get-Date) -lt $deadline) { Start-Sleep -Milliseconds 200 }`,
       '}',
