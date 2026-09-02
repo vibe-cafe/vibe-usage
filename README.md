@@ -64,7 +64,7 @@ npx @vibe-cafe/vibe-usage status       # Show config & detected tools
 | OpenCode | `~/.local/share/opencode/opencode.db` (SQLite, `json_extract` query) |
 | OpenClaw | `~/.openclaw/agents/`, `~/.openclaw-<profile>/agents/` (profile deployments); cache-creation/cache-write tokens are included in input usage |
 | Oh My Pi | `~/.omp/agent/sessions/`, `~/.omp/profiles/*/agent/sessions/`, and `$XDG_DATA_HOME/omp/{sessions,profiles/*/sessions}`; recognizes OMP's `$PI_CODING_AGENT_DIR`, current v3 title slots and path/hashed session directories, deduplicates copied records, includes cache writes in input, and splits reasoning from OMP's inclusive output count |
-| pi | `~/.pi/agent/sessions/` or `$PI_CODING_AGENT_DIR/sessions/`, plus the session directory Pi itself was pointed at via `PI_CODING_AGENT_SESSION_DIR` or `sessionDir` in `~/.pi/agent/settings.json` (fixture/relocation override: `VIBE_USAGE_PI_SESSION_DIRS`). Cache writes are included in input usage; reasoning is read from Pi's `usage.reasoning` (legacy `usage.reasoningTokens` still accepted) and split out of the inclusive output total |
+| pi | `~/.pi/agent/sessions/` or `$PI_CODING_AGENT_DIR/sessions/`, plus the session directory Pi itself was pointed at via `PI_CODING_AGENT_SESSION_DIR` or `sessionDir` in `~/.pi/agent/settings.json`, plus explicitly added `pi-coding-agent` roots for stores only reachable through `pi --session <file>` (fixture/relocation override: `VIBE_USAGE_PI_SESSION_DIRS`). Cache writes are included in input usage; reasoning is read from Pi's `usage.reasoning` (legacy `usage.reasoningTokens` still accepted) and split out of the inclusive output total |
 | Qwen Code | `~/.qwen/tmp/` |
 | Kimi Code | Current `~/.kimi-code/sessions/wd_<slug>_<hash>/session_<id>/agents/<agent>/wire.jsonl` (`usage.record` deltas, including retry/compaction scope and cache creation; main/subagent wires form one session), data root resolved via `$KIMI_CODE_HOME` like the CLI itself, with project names from `session_index.jsonl`; legacy `~/.kimi/sessions/` is parsed alongside (`kimi migrate` never carries usage over, so both stores are always merged) |
 | MiniMax Code (mcode) | `$MCODE_HOME/v2/sqlite/runtime-state.sqlite` (default `~/.minimax/v2/sqlite/runtime-state.sqlite`; fixture override: `VIBE_USAGE_MCODE_DB`). Reads only allow-listed token ledger fields and session workspace/project paths, uses basename-only projects, folds cache writes into input, keeps cache reads and reasoning separate, and never selects raw/message JSON payloads. WAL/lock reads use a disposable snapshot; malformed or incompatible databases are skipped to preserve incremental state. |
@@ -158,7 +158,7 @@ Config stored at `~/.vibe-usage/config.json` (dev: `config.dev.json`).
 | `apiUrl` | Server URL (default: `https://vibecafe.ai`) |
 | `hostname` | Stable device name for usage tracking (set at init, reused across syncs) |
 | `codexExtraHome` | Optional additional Codex Home scanned together with `$CODEX_HOME` / `~/.codex` |
-| `extraRoots` | Tool-specific additional roots managed by the commands below; currently supports `codex`, `grok`, and `antigravity` |
+| `extraRoots` | Tool-specific additional roots managed by the commands below; currently supports `codex`, `grok`, `antigravity`, and `pi-coding-agent` |
 
 The `hostname` is captured once during `init` and reused for all future syncs. This prevents macOS mDNS hostname changes (e.g., `MacBook-Pro` → `MacBook-Pro-2`) from creating duplicate device entries. To change it manually:
 
@@ -178,6 +178,12 @@ npx @vibe-cafe/vibe-usage config add-root grok /path/to/grok-home
 
 # Antigravity expects an alternate HOME containing .gemini/antigravity*/conversations/.
 npx @vibe-cafe/vibe-usage config add-root antigravity /path/to/alternate-home
+
+# Pi accepts a directory that holds session .jsonl files directly, or a Pi
+# agent directory containing sessions/. Use this when a harness starts Pi with
+# `pi --session <file>`: that path is recorded nowhere Pi's own settings can
+# report, so it is invisible to discovery.
+npx @vibe-cafe/vibe-usage config add-root pi-coding-agent /path/to/pi-sessions
 
 npx @vibe-cafe/vibe-usage config roots
 npx @vibe-cafe/vibe-usage config remove-root grok /path/to/grok-home

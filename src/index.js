@@ -121,7 +121,7 @@ function handleConfig(args) {
       const source = args[1];
       const value = args[2];
       if (!source || value === undefined) {
-        console.error('Usage: vibe-usage config add-root <codex|grok|antigravity> <path>');
+        console.error(`Usage: vibe-usage config add-root <${EXTRA_ROOT_SOURCES.join('|')}> <path>`);
         process.exit(1);
       }
       const validation = validateExtraRoot(source, value);
@@ -142,7 +142,7 @@ function handleConfig(args) {
       const source = args[1];
       const value = args[2];
       if (!EXTRA_ROOT_SOURCES.includes(source) || value === undefined) {
-        console.error('Usage: vibe-usage config remove-root <codex|grok|antigravity> <path>');
+        console.error(`Usage: vibe-usage config remove-root <${EXTRA_ROOT_SOURCES.join('|')}> <path>`);
         process.exit(1);
       }
       const config = loadConfig() || {};
@@ -297,7 +297,7 @@ export async function run(rawArgs) {
     npx @vibe-cafe/vibe-usage config get <key>   Get a config value
     npx @vibe-cafe/vibe-usage config set <key> <value>  Set a config value
     npx @vibe-cafe/vibe-usage config set codexExtraHome <path>  Persist another Codex Home
-    npx @vibe-cafe/vibe-usage config add-root <tool> <path>  Add a Codex, Grok, or Antigravity data root
+    npx @vibe-cafe/vibe-usage config add-root <tool> <path>  Add a Codex, Grok, Antigravity, or Pi data root
     npx @vibe-cafe/vibe-usage config remove-root <tool> <path>  Remove an added data root
     npx @vibe-cafe/vibe-usage config roots  Show added data roots as JSON
     npx @vibe-cafe/vibe-usage help         Show this help

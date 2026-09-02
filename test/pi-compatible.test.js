@@ -7,6 +7,7 @@ import { parse as parseCraftAgent } from '../src/parsers/craft-agent.js';
 import { parse as parseOmp } from '../src/parsers/omp.js';
 import { parse as parsePi } from '../src/parsers/pi-coding-agent.js';
 import { getOmpSessionDirs, getPiSessionDirs } from '../src/pi-roots.js';
+import { validateExtraRoot } from '../src/extra-roots.js';
 
 const previousCindyDirs = process.env.VIBE_USAGE_CINDY_DIRS;
 process.env.VIBE_USAGE_CINDY_DIRS = join(tmpdir(), 'vibe-usage-cindy-disabled');
@@ -159,6 +160,11 @@ test('OMP discovers XDG profiles and does not also label its agent store as Pi',
     assert.ok(ompDirs.includes(xdgProfile));
     assert.ok(ompDirs.includes(overriddenSession));
     assert.deepEqual(getPiSessionDirs(), []);
+    // The OMP guard suppresses discovery of an OMP store as Pi; it must not
+    // discard a root the user added explicitly.
+    const piStore = join(root, 'pi-sessions');
+    mkdirSync(piStore, { recursive: true });
+    assert.deepEqual(getPiSessionDirs([piStore]), [piStore]);
   } finally {
     for (const [name, value] of Object.entries(previous)) restoreEnv(name, value);
     rmSync(root, { recursive: true, force: true });
@@ -250,6 +256,72 @@ test('Pi discovery honors PI_CODING_AGENT_SESSION_DIR alongside the agent store'
     assert.ok(dirs.includes(relocated));
   } finally {
     for (const [name, value] of Object.entries(previous)) restoreEnv(name, value);
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test('Pi scans an explicitly configured extra session root that discovery cannot see', async () => {
+  const root = mkdtempSync(join(tmpdir(), 'vibe-usage-pi-extra-root-'));
+  const previous = Object.fromEntries([
+    'VIBE_USAGE_PI_SESSION_DIRS',
+    'PI_CODING_AGENT_DIR',
+    'PI_CODING_AGENT_SESSION_DIR',
+  ].map((name) => [name, process.env[name]]));
+  try {
+    delete process.env.VIBE_USAGE_PI_SESSION_DIRS;
+    delete process.env.PI_CODING_AGENT_SESSION_DIR;
+    const agentDir = join(root, 'agent');
+    const agentSessions = join(agentDir, 'sessions');
+    // A harness that runs `pi --session <file>` writes a flat store with no
+    // agent directory above it, so nothing in Pi's own settings names it.
+    const harnessStore = join(root, 'harness-sessions');
+    mkdirSync(agentSessions, { recursive: true });
+    mkdirSync(harnessStore, { recursive: true });
+    process.env.PI_CODING_AGENT_DIR = agentDir;
+    writeSession(agentSessions, 'default/session-default.jsonl', { sessionId: 'session-default' });
+    writeFileSync(join(harnessStore, 'session-harness.jsonl'), sessionLines({
+      sessionId: 'session-harness',
+      cwd: '/work/harness',
+    }));
+
+    // Discovery alone still stops at the default store.
+    assert.deepEqual(getPiSessionDirs(), [agentSessions]);
+    assert.equal(validateExtraRoot('pi-coding-agent', harnessStore).ok, true);
+    assert.deepEqual(getPiSessionDirs([harnessStore]), [agentSessions, harnessStore]);
+
+    const result = await parsePi({ extraRoots: [harnessStore] });
+    assert.equal(result.skipped, undefined);
+    // Sessions are reported hashed, so assert on the project each store maps to.
+    assert.deepEqual(result.sessions.map(({ project }) => project).sort(), ['harness', 'project']);
+    assert.deepEqual(result.buckets.map(({ project }) => project).sort(), ['harness', 'project']);
+    assert.equal(new Set(result.sessions.map(({ sessionHash }) => sessionHash)).size, 2);
+    // A Pi agent directory is accepted too, and resolves to its sessions/
+    // child only, so the nested walk cannot read the same file twice.
+    assert.deepEqual(getPiSessionDirs([agentDir]), [agentSessions]);
+  } finally {
+    for (const [name, value] of Object.entries(previous)) restoreEnv(name, value);
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test('Pi rejects an extra root with no sessions and skips one that disappears', async () => {
+  const root = mkdtempSync(join(tmpdir(), 'vibe-usage-pi-extra-root-invalid-'));
+  const previous = process.env.VIBE_USAGE_PI_SESSION_DIRS;
+  try {
+    delete process.env.VIBE_USAGE_PI_SESSION_DIRS;
+    const empty = join(root, 'empty');
+    mkdirSync(empty, { recursive: true });
+    assert.equal(validateExtraRoot('pi-coding-agent', empty).ok, false);
+    assert.equal(validateExtraRoot('pi-coding-agent', join(root, 'missing')).ok, false);
+
+    // A configured root that vanishes must not report an empty result: that
+    // would prune already-uploaded state and force a full re-upload.
+    const result = await parsePi({ extraRoots: [join(root, 'missing')] });
+    assert.equal(result.skipped, true);
+    assert.deepEqual(result.buckets, []);
+    assert.match(result.warnings.join('\n'), /额外根目录不可用/);
+  } finally {
+    restoreEnv('VIBE_USAGE_PI_SESSION_DIRS', previous);
     rmSync(root, { recursive: true, force: true });
   }
 });
