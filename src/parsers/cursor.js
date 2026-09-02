@@ -44,10 +44,10 @@ export function getCursorStateDbPath() {
 function readAccessToken(dbPath) {
   // Cursor app holds a write lock; queryDbJsonSnapshotOnLock copies the WAL set
   // to a temp dir and retries on "database is locked".
-  const sql = `SELECT value FROM ItemTable WHERE key = '${ACCESS_TOKEN_KEY}' LIMIT 1`;
+  const sql = 'SELECT value FROM ItemTable WHERE key = ? LIMIT 1';
   const rows = queryDbJsonSnapshotOnLock(dbPath, sql, {
     tempPrefix: 'vibe-usage-cursor-',
-    opts: { maxBuffer: 4 * 1024 * 1024, timeout: 15000 },
+    opts: { maxBuffer: 4 * 1024 * 1024, timeout: 15000, params: [ACCESS_TOKEN_KEY] },
   });
   const value = rows[0]?.value;
   if (typeof value !== 'string') return null;

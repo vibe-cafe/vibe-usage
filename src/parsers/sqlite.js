@@ -20,17 +20,17 @@ const require = createRequire(import.meta.url);
 export function queryDbJson(
   dbPath,
   sql,
-  { timeout = 30000, maxBuffer = 100 * 1024 * 1024, readOnly = true } = {},
+  { timeout = 30000, maxBuffer = 100 * 1024 * 1024, readOnly = true, params = [] } = {},
 ) {
   const db = openNodeSqlite(dbPath, readOnly);
   if (db) {
     try {
-      return db.prepare(sql).all();
+      return db.prepare(sql).all(...params);
     } finally {
       db.close();
     }
   }
-  return queryViaCli(dbPath, sql, { timeout, maxBuffer });
+  return queryViaCli(dbPath, sql, { timeout, maxBuffer, params });
 }
 
 let nodeSqlite; // undefined = not tried, null = unavailable
@@ -79,8 +79,12 @@ function openNodeSqlite(dbPath, readOnly = true) {
   }
 }
 
-function queryViaCli(dbPath, sql, { timeout, maxBuffer }) {
-  const out = execFileSync('sqlite3', ['-json', dbPath, sql], {
+function queryViaCli(dbPath, sql, { timeout, maxBuffer, params = [] }) {
+  const queue = [...params];
+  const bound = queue.length
+    ? sql.replace(/\?/g, () => `'${String(queue.shift()).replace(/'/g, "''")}'`)
+    : sql;
+  const out = execFileSync('sqlite3', ['-json', dbPath, bound], {
     encoding: 'utf-8',
     maxBuffer,
     timeout,
