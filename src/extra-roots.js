@@ -108,11 +108,33 @@ export function piSessionsDir(value) {
   // outranks any `sessions/` child: those files are what the user configured.
   if (hasPiSessionJsonl(root, 0)) return root;
   const nested = join(root, 'sessions');
-  // Agent-home shape: take the child only once its content confirms it.
-  if (isReadableDirectory(nested) && hasPiSessionJsonl(nested)) return nested;
+  // Agent-home shape: narrowing to the child is only safe when every confirmed
+  // session lives below it. A container whose per-task stores happen to include
+  // one named `sessions` is still a container, and resolving it to that child
+  // would drop all its siblings — the same silent undercount as above.
+  if (isReadableDirectory(nested) && hasPiSessionJsonl(nested) && !hasPiSessionsOutsideNested(root)) {
+    return nested;
+  }
   // A configured container holding per-task stores somewhere below it.
   if (hasPiSessionJsonl(root)) return root;
   return null;
+}
+
+// True when a root holds confirmed sessions in some child other than
+// `sessions/`. The per-child depth is one less than the root scan's own so both
+// reach the same files.
+function hasPiSessionsOutsideNested(root) {
+  let children;
+  try {
+    children = readdirSync(root, { withFileTypes: true });
+  } catch {
+    return false;
+  }
+  return children.some(child => (
+    child.isDirectory()
+    && child.name !== 'sessions'
+    && hasPiSessionJsonl(join(root, child.name), 1)
+  ));
 }
 
 const PI_PROBE_BYTES = 16 * 1024;

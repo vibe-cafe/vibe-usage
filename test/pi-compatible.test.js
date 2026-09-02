@@ -503,6 +503,44 @@ test('Pi keeps scanning a bare store when an unrelated sessions/ child appears',
   }
 });
 
+test('Pi scans a whole container even when one task store is named sessions/', async () => {
+  const root = mkdtempSync(join(tmpdir(), 'vibe-usage-pi-extra-root-container-'));
+  const previous = Object.fromEntries([
+    'VIBE_USAGE_PI_SESSION_DIRS',
+    'PI_CODING_AGENT_DIR',
+    'PI_CODING_AGENT_SESSION_DIR',
+  ].map((name) => [name, process.env[name]]));
+  try {
+    delete process.env.VIBE_USAGE_PI_SESSION_DIRS;
+    delete process.env.PI_CODING_AGENT_SESSION_DIR;
+    process.env.PI_CODING_AGENT_DIR = join(root, 'no-default-store');
+
+    // A supported container root: per-task stores below it, one of which
+    // happens to be called `sessions`. Preferring that name made the root look
+    // like an agent home and dropped every sibling store — silently, because
+    // the surviving child still parses successfully.
+    const container = join(root, 'container');
+    const task = join(container, 'task-a');
+    const named = join(container, 'sessions');
+    mkdirSync(task, { recursive: true });
+    mkdirSync(named, { recursive: true });
+    writeFileSync(join(task, 'task.jsonl'), anonymousSessionLines({ sessionId: 'task-a', input: 10 }));
+    writeFileSync(join(named, 'named.jsonl'), anonymousSessionLines({ sessionId: 'named', input: 7 }));
+
+    assert.equal(validateExtraRoot('pi-coding-agent', container).ok, true);
+    assert.equal(piSessionsDir(container), container);
+    const result = await parsePi({ extraRoots: [container] });
+    assert.equal(result.skipped, undefined);
+    assert.equal(
+      result.buckets.reduce((sum, { inputTokens }) => sum + inputTokens, 0),
+      17,
+    );
+  } finally {
+    for (const [name, value] of Object.entries(previous)) restoreEnv(name, value);
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
 test('Pi counts an anonymous record once when extra roots overlap', async () => {
   const root = mkdtempSync(join(tmpdir(), 'vibe-usage-pi-extra-root-overlap-'));
   const previous = Object.fromEntries([
