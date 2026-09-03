@@ -16,10 +16,10 @@ const { parse } = await import('../src/parsers/kimi-code.js');
 
 after(() => rmSync(root, { recursive: true, force: true }));
 
-function usage(time, usageScope, values) {
+function usage(time, usageScope, values, model = 'kimi-code/k3') {
   return {
     type: 'usage.record',
-    model: 'kimi-code/k3',
+    model,
     usage: {
       inputOther: 0,
       output: 0,
@@ -108,4 +108,56 @@ test('current Kimi parser counts all delta scopes, cache creation, and subagents
     userMessageCount: 1,
     userPromptHours: [1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0],
   });
+});
+
+test('current Kimi parser resolves Secondary Agent aliases to the request model', async () => {
+  const sessionDir = join(currentRoot, 'sessions', 'wd_secondary_abcd', 'session_secondary');
+  const mainDir = join(sessionDir, 'agents', 'main');
+  mkdirSync(mainDir, { recursive: true });
+
+  const start = Date.parse('2026-07-18T00:01:00.000Z');
+  const records = [
+    { type: 'turn.prompt', origin: { kind: 'user' }, time: start },
+    {
+      type: 'llm.request',
+      model: 'provider-secondary-v2',
+      modelAlias: '__secondary__',
+      provider: 'anthropic',
+      time: start,
+    },
+    usage(start + 60_000, 'turn', {
+      inputOther: 10,
+      output: 2,
+    }, '__secondary__'),
+    {
+      type: 'llm.request',
+      model: 'provider-secondary-v3',
+      modelAlias: '__secondary__',
+      provider: 'another-provider',
+      time: start + 120_000,
+    },
+    usage(start + 180_000, 'turn', {
+      inputOther: 5,
+      output: 1,
+    }, '__secondary__'),
+  ];
+  writeFileSync(join(mainDir, 'wire.jsonl'), `${records.map(JSON.stringify).join('\n')}\n`, 'utf-8');
+
+  const result = await parse();
+  const secondary = result.buckets.find((bucket) => (
+    bucket.project === 'secondary'
+    && bucket.model === 'provider-secondary-v2'
+  ));
+  const switchedSecondary = result.buckets.find((bucket) => (
+    bucket.project === 'secondary'
+    && bucket.model === 'provider-secondary-v3'
+  ));
+
+  assert.equal(secondary?.inputTokens, 10);
+  assert.equal(secondary?.outputTokens, 2);
+  assert.equal(switchedSecondary?.inputTokens, 5);
+  assert.equal(switchedSecondary?.outputTokens, 1);
+  assert.equal(result.buckets.some((bucket) => (
+    bucket.project === 'secondary' && bucket.model === '__secondary__'
+  )), false);
 });
