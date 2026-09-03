@@ -158,6 +158,8 @@ function parseKimiCode() {
     }
 
     const project = sessionIndex.get(sessionDir) || bucketProject || 'unknown';
+    let lastRequestModel = null;
+    let lastRequestAlias = null;
 
     for (const line of content.split('\n')) {
       if (!line.trim()) continue;
@@ -165,6 +167,19 @@ function parseKimiCode() {
       try { evt = JSON.parse(line); } catch { continue; }
 
       const type = evt.type;
+      // `usage.record.model` may contain the configured alias rather than the
+      // provider model. The preceding `llm.request` carries both values, so
+      // retain the real model for resolving aliases such as `__secondary__`.
+      if (type === 'llm.request') {
+        lastRequestModel = typeof evt.model === 'string' && evt.model.trim()
+          ? evt.model.trim()
+          : null;
+        lastRequestAlias = typeof evt.modelAlias === 'string' && evt.modelAlias.trim()
+          ? evt.modelAlias.trim()
+          : null;
+        continue;
+      }
+
       // Top-level `time` is integer milliseconds since epoch. Validate it:
       // JSON numbers can overflow to Infinity (e.g. 1e400 parses fine), and
       // any out-of-range value yields an Invalid Date that later crashes
@@ -204,9 +219,19 @@ function parseKimiCode() {
       const cachedInputTokens = usageTokens(usage.inputCacheRead);
       if (!inputTokens && !outputTokens && !cachedInputTokens) continue;
 
+      const reportedModel = typeof evt.model === 'string' && evt.model.trim()
+        ? evt.model.trim()
+        : null;
+      const isAlias = reportedModel && (
+        reportedModel === '__secondary__' || reportedModel === lastRequestAlias
+      );
+      const model = isAlias && lastRequestModel
+        ? lastRequestModel
+        : reportedModel || lastRequestModel || 'unknown';
+
       entries.push({
         source: 'kimi-code',
-        model: evt.model || 'unknown',
+        model,
         project,
         timestamp: ts,
         inputTokens,
