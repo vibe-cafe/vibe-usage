@@ -1,6 +1,7 @@
 import { existsSync, readdirSync, readFileSync } from 'node:fs';
 import { delimiter, isAbsolute, join } from 'node:path';
 import { homedir } from 'node:os';
+import { piSessionsDir } from './extra-roots.js';
 
 function expandHome(value) {
   const trimmed = value.trim();
@@ -60,22 +61,30 @@ function settingsSessionDir(agentDir) {
   }
 }
 
-export function getPiSessionDirs() {
+export function getPiSessionDirs(extraRoots = []) {
+  // Explicitly configured roots are user intent, not a fixture: they are always
+  // scanned, and they never replace the default store. A root whose shape no
+  // longer resolves drops out here; the parser reports that as skipped.
+  const extraDirs = extraRoots.map(piSessionsDir).filter(dir => dir !== null);
+
   const override = process.env.VIBE_USAGE_PI_SESSION_DIRS?.trim();
-  if (override) return uniqueExistingDirs(override.split(delimiter));
+  if (override) return uniqueExistingDirs([...override.split(delimiter), ...extraDirs]);
 
   const envAgentDir = process.env.PI_CODING_AGENT_DIR?.trim();
   const agentDir = envAgentDir ? expandHome(envAgentDir) : join(homedir(), '.pi', 'agent');
   // OMP inherits PI_CODING_AGENT_DIR from Pi. Do not parse an identifiable
   // OMP store again as source=pi-coding-agent.
-  if (envAgentDir && looksLikeOmpAgentDir(agentDir)) return [];
+  const isOmpStore = Boolean(envAgentDir) && looksLikeOmpAgentDir(agentDir);
 
-  const dirs = [join(agentDir, 'sessions')];
-  const envSessionDir = process.env.PI_CODING_AGENT_SESSION_DIR?.trim();
-  if (envSessionDir) dirs.push(expandHome(envSessionDir));
-  const configured = settingsSessionDir(agentDir);
-  if (configured) dirs.push(configured);
-  return uniqueExistingDirs(dirs);
+  const dirs = [];
+  if (!isOmpStore) {
+    dirs.push(join(agentDir, 'sessions'));
+    const envSessionDir = process.env.PI_CODING_AGENT_SESSION_DIR?.trim();
+    if (envSessionDir) dirs.push(expandHome(envSessionDir));
+    const configured = settingsSessionDir(agentDir);
+    if (configured) dirs.push(configured);
+  }
+  return uniqueExistingDirs([...dirs, ...extraDirs]);
 }
 
 export function getOmpSessionDirs() {

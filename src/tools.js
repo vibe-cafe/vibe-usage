@@ -320,7 +320,9 @@ export const TOOLS = [
     name: 'pi',
     id: 'pi-coding-agent',
     dataDir: join(homedir(), '.pi', 'agent', 'sessions'),
-    detectDataDirs: findPiDataDirs,
+    detectDataDirs: ({ extraRoots } = {}) => (
+      findPiDataDirs(extraRootList(extraRoots?.['pi-coding-agent']))
+    ),
   },
   {
     name: 'Qwen Code',

@@ -194,6 +194,50 @@ test('config add-root, roots, and remove-root manage tool-specific roots without
   }
 });
 
+test('config add-root accepts a Pi session store and reports it in status', () => {
+  const root = mkdtempSync(join(tmpdir(), 'vibe-usage-cli-pi-root-'));
+  const configDir = join(root, 'config');
+  const piStore = join(root, 'harness-sessions');
+  mkdirSync(configDir, { recursive: true });
+  mkdirSync(piStore, { recursive: true });
+  writeFileSync(join(piStore, 'session-1.jsonl'), `${JSON.stringify({
+    type: 'session',
+    version: 3,
+    id: 'session-1',
+    timestamp: '2026-09-01T00:00:00.000Z',
+    cwd: '/work/harness',
+  })}\n`);
+  writeFileSync(join(configDir, 'config.json'), JSON.stringify({ apiKey: 'vbu_test' }));
+  const env = { VIBE_USAGE_CONFIG_DIR: configDir, HOME: root };
+  try {
+    const add = runWithEnv(['config', 'add-root', 'pi-coding-agent', piStore], env);
+    assert.equal(add.status, 0, add.stderr);
+    const listed = runWithEnv(['config', 'roots'], env);
+    assert.deepEqual(JSON.parse(listed.stdout), { 'pi-coding-agent': [piStore] });
+
+    // An added root also makes the tool detected, not just scanned.
+    const status = runWithEnv(['status'], env);
+    assert.equal(status.status, 0, status.stderr);
+    assert.match(status.stdout, /Extra pi-coding-agent Root: /);
+    assert.match(status.stdout, /Detected tools:[\s\S]*pi/);
+
+    const empty = runWithEnv(['config', 'add-root', 'pi-coding-agent', configDir], env);
+    assert.equal(empty.status, 1);
+    assert.match(empty.stderr, /需要是直接包含 Pi 会话 \.jsonl 的目录/);
+
+    // A same-extension log that is not a Pi session must be rejected too:
+    // accepting it would persist a root the parser then silently ignores.
+    const notPi = join(root, 'unrelated-logs');
+    mkdirSync(notPi, { recursive: true });
+    writeFileSync(join(notPi, 'events.jsonl'), '{"kind":"not-a-pi-session"}\n');
+    const wrong = runWithEnv(['config', 'add-root', 'pi-coding-agent', notPi], env);
+    assert.equal(wrong.status, 1);
+    assert.match(wrong.stderr, /需要是直接包含 Pi 会话 \.jsonl 的目录/);
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
 test('config add-root rejects unsupported tools and invalid layouts', () => {
   const root = mkdtempSync(join(tmpdir(), 'vibe-usage-cli-invalid-root-'));
   try {
