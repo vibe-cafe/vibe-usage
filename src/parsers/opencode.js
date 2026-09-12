@@ -1,151 +1,84 @@
-import { readdirSync, readFileSync, existsSync } from 'node:fs';
+import { readdirSync, readFileSync } from 'node:fs';
 import { join, basename } from 'node:path';
-import { homedir } from 'node:os';
 import { aggregateToBuckets, extractSessions } from './aggregate.js';
 import { queryDbJson, sqliteUnavailableError, isSqliteUnavailableError } from './sqlite.js';
+import { getOpenCodeStores } from '../opencode-roots.js';
 
-const DATA_DIR = join(homedir(), '.local', 'share', 'opencode');
-const DB_PATH = join(DATA_DIR, 'opencode.db');
-const MESSAGES_DIR = join(DATA_DIR, 'storage', 'message');
-
-/**
- * Parse opencode usage data.
- * Tries SQLite database first (opencode >= v0.2), falls back to legacy JSON files.
- */
-export async function parse() {
-  if (existsSync(DB_PATH)) {
-    try {
-      return parseFromSqlite();
-    } catch (err) {
-      process.stderr.write(`warn: opencode sqlite parse failed (${err.message}), trying legacy json...\n`);
-    }
-  }
-  return parseFromJson();
-}
-
-function parseFromSqlite() {
-  const query = `SELECT
-    session_id as sessionID,
-    json_extract(data, '$.role') as role,
-    json_extract(data, '$.time.created') as created,
-    json_extract(data, '$.modelID') as modelID,
-    json_extract(data, '$.tokens') as tokens,
-    json_extract(data, '$.path.root') as rootPath
-    FROM message`;
-
-  let rows;
-  try {
-    rows = queryDbJson(DB_PATH, query);
-  } catch (err) {
+function readSqlite(path) {
+  // Select only accounting/timing metadata, never message text or tool inputs.
+  // Keep the existing top-level model/project precedence for old uploads.
+  const query = `SELECT id, session_id AS sessionID,
+    json_extract(data, '$.role') AS role,
+    json_extract(data, '$.time.created') AS created,
+    coalesce(json_extract(data, '$.modelID'), json_extract(data, '$.model.modelID')) AS modelID,
+    json_extract(data, '$.tokens') AS tokens,
+    json_extract(data, '$.path.root') AS rootPath
+    FROM message ORDER BY id`;
+  try { return queryDbJson(path, query); }
+  catch (err) {
     if (isSqliteUnavailableError(err)) throw sqliteUnavailableError('OpenCode');
     throw err;
   }
-  if (!rows.length) return { buckets: [], sessions: [] };
-
-  const entries = [];
-  const sessionEvents = [];
-  for (const row of rows) {
-    const timestamp = new Date(row.created);
-    if (isNaN(timestamp.getTime())) continue;
-
-    const project = row.rootPath ? basename(row.rootPath) : 'unknown';
-    const sessionId = row.sessionID || 'unknown';
-
-    sessionEvents.push({
-      sessionId,
-      source: 'opencode',
-      project,
-      timestamp,
-      role: row.role === 'user' ? 'user' : 'assistant',
-    });
-
-    if (!row.modelID) continue;
-    let tokens;
-    try {
-      tokens = typeof row.tokens === 'string' ? JSON.parse(row.tokens) : row.tokens;
-    } catch {
-      continue;
-    }
-    if (!tokens || (!tokens.input && !tokens.output)) continue;
-
-    entries.push({
-      source: 'opencode',
-      model: row.modelID || 'unknown',
-      project,
-      timestamp,
-      inputTokens: tokens.input || 0,
-      outputTokens: tokens.output || 0,
-      cachedInputTokens: tokens.cache?.read || 0,
-      reasoningOutputTokens: tokens.reasoning || 0,
-    });
-  }
-
-  return { buckets: aggregateToBuckets(entries), sessions: extractSessions(sessionEvents) };
 }
 
-function parseFromJson() {
-  if (!existsSync(MESSAGES_DIR)) return { buckets: [], sessions: [] };
-
-  const entries = [];
-  const sessionEvents = [];
-  let sessionDirs;
-  try {
-    sessionDirs = readdirSync(MESSAGES_DIR, { withFileTypes: true })
-      .filter(d => d.isDirectory() && d.name.startsWith('ses_'));
-  } catch {
-    return { buckets: [], sessions: [] };
+function readJson(path) {
+  const rows = [];
+  for (const dir of readdirSync(path, { withFileTypes: true })) {
+    if (!dir.isDirectory() || !dir.name.startsWith('ses_')) continue;
+    const sessionPath = join(path, dir.name);
+    for (const file of readdirSync(sessionPath).sort()) {
+      if (!file.endsWith('.json')) continue;
+      const data = JSON.parse(readFileSync(join(sessionPath, file), 'utf8'));
+      rows.push({ id: data.id || basename(file, '.json'), sessionID: dir.name,
+        role: data.role, created: data.time?.created,
+        modelID: data.modelID || data.model?.modelID,
+        tokens: data.tokens, rootPath: data.path?.root });
+    }
   }
+  return rows;
+}
 
-  for (const sessionDir of sessionDirs) {
-    const sessionPath = join(MESSAGES_DIR, sessionDir.name);
-    let msgFiles;
+function tokenSize(row) {
+  const t = row.tokens;
+  return ['input', 'output', 'reasoning'].reduce((n, key) => n + (Number(t?.[key]) || 0), 0)
+    + (Number(t?.cache?.read) || 0);
+}
+
+export async function parse({ extraRoots = [] } = {}) {
+  const warnings = [];
+  const stores = getOpenCodeStores({ extraRoots, onWarning: message => warnings.push(message) });
+  const records = new Map();
+  for (const store of stores) {
     try {
-      msgFiles = readdirSync(sessionPath).filter(f => f.endsWith('.json'));
-    } catch {
-      continue;
-    }
-
-    for (const file of msgFiles) {
-      const filePath = join(sessionPath, file);
-
-      let data;
-      try {
-        data = JSON.parse(readFileSync(filePath, 'utf-8'));
-      } catch {
-        continue;
+      const rows = store.kind === 'sqlite' ? readSqlite(store.path) : readJson(store.path);
+      for (const [index, row] of rows.entries()) {
+        const timestamp = new Date(row.created);
+        if (!Number.isFinite(timestamp.getTime())) continue;
+        if (typeof row.tokens === 'string') row.tokens = JSON.parse(row.tokens);
+        const sessionId = row.sessionID || 'unknown';
+        // Message ids are unique within an OpenCode session. Across stores,
+        // keep the most complete copy; never dedup unrelated equal-sized calls.
+        // Missing ids cannot prove that two stores hold the same record.
+        const key = JSON.stringify([sessionId, row.id || `${store.path}:${index}`]);
+        const old = records.get(key);
+        if (!old || tokenSize(row) > tokenSize(old)) records.set(key, { ...row, timestamp, sessionId });
       }
-
-      const timestamp = new Date(data.time?.created);
-      if (isNaN(timestamp.getTime())) continue;
-
-      const rootPath = data.path?.root;
-      const project = rootPath ? basename(rootPath) : 'unknown';
-
-      sessionEvents.push({
-        sessionId: sessionDir.name,
-        source: 'opencode',
-        project,
-        timestamp,
-        role: data.role === 'user' ? 'user' : 'assistant',
-      });
-
-      if (!data.modelID) continue;
-      const tokens = data.tokens;
-      if (!tokens) continue;
-      if (!tokens.input && !tokens.output) continue;
-
-      entries.push({
-        source: 'opencode',
-        model: data.modelID || 'unknown',
-        project,
-        timestamp,
-        inputTokens: tokens.input || 0,
-        outputTokens: tokens.output || 0,
-        cachedInputTokens: tokens.cache?.read || 0,
-        reasoningOutputTokens: tokens.reasoning || 0,
-      });
-    }
+    } catch (err) { warnings.push(`OpenCode: 无法读取 ${store.path}: ${err.message}`); }
   }
+  if (warnings.length) return { buckets: [], sessions: [], skipped: true, warnings };
 
-  return { buckets: aggregateToBuckets(entries), sessions: extractSessions(sessionEvents) };
+  const entries = [], events = [];
+  for (const row of records.values()) {
+    // Keep the existing project derivation and token semantics. Additional roots
+    // must not rename previously uploaded projects/models or alter their counts.
+    const project = row.rootPath ? basename(row.rootPath) : 'unknown';
+    const base = { source: 'opencode', project, timestamp: row.timestamp };
+    events.push({ ...base, sessionId: row.sessionId, role: row.role === 'user' ? 'user' : 'assistant' });
+    const tokens = row.tokens;
+    if (!row.modelID || !tokens || (!tokens.input && !tokens.output)) continue;
+    entries.push({ ...base, model: row.modelID,
+      inputTokens: tokens.input || 0, outputTokens: tokens.output || 0,
+      cachedInputTokens: tokens.cache?.read || 0, reasoningOutputTokens: tokens.reasoning || 0 });
+  }
+  return { buckets: aggregateToBuckets(entries), sessions: extractSessions(events) };
 }

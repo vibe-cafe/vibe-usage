@@ -297,3 +297,46 @@ test('config add-root rejects unsupported tools and invalid layouts', () => {
     rmSync(root, { recursive: true, force: true });
   }
 });
+
+test('Claude Code and OpenCode added roots route from saved config into their parsers', () => {
+  const root = mkdtempSync(join(tmpdir(), 'cli-claude-opencode-'));
+  const configDir = join(root, 'config'), claude = join(root, 'claude'), opencode = join(root, 'opencode');
+  mkdirSync(join(claude, 'projects', 'project'), { recursive: true });
+  writeFileSync(join(claude, 'projects', 'project', 'session.jsonl'), JSON.stringify({ type: 'assistant',
+    timestamp: '2026-09-12T00:00:00Z', cwd: '/work/project', uuid: 'one',
+    message: { id: 'call', model: 'test-model', usage: { input_tokens: 10, output_tokens: 2 } } }) + '\n');
+  mkdirSync(join(opencode, 'storage', 'message', 'ses_one'), { recursive: true });
+  writeFileSync(join(opencode, 'storage', 'message', 'ses_one', 'reply.json'), JSON.stringify({ id: 'reply',
+    role: 'assistant', time: { created: 1789171200000 }, modelID: 'test-model', tokens: { input: 10, output: 2 } }));
+  const env = { ...process.env, VIBE_USAGE_CONFIG_DIR: configDir,
+    VIBE_USAGE_CLAUDE_DIRS: join(root, 'no-default-claude'), VIBE_USAGE_OPENCODE_DIRS: join(root, 'no-default-opencode') };
+  try {
+    for (const [source, path] of [['claude-code', claude], ['opencode', opencode]]) {
+      const result = runWithEnv(['config', 'add-root', source, path], env);
+      assert.equal(result.status, 0, result.stderr);
+    }
+    const config = JSON.parse(readFileSync(join(configDir, 'config.json'), 'utf8'));
+    assert.deepEqual(config.extraRoots, { 'claude-code': [claude], opencode: [opencode] });
+    const code = `import {loadConfig} from './src/config.js';
+      import {extraRootList} from './src/extra-roots.js';
+      const config=loadConfig(); const out={};
+      for(const source of ['claude-code','opencode']) {
+        const {parse}=await import('./src/parsers/'+source+'.js');
+        out[source]=(await parse({extraRoots:extraRootList(config.extraRoots?.[source])})).buckets.length;
+      } console.log(JSON.stringify(out));`;
+    const parsed = spawnSync(process.execPath, ['--input-type=module', '-e', code], {
+      cwd: join(testDir, '..'), env, encoding: 'utf8' });
+    assert.equal(parsed.status, 0, parsed.stderr);
+    assert.deepEqual(JSON.parse(parsed.stdout), { 'claude-code': 1, opencode: 1 });
+    const status = runWithEnv(['status'], env);
+    assert.equal(status.status, 0, status.stderr);
+    assert.match(status.stdout, /Claude Code: installed/);
+    assert.match(status.stdout, /OpenCode: installed/);
+    for (const source of ['claude', 'zcode']) {
+      assert.equal(runWithEnv(['config', 'add-root', source, claude], env).status, 1);
+    }
+    assert.equal(runWithEnv(['config', 'remove-root', 'claude-code', claude], env).status, 0);
+    assert.equal(runWithEnv(['config', 'remove-root', 'opencode', opencode], env).status, 0);
+    assert.deepEqual(JSON.parse(runWithEnv(['config', 'roots'], env).stdout), {});
+  } finally { rmSync(root, { recursive: true, force: true }); }
+});

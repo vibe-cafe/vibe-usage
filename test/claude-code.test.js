@@ -362,3 +362,23 @@ test('Claude streaming session rollup preserves out-of-order timestamp semantics
     rmSync(root, { recursive: true, force: true });
   }
 });
+
+test('explicit Claude roots are additive and copied sessions remain deduplicated', async () => {
+  const root = mkdtempSync(join(tmpdir(), 'claude-extra-'));
+  const primary = join(root, 'primary'), extra = join(root, 'extra');
+  const records = [record({ type: 'user' }), record({ uuid: 'one', messageId: 'call', requestId: 'request', usage: { input_tokens: 10, output_tokens: 2 } })];
+  writeSession(primary, 'project', 'one', records);
+  writeSession(extra, 'project', 'one', records);
+  writeSession(extra, 'project', 'two', [record({ type: 'user' }), record({ uuid: 'two', messageId: 'call2', requestId: 'request2', usage: { input_tokens: 5, output_tokens: 1 } })]);
+  try {
+    await withClaudeRoots([primary], async () => {
+      const result = await parse({ extraRoots: [extra, primary] });
+      assert.equal(result.buckets[0].inputTokens, 15);
+      assert.equal(result.sessions.length, 2);
+      assert.ok(findClaudeCodeDataDirs([extra]).includes(join(extra, 'projects')));
+      const missing = await parse({ extraRoots: [join(root, 'missing')] });
+      assert.equal(missing.skipped, true);
+      assert.ok(missing.warnings.length);
+    });
+  } finally { rmSync(root, { recursive: true, force: true }); }
+});

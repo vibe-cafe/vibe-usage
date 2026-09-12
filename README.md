@@ -71,7 +71,7 @@ npx @vibe-cafe/vibe-usage help --all   # Full help (plain `help` shows the short
 | Cursor | `state.vscdb` (SQLite, reads `cursorAuth/accessToken`, fetches CSV from `cursor.com`); cloud data is stamped with a fixed `cursor-cloud` hostname so multi-machine setups don't double-count |
 | DimAgent | `$DIMCODE_HOME/dimcode.sqlite` (default `~/.dimcode/v2/dimcode.sqlite`); exact usage from `usage_ledger`, with forked ledger/history copies deduplicated |
 | Gemini CLI | `~/.gemini/tmp/<project_hash>/chats/session-*.jsonl` (current line-delimited format) and legacy `session-*.json`; recurses into nested subagent sessions |
-| OpenCode | `~/.local/share/opencode/opencode.db` (SQLite, `json_extract` query) |
+| OpenCode | `~/.local/share/opencode/opencode.db` (SQLite), with `storage/message/` as the legacy alternative; supports explicitly added data roots |
 | OpenClaw | `~/.openclaw/agents/`, `~/.openclaw-<profile>/agents/` (profile deployments); cache-creation/cache-write tokens are included in input usage |
 | Oh My Pi | `~/.omp/agent/sessions/`, `~/.omp/profiles/*/agent/sessions/`, and `$XDG_DATA_HOME/omp/{sessions,profiles/*/sessions}`; recognizes OMP's `$PI_CODING_AGENT_DIR`, current v3 title slots and path/hashed session directories, deduplicates copied records, includes cache writes in input, and splits reasoning from OMP's inclusive output count |
 | pi | `~/.pi/agent/sessions/` or `$PI_CODING_AGENT_DIR/sessions/`, plus the session directory Pi itself was pointed at via `PI_CODING_AGENT_SESSION_DIR` or `sessionDir` in `~/.pi/agent/settings.json`, plus explicitly added `pi-coding-agent` roots for stores only reachable through `pi --session <file>` (fixture/relocation override: `VIBE_USAGE_PI_SESSION_DIRS`). Cache writes are included in input usage; reasoning is read from Pi's `usage.reasoning` (legacy `usage.reasoningTokens` still accepted) and split out of the inclusive output total |
@@ -203,6 +203,13 @@ Add isolated runtime data without editing JSON by hand:
 # <workspace>/<task>/codex-home directories are at most three levels below it.
 npx @vibe-cafe/vibe-usage config add-root codex /path/to/multica-container
 
+# Claude Code expects a .claude root containing projects/ or transcripts/.
+# Use the source id claude-code (not claude).
+npx @vibe-cafe/vibe-usage config add-root claude-code /mnt/c/Users/you/.claude
+
+# OpenCode accepts a data root containing opencode.db or storage/message/.
+npx @vibe-cafe/vibe-usage config add-root opencode /path/to/other/opencode
+
 # Grok expects a Grok Home containing sessions/.
 npx @vibe-cafe/vibe-usage config add-root grok /path/to/grok-home
 
@@ -220,6 +227,8 @@ npx @vibe-cafe/vibe-usage config remove-root grok /path/to/grok-home
 ```
 
 Default roots are always scanned and existing `codexExtraHome` configurations remain valid. Additional roots are only scanned after they are explicitly added. If a configured root later becomes unavailable, that tool is skipped for the current sync so its incremental upload state is not pruned.
+
+For OpenCode, each root uses its SQLite database when present; only roots without a database use legacy JSON. Copied records across roots are counted once using session/message ids, keeping the most complete copy. A broken database is reported and preserves sync state instead of silently substituting potentially stale JSON. Existing model names take precedence; nested model fields are only a fallback when the old field is absent. Claude Code retains its existing session and request deduplication rules.
 
 ## Background sync
 

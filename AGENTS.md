@@ -146,8 +146,8 @@ passing this gate.
 `src/extra-roots.js` owns `EXTRA_ROOT_SOURCES`, `validateExtraRoot()`,
 `extraRootList()`, and the source-specific layout resolvers, including
 `grokSessionsDir()`, `antigravityConversationDirs()`, and `piSessionsDir()`.
-The currently supported source ids are `antigravity`, `codex`, `grok`, and
-`pi-coding-agent`.
+The currently supported source ids are `antigravity`, `claude-code`, `codex`, `grok`,
+`opencode`, and `pi-coding-agent`.
 
 - **Config routing:** `config roots` lists `config.extraRoots` as JSON;
   `config add-root <source> <path>` validates and persists a normalized path;
@@ -168,6 +168,10 @@ The currently supported source ids are `antigravity`, `codex`, `grok`, and
   currently still validates and appends explicit `extraRoots` when
   `VIBE_USAGE_PI_SESSION_DIRS` is set, so its tests must also pass only temporary
   extra roots. Do not assume the override alone isolates those tests.
+
+- **Claude / OpenCode roots:** the config id is `claude-code`, never `claude`. Claude keeps its existing physical-session/request-copy selection; validate explicit roots on every run and mark the source skipped if projects/transcripts disappear. OpenCode discovery and parsing share `opencode-roots.js`: SQLite wins independently within each root, including empty databases; JSON is used only where no database exists. Read failures suppress partial OpenCode outputs and protect state.
+- OpenCode merges raw accounting/timing records before aggregation. Deduplicate copied stores by session id + message id, keeping the copy with the largest token payload (default root wins ties); anonymous ids stay scoped to their physical store. Canonical paths remove symlink overlap. Keep existing token semantics and top-level model/project precedence; nested `model.modelID` only fills an absent model field; project derivation is unchanged. No reset or backend change is needed. `VIBE_USAGE_OPENCODE_DIRS` replaces default discovery; explicit test `extraRoots` remain additive, like Claude.
+- Validation for #81 includes a read-only comparison against an actual default OpenCode store: buckets and sessions matched pre-change main exactly. Synthetic SQLite/JSON stores cover cross-root copying, model fallback, failures, and the full config → detection → parser route. No production upload was performed.
 
 ## Architecture: Two-Track Data Model
 

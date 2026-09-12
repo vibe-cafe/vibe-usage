@@ -1,9 +1,10 @@
 import { accessSync, closeSync, constants, openSync, readSync, readdirSync, statSync } from 'node:fs';
 import { homedir } from 'node:os';
 import { basename, join, resolve } from 'node:path';
+import { openCodeStore } from './opencode-roots.js';
 import { codexSessionDirs } from './codex-roots.js';
 
-export const EXTRA_ROOT_SOURCES = ['antigravity', 'codex', 'grok', 'pi-coding-agent'];
+export const EXTRA_ROOT_SOURCES = ['antigravity', 'claude-code', 'codex', 'grok', 'opencode', 'pi-coding-agent'];
 
 // Probing a candidate Pi store has three outcomes, never two: a confirmed
 // session, a directory proven to hold none, and one that could not be read.
@@ -278,6 +279,11 @@ function probePiSessions(dir, depth = 2) {
   return unreadable ? PI_SESSIONS_UNREADABLE : PI_SESSIONS_ABSENT;
 }
 
+export function claudeProjectsDir(value) {
+  const root = normalizeExtraRoot(value);
+  return [join(root, 'projects'), join(root, 'transcripts')].filter(isReadableDirectory);
+}
+
 export function validateExtraRoot(source, value) {
   if (!EXTRA_ROOT_SOURCES.includes(source)) {
     return { ok: false, path: value, reason: `不支持的工具: ${source}` };
@@ -290,6 +296,22 @@ export function validateExtraRoot(source, value) {
       path,
       reason: '需要是 Codex Home，或包含 */*/codex-home 的 Multica 容器',
     };
+  }
+  if (source === 'claude-code') {
+    const dirs = claudeProjectsDir(path);
+    return {
+      ok: dirs.length > 0,
+      path,
+      reason: '需要包含 projects/ 或 transcripts/',
+    };
+  }
+  if (source === 'opencode') {
+    try {
+      return { ok: openCodeStore(path) !== null, path,
+        reason: '需要包含可读的 opencode.db 或 storage/message/' };
+    } catch (err) {
+      return { ok: false, path, reason: `无法读取 OpenCode 目录: ${err.message}` };
+    }
   }
   if (source === 'pi-coding-agent') {
     // piSessionsDir only returns a directory it has already confirmed by

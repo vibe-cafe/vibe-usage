@@ -331,7 +331,7 @@ function* iterateUsageEntries(ctx) {
   for (const entry of ctx.entriesByKey.values()) yield entry;
 }
 
-export async function parse() {
+export async function parse({ extraRoots = [] } = {}) {
   const ctx = {
     entriesByKey: new Map(),
     anonymousEntries: [],
@@ -341,6 +341,7 @@ export async function parse() {
   };
   const roots = getClaudeRoots({
     onWarning: (message) => addWarning(ctx, message),
+    extraRoots,
   });
   const projectGroups = collectCandidates(roots, 'projects', ctx);
   const projectSessionIds = new Set();

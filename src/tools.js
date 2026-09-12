@@ -1,6 +1,7 @@
 import { existsSync, readdirSync, statSync } from 'node:fs';
 import { dirname, isAbsolute, join, posix, resolve, win32 } from 'node:path';
 import { homedir } from 'node:os';
+import { getOpenCodeStores } from './opencode-roots.js';
 import { findClaudeCodeDataDirs } from './claude-roots.js';
 import { findCindyDataDirs, getCindyDataRoots } from './cindy-roots.js';
 import { codexSessionDirs, resolveCodexHomes } from './codex-roots.js';
@@ -258,7 +259,7 @@ export const TOOLS = [
     name: 'Claude Code',
     id: 'claude-code',
     dataDir: join(homedir(), '.claude', 'projects'),
-    detectDataDirs: findClaudeCodeDataDirs,
+    detectDataDirs: ({ extraRoots } = {}) => findClaudeCodeDataDirs(extraRootList(extraRoots?.['claude-code'])),
   },
   {
     name: 'Codex CLI',
@@ -311,6 +312,9 @@ export const TOOLS = [
     name: 'OpenCode',
     id: 'opencode',
     dataDir: join(homedir(), '.local', 'share', 'opencode'),
+    detectDataDirs: ({ extraRoots } = {}) => getOpenCodeStores({
+      extraRoots: extraRootList(extraRoots?.opencode),
+    }).map(store => store.path),
   },
   {
     name: 'OpenClaw',
