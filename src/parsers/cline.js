@@ -2,11 +2,13 @@ import { statSync } from 'node:fs';
 import { join } from 'node:path';
 import { aggregateToBuckets, extractSessions } from './aggregate.js';
 import { readJsonSafe, projectFromPath } from './fs-utils.js';
-import { findClineDataDirs } from '../cline-roots.js';
+import { findClineStores } from '../cline-roots.js';
+import { readClineSdk } from './cline-sdk.js';
 
 export async function parse() {
-  const extDirs = findClineDataDirs();
-  if (extDirs.length === 0) return { buckets: [], sessions: [] };
+  const warnings = [];
+  const onWarning = message => warnings.push(message);
+  const { legacyRoots: extDirs, sdkSessionDirs } = findClineStores({ onWarning });
 
   const entries = [];
   const events = [];
@@ -88,5 +90,8 @@ export async function parse() {
       }
   }
 
-  return { buckets: aggregateToBuckets(entries), sessions: extractSessions(events) };
+  const sdk = readClineSdk(sdkSessionDirs, onWarning);
+  if (warnings.length) return { buckets: [], sessions: [], skipped: true, warnings };
+  return { buckets: aggregateToBuckets([...entries, ...sdk.entries]),
+    sessions: extractSessions([...events, ...sdk.events]) };
 }

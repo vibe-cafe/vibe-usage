@@ -16,6 +16,7 @@ vibe-usage/
 │   │   ├── fs-utils.js        # readJsonSafe() / projectFromPath() / projectFromCwd() / toCount()
 │   │   ├── claude-code.js
 │   │   ├── cindy-ledger.js      # Cindy-private Codex/Pi daily ledger augmentation; no chat reads
+│   │   ├── cline-sdk.js       # Current Cline SDK session artifacts; used alongside the legacy Cline reader
 │   │   ├── codex.js
 │   │   ├── codex-cache.js     # Versioned, disposable per-rollout Codex parser cache
 │   │   ├── cola.js            # Cola Pi-compatible sessions; copied headers retain record identities
@@ -45,7 +46,7 @@ vibe-usage/
 │   │   └── zcode.js           # SQLite (via sqlite.js), reads message table
 │   ├── extra-roots.js         # Additional-root validation and per-source layout resolvers; used by config roots/add-root/remove-root
 │   ├── pi-roots.js            # Pi/OMP default, Pi-configured (env + settings.json), profile, XDG, and override discovery
-│   ├── cline-roots.js         # Standalone + VSCode-host Cline discovery
+│   ├── cline-roots.js         # Current SDK + legacy standalone/VSCode-host Cline discovery
 │   ├── cola-roots.js          # Cola sessions discovery, including COLA_DATA_DIR
 │   ├── cindy-roots.js          # Cindy Global/CN Electron roots + per-owner DB discovery
 │   ├── craft-roots.js         # CraftAgent root resolution and detection
@@ -226,6 +227,14 @@ Qoder parsers (`qoder.js`, two editions via `../qoder-roots.js`):
 - Source `qoder` (qoder.com) and `qoder-cn` (qoder.com.cn) are separate accounts, billing and data dirs; never merge them. The IDE store `SharedClientCache/cache/db/local.db` yields real tokens (`prompt_tokens` includes `cached_tokens`) with `model_key` usually a routing tier; only token/model/timing columns are selected. Routing tiers (`auto`, `ultimate`, `performance`, `efficient`, `lite`) are reported as `qoder-<tier>`: a bare `auto` collides with the Cursor `auto` entry in the server pricing map and would be billed at Cursor's rate, whereas `qoder-*` never matches a price and renders as unmatched, which is the truthful state. CLI + desktop app transcripts under `<configDir>/projects/**/*.jsonl` are credit-billed with all token fields 0 — they contribute sessions only. Reading the `credits` field would violate the cost-accounting invariant above and needs the architecture gate; do not add it as a pseudo-model quietly.
 - One assistant message is written as several JSONL lines (one per content block); dedupe by `sessionId|message.id`, keeping the last usage-bearing line. `user` records with `toolUseResult` / `tool_result` blocks are tool results, not human prompts.
 - `~/.qoder` alone does not mean the CLI is installed (the IDE's `dataFolderName` is `.qoder` too); detection checks `projects/` or the IDE db.
+
+Cline (`cline.js`, `cline-sdk.js`, `cline-roots.js`):
+- Cline CLI 3.0.61 / core 0.0.82 writes per-call metrics to `~/.cline/data/sessions/<id>/*.messages.json`; `data/db/sessions.db` is only an index and is not needed for accounting. Read the adjacent version-1 `<id>.json` manifest for project/model fallback. Include child-agent artifacts in that same session directory. Keep old standalone and editor `state/taskHistory.json` + `tasks/<id>/ui_messages.json` stores, including the legacy `~/.cline/data` layout. Honor `CLINE_DIR`, `CLINE_DATA_DIR`, and `CLINE_SESSION_DATA_DIR`; `VIBE_USAGE_CLINE_DIRS` replaces all machine discovery for fixtures.
+- SDK `metrics.inputTokens` already includes cache reads and writes: subtract `cacheReadTokens` once into `cachedInputTokens`, leaving cache writes in ordinary input. `outputTokens` is already the full output; the persisted metrics have no separate reasoning field. Never read stored cost as the estimated price. Legacy `tokensIn` is uncached input, so its existing cache-write addition stays unchanged.
+- SDK assistant message ids and timestamps identify copied history; keep the richest metrics, with deterministic attribution to the earliest original session. Anonymous messages are scoped to the artifact/session and position. Preserve the existing legacy task-copy selection and upload session ids. Ignore child-agent prompts, tool results, and synthetic user events when counting human turns. Legacy-to-SDK migration can attach cumulative usage to an old assistant without a timestamp: skip that record instead of assigning it the migration time; the legacy store retains the original accounting.
+- Read canonical `.messages.json` artifacts only, not compaction sidecars or backups. Reduce parsed records to token/model/timing fields; do not retain or upload message content, system prompts, provider credentials, or costs. Unreadable, corrupt, or unsupported SDK artifacts return `skipped` with warnings so earlier upload state is preserved. Regression coverage: `test/cline.test.js` and `test/cline-sdk.test.js`.
+- Service installation preserves all three Cline directory environment variables for launchd, systemd, and Windows tasks, so background sync sees the same relocated store as manual sync. Existing services need reinstallation to capture a newly set variable.
+- Verified using the installed official CLI in an isolated directory with a local OpenAI-compatible test endpoint: a new headless conversation followed by an interactive `--id` resume wrote two calls of 100 input (including 30 cache reads) and 20 output; parsing yielded 140 uncached input, 60 cache reads, 40 output, and one session with two human prompts. No paid provider call or backend upload was used for that verification.
 
 Network-fetch parsers (the Cursor exception):
 - Cursor stores no usage locally — only an auth token in `state.vscdb`. The parser reads the token via `queryDbJson()`, then GETs a CSV from `cursor.com`.

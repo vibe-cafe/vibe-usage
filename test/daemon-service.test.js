@@ -143,6 +143,18 @@ test('services preserve Pi store relocation variables', () => {
   assert.match(plist, /<string>\/tmp\/pi&amp;a&lt;b&gt;\/sessions<\/string>/);
 });
 
+test('services preserve Cline home, data and session directory overrides', () => {
+  for (const key of ['CLINE_DIR', 'CLINE_DATA_DIR', 'CLINE_SESSION_DATA_DIR']) {
+    const env = { [key]: '/tmp/cline custom' };
+    assert.ok(generateSystemdUnit('/usr/bin/node', '/opt/vibe/bin.js', undefined, env)
+      .includes(`Environment="${key}=/tmp/cline custom"`));
+    assert.ok(generateLaunchdPlist('/usr/bin/node', '/opt/vibe/bin.js', undefined, env)
+      .includes(`<key>${key}</key>`));
+    assert.ok(generateWindowsTaskCmd('C:\\node\\node.exe', 'C:\\vibe\\bin.js', undefined,
+      { [key]: 'C:\\Cline 100%' }).includes(`set "${key}=C:\\Cline 100%%"`));
+  }
+});
+
 test('services preserve a custom Hermes home for background sync', () => {
   const env = { HERMES_HOME: '/tmp/hermes&a<b>' };
   const unit = generateSystemdUnit('/usr/bin/node', '/opt/vibe-usage/bin.js', undefined, env);

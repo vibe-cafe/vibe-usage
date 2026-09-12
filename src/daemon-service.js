@@ -115,6 +115,9 @@ function escapeXml(value) {
 // launchd/systemd unit that inherits nothing, so anything the parsers read for
 // discovery has to be captured into the unit at install time.
 const PRESERVED_SERVICE_ENV = [
+  'CLINE_DIR',
+  'CLINE_DATA_DIR',
+  'CLINE_SESSION_DATA_DIR',
   'COLA_DATA_DIR',
   'HERMES_HOME',
   'MCODE_HOME',
