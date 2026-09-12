@@ -10,6 +10,7 @@ import {
 import { join } from 'node:path';
 import { createInterface } from 'node:readline';
 import { createHash } from 'node:crypto';
+import { mergeCodexSegments, codexSegmentSignature } from './codex-segments.js';
 import { aggregateToBuckets } from './aggregate.js';
 import { mergeCindyHarnessUsage, readCindyHarnessUsage } from './cindy-ledger.js';
 import {
@@ -314,7 +315,7 @@ const OWN_TASK_START_WINDOW_MS = 5_000;
  * full prefix. Together they bound matching to source records that existed at
  * spawn without over-skipping child work when the parent later grows.
  */
-async function indexSessionFile(filePath, snapshotSize) {
+async function indexSessionFile(filePath, snapshotSize, lines = null) {
   let sessionId = null;
   let forkedFromId = null;
   let parentThreadId = null;
@@ -332,7 +333,7 @@ async function indexSessionFile(filePath, snapshotSize) {
   let firstTaskBoundary = null;
   let ownTaskBoundary = null;
 
-  for await (const line of readLines(filePath, snapshotSize)) {
+  for await (const line of (lines ?? readLines(filePath, snapshotSize))) {
     if (!line.trim()) continue;
     try {
       const obj = JSON.parse(line);
@@ -361,7 +362,7 @@ async function indexSessionFile(filePath, snapshotSize) {
         }
       } else if (obj.type === 'event_msg' && obj.payload?.type === 'token_count') {
         rawTokenCount++;
-        tokenFingerprints.push(tokenFingerprint(obj.payload));
+        tokenFingerprints.push(lines ? obj._tokenFingerprint : tokenFingerprint(obj.payload));
         if (recordTimestamp == null) {
           tokenTimes.push(Number.POSITIVE_INFINITY);
           pendingTokenTimeIndexes.push(tokenTimes.length - 1);
@@ -612,6 +613,7 @@ function mergeBucketLists(lists) {
 async function parseSessionFile(filePath, snapshotSize, fm, boundary, {
   previousTail = null,
   captureTail = false,
+  lines = null,
 } = {}) {
   const entries = [];
   const sessionEvents = [];
@@ -632,7 +634,7 @@ async function parseSessionFile(filePath, snapshotSize, fm, boundary, {
   let prevTotal = previousTail?.prevTotal || null;
   let prevCumulativeTotal = previousTail?.prevCumulativeTotal ?? null;
   const start = previousTail?.parsedBytes || 0;
-  for await (const line of readLines(filePath, snapshotSize, start)) {
+  for await (const line of (lines ?? readLines(filePath, snapshotSize, start))) {
     if (!line.trim()) continue;
     try {
       const obj = JSON.parse(line);
@@ -750,8 +752,11 @@ async function parseSessionFile(filePath, snapshotSize, fm, boundary, {
       const timestamp = obj.timestamp ? new Date(obj.timestamp) : null;
       if (!timestamp || isNaN(timestamp.getTime())) continue;
 
-      const rawModel = info.model || payload.model || turnContextModel || 'unknown';
-      const model = decorateCodexModel(rawModel, serviceTier, timestamp.getTime());
+      const segmentContext = lines ? obj._segmentContext : null;
+      const rawModel = info.model || payload.model || segmentContext?.model || turnContextModel || 'unknown';
+      const effectiveTier = Object.hasOwn(segmentContext || {}, 'serviceTier')
+        ? normalizeCodexServiceTier(segmentContext.serviceTier) : serviceTier;
+      const model = decorateCodexModel(rawModel, effectiveTier, timestamp.getTime());
 
         // OpenAI API: input_tokens INCLUDES cached, output_tokens INCLUDES reasoning.
         // Normalize to Anthropic-style semantics where each field is non-overlapping.
@@ -967,13 +972,12 @@ async function parseNativeCodex({ codexExtraHome, extraRoots = [] } = {}) {
         cacheStats.filesRead++;
         updateFileCache(file, { header: file.header });
       } catch {
-        if (file.strict) {
-          return {
-            buckets: [], sessions: [], skipped: true,
-            warnings: [`codex: 额外根目录读取失败，已保留上次同步数据: ${file.codexHome}`],
-          };
-        }
-        continue;
+        // An unreadable header may hide another segment of a known session.
+        // Never upload the remaining readable segment as its complete total.
+        return {
+          buckets: [], sessions: [], skipped: true,
+          warnings: ['codex: 会话文件读取失败，已保留上次同步数据'],
+        };
       }
     }
     if (file.header.sessionId) {
@@ -1045,8 +1049,55 @@ async function parseNativeCodex({ codexExtraHome, extraRoots = [] } = {}) {
     }
   }
 
-  // Select the most complete physical copy exactly as before. Unique ordinary
-  // sessions have no full record count, but cannot compete with another copy.
+  // Duplicate ids can be disjoint continuation segments, not just archives.
+  // Keep physical caches intact and give each combined session its own cache.
+  const groupedFiles = [];
+  let groupAudited = false;
+  for (const id of duplicateIds) {
+    const members = candidatesById.get(id);
+    if (members.some(file => !fileMeta.has(file.filePath))) {
+      return { buckets: [], sessions: [], skipped: true,
+        warnings: ['codex: 同一会话的部分文件读取失败，已保留上次同步数据'] };
+    }
+    members.sort((a, b) => (fileMeta.get(b.filePath).parsedRecordCount || 0)
+      - (fileMeta.get(a.filePath).parsedRecordCount || 0) || a.filePath.localeCompare(b.filePath));
+    const selected = members[0];
+    const filePath = `${selected.codexHome}/.vibe-usage-session-${createHash('sha256').update(id).digest('hex')}`;
+    const signature = codexSegmentSignature(members);
+    let cache = members.some(file => auditPaths.has(file.filePath)) ? null
+      : loadCodexFileCache(selected.codexHome, filePath, signature);
+    if (cache?.result && !groupAudited && auditPaths.size === 0
+      && signature.size <= auditMaxBytes()
+      && (cache.lastAuditedAt || 0) <= Date.now() - auditIntervalMs()) {
+      cache = null;
+      groupAudited = true;
+      cacheStats.audited++;
+    }
+    const group = { ...selected, filePath, signature, snapshotSize: signature.size,
+      cache, members, lines: null, appendTail: null, priorTail: null };
+    try {
+      let meta = cache?.index;
+      if (!meta) {
+        group.lines = await mergeCodexSegments(members, readLines);
+        cacheStats.filesRead += members.length;
+        meta = await indexSessionFile(filePath, null, group.lines);
+        updateFileCache(group, { header: group.header, index: meta });
+      } else cacheStats.indexHits++;
+      fileMeta.set(filePath, meta);
+      needsIndex.add(filePath);
+      for (const member of members) fileMeta.delete(member.filePath);
+      groupedFiles.push(group);
+    } catch (err) {
+      return { buckets: [], sessions: [], skipped: true,
+        warnings: [`codex: 无法合并会话分段，已保留上次同步数据: ${err.message}`] };
+    }
+    if (overBudget()) return { buckets: [], sessions: [], skipped: true,
+      indexing: { phase: 'segments', completed: groupedFiles.length, total: duplicateIds.size }, cache: cacheStats };
+  }
+  files.push(...groupedFiles);
+
+  // One index per logical session, including all continuation segments, feeds
+  // the unchanged fork/subagent replay boundary logic.
   const sessionById = new Map();
   for (const file of files) {
     const meta = fileMeta.get(file.filePath);
@@ -1077,11 +1128,16 @@ async function parseNativeCodex({ codexExtraHome, extraRoots = [] } = {}) {
       const previousTail = !needsIndex.has(file.filePath) && !auditPaths.has(file.filePath)
         ? file.appendTail
         : null;
+      if (file.members && !file.lines) {
+        file.lines = await mergeCodexSegments(file.members, readLines);
+        cacheStats.filesRead += file.members.length;
+      }
       const parsed = await parseSessionFile(file.filePath, file.snapshotSize, fm, boundary, {
         previousTail,
         captureTail: !needsIndex.has(file.filePath),
+        lines: file.lines,
       });
-      cacheStats.filesRead++;
+      if (!file.members) cacheStats.filesRead++;
       if (previousTail) cacheStats.tailHits++;
       const { tail, ...summary } = parsed;
       if (tail) {
@@ -1098,6 +1154,7 @@ async function parseNativeCodex({ codexExtraHome, extraRoots = [] } = {}) {
       file.priorTail = null;
       if (auditPaths.has(file.filePath)) cacheStats.audited++;
     }
+    file.lines = null; // Never retain the transient combined transcript after parsing.
     results.push(result);
 
     if (overBudget() && i < files.length - 1) {
