@@ -1,7 +1,7 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import { execFile } from 'node:child_process';
-import { mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { createServer } from 'node:http';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
@@ -379,6 +379,119 @@ test('a successful batch is persisted before a later batch fails', async () => {
       { phase: 'first', buckets: 100 },
       { phase: 'first', buckets: 1 },
       { phase: 'retry', buckets: 1 },
+    ]);
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
+// Buckets AND sessions of a source the backend soft-drops must both stay
+// uncommitted, so the first sync after the server registers that source
+// re-sends them instead of losing them permanently.
+test('dropped unknown sources leave bucket and session state uncommitted', async () => {
+  const root = mkdtempSync(join(tmpdir(), 'vibe-usage-dropped-source-'));
+  const configDir = join(root, 'config');
+  const stateDir = join(root, 'state');
+  const homeDir = join(root, 'home');
+  mkdirSync(configDir, { recursive: true });
+  mkdirSync(homeDir, { recursive: true });
+
+  const received = [];
+  let dropUnknownSource = true;
+  try {
+    await withServer((req, res) => {
+      if (req.method === 'GET' && req.url === '/api/usage/settings') {
+        res.writeHead(200, { 'content-type': 'application/json' });
+        res.end(JSON.stringify({ uploadProject: true }));
+        return;
+      }
+      if (req.method === 'POST' && req.url === '/api/usage/ingest') {
+        const chunks = [];
+        req.on('data', chunk => chunks.push(chunk));
+        req.on('end', () => {
+          const body = req.headers['content-encoding'] === 'gzip'
+            ? gunzipSync(Buffer.concat(chunks))
+            : Buffer.concat(chunks);
+          const payload = JSON.parse(body.toString('utf8'));
+          received.push({ buckets: payload.buckets.length, sessions: payload.sessions?.length || 0 });
+          res.writeHead(200, { 'content-type': 'application/json' });
+          res.end(JSON.stringify(dropUnknownSource
+            ? {
+                ingested: 0,
+                sessions: 0,
+                dropped: {
+                  buckets: payload.buckets.length,
+                  unknownSources: ['devin'],
+                },
+              }
+            : {
+                ingested: payload.buckets.length,
+                sessions: payload.sessions?.length || 0,
+              }));
+        });
+        return;
+      }
+      res.writeHead(404).end();
+    }, async apiUrl => {
+      writeFileSync(join(configDir, 'config.json'), JSON.stringify({
+        apiKey: 'vbu_dropped_source_test',
+        apiUrl,
+        hostname: 'dropped-source-test',
+      }));
+      const env = {
+        ...process.env,
+        HOME: homeDir,
+        VIBE_USAGE_DEV: '0',
+        VIBE_USAGE_CONFIG_DIR: configDir,
+        VIBE_USAGE_STATE_DIR: stateDir,
+      };
+      const command = `
+        import { parsers } from './src/parsers/index.js';
+        for (const source of Object.keys(parsers)) delete parsers[source];
+        parsers['devin'] = async () => ({
+          buckets: [{
+            source: 'devin', model: 'swe-2-high', project: 'project',
+            bucketStart: '2026-09-16T00:00:00.000Z',
+            inputTokens: 1, outputTokens: 2,
+            cachedInputTokens: 0, reasoningOutputTokens: 0, totalTokens: 3,
+          }],
+          sessions: [{
+            source: 'devin', project: 'project', sessionHash: 'abc',
+            firstMessageAt: '2026-09-16T00:00:00.000Z',
+            lastMessageAt: '2026-09-16T00:10:00.000Z',
+            durationSeconds: 600, activeSeconds: 100,
+            messageCount: 4, userMessageCount: 1,
+            userPromptHours: [0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0],
+          }],
+        });
+        const { runSync } = await import('./src/sync.js');
+        await runSync({ throws: true, quiet: true });
+      `;
+
+      // First sync: the backend drops the unknown source — nothing is
+      // committed (state.json may not even exist yet).
+      await execFileAsync(process.execPath, ['--input-type=module', '-e', command], {
+        cwd: process.cwd(), env,
+      });
+      const droppedState = existsSync(join(stateDir, 'state.json'))
+        ? JSON.parse(readFileSync(join(stateDir, 'state.json'), 'utf8'))
+        : {};
+      assert.equal(Object.keys(droppedState.buckets || {}).length, 0);
+      assert.equal(Object.keys(droppedState.sessions || {}).length, 0);
+
+      // After the backend learns the source, the next sync re-sends and commits.
+      dropUnknownSource = false;
+      await execFileAsync(process.execPath, ['--input-type=module', '-e', command], {
+        cwd: process.cwd(), env,
+      });
+      const committedState = JSON.parse(readFileSync(join(stateDir, 'state.json'), 'utf8'));
+      assert.equal(Object.keys(committedState.buckets).length, 1);
+      assert.equal(Object.keys(committedState.sessions).length, 1);
+    });
+
+    assert.deepEqual(received, [
+      { buckets: 1, sessions: 1 },
+      { buckets: 1, sessions: 1 },
     ]);
   } finally {
     rmSync(root, { recursive: true, force: true });

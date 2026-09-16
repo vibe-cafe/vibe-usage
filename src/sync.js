@@ -411,6 +411,10 @@ export async function runSync({
         }
       }
       for (const s of batchSessions) {
+        // Same uncommitted-on-drop rule as buckets: a session the backend
+        // rejected for an unknown source must be retried on the next sync
+        // rather than permanently lost.
+        if (batchUnknownSources.has(s.source)) continue;
         const key = sessionKey(s);
         const entry = pendingSessionState.get(key);
         if (entry) {
