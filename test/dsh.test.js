@@ -177,6 +177,8 @@ test('DSH buckets map uncached input, cache reads, and split reasoning from outp
         outputTokens: 30,
         cachedInputTokens: 400,
         reasoningOutputTokens: 15,
+        cacheCreation5mTokens: 0,
+        cacheCreation1hTokens: 0,
         totalTokens: 215,
       },
     ]);

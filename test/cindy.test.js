@@ -151,6 +151,8 @@ test('Cindy ledger augments Codex and Pi without duplicating Claude transcripts'
       outputTokens: 5,
       cachedInputTokens: 25,
       reasoningOutputTokens: 0,
+      cacheCreation5mTokens: 0,
+      cacheCreation1hTokens: 0,
       totalTokens: 58,
     }]);
 
@@ -164,6 +166,8 @@ test('Cindy ledger augments Codex and Pi without duplicating Claude transcripts'
       outputTokens: 4,
       cachedInputTokens: 20,
       reasoningOutputTokens: 0,
+      cacheCreation5mTokens: 0,
+      cacheCreation1hTokens: 0,
       totalTokens: 47,
     }]);
     const integratedPi = await parsePi();
