@@ -1,4 +1,5 @@
-import { discoverHermesDatabases } from '../hermes-roots.js';
+import { discoverHermesDatabases, hermesPathKey, inspectHermesHome } from '../hermes-roots.js';
+import { normalizeExtraRoot } from '../extra-roots.js';
 import { aggregateToBuckets, extractSessions } from './aggregate.js';
 import { toCount } from './fs-utils.js';
 import { queryDbJson, sqliteUnavailableError, isSqliteUnavailableError } from './sqlite.js';
@@ -9,14 +10,30 @@ import { queryDbJson, sqliteUnavailableError, isSqliteUnavailableError } from '.
  * Hermes supports multiple profiles — the default profile lives at
  * <home>/state.db, while named profiles live at <home>/profiles/<name>/state.db.
  * The home is shared by CLI/Desktop: ~/.hermes on macOS/Linux, LOCALAPPDATA/hermes
- * on Windows, or an explicit HERMES_HOME.
- * Each profile is an independent HERMES_HOME with its own state.db, so we scan all of them.
+ * on Windows, or an explicit HERMES_HOME. Additional homes configured with
+ * `config add-root hermes <path>` are scanned too and deduped against that default.
+ * Each profile is an independent store with its own state.db, so we scan all of them.
  *
  * Token buckets come from the sessions table (cumulative per-session totals).
  * Session timing comes from the messages table (per-message role + timestamp).
  */
-export async function parse() {
+export async function parse({ extraRoots = [] } = {}) {
   const dbs = discoverHermesDatabases();
+  const seen = new Set(dbs.map(db => hermesPathKey(db.path)));
+  for (const root of extraRoots) {
+    const path = normalizeExtraRoot(root);
+    const inspected = inspectHermesHome(path);
+    // Missing or unreadable configured homes must not look like an empty sync,
+    // even when the path is the default home / HERMES_HOME already scanned above.
+    // Databases already reached through that default are skipped via `seen`.
+    if (inspected.error || !inspected.ok) return skippedExtra(path, inspected.error);
+    for (const db of inspected.dbs) {
+      const key = hermesPathKey(db.path);
+      if (seen.has(key)) continue;
+      seen.add(key);
+      dbs.push(db);
+    }
+  }
   if (dbs.length === 0) return { buckets: [], sessions: [] };
 
   const entries = [];
@@ -95,4 +112,15 @@ export async function parse() {
 
 function queryDb(dbPath, sql) {
   return queryDbJson(dbPath, sql);
+}
+
+function skippedExtra(path, error) {
+  return {
+    buckets: [],
+    sessions: [],
+    skipped: true,
+    warnings: [error
+      ? `hermes: 额外根目录读取失败，已保留上次同步数据: ${path}`
+      : `hermes: 额外根目录不可用，已跳过本次 Hermes 同步: ${path}`],
+  };
 }

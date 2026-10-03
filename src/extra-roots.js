@@ -3,8 +3,9 @@ import { homedir } from 'node:os';
 import { basename, join, resolve } from 'node:path';
 import { openCodeStore } from './opencode-roots.js';
 import { codexSessionDirs } from './codex-roots.js';
+import { inspectHermesHome } from './hermes-roots.js';
 
-export const EXTRA_ROOT_SOURCES = ['antigravity', 'claude-code', 'codex', 'grok', 'opencode', 'pi-coding-agent'];
+export const EXTRA_ROOT_SOURCES = ['antigravity', 'claude-code', 'codex', 'grok', 'opencode', 'pi-coding-agent', 'hermes'];
 
 // Probing a candidate Pi store has three outcomes, never two: a confirmed
 // session, a directory proven to hold none, and one that could not be read.
@@ -320,6 +321,16 @@ export function validateExtraRoot(source, value) {
       ok: piSessionsDir(path) !== null,
       path,
       reason: '需要是直接包含 Pi 会话 .jsonl 的目录，或包含 sessions/ 的 Pi agent 目录',
+    };
+  }
+  if (source === 'hermes') {
+    const inspected = inspectHermesHome(path);
+    return {
+      ok: inspected.ok,
+      path,
+      reason: inspected.error
+        ? `无法读取 Hermes 目录: ${inspected.error.message}`
+        : '需要包含可读的 state.db 或 profiles/*/state.db',
     };
   }
   const dirs = source === 'grok'

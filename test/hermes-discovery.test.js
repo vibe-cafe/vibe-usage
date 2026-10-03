@@ -12,17 +12,23 @@ const probe = `
   os.homedir = () => process.env.VIBE_USAGE_TEST_HERMES_USER;
   syncBuiltinESMExports();
   Object.defineProperty(process, 'platform', { value: process.env.VIBE_USAGE_TEST_PLATFORM });
+  import { delimiter } from 'node:path';
   const { parse } = await import('./src/parsers/hermes.js');
   const { detectInstalledTools } = await import('./src/tools.js');
+  const extraRoots = (process.env.VIBE_USAGE_TEST_HERMES_EXTRA || '')
+    .split(delimiter)
+    .filter(Boolean);
   let result;
   try {
-    result = await parse();
+    result = await parse({ extraRoots });
   } catch (error) {
     result = { error: { code: error.code, message: error.message } };
   }
   console.log(JSON.stringify({
     ...result,
-    detected: detectInstalledTools().some(tool => tool.id === 'hermes'),
+    detected: detectInstalledTools({
+      extraRoots: extraRoots.length ? { hermes: extraRoots } : undefined,
+    }).some(tool => tool.id === 'hermes'),
   }));
 `;
 
@@ -188,4 +194,73 @@ test('Hermes rejects a failed messages query instead of reporting partial succes
   assert.equal(result.buckets, undefined);
   assert.equal(result.sessions, undefined);
   assert.equal(result.detected, true);
+});
+
+test('configured Hermes extra home is discovered alongside the default home', async (t) => {
+  const { root, userDir, writeDb, run } = await fixture(t);
+  await writeDb(join(userDir, '.hermes'));
+  const extra = join(root, 'extra-hermes');
+  await writeDb(
+    join(extra, 'profiles', 'work'),
+    "UPDATE sessions SET id = 'extra-session'; UPDATE messages SET session_id = 'extra-session';",
+  );
+  const result = run('darwin', { VIBE_USAGE_TEST_HERMES_EXTRA: extra });
+  assert.equal(result.detected, true);
+  assert.equal(result.skipped, undefined);
+  const projects = result.buckets.map(bucket => bucket.project).sort();
+  assert.deepEqual(projects, ['default', 'work']);
+  assert.equal(result.buckets.reduce((sum, bucket) => sum + bucket.totalTokens, 0), 240);
+  assert.equal(result.sessions.length, 2);
+});
+
+test('Hermes extra home equal to the default home is not double-counted', async (t) => {
+  const { userDir, writeDb, run } = await fixture(t);
+  const home = join(userDir, '.hermes');
+  await writeDb(home);
+  const result = run('darwin', { VIBE_USAGE_TEST_HERMES_EXTRA: home });
+  assertUsage(result);
+  assert.equal(result.skipped, undefined);
+});
+
+test('Hermes extra home equal to HERMES_HOME is not double-counted', async (t) => {
+  const { root, writeDb, run } = await fixture(t);
+  const home = join(root, 'custom-home');
+  await writeDb(home);
+  const result = run('darwin', {
+    HERMES_HOME: home,
+    VIBE_USAGE_TEST_HERMES_EXTRA: home,
+  });
+  assertUsage(result);
+  assert.equal(result.skipped, undefined);
+});
+
+test('a missing configured Hermes home skips the sync instead of reporting empty success', async (t) => {
+  const { root, userDir, writeDb, run } = await fixture(t);
+  await writeDb(join(userDir, '.hermes'));
+  const missing = join(root, 'missing-hermes');
+  const result = run('darwin', { VIBE_USAGE_TEST_HERMES_EXTRA: missing });
+  assert.equal(result.skipped, true);
+  assert.deepEqual(result.buckets, []);
+  assert.deepEqual(result.sessions, []);
+  assert.match(result.warnings?.[0] || '', /额外根目录不可用/);
+});
+
+test('an unreadable configured Hermes home skips the sync', {
+  skip: process.platform === 'win32' ? 'POSIX chmod fixture: Windows requires a separate ACL denial test'
+    : process.getuid?.() === 0 && 'POSIX root bypasses chmod denial; run as an unprivileged user',
+}, async (t) => {
+  const { root, userDir, writeDb, run } = await fixture(t);
+  await writeDb(join(userDir, '.hermes'));
+  const extra = join(root, 'locked-hermes');
+  await writeDb(extra);
+  chmodSync(extra, 0);
+  try {
+    const result = run('darwin', { VIBE_USAGE_TEST_HERMES_EXTRA: extra });
+    assert.equal(result.skipped, true);
+    assert.equal(result.error, undefined);
+    assert.deepEqual(result.buckets, []);
+    assert.match(result.warnings?.[0] || '', /额外根目录读取失败/);
+  } finally {
+    chmodSync(extra, 0o700);
+  }
 });

@@ -10,6 +10,7 @@ import {
   discoverCodexHomes,
   extraRootList,
   grokSessionsDir,
+  normalizeExtraRoot,
 } from './extra-roots.js';
 import { findClineDataDirs } from './cline-roots.js';
 import { findCodeartsAgentDbs, resolveCodeartsAgentRoots } from './codearts-roots.js';
@@ -520,7 +521,9 @@ export const TOOLS = [
     name: 'Hermes',
     id: 'hermes',
     dataDir: join(getHermesHome(), 'state.db'),
-    detectDataDirs: findHermesDataDirs,
+    detectDataDirs: ({ extraRoots } = {}) => findHermesDataDirs(
+      extraRootList(extraRoots?.hermes).map(root => normalizeExtraRoot(root)),
+    ),
   },
   {
     name: 'Kiro',

@@ -159,8 +159,10 @@ passing this gate.
 `src/extra-roots.js` owns `EXTRA_ROOT_SOURCES`, `validateExtraRoot()`,
 `extraRootList()`, and the source-specific layout resolvers, including
 `grokSessionsDir()`, `antigravityConversationDirs()`, and `piSessionsDir()`.
+Hermes homes are checked with `inspectHermesHome()` in `hermes-roots.js`
+(readable `state.db` or `profiles/<name>/state.db` under the configured path).
 The currently supported source ids are `antigravity`, `claude-code`, `codex`, `grok`,
-`opencode`, and `pi-coding-agent`.
+`opencode`, `pi-coding-agent`, and `hermes`.
 
 - **Config routing:** `config roots` lists `config.extraRoots` as JSON;
   `config add-root <source> <path>` validates and persists a normalized path;
@@ -365,6 +367,7 @@ Extra-root regression coverage:
 | `test/codex-roots.test.js` | Additive root discovery, path deduplication, live/archive and Multica layouts |
 | `test/grok.test.js` | Default-plus-extra stores, copied sessions, missing/unreadable configured roots, `usage.json` ledger (1.0) incl. no-double-count with ACP usage, signals-based format canary |
 | `test/pi-compatible.test.js` | Extra-root layouts, overlapping paths, copied records, missing/unreadable roots |
+| `test/hermes-discovery.test.js`, `test/hermes.test.js` | Custom Hermes homes beside the default/`HERMES_HOME`, dedup, missing/unreadable roots |
 | `test/state.test.js` | Pruning only sources whose parsers succeeded |
 
 Run the focused checks locally:
