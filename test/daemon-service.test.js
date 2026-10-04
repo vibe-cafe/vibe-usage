@@ -275,3 +275,16 @@ test('installed mode is read back correctly from every generated unit form', () 
   assert.equal(installedModeFromText(generateWindowsTaskCmd('C:\\nodejs\\node.exe', 'C:\\x\\bin.js', undefined, {}, winLauncher)), 'npx');
   assert.equal(installedModeFromText(generateWindowsTaskCmd('C:\\nodejs\\node.exe', 'C:\\x\\bin.js', undefined, {})), 'pinned');
 });
+
+
+test('all service templates preserve KIKI_HOME independently of Kimi Code', () => {
+  const env = { KIKI_HOME: '/tmp/kiki-home', KIMI_CODE_HOME: '/tmp/kimi-home' };
+  const unit = generateSystemdUnit('/usr/bin/node', '/opt/vibe-usage/bin.js', undefined, env);
+  assert.match(unit, /Environment="KIKI_HOME=\/tmp\/kiki-home"/);
+  assert.match(unit, /Environment="KIMI_CODE_HOME=\/tmp\/kimi-home"/);
+  const plist = generateLaunchdPlist('/usr/bin/node', '/opt/vibe-usage/bin.js', undefined, env);
+  assert.match(plist, /<key>KIKI_HOME<\/key>\s*<string>\/tmp\/kiki-home<\/string>/);
+  const cmd = generateWindowsTaskCmd('C:\\node\\node.exe', 'C:\\vibe\\bin.js', undefined, { KIKI_HOME: 'C:\\fixture\\kiki', KIMI_CODE_HOME: 'C:\\fixture\\kimi' });
+  assert.ok(cmd.includes('set "KIKI_HOME=C:\\fixture\\kiki"'));
+  assert.ok(cmd.includes('set "KIMI_CODE_HOME=C:\\fixture\\kimi"'));
+});

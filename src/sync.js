@@ -10,6 +10,7 @@ import { parsers } from './parsers/index.js';
 import { aggregateToBuckets } from './parsers/aggregate.js';
 import { normalizeParserResult } from './parsers/contract.js';
 import { extraRootList } from './extra-roots.js';
+import { planKikiMigration } from './kiki-migration.js';
 import { success, failure, warn, arrow, link, dim } from './output.js';
 
 const BATCH_SIZE = 100;
@@ -297,10 +298,26 @@ export async function runSync({
   if (state.identityChanged && !quiet) {
     console.log(dim('检测到上传账号已更换，本次全量重传本地历史'));
   }
+  let migration;
+  try {
+    migration = planKikiMigration(allBuckets, allSessions, state, config.kikiStartAt);
+  } catch (err) {
+    process.stderr.write(`${dim(`  kiki: ${err.message}`)}\n`);
+    migration = planKikiMigration(allBuckets, allSessions, state);
+    migration.buckets = migration.buckets.filter(b => b.source !== 'kiki');
+    migration.sessions = migration.sessions.filter(s => s.source !== 'kiki');
+    okSources.delete('kiki');
+  }
+  if (migration.blocked) {
+    okSources.delete('kiki');
+    process.stderr.write(`${dim('  kiki: 历史与 kimi-code 同步记录重叠，暂停 Kiki 上传以避免双计。请保留 state.json，停用旧兼容采集器并按 README 迁移，显式设置 config set kikiStartAt <UTC半小时切点>。')}\n`);
+  }
+  allBuckets = migration.buckets;
+  const uploadSessions = migration.sessions;
   const changedBuckets = [];
   const changedSessions = [];
-  const liveBucketKeys = new Set();
-  const liveSessionKeys = new Set();
+  const liveBucketKeys = new Set(migration.preserveBuckets);
+  const liveSessionKeys = new Set(migration.preserveSessions);
   // key -> hash, committed to state only after the owning batch's upload
   // succeeds (a failed batch re-sends next sync — no silent gap).
   const pendingBucketState = new Map();
@@ -310,15 +327,15 @@ export async function runSync({
     const key = bucketKey(b);
     const h = bucketHash(b);
     liveBucketKeys.add(key);
-    if (state.buckets[key] === h) continue;
+    if (migration.preserveBuckets.has(key) || state.buckets[key] === h) continue;
     changedBuckets.push(b);
     pendingBucketState.set(key, h);
   }
-  for (const s of allSessions) {
+  for (const s of uploadSessions) {
     const key = sessionKey(s);
     const h = sessionHash(s);
     liveSessionKeys.add(key);
-    if (state.sessions[key] === h) continue;
+    if (migration.preserveSessions.has(key) || state.sessions[key] === h) continue;
     changedSessions.push(s);
     pendingSessionState.set(key, h);
   }

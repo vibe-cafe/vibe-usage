@@ -11,6 +11,12 @@ const customHome = join(root, 'custom-kimi-home');
 const legacyRoot = join(root, 'kimi-legacy');
 process.env.KIMI_CODE_HOME = customHome;
 process.env.VIBE_USAGE_KIMI_DIR = legacyRoot;
+// The additive desktop home must be isolated too, otherwise this test reads
+// real Kimi Work history on a developer's machine.
+process.env.APPDATA = join(root, 'appdata');
+process.env.XDG_CONFIG_HOME = join(root, 'xdg');
+process.env.HOME = root;
+process.env.USERPROFILE = root;
 
 const { parse } = await import('../src/parsers/kimi-code.js');
 

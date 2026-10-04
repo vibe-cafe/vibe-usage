@@ -12,6 +12,7 @@ import { dim as dimText, failure, hint, smallHeader, warn } from './output.js';
 import { loadState } from './state.js';
 import { fetchAccount } from './api.js';
 import { COLLECTOR_VERSION } from './client-meta.js';
+import { kikiStartTime } from './kiki-migration.js';
 
 function printSmallHeader() {
   console.log();
@@ -123,7 +124,7 @@ async function printBoundAccount(apiUrl, apiKey) {
   }
 }
 
-const VALID_CONFIG_KEYS = ['apiKey', 'apiUrl', 'hostname', 'codexExtraHome'];
+const VALID_CONFIG_KEYS = ['apiKey', 'apiUrl', 'hostname', 'codexExtraHome', 'kikiStartAt'];
 
 function handleConfig(args) {
   const sub = args[0];
@@ -165,6 +166,20 @@ function handleConfig(args) {
         value = validation.path;
       }
       const config = loadConfig() || {};
+      if (key === 'kikiStartAt') {
+        try {
+          const time = kikiStartTime(value);
+          const state = loadState();
+          const hasKikiState = [...Object.keys(state.buckets), ...Object.keys(state.sessions)].some(key => key.startsWith('kiki|'));
+          if (hasKikiState && kikiStartTime(config.kikiStartAt) !== time) {
+            throw new Error('已保存的 Kiki 切点不能直接更改；请先与服务端维护者协调历史迁移。');
+          }
+          value = new Date(time).toISOString();
+        } catch (err) {
+          console.error(failure(err.message));
+          process.exit(1);
+        }
+      }
       config[key] = value;
       saveConfig(config);
       break;

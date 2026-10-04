@@ -18,6 +18,7 @@ import { findColaDataDirs, getColaSessionsDir } from './cola-roots.js';
 import { findCraftDataDirs } from './craft-roots.js';
 import { findHermesDataDirs, getHermesHome } from './hermes-roots.js';
 import { findKimiCodeDataDirs } from './kimi-roots.js';
+import { findKikiDataDirs, KIKI_SOURCE_ID, resolveKikiRoots } from './kiki-roots.js';
 import { findOmpDataDirs, findPiDataDirs } from './pi-roots.js';
 import { findQoderDataDirs, getQoderProjectsDir } from './qoder-roots.js';
 import { findWorkbuddyDataDirs } from './workbuddy-roots.js';
@@ -467,10 +468,14 @@ export const TOOLS = [
     dataDir: join(homedir(), '.qwen', 'tmp'),
   },
   {
+    name: 'Kiki',
+    id: KIKI_SOURCE_ID,
+    dataDir: join(resolveKikiRoots()[0], 'sessions'),
+    detectDataDirs: findKikiDataDirs,
+  },
+  {
     name: 'Kimi Code',
     id: 'kimi-code',
-    // Current layout is ~/.kimi-code/sessions; ~/.kimi/sessions is the legacy
-    // path. The parser reads whichever exists (preferring ~/.kimi-code).
     dataDir: join(homedir(), '.kimi-code', 'sessions'),
     detectDataDirs: findKimiCodeDataDirs,
   },
