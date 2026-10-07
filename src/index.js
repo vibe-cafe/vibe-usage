@@ -167,6 +167,17 @@ function handleConfig(args) {
       }
       const config = loadConfig() || {};
       if (key === 'kikiStartAt') {
+        // `none` is the documented escape hatch for a user who asserts no
+        // compatibility collector ever ran. It clears the cut (deleting the
+        // key so nothing ever stores or prints the literal) and is allowed at
+        // any time, unlike changing to a different time once `kiki|` state
+        // exists — otherwise a user who set a cut could never back it out.
+        if (value === 'none') {
+          if ('kikiStartAt' in config) delete config.kikiStartAt;
+          saveConfig(config);
+          console.log(warn('已清除 Kiki 切点：早于原切点的 Kiki 历史现在会作为 kiki 上传。若实际上运行过把 Kiki 记为 kimi-code 的兼容采集器，这会与原记录双计，请自行确认。'));
+          break;
+        }
         try {
           const time = kikiStartTime(value);
           const state = loadState();

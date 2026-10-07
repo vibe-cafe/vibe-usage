@@ -116,7 +116,7 @@ Quota results are never uploaded or added to incremental sync state. Credential-
 
 For a relocated Kiki home, set `KIKI_HOME` before installing the background service; reinstall an existing service to capture a changed home. A home already collected by Kimi Code is not collected again as Kiki. Server deployment must register `kiki` with display name **Kiki** before this support is published; an unregistered source is reported in `dropped.unknownSources`, not retried under `kimi-code`. This collects token usage, not a Kiki subscription balance.
 
-If you used a compatibility collector that uploaded Kiki as `kimi-code`, **keep its `state.json`, hostname and project-upload setting**. On the first independent Kiki upload, matching legacy bucket/session keys pause Kiki only; other tools continue and overlapping old Kimi buckets are not overwritten with smaller Kimi-only totals. An unchanged Kimi-only bucket does not trigger it. A changed genuine Kimi bucket at the same model/project/host/time can still match, so this is a conservative signal, not proof of mixed history. An unrelated Kimi history does not trigger it. Missing state or changed identity cannot prove whether cloud history overlaps; resolve that with the maintainer before importing history.
+If you used a compatibility collector that uploaded Kiki as `kimi-code`, **keep its `state.json`, hostname and project-upload setting**. On the first independent Kiki upload, matching legacy bucket/session keys pause Kiki only; other tools continue and overlapping old Kimi buckets are not overwritten with smaller Kimi-only totals. The legacy match recognises both the CLI's own bucket coordinates and the published collector's identity: Kiki's `kap-server` export (`vibe-kimi-bucket-v1`) uploaded source `kimi-code` with `project: 'unknown'` and `hostname: kiki-<stream_id>`, which never equals the session project and machine hostname this CLI writes, so a row with the same model and half-hour window but a different project/hostname and a different recorded hash also triggers the guard. An unchanged Kimi-only bucket does not trigger it. An unrelated Kimi history does not trigger it. Missing state or changed identity cannot prove whether cloud history overlaps; resolve that with the maintainer before importing history.
 
 Choose an explicit UTC half-hour cut **T** with no compatibility uploads at or after T. Finish and verify the old collector's coverage below T, stop that collector, then configure the new CLI before its first sync:
 
@@ -124,7 +124,15 @@ Choose an explicit UTC half-hour cut **T** with no compatibility uploads at or a
 npx @vibe-cafe/vibe-usage config set kikiStartAt 2026-10-05T12:30:00Z  # replace with your verified cut
 ```
 
-If the cut overlaps recorded legacy buckets, Kiki stays paused; set a later verified cut. Once independent Kiki uploads are recorded, the cut cannot be changed by `config set`. Kiki tokens at/after T are sent as `kiki`; old mixed buckets below T remain untouched under `kimi-code`. Sessions starting before T retain their old timing identity, even if their later tokens are in new Kiki buckets. Do not run both collectors for the same interval, remove the cut to backfill, delete state to bypass the check, or use a whole-account reset as a migration shortcut.
+A cut (or the guard) withholds real Kiki history and freezes the overlapping old `kimi-code` rows, so those server cells stop following local growth. `sync` reports this on stderr even in quiet/daemon runs: the withheld bucket/session counts and time range, the frozen row counts, and both remedies. If the cut overlaps recorded legacy buckets, Kiki stays paused; set a later verified cut. Kiki tokens at/after T are sent as `kiki`; old mixed buckets below T remain untouched under `kimi-code`. Sessions starting before T retain their old timing identity, even if their later tokens are in new Kiki buckets.
+
+Once independent Kiki uploads are recorded, the cut cannot be changed to a *different* time by `config set`. It can always be cleared with:
+
+```bash
+npx @vibe-cafe/vibe-usage config set kikiStartAt none  # only if you are certain no compatibility collector ever ran
+```
+
+`none` deletes the cut and re-admits the previously withheld pre-cut Kiki history under `kiki`; if a legacy collector had in fact run, that history double counts, so only use it when you know it never did. Do not run both collectors for the same interval, delete state to bypass the check, or use a whole-account reset as a migration shortcut.
 
 To relabel old history, the maintainer needs the old bucket keys, raw per-tool token contributions, the cut and the target account/device. A hash of a mixed Kimi/Kiki bucket cannot be split client-side. This CLI neither deletes cloud rows nor copies that history into a second source.
 
@@ -223,7 +231,7 @@ Config stored at `~/.vibe-usage/config.json` (dev: `config.dev.json`).
 | `apiUrl` | Server URL (default: `https://vibecafe.ai`) |
 | `hostname` | Stable device name for usage tracking (set at init, reused across syncs) |
 | `codexExtraHome` | Optional additional Codex Home scanned together with `$CODEX_HOME` / `~/.codex` |
-| `kikiStartAt` | Explicit UTC half-hour cut for migrating a collector that reported Kiki as `kimi-code`; see the Kiki migration steps above. Unset for new installations |
+| `kikiStartAt` | Explicit UTC half-hour cut for migrating a collector that reported Kiki as `kimi-code`; see the Kiki migration steps above. Unset for new installations; `config set kikiStartAt none` clears an existing cut |
 | `extraRoots` | Tool-specific additional roots managed by the commands below; currently supports `antigravity`, `claude-code`, `codex`, `grok`, `hermes`, `opencode`, and `pi-coding-agent` |
 
 The `hostname` is captured once during `init` and reused for all future syncs. This prevents macOS mDNS hostname changes (e.g., `MacBook-Pro` → `MacBook-Pro-2`) from creating duplicate device entries. To change it manually:

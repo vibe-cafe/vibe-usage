@@ -143,11 +143,25 @@ deltas. `$KIKI_HOME` defaults to `~/.kiki`; `VIBE_USAGE_KIKI_DIR` replaces disco
 for fixtures. A physical home owned by Kimi Code is excluded from Kiki.
 
 `src/kiki-migration.js` protects first-upload legacy overlaps in `sync.js` after
-hostname/privacy mapping. Matching legacy bucket keys with a changed or absent
-Kimi-only hash, or matching session keys, are conservative evidence, not proof
-of a mixed bucket. Other sources continue. Explicit `kikiStartAt` is a UTC
-half-hour boundary: old mixed keys remain untouched, new Kiki buckets start at
-the cut, straddling sessions are not re-keyed. No cloud deletion, automatic cut,
+hostname/privacy mapping. A legacy overlap is either an exact bucket key with a
+changed or absent Kimi-only hash, a `kimi-code` state key sharing the same model
+and half-hour window but a different project/hostname whose hash differs from
+the CLI's own current Kimi snapshot, or a matching session key. The
+different-coordinate arm exists because the one collector that ever reported
+Kiki as `kimi-code` (Kiki's `kap-server` export, `vibe-kimi-bucket-v1`) uploaded
+`project: 'unknown'` and `hostname: kiki-<stream_id>`, which the CLI can never
+reproduce — matching only its own coordinates left the guard dead code. These
+are conservative evidence, not proof of a mixed bucket; an unchanged genuine
+Kimi-only bucket is not a signal. Other sources continue. Explicit `kikiStartAt`
+is a UTC half-hour boundary: old mixed keys remain untouched, new Kiki buckets
+start at the cut, straddling sessions are not re-keyed. `config set kikiStartAt
+none` clears the cut at any time (the documented escape hatch for a user who
+asserts no collector ran); changing to a *different* time once `kiki|` state
+exists is still refused. `planKikiMigration` also returns `withheld`
+(bucket/session counts, `totalTokens`, `earliest`/`latest` ISO starts) for
+everything the plan drops and `frozenBuckets`/`frozenSessions` for the
+`kimi-code` rows held at their recorded hash; `sync.js` reports all of it on
+stderr even in quiet/daemon runs. No cloud deletion, automatic cut,
 compatibility-source upload or whole-history relabel is performed. Missing
 state/changed identities and exact same-key genuine Kimi changes require user
 coordination; hashes cannot reconstruct per-tool historical contributions.

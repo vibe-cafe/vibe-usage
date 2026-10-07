@@ -1,4 +1,4 @@
-import { readdirSync, readFileSync, existsSync, realpathSync } from 'node:fs';
+import { readdirSync, readFileSync, existsSync, realpathSync, statSync } from 'node:fs';
 import { join, basename } from 'node:path';
 import { homedir } from 'node:os';
 import { createHash } from 'node:crypto';
@@ -97,14 +97,25 @@ function usageTokens(value) {
 }
 
 // Collect every agents/<id>/wire.jsonl under sessions/wd_<...>/session_<...>/.
-function findKimiCodeWireFiles(baseDir) {
+// `failures` collects read errors on paths that exist: an absent home is a
+// normal empty result, but an existing-and-unreadable one must surface as a
+// skip (see parseCurrentKimiRoots) so sync.js cannot prune that source's state.
+function findKimiCodeWireFiles(baseDir, failures) {
   const results = [];
-  if (!existsSync(baseDir)) return results;
+  let baseStat;
+  try {
+    baseStat = statSync(baseDir);
+  } catch (err) {
+    if (err.code !== 'ENOENT') failures.push({ path: baseDir, code: err.code || err.message });
+    return results;
+  }
+  if (!baseStat.isDirectory()) return results;
 
   let workDirs;
   try {
     workDirs = readdirSync(baseDir, { withFileTypes: true });
-  } catch {
+  } catch (err) {
+    failures.push({ path: baseDir, code: err.code || err.message });
     return results;
   }
 
@@ -116,7 +127,8 @@ function findKimiCodeWireFiles(baseDir) {
     let sessions;
     try {
       sessions = readdirSync(workDirPath, { withFileTypes: true });
-    } catch {
+    } catch (err) {
+      if (err.code !== 'ENOENT') failures.push({ path: workDirPath, code: err.code || err.message });
       continue;
     }
 
@@ -128,7 +140,10 @@ function findKimiCodeWireFiles(baseDir) {
       let agents;
       try {
         agents = readdirSync(agentsDir, { withFileTypes: true });
-      } catch {
+      } catch (err) {
+        // A missing agents/ directory is a normal empty session; any other
+        // error means data we would otherwise have collected is unreadable.
+        if (err.code !== 'ENOENT') failures.push({ path: agentsDir, code: err.code || err.message });
         continue;
       }
 
@@ -149,12 +164,12 @@ function findKimiCodeWireFiles(baseDir) {
  * Two roots can resolve to the same store (symlink, relocated home), so the
  * same physical wire file is returned once.
  */
-function findKimiCodeWireFilesInAllRoots(roots) {
+function findKimiCodeWireFilesInAllRoots(roots, failures) {
   const results = [];
   const seen = new Set();
   for (const root of roots) {
     const sessionIndex = loadSessionIndex(join(root, 'session_index.jsonl'));
-    for (const { wireFile, sessionDir, bucketProject } of findKimiCodeWireFiles(join(root, 'sessions'))) {
+    for (const { wireFile, sessionDir, bucketProject } of findKimiCodeWireFiles(join(root, 'sessions'), failures)) {
       let identity = wireFile;
       try { identity = realpathSync(wireFile); } catch { /* keep the literal path */ }
       if (seen.has(identity)) continue;
@@ -171,8 +186,9 @@ export function parseCurrentKimiRoots(roots, {
   normalizeModel = model => model || 'unknown',
   deduplicateCopies = false,
 } = {}) {
-  const wireFiles = findKimiCodeWireFilesInAllRoots(roots);
-  if (wireFiles.length === 0) return null;
+  const failures = [];
+  const wireFiles = findKimiCodeWireFilesInAllRoots(roots, failures);
+  if (wireFiles.length === 0 && failures.length === 0) return null;
 
   const entries = [];
   const sessionEvents = [];
@@ -204,7 +220,8 @@ export function parseCurrentKimiRoots(roots, {
     let content;
     try {
       content = readFileSync(wireFile, 'utf-8');
-    } catch {
+    } catch (err) {
+      failures.push({ path: wireFile, code: err.code || err.message });
       continue;
     }
 
@@ -275,7 +292,15 @@ export function parseCurrentKimiRoots(roots, {
     }
   }
 
-  return { buckets: aggregateToBuckets(entries), sessions: extractSessions(sessionEvents) };
+  const result = { buckets: aggregateToBuckets(entries), sessions: extractSessions(sessionEvents) };
+  if (failures.length > 0) {
+    // A read failure must never look like an empty success: sync.js would then
+    // mark the source ok and prune its incremental state, forcing a full
+    // re-upload of untouched history. Wording matches the parser conventions.
+    result.skipped = true;
+    result.warnings = failures.map(({ path, code }) => `${source}: 无法读取 ${path}: ${code}`);
+  }
+  return result;
 }
 
 // ---------------------------------------------------------------------------
@@ -467,8 +492,15 @@ export async function parse() {
   // history exists only in ~/.kimi.
   const current = parseCurrentKimiRoots(resolveKimiCodeRoots());
   const legacy = parseLegacyKimi();
-  return {
+  const result = {
     buckets: [...(current?.buckets ?? []), ...legacy.buckets],
     sessions: [...(current?.sessions ?? []), ...legacy.sessions],
   };
+  // A current-home read failure must protect this source's incremental state;
+  // legacy buckets that did parse may still upload, like other partial parsers.
+  if (current?.skipped) {
+    result.skipped = true;
+    result.warnings = current.warnings ?? [];
+  }
+  return result;
 }

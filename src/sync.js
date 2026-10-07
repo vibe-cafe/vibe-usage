@@ -306,11 +306,40 @@ export async function runSync({
     migration = planKikiMigration(allBuckets, allSessions, state);
     migration.buckets = migration.buckets.filter(b => b.source !== 'kiki');
     migration.sessions = migration.sessions.filter(s => s.source !== 'kiki');
+    // The invalid cut drops every Kiki row regardless of what the fallback
+    // plan did; report that as withheld so the diagnostic is not silent.
+    const droppedBuckets = allBuckets.filter(b => b.source === 'kiki');
+    const droppedSessions = allSessions.filter(s => s.source === 'kiki');
+    const droppedStarts = droppedBuckets.map(b => Date.parse(b.bucketStart)).filter(Number.isFinite);
+    migration.withheld = {
+      buckets: droppedBuckets.length,
+      sessions: droppedSessions.length,
+      totalTokens: droppedBuckets.reduce((sum, b) => sum + (Number(b.totalTokens) || 0), 0),
+      earliest: droppedStarts.length > 0 ? new Date(Math.min(...droppedStarts)).toISOString() : null,
+      latest: droppedStarts.length > 0 ? new Date(Math.max(...droppedStarts)).toISOString() : null,
+    };
     okSources.delete('kiki');
   }
   if (migration.blocked) {
     okSources.delete('kiki');
     process.stderr.write(`${dim('  kiki: 历史与 kimi-code 同步记录重叠，暂停 Kiki 上传以避免双计。请保留 state.json，停用旧兼容采集器并按 README 迁移，显式设置 config set kikiStartAt <UTC半小时切点>。')}\n`);
+  }
+  // A cut (or the guard) withholds real Kiki history and freezes legacy
+  // kimi-code rows; neither is silent, even in quiet/daemon runs. The user
+  // learns the counts and time range, and both ways out: set a verified cut, or
+  // clear the guard when they know no compatibility collector ever ran.
+  const withheld = migration.withheld;
+  if (withheld.buckets > 0 || withheld.sessions > 0
+    || migration.frozenBuckets > 0 || migration.frozenSessions > 0) {
+    const parts = [];
+    if (withheld.buckets > 0 || withheld.sessions > 0) {
+      const range = withheld.earliest ? `，时间范围 ${withheld.earliest} 至 ${withheld.latest}` : '';
+      parts.push(`本次未上传 ${withheld.buckets} 个桶 / ${withheld.sessions} 个会话（${withheld.totalTokens} tokens${range}）`);
+    }
+    if (migration.frozenBuckets > 0 || migration.frozenSessions > 0) {
+      parts.push(`已冻结 ${migration.frozenBuckets} 个旧 kimi-code 桶 / ${migration.frozenSessions} 个会话，其增长不再上传（服务端记录会停留在旧值）`);
+    }
+    process.stderr.write(`${dim(`  kiki: ${parts.join('；')}。若这段历史应归入 Kiki，请设置切点 config set kikiStartAt <UTC半小时切点>；若确认从未运行过兼容采集器，可用 config set kikiStartAt none 解除保护。`)}\n`);
   }
   allBuckets = migration.buckets;
   const uploadSessions = migration.sessions;
