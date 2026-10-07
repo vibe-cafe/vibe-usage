@@ -305,7 +305,7 @@ const FULL_HELP = `
     ${BARE} config get <key>   Get a config value
     ${BARE} config set <key> <value>  Set a config value
     ${BARE} config set codexExtraHome <path>  Persist another Codex Home
-    ${BARE} config add-root <tool> <path>  Add a Claude Code, Codex, Grok, OpenCode, Antigravity, or Pi data root
+    ${BARE} config add-root <tool> <path>  Add a Claude Code, Codex, Grok, OpenCode, Antigravity, Pi, or Hermes data root
     ${BARE} config remove-root <tool> <path>  Remove an added data root
     ${BARE} config roots  Show added data roots as JSON
     ${BARE} help         Show the short help

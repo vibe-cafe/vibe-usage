@@ -98,7 +98,7 @@ Quota results are never uploaded or added to incremental sync state. Credential-
 | Amp | `~/.local/share/amp/threads/`; cache-creation tokens are included in input usage |
 | Droid | `~/.factory/sessions/` |
 | DeepSeek Harness | `$DSH_HOME/sessions/` (default `~/.dsh`, fixture/relocation override: `VIBE_USAGE_DSH_SESSIONS`). Reads V0–V4 logs, including `session.v4.jsonl.zstd` from DSH's V4 integration format, with multi-frame Zstandard support (Node ≥ 22.15 built-in, `zstd` CLI fallback) and plain JSONL support. Each session uses its highest `session[.vN].jsonl[.zstd]` generation once, so frozen pre-migration logs are not double-counted. Usage comes from `assistant/message`: cache writes join uncached input, cache reads remain separate, and reasoning is split out of inclusive output. Fork history uses V0/V1 `seedLength` or V2–V4's last `session/end-seed` tagged `inherited: true`, and is skipped only when the parent copy confirms it; missing parents retain the sole local history. Unknown versions warn and protect sync state. |
-| Hermes (CLI / Desktop) | `<home>/state.db` + `<home>/profiles/<name>/state.db` (SQLite, multi-profile). Home: `$HERMES_HOME`, otherwise `~/.hermes` on macOS/Linux or `%LOCALAPPDATA%\hermes` on Windows (falls back to an existing `~/.hermes` only when the Windows native root is absent). Cache writes join input; reasoning is separated from inclusive output. Usage is currently a cumulative session total attributed to session start: a session spanning several days does **not** yet provide an accurate daily breakdown. |
+| Hermes (CLI / Desktop) | `<home>/state.db` + `<home>/profiles/<name>/state.db` (SQLite, multi-profile). Home: `$HERMES_HOME`, otherwise `~/.hermes` on macOS/Linux or `%LOCALAPPDATA%\hermes` on Windows (falls back to an existing `~/.hermes` only when the Windows native root is absent). Additional homes: `config add-root hermes <path>` (a directory containing `state.db` or `profiles/*/state.db`), scanned alongside the default and deduped. Cache writes join input; reasoning is separated from inclusive output. Usage is currently a cumulative session total attributed to session start: a session spanning several days does **not** yet provide an accurate daily breakdown. |
 | Kiro | Kiro CLI native event streams `~/.kiro/sessions/cli/*.jsonl` (estimated tokens from message text: input = prompt + tool results, output = reply + tool calls, reasoning = thinking, cacheRead = re-sent context; thinking-block signatures excluded). Falls back to `~/Library/Application Support/kiro-cli/data.sqlite3` / `~/.local/share/kiro-cli/data.sqlite3` + optional `~/.kiro_sessions/*.json` archives, then IDE `q-client.log` whole-credit deltas as `kiro-credits` (floored cumulative diff — the server stores token counts as bigint); legacy IDE `dev_data/devdata.sqlite` token telemetry is opt-in with `VIBE_USAGE_KIRO_LEGACY_TOKENS=1` |
 | Cline (CLI / SDK / Desktop app) | All variants write the same `~/.cline/data/sessions/*/*.messages.json` per-call metrics (the desktop app's manifest says `source: "desktop"`; its Electron userData holds only WebView caches), plus legacy `~/.cline/{,data/}state/taskHistory.json` and editor extension stores. Honors `CLINE_DIR`, `CLINE_DATA_DIR`, and `CLINE_SESSION_DATA_DIR`; copied history is deduplicated |
 | Roo Code | `<host>/User/globalStorage/rooveterinaryinc.roo-cline/{tasks/_index.json,tasks/<id>/{history_item,ui_messages}.json}` (walks all VSCode-fork hosts) |
@@ -206,7 +206,7 @@ Config stored at `~/.vibe-usage/config.json` (dev: `config.dev.json`).
 | `apiUrl` | Server URL (default: `https://vibecafe.ai`) |
 | `hostname` | Stable device name for usage tracking (set at init, reused across syncs) |
 | `codexExtraHome` | Optional additional Codex Home scanned together with `$CODEX_HOME` / `~/.codex` |
-| `extraRoots` | Tool-specific additional roots managed by the commands below; currently supports `codex`, `grok`, `antigravity`, and `pi-coding-agent` |
+| `extraRoots` | Tool-specific additional roots managed by the commands below; currently supports `antigravity`, `claude-code`, `codex`, `grok`, `hermes`, `opencode`, and `pi-coding-agent` |
 
 The `hostname` is captured once during `init` and reused for all future syncs. This prevents macOS mDNS hostname changes (e.g., `MacBook-Pro` → `MacBook-Pro-2`) from creating duplicate device entries. To change it manually:
 
@@ -230,6 +230,10 @@ npx @vibe-cafe/vibe-usage config add-root opencode /path/to/other/opencode
 
 # Grok expects a Grok Home containing sessions/.
 npx @vibe-cafe/vibe-usage config add-root grok /path/to/grok-home
+
+# Hermes expects a Hermes home containing state.db or profiles/*/state.db.
+# This is in addition to ~/.hermes and $HERMES_HOME, not a replacement.
+npx @vibe-cafe/vibe-usage config add-root hermes /path/to/hermes-home
 
 # Antigravity expects an alternate HOME containing .gemini/antigravity*/conversations/.
 npx @vibe-cafe/vibe-usage config add-root antigravity /path/to/alternate-home

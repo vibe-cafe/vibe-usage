@@ -159,8 +159,10 @@ passing this gate.
 `src/extra-roots.js` owns `EXTRA_ROOT_SOURCES`, `validateExtraRoot()`,
 `extraRootList()`, and the source-specific layout resolvers, including
 `grokSessionsDir()`, `antigravityConversationDirs()`, and `piSessionsDir()`.
+Hermes homes are checked with `inspectHermesHome()` in `hermes-roots.js`
+(readable `state.db` or `profiles/<name>/state.db` under the configured path).
 The currently supported source ids are `antigravity`, `claude-code`, `codex`, `grok`,
-`opencode`, and `pi-coding-agent`.
+`opencode`, `pi-coding-agent`, and `hermes`.
 
 - **Config routing:** `config roots` lists `config.extraRoots` as JSON;
   `config add-root <source> <path>` validates and persists a normalized path;
@@ -171,8 +173,19 @@ The currently supported source ids are `antigravity`, `claude-code`, `codex`, `g
 - **Additive discovery:** keep each tool's default store and any legacy
   `codexExtraHome` configuration. Extra roots must not replace or mask them.
 - **Parser result:** merge roots and de-duplicate overlapping paths or copied
-  records inside the parser before returning buckets and sessions, using that
-  source's existing deduplication rules.
+  records inside the parser before returning buckets and sessions. The dedup
+  identity is the source's own stable **record identity** — session id and/or
+  message id — never the database or file path alone. Two paths holding the same
+  session (a migrated or copied home, a backup directory, a mirrored profile)
+  must count it once, and when the copies disagree keep the most complete one,
+  the earliest root winning a tie. Path identity remains as the first pass that
+  stops one physical file being read twice; it cannot see a second file holding
+  the same records. Per source: OpenCode session id + message id, grok session
+  id, pi message id, claude-code logical session id + request id, codex
+  cross-file copy suppression, hermes session id + `(session, role, timestamp)`
+  message triple. Path-only dedup is not sufficient — it silently double-counts
+  every token of a copied store while the timing stream, grouped by session
+  hash, still reports a single session, so the two tracks disagree (issue #118).
 - **Read failures:** a configured root that is missing, unreadable, or no longer
   resolves must produce `skipped: true` with a warning, never an empty success.
   This prevents `sync.js` from pruning that source's prior incremental state.
@@ -187,6 +200,8 @@ The currently supported source ids are `antigravity`, `claude-code`, `codex`, `g
 - **OpenCode 2.x store (2026-09-26, issue #114)** — 2.x writes the event-sourced `session_message` projection instead of the legacy `message` table (`seq`-ordered `id, session_id, type, data, time_created`), and its session table is renamed to `session_v2` (`session` is the pre-split 1.18-era name; a fresh 2.x database has no `message`/`part` tables at all) — join `session_v2` when it exists, else `session`. Assistant rows carry `type='assistant'`, `data.model.id`, `data.tokens` (per-message deltas; the `session_v2.tokens_*` columns are their sum, so never add both), and no project path, so their project falls back to the session row's `directory`; `time_created` is ms epoch (prefer `data.time.created`, fall back to the column). Read every shape present in one database, legacy table first, and merge copies by session id + message id: a 2.x upgrade that keeps both representations must not double count, and legacy-first ordering keeps the project label earlier uploads already used. V2 rows are new uploads, so their directory-derived project cannot rename anything. A database with neither table returns `不认识的表结构` (naming the path) and skips the source; the pre-2.x query failed on `no such table: message` for every 2.x user, which silently uploaded nothing.
 - **OpenCode cache writes are a priced dimension (2026-09-26)** — `tokens.cache.write` maps to `cacheCreation5mTokens`, the same rule as CodeArts Agent (identical store layout, one untyped total, no per-TTL breakdown). Emitting only input/output/cache-read/reasoning under-billed every Anthropic run through OpenCode at the 1.25x cache-write tier (69.3M dropped cache-write tokens on the maintainer's own store). `inputTokens` stays uncached-only, and existing buckets re-upload under the same key, so the correction replaces rather than adds.
 - Validation for #81 includes a read-only comparison against an actual default OpenCode store: buckets and sessions matched pre-change main exactly. Synthetic SQLite/JSON stores cover cross-root copying, model fallback, failures, and the full config → detection → parser route. No production upload was performed.
+
+- **Hermes roots (2026-10-07, PR #118):** `hermes` is an extra-root source driven by `extraRoots.hermes`; `inspectHermesHome()` in `hermes-roots.js` validates a configured home (a readable `state.db`, or at least one `profiles/<name>/state.db`), and a configured home that is missing or unreadable yields `skipped: true` with a warning rather than an empty success. Default discovery (`~/.hermes`, Windows `LOCALAPPDATA/hermes`) and `HERMES_HOME` stay additive and are never masked. Each profile is an independent store, and `profile` — `'default'` for `<home>/state.db`, else the directory name under `profiles/` — is the project label, which a copied home preserves. The parser applies the record-identity rule above: the `sessions` table holds cumulative per-session totals, so it keeps the richest row per session `id`, and the `messages` timing stream is deduped by `(session_id, role, timestamp)`. Verifying `state.db` by realpath only stops one file being read twice; a *copy* at a second path is a different path and is caught by the record rule instead. `HERMES_HOME` was already in `PRESERVED_SERVICE_ENV`, and extra roots live in `config.json`, which the daemon reads through `runSync`, so this needs no service-env change. Coverage: `test/hermes.test.js` (copied store, richest-copy-wins, symlinked root) and `test/hermes-discovery.test.js` (additive discovery, skip-on-missing).
 
 ## Architecture: Two-Track Data Model
 
@@ -365,6 +380,7 @@ Extra-root regression coverage:
 | `test/codex-roots.test.js` | Additive root discovery, path deduplication, live/archive and Multica layouts |
 | `test/grok.test.js` | Default-plus-extra stores, copied sessions, missing/unreadable configured roots, `usage.json` ledger (1.0) incl. no-double-count with ACP usage, signals-based format canary |
 | `test/pi-compatible.test.js` | Extra-root layouts, overlapping paths, copied records, missing/unreadable roots |
+| `test/hermes-discovery.test.js`, `test/hermes.test.js` | Custom Hermes homes beside the default/`HERMES_HOME`, dedup, missing/unreadable roots |
 | `test/state.test.js` | Pruning only sources whose parsers succeeded |
 
 Run the focused checks locally:
