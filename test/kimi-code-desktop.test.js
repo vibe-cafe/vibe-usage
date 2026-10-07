@@ -63,7 +63,7 @@ test('CLI home stays primary and the desktop home is additive, without duplicate
   mkdirSync(cliHome, { recursive: true });
   // Same store reachable under the desktop home path: scan it once, not twice.
   mkdirSync(posix.join(fakeHome, '.config', 'kimi-desktop', 'daimon-share', 'daimon', 'runtime', 'kimi-code'), { recursive: true });
-  symlinkSync(cliHome, kimiWorkCodeHome({}, 'linux', fakeHome));
+  symlinkSync(cliHome, kimiWorkCodeHome({}, 'linux', fakeHome), process.platform === 'win32' ? 'junction' : 'dir');
   try {
     assert.deepEqual(resolveKimiCodeRoots({ KIMI_CODE_HOME: cliHome }, 'linux', fakeHome), [cliHome]);
     assert.deepEqual(

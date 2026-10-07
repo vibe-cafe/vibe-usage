@@ -10,6 +10,7 @@ import { parsers } from './parsers/index.js';
 import { aggregateToBuckets } from './parsers/aggregate.js';
 import { normalizeParserResult } from './parsers/contract.js';
 import { extraRootList } from './extra-roots.js';
+import { planKikiMigration } from './kiki-migration.js';
 import { success, failure, warn, arrow, link, dim } from './output.js';
 
 const BATCH_SIZE = 100;
@@ -297,10 +298,55 @@ export async function runSync({
   if (state.identityChanged && !quiet) {
     console.log(dim('检测到上传账号已更换，本次全量重传本地历史'));
   }
+  let migration;
+  try {
+    migration = planKikiMigration(allBuckets, allSessions, state, config.kikiStartAt);
+  } catch (err) {
+    process.stderr.write(`${dim(`  kiki: ${err.message}`)}\n`);
+    migration = planKikiMigration(allBuckets, allSessions, state);
+    migration.buckets = migration.buckets.filter(b => b.source !== 'kiki');
+    migration.sessions = migration.sessions.filter(s => s.source !== 'kiki');
+    // The invalid cut drops every Kiki row regardless of what the fallback
+    // plan did; report that as withheld so the diagnostic is not silent.
+    const droppedBuckets = allBuckets.filter(b => b.source === 'kiki');
+    const droppedSessions = allSessions.filter(s => s.source === 'kiki');
+    const droppedStarts = droppedBuckets.map(b => Date.parse(b.bucketStart)).filter(Number.isFinite);
+    migration.withheld = {
+      buckets: droppedBuckets.length,
+      sessions: droppedSessions.length,
+      totalTokens: droppedBuckets.reduce((sum, b) => sum + (Number(b.totalTokens) || 0), 0),
+      earliest: droppedStarts.length > 0 ? new Date(Math.min(...droppedStarts)).toISOString() : null,
+      latest: droppedStarts.length > 0 ? new Date(Math.max(...droppedStarts)).toISOString() : null,
+    };
+    okSources.delete('kiki');
+  }
+  if (migration.blocked) {
+    okSources.delete('kiki');
+    process.stderr.write(`${dim('  kiki: 历史与 kimi-code 同步记录重叠，暂停 Kiki 上传以避免双计。请保留 state.json，停用旧兼容采集器并按 README 迁移，显式设置 config set kikiStartAt <UTC半小时切点>。')}\n`);
+  }
+  // A cut (or the guard) withholds real Kiki history and freezes legacy
+  // kimi-code rows; neither is silent, even in quiet/daemon runs. The user
+  // learns the counts and time range, and both ways out: set a verified cut, or
+  // clear the guard when they know no compatibility collector ever ran.
+  const withheld = migration.withheld;
+  if (withheld.buckets > 0 || withheld.sessions > 0
+    || migration.frozenBuckets > 0 || migration.frozenSessions > 0) {
+    const parts = [];
+    if (withheld.buckets > 0 || withheld.sessions > 0) {
+      const range = withheld.earliest ? `，时间范围 ${withheld.earliest} 至 ${withheld.latest}` : '';
+      parts.push(`本次未上传 ${withheld.buckets} 个桶 / ${withheld.sessions} 个会话（${withheld.totalTokens} tokens${range}）`);
+    }
+    if (migration.frozenBuckets > 0 || migration.frozenSessions > 0) {
+      parts.push(`已冻结 ${migration.frozenBuckets} 个旧 kimi-code 桶 / ${migration.frozenSessions} 个会话，其增长不再上传（服务端记录会停留在旧值）`);
+    }
+    process.stderr.write(`${dim(`  kiki: ${parts.join('；')}。若这段历史应归入 Kiki，请设置切点 config set kikiStartAt <UTC半小时切点>；若确认从未运行过兼容采集器，可用 config set kikiStartAt none 解除保护。`)}\n`);
+  }
+  allBuckets = migration.buckets;
+  const uploadSessions = migration.sessions;
   const changedBuckets = [];
   const changedSessions = [];
-  const liveBucketKeys = new Set();
-  const liveSessionKeys = new Set();
+  const liveBucketKeys = new Set(migration.preserveBuckets);
+  const liveSessionKeys = new Set(migration.preserveSessions);
   // key -> hash, committed to state only after the owning batch's upload
   // succeeds (a failed batch re-sends next sync — no silent gap).
   const pendingBucketState = new Map();
@@ -310,15 +356,15 @@ export async function runSync({
     const key = bucketKey(b);
     const h = bucketHash(b);
     liveBucketKeys.add(key);
-    if (state.buckets[key] === h) continue;
+    if (migration.preserveBuckets.has(key) || state.buckets[key] === h) continue;
     changedBuckets.push(b);
     pendingBucketState.set(key, h);
   }
-  for (const s of allSessions) {
+  for (const s of uploadSessions) {
     const key = sessionKey(s);
     const h = sessionHash(s);
     liveSessionKeys.add(key);
-    if (state.sessions[key] === h) continue;
+    if (migration.preserveSessions.has(key) || state.sessions[key] === h) continue;
     changedSessions.push(s);
     pendingSessionState.set(key, h);
   }

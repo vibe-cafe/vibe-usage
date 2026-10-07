@@ -265,6 +265,7 @@ test('status separates "detected but never uploaded" from a syncing tool', () =>
       USERPROFILE: home,
       XDG_DATA_HOME: join(home, 'data'),
       APPDATA: join(home, 'appdata'),
+      VIBE_USAGE_KIKI_DIR: join(home, '.kiki'),
       VIBE_USAGE_CONFIG_DIR: configDir,
       VIBE_USAGE_STATE_DIR: stateDir,
     });

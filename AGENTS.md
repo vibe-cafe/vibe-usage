@@ -127,6 +127,47 @@ passing this gate.
 
 **Approved 2026-09-19 by the maintainer (江昪) — new upload source `codearts-agent` (Huawei Cloud CodeArts Agent / CodeArts Doer for Coding), contributed in #106.** A new source id is a cross-repository contract, so it passes this gate even though the client change is purely additive. Model ids travel unchanged (`GLM-5.2`, `glm-5.3-flash`, `deepseek-v4-flash-0731`); each was checked against the pricing map per step 6 of Adding a New Parser and matches its own vendor family, with no cross-vendor collision. **Release prerequisite, not yet done: append `codearts-agent` to `USAGE_SOURCES` in `vibe-cafe/apps/web/src/lib/usage-sources.ts` before publishing the version that carries this parser.** Until it is registered, ingest soft-drops every CodeArts bucket — a 200 with `dropped.unknownSources`, no error — so an unregistered release loses that data silently. Merging without it is safe; publishing without it is not. Rollback is removal of the parser/registry entries; local sync state stays isolated under `codearts-agent` and needs no migration.
 
+## Kiki source proposal
+
+Kiki reports `source: 'kiki'` and displays as `Kiki`; it never falls back to
+`kimi-code`. This proposal requires maintainer approval of the additive source
+and compatibility-history cut, plus registration in the web application's
+`USAGE_SOURCES` before publishing. The web source registry is not in this CLI
+repository. Pricing continues to resolve model ids through the existing,
+source-agnostic map; check normalized ids there before release.
+
+`src/parsers/kiki.js` reuses `parseCurrentKimiRoots()` with Kiki-only model
+normalization and exact cross-copy accounting/timing dedup (session + agent +
+allow-listed payload + occurrence). Identical calls within a wire remain real
+deltas. `$KIKI_HOME` defaults to `~/.kiki`; `VIBE_USAGE_KIKI_DIR` replaces discovery
+for fixtures. A physical home owned by Kimi Code is excluded from Kiki.
+
+`src/kiki-migration.js` protects first-upload legacy overlaps in `sync.js` after
+hostname/privacy mapping. A legacy overlap is either an exact bucket key with a
+changed or absent Kimi-only hash, a `kimi-code` state key sharing the same model
+and half-hour window but a different project/hostname whose hash differs from
+the CLI's own current Kimi snapshot, or a matching session key. The
+different-coordinate arm exists because the one collector that ever reported
+Kiki as `kimi-code` (Kiki's `kap-server` export, `vibe-kimi-bucket-v1`) uploaded
+`project: 'unknown'` and `hostname: kiki-<stream_id>`, which the CLI can never
+reproduce — matching only its own coordinates left the guard dead code. These
+are conservative evidence, not proof of a mixed bucket; an unchanged genuine
+Kimi-only bucket is not a signal. Other sources continue. Explicit `kikiStartAt`
+is a UTC half-hour boundary: old mixed keys remain untouched, new Kiki buckets
+start at the cut, straddling sessions are not re-keyed. `config set kikiStartAt
+none` clears the cut at any time (the documented escape hatch for a user who
+asserts no collector ran); changing to a *different* time once `kiki|` state
+exists is still refused. `planKikiMigration` also returns `withheld`
+(bucket/session counts, `totalTokens`, `earliest`/`latest` ISO starts) for
+everything the plan drops and `frozenBuckets`/`frozenSessions` for the
+`kimi-code` rows held at their recorded hash; `sync.js` reports all of it on
+stderr even in quiet/daemon runs. No cloud deletion, automatic cut,
+compatibility-source upload or whole-history relabel is performed. Missing
+state/changed identities and exact same-key genuine Kimi changes require user
+coordination; hashes cannot reconstruct per-tool historical contributions.
+Focused fixtures: `test/kiki.test.js`, `test/kiki-migration.test.js` and
+`test/daemon-service.test.js`. All test data must be synthetic and home-isolated.
+
 ## Key Conventions
 
 - **Approved 2026-09-10 — Cola source:** add `cola` to the CLI and backend source registries using the existing bucket/session schema and backend-owned privacy policy. Read `~/.cola/sessions` or `$COLA_DATA_DIR/sessions`; project comes from the session cwd basename, never a channel/scope slug. Cola 1.4.4 copies transcripts with a new header id/time but unchanged records: opt only Cola into dedup by record id + original timestamp + parent id + role + model, keep the richest usage, and attribute it to the earliest available header (stable session-id/path tie-break). Existing Pi-family dedup keys remain unchanged. Read failures protect prior upload state and suppress partial Cola uploads. No migration/reset is required. Release ordering: deploy backend source registration first, then commit the CLI support together with the Hermes fixes in the unpublished release; the maintainer publishes npm. Rollback removes Cola parsing/registration while preserving existing data.

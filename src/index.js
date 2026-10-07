@@ -12,6 +12,7 @@ import { dim as dimText, failure, hint, smallHeader, warn } from './output.js';
 import { loadState } from './state.js';
 import { fetchAccount } from './api.js';
 import { COLLECTOR_VERSION } from './client-meta.js';
+import { kikiStartTime } from './kiki-migration.js';
 
 function printSmallHeader() {
   console.log();
@@ -123,7 +124,7 @@ async function printBoundAccount(apiUrl, apiKey) {
   }
 }
 
-const VALID_CONFIG_KEYS = ['apiKey', 'apiUrl', 'hostname', 'codexExtraHome'];
+const VALID_CONFIG_KEYS = ['apiKey', 'apiUrl', 'hostname', 'codexExtraHome', 'kikiStartAt'];
 
 function handleConfig(args) {
   const sub = args[0];
@@ -165,6 +166,31 @@ function handleConfig(args) {
         value = validation.path;
       }
       const config = loadConfig() || {};
+      if (key === 'kikiStartAt') {
+        // `none` is the documented escape hatch for a user who asserts no
+        // compatibility collector ever ran. It clears the cut (deleting the
+        // key so nothing ever stores or prints the literal) and is allowed at
+        // any time, unlike changing to a different time once `kiki|` state
+        // exists — otherwise a user who set a cut could never back it out.
+        if (value === 'none') {
+          if ('kikiStartAt' in config) delete config.kikiStartAt;
+          saveConfig(config);
+          console.log(warn('已清除 Kiki 切点：早于原切点的 Kiki 历史现在会作为 kiki 上传。若实际上运行过把 Kiki 记为 kimi-code 的兼容采集器，这会与原记录双计，请自行确认。'));
+          break;
+        }
+        try {
+          const time = kikiStartTime(value);
+          const state = loadState();
+          const hasKikiState = [...Object.keys(state.buckets), ...Object.keys(state.sessions)].some(key => key.startsWith('kiki|'));
+          if (hasKikiState && kikiStartTime(config.kikiStartAt) !== time) {
+            throw new Error('已保存的 Kiki 切点不能直接更改；请先与服务端维护者协调历史迁移。');
+          }
+          value = new Date(time).toISOString();
+        } catch (err) {
+          console.error(failure(err.message));
+          process.exit(1);
+        }
+      }
       config[key] = value;
       saveConfig(config);
       break;
