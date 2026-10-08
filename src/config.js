@@ -1,6 +1,7 @@
 import { readFileSync, writeFileSync, chmodSync, mkdirSync, existsSync } from 'node:fs';
 import { join } from 'node:path';
 import { homedir } from 'node:os';
+import { moveDirectoryOutOfFilePath } from './path-repair.js';
 
 // VIBE_USAGE_CONFIG_DIR overrides the dir (test hook).
 const CONFIG_DIR = process.env.VIBE_USAGE_CONFIG_DIR?.trim() || join(homedir(), '.vibe-usage');
@@ -22,6 +23,9 @@ export function loadConfig() {
 
 export function saveConfig(config) {
   mkdirSync(CONFIG_DIR, { recursive: true });
+  // A directory sitting where the config file belongs would make this write
+  // throw EISDIR forever; move it aside so the run can save.
+  moveDirectoryOutOfFilePath(CONFIG_FILE);
   // The file holds the vbu_ API key — never leave it group/world-readable.
   // mode only applies at file creation, so chmod explicitly for pre-existing
   // files written before this hardening.

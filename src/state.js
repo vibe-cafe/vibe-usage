@@ -2,6 +2,7 @@ import { readFileSync, writeFileSync, unlinkSync, mkdirSync, existsSync, renameS
 import { join } from 'node:path';
 import { homedir } from 'node:os';
 import { createHash, randomBytes } from 'node:crypto';
+import { moveDirectoryOutOfFilePath } from './path-repair.js';
 
 // Persisted sync state, kept next to config.js's files (same dir + dev split).
 // Maps a stable item key -> hash of its mutable fields, recording what we have
@@ -79,6 +80,9 @@ export function loadState(identity) {
 
 export function saveState(state, identity) {
   mkdirSync(STATE_DIR, { recursive: true });
+  // Same EISDIR repair as config: a directory where the state file belongs
+  // would block every save, and with it every incremental sync.
+  moveDirectoryOutOfFilePath(STATE_FILE);
   // Only the durable fields are written: `identityChanged` is loadState()'s
   // one-run signal, not state. A CLI older than 0.11.1 reads just
   // buckets/sessions, so the extra top-level `identity` key is ignored there —

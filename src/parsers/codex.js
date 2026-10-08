@@ -104,7 +104,9 @@ function extractProject(meta) {
     const match = meta.git.repository_url.match(/([^/]+\/[^/]+?)(?:\.git)?$/);
     if (match) return match[1];
   }
-  if (meta.cwd) return meta.cwd.split('/').pop() || 'unknown';
+  // Windows reports cwd with backslashes, so splitting on '/' alone yields the
+  // whole path as the "project".
+  if (meta.cwd) return meta.cwd.split(/[\\/]/).pop() || 'unknown';
   return 'unknown';
 }
 

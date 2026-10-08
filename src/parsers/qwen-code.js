@@ -40,7 +40,9 @@ function findSessionFiles(baseDir) {
 
 function extractProject(cwd, filePath) {
   if (cwd) {
-    const parts = cwd.split('/').filter(Boolean);
+    // Windows reports cwd with backslashes; split on both separators so the
+    // project is the last path segment rather than the whole path.
+    const parts = cwd.split(/[\\/]/).filter(Boolean);
     if (parts.length > 0) return parts[parts.length - 1];
   }
   const tmpPrefix = QWEN_TMP_DIR + sep;

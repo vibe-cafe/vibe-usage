@@ -3,9 +3,17 @@ import { join } from 'node:path';
 import { homedir } from 'node:os';
 import { aggregateToBuckets, extractSessions } from './aggregate.js';
 
-function resolveThreadsDir() {
+/** Threads directory, XDG first and %LOCALAPPDATA% on Windows. Exported so the
+ *  Windows branch can be exercised from a POSIX test host. */
+export function resolveThreadsDir() {
   if (process.env.AMP_DATA_DIR) return process.env.AMP_DATA_DIR;
   if (process.env.XDG_DATA_HOME) return join(process.env.XDG_DATA_HOME, 'amp', 'threads');
+  // Amp on Windows keeps its threads under %LOCALAPPDATA%; without this the
+  // source silently collected nothing there.
+  if (process.platform === 'win32' && process.env.LOCALAPPDATA) {
+    const winDir = join(process.env.LOCALAPPDATA, 'amp', 'threads');
+    if (existsSync(winDir)) return winDir;
+  }
   return join(homedir(), '.local', 'share', 'amp', 'threads');
 }
 

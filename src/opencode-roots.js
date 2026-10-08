@@ -24,10 +24,21 @@ export function openCodeStore(root) {
   return null;
 }
 
+// XDG first, then the Windows per-user store. A root that does not resolve is
+// skipped by the caller, so probing costs nothing when it is absent.
+function defaultOpenCodeRoots() {
+  const xdg = join(homedir(), '.local', 'share', 'opencode');
+  const localAppData = process.env.LOCALAPPDATA?.trim();
+  if (process.platform === 'win32' && localAppData) {
+    return [xdg, join(localAppData, 'opencode')];
+  }
+  return [xdg];
+}
+
 export function getOpenCodeStores({ extraRoots = [], onWarning = () => {} } = {}) {
   const override = process.env.VIBE_USAGE_OPENCODE_DIRS?.trim();
   const defaults = override ? override.split(delimiter).map(p => p.trim()).filter(Boolean)
-    : [join(homedir(), '.local', 'share', 'opencode')];
+    : defaultOpenCodeRoots();
   const seen = new Set(), stores = [];
   for (const root of [...defaults, ...extraRoots]) {
     try {

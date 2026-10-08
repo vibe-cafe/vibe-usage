@@ -21,7 +21,16 @@ function prompt(question) {
 }
 
 function openBrowser(url) {
-  const cmds = { darwin: 'open', linux: 'xdg-open', win32: 'start' };
+  // `start` is a cmd.exe builtin, not an executable: execFile('start', …) fails
+  // outright on Windows, so the device-flow login never opened a tab and the
+  // user was left staring at the code with no browser to type it into. Go
+  // through cmd, and escape a bare `&` (present in verificationUriComplete's
+  // query string) or cmd would read it as a command separator.
+  if (platform() === 'win32') {
+    execFile('cmd', ['/c', 'start', '', url.replace(/&/g, '^&')], { windowsHide: true }, () => {});
+    return;
+  }
+  const cmds = { darwin: 'open', linux: 'xdg-open' };
   const cmd = cmds[platform()] || cmds.linux;
   // Use execFile with args array to avoid shell injection via VIBE_USAGE_API_URL
   execFile(cmd, [url], () => {});
