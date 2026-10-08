@@ -1,6 +1,6 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { appendFileSync, chmodSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
+import { appendFileSync, chmodSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, rmSync, statSync, writeFileSync } from 'node:fs';
 import { join } from 'node:path';
 import { tmpdir } from 'node:os';
 import { parse } from '../src/parsers/codex.js';
@@ -1281,7 +1281,224 @@ test('an unreadable continuation suppresses partial Codex uploads', {
       assert.ok(failed.warnings.length);
     });
   } finally {
-    chmodSync(blocked, 0o600);
+      chmodSync(blocked, 0o600);
+      rmSync(fixture.root, { recursive: true, force: true });
+    }
+});
+
+// ---------------------------------------------------------------------------
+// Durable usage records
+// ---------------------------------------------------------------------------
+// Codex writes the same request twice: once as a durable `token_usage_record`,
+// and once as the UI-facing `event_msg` / `token_count`. The UI event is missing
+// entirely when a call is interrupted before it is emitted, and after such a call
+// its cumulative counter can lag the durable one — so the two forms are matched
+// on per-request usage rather than on cumulative totals.
+
+const recordInstant = (second) => new Date(Date.UTC(2026, 8, 20, 0, 0, second)).toISOString();
+
+function durableRecord(second, threadTotal = usage(100, 20, 10, 2), requestUsage = usage(100, 20, 10, 2)) {
+  return {
+    timestamp: recordInstant(second),
+    type: 'token_usage_record',
+    payload: { usage: requestUsage, thread_token_usage: threadTotal },
+  };
+}
+
+function uiTokenCount(second, threadTotal = usage(100, 20, 10, 2), requestUsage = usage(100, 20, 10, 2)) {
+  return {
+    timestamp: recordInstant(second),
+    type: 'event_msg',
+    payload: {
+      type: 'token_count',
+      info: { last_token_usage: requestUsage, total_token_usage: threadTotal },
+    },
+  };
+}
+
+function turnContext(second = 0) {
+  return { timestamp: recordInstant(second), type: 'turn_context', payload: { model: 'test-model' } };
+}
+
+const countedTokens = (buckets) => {
+  const sum = sumBuckets(buckets);
+  return sum.input + sum.output + sum.cached + sum.reasoning;
+};
+
+test('a durable usage record without a UI event is counted', async () => {
+  const { buckets } = await parseFixture({
+    'a.jsonl': [sessionMeta(recordInstant(0), 'session'), turnContext(), durableRecord(1)],
+  });
+  assert.equal(countedTokens(buckets), 110);
+});
+
+test('a durable record and its UI mirror are counted once when the cumulative totals diverge', async () => {
+  const { buckets } = await parseFixture({
+    'a.jsonl': [
+      sessionMeta(recordInstant(0), 'session'),
+      turnContext(),
+      durableRecord(1),
+      uiTokenCount(2, usage(90, 20, 10, 2)),
+      durableRecord(3, usage(200, 40, 20, 4)),
+      uiTokenCount(4, usage(180, 40, 20, 4)),
+    ],
+  });
+  assert.equal(countedTokens(buckets), 220);
+});
+
+test('a missing UI mirror does not suppress the next real request', async () => {
+  const { buckets } = await parseFixture({
+    'a.jsonl': [
+      sessionMeta(recordInstant(0), 'session'),
+      turnContext(),
+      durableRecord(1),
+      durableRecord(3, usage(200, 40, 20, 4)),
+      uiTokenCount(4),
+    ],
+  });
+  assert.equal(countedTokens(buckets), 220);
+});
+
+test('a UI mirror arriving after the cache checkpoint is not double counted', async () => {
+  const fixture = createPersistentFixture({
+    'a.jsonl': [sessionMeta(recordInstant(0), 'session'), turnContext(), durableRecord(1)],
+  });
+  try {
+    await withCodexEnv(fixture, async () => {
+      const first = await parse();
+      assert.equal(countedTokens(first.buckets), 110);
+
+      appendFileSync(join(fixture.dir, 'a.jsonl'), JSON.stringify(uiTokenCount(2, usage(90, 20, 10, 2))) + '\n');
+      const warm = await parse();
+      assert.equal(countedTokens(warm.buckets), 110);
+
+      process.env.VIBE_USAGE_CODEX_CACHE = '0';
+      assert.deepEqual((await parse()).buckets, warm.buckets);
+    });
+  } finally {
+    rmSync(fixture.root, { recursive: true, force: true });
+  }
+});
+
+test('a cumulative-only legacy fallback keeps its own mirror baseline', async () => {
+  const cumulativeOnly = uiTokenCount(3, usage(190, 40, 20, 4));
+  delete cumulativeOnly.payload.info.last_token_usage;
+  const { buckets } = await parseFixture({
+    'a.jsonl': [
+      sessionMeta(recordInstant(0), 'session'),
+      turnContext(),
+      durableRecord(1),
+      uiTokenCount(2, usage(90, 20, 10, 2)),
+      cumulativeOnly,
+    ],
+  });
+  assert.equal(countedTokens(buckets), 220);
+});
+
+test('same-session segments keep durable records and model context', async () => {
+  const { buckets } = await parseFixture({
+    'a.jsonl': [sessionMeta(recordInstant(0), 'session'), turnContext(), durableRecord(1)],
+    'b.jsonl': [
+      sessionMeta(recordInstant(0), 'session'),
+      turnContext(),
+      durableRecord(1),
+      uiTokenCount(2, usage(90, 20, 10, 2)),
+      durableRecord(3, usage(200, 40, 20, 4)),
+    ],
+  });
+  assert.equal(countedTokens(buckets), 220);
+  assert.equal(buckets[0].model, 'test-model');
+});
+
+test('fork replay of durable and legacy records is excluded', async () => {
+  const { buckets } = await parseFixture({
+    'a.jsonl': [sessionMeta(recordInstant(0), 'parent'), turnContext(), durableRecord(1), uiTokenCount(2)],
+    'b.jsonl': [
+      sessionMeta(recordInstant(3), 'child', { forked_from_id: 'parent' }),
+      turnContext(),
+      durableRecord(1),
+      uiTokenCount(2),
+      durableRecord(4, usage(200, 40, 20, 4)),
+      uiTokenCount(5, usage(200, 40, 20, 4)),
+    ],
+  });
+  assert.equal(countedTokens(buckets), 220);
+});
+
+test('an invalid durable record does not hide valid legacy usage', async () => {
+  const { buckets } = await parseFixture({
+    'a.jsonl': [
+      sessionMeta(recordInstant(0), 'session'),
+      turnContext(),
+      durableRecord(1, usage(100, 20, 10, 2), usage(-1, 0, 0, 0)),
+      uiTokenCount(2),
+    ],
+  });
+  assert.equal(countedTokens(buckets), 110);
+});
+
+test('an equally sized legacy call in a new turn stays a distinct request', async () => {
+  const { buckets } = await parseFixture({
+    'a.jsonl': [
+      sessionMeta(recordInstant(0), 'session'),
+      turnContext(),
+      durableRecord(1),
+      turnContext(2),
+      uiTokenCount(3, usage(200, 40, 20, 4)),
+    ],
+  });
+  assert.equal(countedTokens(buckets), 220);
+});
+
+test('repeated durable records are counted once despite lagging UI counters', async () => {
+  const { buckets } = await parseFixture({
+    'a.jsonl': [
+      sessionMeta(recordInstant(0), 'session'),
+      turnContext(),
+      durableRecord(1),
+      uiTokenCount(2, usage(90, 20, 10, 2)),
+      durableRecord(3),
+      uiTokenCount(4, usage(90, 20, 10, 2)),
+    ],
+  });
+  assert.equal(countedTokens(buckets), 110);
+});
+
+test('a malformed durable record cannot turn the next legacy request into a mirror', async () => {
+  const { buckets } = await parseFixture({
+    'a.jsonl': [
+      sessionMeta(recordInstant(0), 'session'),
+      turnContext(),
+      durableRecord(1),
+      durableRecord(2, usage(100, 20, 10, 2), usage(-1, 0, 0, 0)),
+      uiTokenCount(3, usage(200, 40, 20, 4)),
+    ],
+  });
+  assert.equal(countedTokens(buckets), 220);
+});
+
+test('the durable usage cache keeps numeric accounting fields only', async () => {
+  const fixture = createPersistentFixture({
+    'a.jsonl': [
+      sessionMeta(recordInstant(0), 'session'),
+      turnContext(),
+      durableRecord(1, usage(100, 20, 10, 2), {
+        ...usage(100, 20, 10, 2),
+        private_text: 'SENSITIVE_TEST_CONTENT',
+      }),
+    ],
+  });
+  try {
+    await withCodexEnv(fixture, async () => {
+      await parse();
+      for (const name of readdirSync(fixture.cacheDir, { recursive: true })) {
+        const entry = join(fixture.cacheDir, name);
+        if (statSync(entry).isFile()) {
+          assert.ok(!readFileSync(entry, 'utf8').includes('SENSITIVE_TEST_CONTENT'));
+        }
+      }
+    });
+  } finally {
     rmSync(fixture.root, { recursive: true, force: true });
   }
 });

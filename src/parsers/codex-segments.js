@@ -1,4 +1,5 @@
 import { createHash } from 'node:crypto';
+import { normalizeUsageRecord } from './codex-usage-record.js';
 
 const hash = value => createHash('sha256').update(JSON.stringify(value)).digest('base64url');
 function pick(value, keys) {
@@ -10,6 +11,7 @@ const usageKeys = ['input_tokens', 'output_tokens', 'cached_input_tokens', 'cach
 // Retain only fields consumed by the existing token/timing parser. Full JSON is
 // hashed transiently to identify exact copies; chat/tool text is never retained.
 function accountingRecord(obj, context) {
+  obj = normalizeUsageRecord(obj);
   const next = { type: obj.type, timestamp: obj.timestamp };
   const p = obj.payload;
   if (obj.type === 'session_meta' && p) {
@@ -22,7 +24,7 @@ function accountingRecord(obj, context) {
   } else if (obj.type === 'turn_context') {
     next.payload = pick(p, ['model', 'service_tier']);
   } else if (obj.type === 'event_msg' && p) {
-    next.payload = pick(p, ['type', 'started_at', 'model']);
+    next.payload = pick(p, ['type', 'started_at', 'model', 'usage_record']);
     if (p.type === 'token_count') {
       next._tokenFingerprint = hash(p).slice(0, 16);
       next._segmentContext = { ...context };
