@@ -2,4 +2,7 @@ node_modules/
 .env
 .env.local
 *.tgz
+# Written by scripts/release.sh for every publish attempt, including failures.
+# Untracked leftovers here make the next release's clean-tree check fail.
+npm-publish-*.log
 .DS_Store
