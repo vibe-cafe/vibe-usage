@@ -4,7 +4,7 @@ import { delimiter, join } from 'node:path';
 import { homedir } from 'node:os';
 import { antigravityConversationDirs, normalizeExtraRoot } from '../extra-roots.js';
 import { aggregateToBuckets, extractSessions } from './aggregate.js';
-import { listDbCascades, readDbUsageRecords, readDbWorkspaceUri, readDbSessionEvents, readDbStepTimestamps, resolveUsageTimestamp } from './antigravity-db.js';
+import { hasTokenUsage, listDbCascades, readDbUsageRecords, readDbWorkspaceUri, readDbStepRows, resolveUsageTimestamp } from './antigravity-db.js';
 
 
 
@@ -310,11 +310,150 @@ function listPbCascades(conversationsDir) {
 
 // ── Main parse ───────────────────────────────────────────────────────
 
-/** Model name for an offline .db record: real display name → slug → unknown. */
+// Model ids (`GeneratorMetadata` chatModel field 3 / `ModelUsage` field 1) for
+// the models current builds serve. Cross-verified against the ccusage
+// Antigravity adapter's id table, which decodes the same wire format; an id
+// outside this table falls through to the cascade's last named model rather
+// than inventing a placeholder nobody can price.
+const MODEL_ID_NAMES = {
+  246: 'gemini-2.5-pro',
+  312: 'gemini-2.5-flash',
+  313: 'gemini-2.5-flash-thinking',
+  329: 'gemini-2.5-flash-thinking',
+  330: 'gemini-2.5-flash-lite',
+  281: 'claude-4-sonnet',
+  282: 'claude-4-sonnet',
+  290: 'claude-4-opus',
+  291: 'claude-4-opus',
+  333: 'claude-4.5-sonnet',
+  334: 'claude-4.5-sonnet',
+  340: 'claude-4.5-haiku',
+  341: 'claude-4.5-haiku',
+  342: 'gpt-oss-120b-medium',
+  1071: 'gemini-3.6-flash-high',
+  1072: 'gemini-3.6-flash-medium',
+  1073: 'gemini-3.6-flash-low',
+  1298: 'gemini-3.7-flash-high',
+  1299: 'gemini-3.7-flash-medium',
+  1300: 'gemini-3.7-flash-low',
+  1318: 'gemini-3.8-flash-high',
+  1319: 'gemini-3.8-flash-medium',
+  1320: 'gemini-3.8-flash-low',
+};
+
+/** Model name for a .db usage record: display name → slug → step model → id. */
 function modelFromRecord(rec) {
   if (rec.displayName) return rec.displayName;
   if (rec.responseModel) return normalizeModel(rec.responseModel);
+  if (rec.modelName) return normalizeModel(rec.modelName);
+  if (rec.modelId && MODEL_ID_NAMES[rec.modelId]) return MODEL_ID_NAMES[rec.modelId];
   return 'unknown';
+}
+
+/** Identity keys naming one provider call; any shared key links two records. */
+function usageIdentityKeys(rec) {
+  const keys = [];
+  if (rec.responseId) keys.push(`response:${rec.responseId}`);
+  if (rec.providerMessageId) keys.push(`provider:${rec.providerMessageId}`);
+  if (rec.messageId) keys.push(`message:${rec.messageId}`);
+  return keys;
+}
+
+/** Ranking used to keep the richest copy of one call. */
+function usageScore(rec) {
+  return (rec.inputTokens || 0) + (rec.totalOutputTokens || 0) +
+    (rec.cacheReadTokens || 0) + (rec.cacheCreationTokens || 0);
+}
+
+/** Keep the richest payload, borrowing the loser's clock and model name. */
+function richerUsageRecord(a, b) {
+  const [rich, poor] = usageScore(b) > usageScore(a) ? [b, a] : [a, b];
+  return {
+    ...rich,
+    timestamp: rich.timestamp ?? poor.timestamp ?? null,
+    displayName: rich.displayName || poor.displayName || '',
+    responseModel: rich.responseModel || poor.responseModel || '',
+  };
+}
+
+/**
+ * Merge one cascade's usage records from the two tables that can carry them.
+ *
+ * Older stores write every call into `gen_metadata`; newer builds keep the live
+ * usage on the *step* instead, so a cascade can have a moving step stream and no
+ * generator usage at all — the shape where this parser used to go silently
+ * empty while its session timing kept advancing. Both carriers name a call by
+ * the provider's response id and, on some builds, by message ids only, so two
+ * records are linked by *any* shared identity and the richest payload wins;
+ * counting both would double-bill every turn that both tables saw.
+ *
+ * A step record with no identity at all can only be proven new when the cascade
+ * has no generator usage for it to duplicate; next to generator usage it is
+ * dropped rather than risk the same turn twice.
+ */
+function mergeCascadeUsage(genRecords, stepRows) {
+  const groups = new Set();
+  const byIdentity = new Map();
+
+  const merge = (record) => {
+    const keys = usageIdentityKeys(record);
+    const hits = new Set();
+    for (const key of keys) {
+      const group = byIdentity.get(key);
+      if (group) hits.add(group);
+    }
+    let target;
+    if (hits.size === 0) {
+      target = { rec: record, keys: new Set() };
+      groups.add(target);
+    } else {
+      target = hits.values().next().value;
+      for (const other of hits) {
+        if (other === target) continue;
+        target.rec = richerUsageRecord(target.rec, other.rec);
+        for (const key of other.keys) {
+          byIdentity.set(key, target);
+          target.keys.add(key);
+        }
+        groups.delete(other);
+      }
+      target.rec = richerUsageRecord(target.rec, record);
+    }
+    for (const key of keys) {
+      byIdentity.set(key, target);
+      target.keys.add(key);
+    }
+  };
+
+  for (const rec of genRecords) {
+    merge(rec);
+    // Retry entries repeat the call they belong to (same response id), so they
+    // collapse into it; a genuine extra attempt keeps its own id and counts.
+    for (const retry of rec.retryUsages || []) merge({ ...retry, timestamp: rec.timestamp });
+  }
+  const stepUsageStandsAlone = genRecords.length === 0;
+  for (const row of stepRows.usages) {
+    for (const usage of [row.usage, ...row.retryUsages]) {
+      if (!hasTokenUsage(usage)) continue;
+      if (!stepUsageStandsAlone && usageIdentityKeys(usage).length === 0) continue;
+      merge({
+        ...usage,
+        timestamp: row.timestamp,
+        displayName: '',
+        responseModel: '',
+        modelName: row.modelName,
+      });
+    }
+  }
+
+  // Records merged in first-seen order; resolve each model, carrying the
+  // cascade's last named model onto records that only carry an id.
+  let carriedModel = '';
+  return [...groups].map((group) => {
+    const model = modelFromRecord(group.rec);
+    if (model !== 'unknown') carriedModel = model;
+    return { ...group.rec, model: model === 'unknown' ? carriedModel || 'unknown' : model };
+  });
 }
 
 export async function parse({ extraRoots = [] } = {}) {
@@ -396,11 +535,13 @@ export async function parse({ extraRoots = [] } = {}) {
     if (selected && selected.dir !== dir) continue;
     try {
       const options = { strict };
-      const records = readDbUsageRecords(dir, cascadeId, options);
+      // One steps scan feeds all of it: the usage newer builds keep on the step
+      // (which `gen_metadata` no longer carries), the idx → clock fallback for
+      // generator rows that lost their own timestamp, and session events.
+      const stepRows = readDbStepRows(dir, cascadeId, options);
+      const genRecords = readDbUsageRecords(dir, cascadeId, options);
       const project = projectFromUri(readDbWorkspaceUri(dir, cascadeId)) || 'unknown';
-      const stepTimestampsByIdx = records.some((rec) => !rec.timestamp || isNaN(rec.timestamp.getTime()))
-        ? readDbStepTimestamps(dir, cascadeId, options)
-        : new Map();
+      const records = mergeCascadeUsage(genRecords, stepRows);
 
       if (records.length > 0) {
         dbHandled.add(cascadeId);
@@ -408,25 +549,30 @@ export async function parse({ extraRoots = [] } = {}) {
           if (rec.responseId && seenResponseIds.has(rec.responseId)) continue;
           if (rec.responseId) seenResponseIds.add(rec.responseId);
           // Gemini 3.7 CLI blobs dropped chatStartMetadata.createdAt (9.4.1)
-          // and modelDisplayName (21). Usage is still in field 4; clock is
-          // recovered from steps.metadata at the same idx.
-          const timestamp = resolveUsageTimestamp(rec, stepTimestampsByIdx);
+          // and modelDisplayName (21); newer stores drop generator usage
+          // altogether and keep it on the step. Either way the clock comes from
+          // the record itself or from steps.metadata at the same idx.
+          const timestamp = resolveUsageTimestamp(rec, stepRows.timestamps);
           if (!timestamp || isNaN(timestamp.getTime())) continue;
           entries.push({
             source: SOURCE,
-            model: modelFromRecord(rec),
+            model: rec.model,
             project,
             timestamp,
             inputTokens: toSafeNumber(rec.inputTokens),
             outputTokens: toSafeNumber(rec.outputTokens),
             cachedInputTokens: toSafeNumber(rec.cacheReadTokens),
+            // The store carries one untyped cache-write count; an unexplained
+            // total belongs in the cheaper 5m tier (see the cache-write rule in
+            // AGENTS.md).
+            cacheCreation5mTokens: toSafeNumber(rec.cacheCreationTokens),
             reasoningOutputTokens: toSafeNumber(rec.thinkingOutputTokens),
           });
         }
       }
 
-      // Session timing from steps (independent of token usage presence).
-      for (const ev of readDbSessionEvents(dir, cascadeId, options)) {
+      // Session timing from the same steps scan (independent of token usage).
+      for (const ev of stepRows.events) {
         sessionEvents.push({
           sessionId: cascadeId,
           source: SOURCE,
@@ -497,15 +643,22 @@ export async function parse({ extraRoots = [] } = {}) {
             const responseId = usage.responseId || '';
             if (responseId && seenResponseIds.has(responseId)) continue;
             if (responseId) seenResponseIds.add(responseId);
+            // The language server serializes the same GeneratorMetadata
+            // protobuf the .db rows carry, where `outputTokens` (field 3) is
+            // the total and thinking is one part of it — billed at the same
+            // output rate, but only once.
+            const totalOutputTokens = toSafeNumber(usage.outputTokens);
+            const thinkingOutputTokens = toSafeNumber(usage.thinkingOutputTokens);
+            const outputTokens = Math.max(0, totalOutputTokens - thinkingOutputTokens);
             entries.push({
               source: SOURCE,
               model,
               project,
               timestamp: ts,
               inputTokens: toSafeNumber(usage.inputTokens),
-              outputTokens: toSafeNumber(usage.outputTokens),
+              outputTokens,
               cachedInputTokens: toSafeNumber(usage.cacheReadTokens),
-              reasoningOutputTokens: toSafeNumber(usage.thinkingOutputTokens),
+              reasoningOutputTokens: Math.max(thinkingOutputTokens, totalOutputTokens - outputTokens),
             });
           }
         }

@@ -105,7 +105,73 @@ function firstMessage(fields, num) {
   return b ? decodeMessage(b) : undefined;
 }
 
-// ── GeneratorMetadata parsing ─────────────────────────────────────────
+// ── Usage message decoding ────────────────────────────────────────────
+
+/**
+ * Decode one ModelUsage message. The identical wire shape appears in three
+ * carriers — `gen_metadata` chatModel.usage (1.4), that message's per-attempt
+ * retry entries (1.17.2), and `steps.metadata` usage (9) with its retries
+ * (28.2) — so every carrier shares this decoder:
+ *
+ *   modelId           = 1
+ *   inputTokens       = 2
+ *   totalOutputTokens = 3   (visible + thinking)
+ *   cacheCreation     = 4
+ *   cacheReadTokens   = 5
+ *   provider          = 6
+ *   messageId         = 7
+ *   thinkingOutput    = 9
+ *   visibleOutput     = 10
+ *   responseId        = 11
+ *   providerMessageId = 12
+ *
+ * Field 3 is the *total* output: verified on a live store where 3 = 9 + 10 on
+ * every usage row. The bucket schema bills output + reasoning at the output
+ * rate, so thinking must leave `outputTokens` here — leaving it inside counts
+ * every thinking token a second time in 总 Token and once more in cost.
+ */
+function parseUsageMessage(usage) {
+  const inputTokens = firstVarint(usage, 2) || 0;
+  const totalOutputTokens = firstVarint(usage, 3) || 0;
+  const cacheCreationTokens = firstVarint(usage, 4) || 0;
+  const cacheReadTokens = firstVarint(usage, 5) || 0;
+  const thinkingOutputTokens = firstVarint(usage, 9) || 0;
+  const visibleOutputTokens = firstVarint(usage, 10);
+  const outputTokens = visibleOutputTokens === undefined
+    ? Math.max(0, totalOutputTokens - thinkingOutputTokens)
+    : Math.min(visibleOutputTokens, totalOutputTokens);
+  return {
+    modelId: firstVarint(usage, 1) || 0,
+    inputTokens,
+    outputTokens,
+    cacheCreationTokens,
+    cacheReadTokens,
+    // Older blobs omit the visible/reasoning split; the remainder after the
+    // visible part is thinking, and vice versa, so the two always sum to 3.
+    thinkingOutputTokens: Math.max(thinkingOutputTokens, totalOutputTokens - outputTokens),
+    messageId: firstString(usage, 7) || '',
+    responseId: firstString(usage, 11) || '',
+    providerMessageId: firstString(usage, 12) || '',
+    totalOutputTokens,
+  };
+}
+
+/** True when a decoded usage message carries any real token count. */
+export function hasTokenUsage(usage) {
+  return Boolean(usage && (usage.inputTokens || usage.totalOutputTokens ||
+    usage.cacheCreationTokens || usage.cacheReadTokens || usage.thinkingOutputTokens));
+}
+
+/** Decode the usage of every retry entry carried at `fieldNumber` (2 = usage). */
+function parseRetryUsages(fields, fieldNumber) {
+  const out = [];
+  for (const entry of fields.get(fieldNumber) || []) {
+    if (entry.wireType !== 2) continue;
+    const usage = firstMessage(decodeMessage(entry.value), 2);
+    if (usage) out.push(parseUsageMessage(usage));
+  }
+  return out;
+}
 
 /**
  * Parse one gen_metadata blob into a normalized usage record, or null if it
@@ -113,7 +179,8 @@ function firstMessage(fields, num) {
  *
  * @param {Buffer} buf raw protobuf bytes of a GeneratorMetadata row
  * @returns {{inputTokens, outputTokens, cacheReadTokens, thinkingOutputTokens,
- *            responseId, timestamp: Date|null, displayName, responseModel}|null}
+ *            responseId, timestamp: Date|null, displayName, responseModel,
+ *            retryUsages}|null}
  */
 export function parseGenMetadataBlob(buf) {
   const chatModel = firstMessage(decodeMessage(buf), 1);
@@ -122,49 +189,73 @@ export function parseGenMetadataBlob(buf) {
   const usage = firstMessage(chatModel, 4);
   if (!usage) return null;
 
-  const inputTokens = firstVarint(usage, 2) || 0;
-  const outputTokens = firstVarint(usage, 3) || 0;
-  const cacheReadTokens = firstVarint(usage, 5) || 0;
-  const thinkingOutputTokens = firstVarint(usage, 9) || 0;
-  const responseId = firstString(usage, 11) || '';
-
-  // Skip rows with no real usage (errors, planning-only steps).
-  if (!inputTokens && !outputTokens && !cacheReadTokens && !thinkingOutputTokens) {
-    return null;
-  }
+  const parsed = parseUsageMessage(usage);
+  if (!hasTokenUsage(parsed)) return null;
 
   const chatStartMetadata = firstMessage(chatModel, 9);
   const createdAt = chatStartMetadata ? firstMessage(chatStartMetadata, 4) : undefined;
   const seconds = createdAt ? firstVarint(createdAt, 1) : undefined;
-  const timestamp = seconds ? new Date(seconds * 1000) : null;
 
   return {
-    inputTokens,
-    outputTokens,
-    cacheReadTokens,
-    thinkingOutputTokens,
-    responseId,
-    timestamp,
+    ...parsed,
+    timestamp: seconds ? new Date(seconds * 1000) : null,
     displayName: firstString(chatModel, 21) || '',
     responseModel: firstString(chatModel, 19) || '',
+    retryUsages: parseRetryUsages(chatModel, 17),
   };
 }
 
 /**
- * Extract createdAt seconds from a steps.metadata blob, regardless of step
- * source. Gemini 3.7 CLI gen_metadata blobs no longer carry chatStartMetadata
- * (field 9.4); the step timestamp at field 1.1 is the remaining clock.
+ * Decode the usage a `steps.metadata` blob carries itself. Newer Antigravity
+ * builds stop writing usage into `gen_metadata` while the step keeps it (field
+ * 9), so a store can have a live step stream with no generator usage at all —
+ * the exact shape where the parser used to go silently empty.
+ *
+ * @returns {{usage, retryUsages, modelName, modelId}} usage/entries may be null
+ */
+function decodeStepUsage(meta) {
+  const usage = firstMessage(meta, 9);
+  const modelInfo = firstMessage(meta, 24);
+  return {
+    usage: usage ? parseUsageMessage(usage) : null,
+    retryUsages: parseRetryUsages(meta, 28),
+    modelName: modelInfo ? (firstString(modelInfo, 12) || firstString(modelInfo, 8) || '') : '',
+    modelId: modelInfo ? (firstVarint(modelInfo, 1) || 0) : 0,
+  };
+}
+
+/** Parse one steps.metadata blob's own usage record (field 9 + retries). */
+export function parseStepUsageBlob(buf) {
+  return decodeStepUsage(decodeMessage(buf));
+}
+
+/**
+ * Extract a step's own clock, regardless of step source. Field 1.1 is the
+ * createdAt this parser has always used (Gemini 3.7 CLI gen_metadata blobs no
+ * longer carry chatStartMetadata, so the step is the remaining clock); field 8
+ * carries a completion timestamp on some builds and only fills in when 1.1 is
+ * absent, so every timestamp that resolved before keeps its exact second.
+ */
+function stepTimestamp(meta) {
+  let seconds;
+  for (const fieldNumber of [1, 8]) {
+    const message = firstMessage(meta, fieldNumber);
+    seconds = message ? firstVarint(message, 1) : undefined;
+    if (seconds) break;
+  }
+  if (!seconds) return null;
+  const timestamp = new Date(seconds * 1000);
+  return Number.isNaN(timestamp.getTime()) ? null : timestamp;
+}
+
+/**
+ * Extract a steps.metadata blob's own timestamp (see {@link stepTimestamp}).
  *
  * @param {Buffer} buf
  * @returns {Date|null}
  */
 export function parseStepTimestamp(buf) {
-  const meta = decodeMessage(buf);
-  const createdAt = firstMessage(meta, 1);
-  const seconds = createdAt ? firstVarint(createdAt, 1) : undefined;
-  if (!seconds) return null;
-  const timestamp = new Date(seconds * 1000);
-  return Number.isNaN(timestamp.getTime()) ? null : timestamp;
+  return stepTimestamp(decodeMessage(buf));
 }
 
 /**
@@ -244,11 +335,24 @@ export function readDbUsageRecords(conversationsDir, cascadeId, { strict = false
 }
 
 /**
- * Map steps.idx → createdAt for every step that has a timestamp, including
- * system/tool steps that parseStepMetadata skips. Used to timestamp 3.7
- * gen_metadata rows that no longer embed chatStartMetadata.
+ * Read every `steps` row in one pass and derive everything the parser needs
+ * from that same scan:
+ *
+ *  - `usages` — the usage each step carries itself (field 9, plus the field 28
+ *    retry entries). Newer Antigravity builds keep the live usage here instead
+ *    of `gen_metadata`, so a store whose generator rows carry no usage still
+ *    has its tokens on the step.
+ *  - `timestamps` — idx → clock for every step that has one, including the
+ *    system/tool steps that produce no event. Used to timestamp gen_metadata
+ *    rows that no longer embed chatStartMetadata.
+ *  - `events` — user/assistant turns, chronological by idx, for session timing.
+ *
+ * Step source enum in steps.metadata field 3 (behavior-verified against payload
+ * contents, since it mirrors the RPC's CORTEX_STEP_SOURCE_*): 4 = user turn,
+ * 2 = model turn. Everything else (system, tool, unspecified) contributes a
+ * timestamp and nothing else.
  */
-export function readDbStepTimestamps(conversationsDir, cascadeId, { strict = false } = {}) {
+export function readDbStepRows(conversationsDir, cascadeId, { strict = false } = {}) {
   let rows;
   try {
     rows = queryCascadeDb(
@@ -258,22 +362,41 @@ export function readDbStepTimestamps(conversationsDir, cascadeId, { strict = fal
     );
   } catch (err) {
     if (isSqliteUnavailableError(err) || strict) throw err;
-    return new Map();
+    return { usages: [], timestamps: new Map(), events: [] };
   }
-  const byIdx = new Map();
+  const usages = [];
+  const timestamps = new Map();
+  const events = [];
   for (const row of rows) {
     if (!row.h) continue;
-    let ts;
+    let meta;
     try {
-      ts = parseStepTimestamp(Buffer.from(row.h, 'hex'));
+      meta = decodeMessage(Buffer.from(row.h, 'hex'));
     } catch {
-      continue;
+      continue; // one malformed blob must not kill the rest
     }
-    if (!ts) continue;
     const idx = Number(row.idx);
-    if (Number.isFinite(idx)) byIdx.set(idx, ts);
+    const timestamp = stepTimestamp(meta);
+    if (timestamp && Number.isFinite(idx)) timestamps.set(idx, timestamp);
+
+    const source = firstVarint(meta, 3);
+    const role = source === STEP_SOURCE_USER
+      ? 'user'
+      : source === STEP_SOURCE_MODEL ? 'assistant' : null;
+    if (role && timestamp) events.push({ role, timestamp });
+
+    const stepUsage = decodeStepUsage(meta);
+    if (!stepUsage.usage && stepUsage.retryUsages.length === 0) continue;
+    usages.push({
+      idx: Number.isFinite(idx) ? idx : null,
+      timestamp,
+      modelName: stepUsage.modelName,
+      modelId: stepUsage.modelId,
+      usage: stepUsage.usage,
+      retryUsages: stepUsage.retryUsages,
+    });
   }
-  return byIdx;
+  return { usages, timestamps, events };
 }
 
 /**
@@ -304,56 +427,3 @@ export function readDbWorkspaceUri(conversationsDir, cascadeId) {
 // 2 = model turn. Everything else (system, tool, unspecified) is skipped.
 const STEP_SOURCE_USER = 4;
 const STEP_SOURCE_MODEL = 2;
-
-/**
- * Parse one steps.metadata blob into a session-timing event, or null if the
- * step is neither a user nor a model turn (system/tool/unspecified). createdAt
- * is a Timestamp at field 1 (seconds at 1.1); source enum is field 3.
- *
- * @param {Buffer} buf
- * @returns {{role:'user'|'assistant', timestamp: Date}|null}
- */
-export function parseStepMetadata(buf) {
-  const meta = decodeMessage(buf);
-  const source = firstVarint(meta, 3);
-  let role;
-  if (source === STEP_SOURCE_USER) role = 'user';
-  else if (source === STEP_SOURCE_MODEL) role = 'assistant';
-  else return null;
-
-  const createdAt = firstMessage(meta, 1);
-  const seconds = createdAt ? firstVarint(createdAt, 1) : undefined;
-  if (!seconds) return null;
-
-  return { role, timestamp: new Date(seconds * 1000) };
-}
-
-/**
- * Read session timing events (user/assistant turns) for a cascade from the
- * steps table, chronological by idx.
- */
-export function readDbSessionEvents(conversationsDir, cascadeId, { strict = false } = {}) {
-  let rows;
-  try {
-    rows = queryCascadeDb(
-      conversationsDir,
-      cascadeId,
-      'SELECT hex(metadata) AS h FROM steps WHERE metadata IS NOT NULL ORDER BY idx',
-    );
-  } catch (err) {
-    if (isSqliteUnavailableError(err) || strict) throw err;
-    return [];
-  }
-  const events = [];
-  for (const row of rows) {
-    if (!row.h) continue;
-    let ev;
-    try {
-      ev = parseStepMetadata(Buffer.from(row.h, 'hex'));
-    } catch {
-      continue;
-    }
-    if (ev) events.push(ev);
-  }
-  return events;
-}
