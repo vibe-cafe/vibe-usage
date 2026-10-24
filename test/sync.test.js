@@ -676,3 +676,104 @@ test('dropped unknown sources leave bucket and session state uncommitted', async
     rmSync(root, { recursive: true, force: true });
   }
 });
+
+// A bucket the backend dropped for a reason it did not attribute to a key
+// (unknown model / implausible value) must stay uncommitted too, so the next
+// sync retries it instead of the usage disappearing for good.
+test('dropped buckets without a key stay uncommitted and are retried', async () => {
+  const root = mkdtempSync(join(tmpdir(), 'vibe-usage-dropped-key-'));
+  const configDir = join(root, 'config');
+  const stateDir = join(root, 'state');
+  const homeDir = join(root, 'home');
+  mkdirSync(configDir, { recursive: true });
+  mkdirSync(homeDir, { recursive: true });
+
+  const received = [];
+  let dropUnknownModel = true;
+  try {
+    await withServer((req, res) => {
+      if (req.method === 'GET' && req.url === '/api/usage/settings') {
+        res.writeHead(200, { 'content-type': 'application/json' });
+        res.end(JSON.stringify({ uploadProject: true }));
+        return;
+      }
+      if (req.method === 'POST' && req.url === '/api/usage/ingest') {
+        const chunks = [];
+        req.on('data', chunk => chunks.push(chunk));
+        req.on('end', () => {
+          const body = req.headers['content-encoding'] === 'gzip'
+            ? gunzipSync(Buffer.concat(chunks))
+            : Buffer.concat(chunks);
+          const payload = JSON.parse(body.toString('utf8'));
+          received.push(payload.buckets.length);
+          res.writeHead(200, { 'content-type': 'application/json' });
+          res.end(JSON.stringify(dropUnknownModel
+            ? {
+                ingested: 0,
+                sessions: 0,
+                dropped: {
+                  buckets: payload.buckets.length,
+                  unknownModels: payload.buckets.length,
+                },
+              }
+            : {
+                ingested: payload.buckets.length,
+                sessions: payload.sessions?.length || 0,
+              }));
+        });
+        return;
+      }
+      res.writeHead(404).end();
+    }, async apiUrl => {
+      writeFileSync(join(configDir, 'config.json'), JSON.stringify({
+        apiKey: 'vbu_dropped_key_test',
+        apiUrl,
+        hostname: 'dropped-key-test',
+      }));
+      const env = {
+        ...process.env,
+        HOME: homeDir,
+        VIBE_USAGE_DEV: '0',
+        VIBE_USAGE_CONFIG_DIR: configDir,
+        VIBE_USAGE_STATE_DIR: stateDir,
+      };
+      const command = `
+        import { parsers } from './src/parsers/index.js';
+        for (const source of Object.keys(parsers)) delete parsers[source];
+        parsers['devin'] = async () => ({
+          buckets: [{
+            source: 'devin', model: 'swe-2-high', project: 'project',
+            bucketStart: '2026-09-16T00:00:00.000Z',
+            inputTokens: 1, outputTokens: 2,
+            cachedInputTokens: 0, reasoningOutputTokens: 0, totalTokens: 3,
+          }],
+          sessions: [],
+        });
+        const { runSync } = await import('./src/sync.js');
+        await runSync({ throws: true, quiet: true });
+      `;
+
+      // First sync: the backend drops the bucket for an unknown model. The
+      // hash must not be committed, or the bucket would never be sent again.
+      await execFileAsync(process.execPath, ['--input-type=module', '-e', command], {
+        cwd: process.cwd(), env,
+      });
+      const droppedState = existsSync(join(stateDir, 'state.json'))
+        ? JSON.parse(readFileSync(join(stateDir, 'state.json'), 'utf8'))
+        : {};
+      assert.equal(Object.keys(droppedState.buckets || {}).length, 0);
+
+      // The backend learns the model: the next sync re-sends and commits.
+      dropUnknownModel = false;
+      await execFileAsync(process.execPath, ['--input-type=module', '-e', command], {
+        cwd: process.cwd(), env,
+      });
+      const committedState = JSON.parse(readFileSync(join(stateDir, 'state.json'), 'utf8'));
+      assert.equal(Object.keys(committedState.buckets).length, 1);
+    });
+
+    assert.deepEqual(received, [1, 1]);
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+});

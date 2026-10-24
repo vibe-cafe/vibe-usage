@@ -1,4 +1,5 @@
 import { existsSync } from 'node:fs';
+import { createHash } from 'node:crypto';
 import { projectFromPath } from './fs-utils.js';
 import { aggregateToBuckets } from './aggregate.js';
 import {
@@ -25,6 +26,11 @@ const TOKEN_COLUMNS = [
   'cache_write_tokens',
 ];
 
+// `turn_id` groups the token rows of one assistant turn (a single user prompt
+// can drive several model calls). It is optional: a store without the column
+// still parses, and each token row then counts as its own turn.
+const OPTIONAL_TOKEN_COLUMNS = ['turn_id'];
+
 // `local_runtime_sessions` carries both `workspace_dir` (per-session scratch
 // dir, always present) and `project_workspace_dir` (the project root when one
 // is known). We pick the project column first, then the workspace, then
@@ -34,15 +40,20 @@ const SESSION_COLUMNS = ['session_id', 'workspace_dir', 'project_workspace_dir']
 // Keep token rows and their project metadata in one SQLite statement. Separate
 // reads can observe different WAL snapshots while mcode is writing, causing a
 // token row to be uploaded once as "unknown" and again under its real project.
-const USAGE_SQL = `
+function usageSql(includeTurnId) {
+  const columns = includeTurnId
+    ? [...TOKEN_COLUMNS, ...OPTIONAL_TOKEN_COLUMNS]
+    : TOKEN_COLUMNS;
+  return `
   SELECT
-    ${TOKEN_COLUMNS.map(column => `token.${column}`).join(', ')},
+    ${columns.map(column => `token.${column}`).join(', ')},
     session.workspace_dir,
     session.project_workspace_dir
   FROM local_runtime_token_usage AS token
   LEFT JOIN local_runtime_sessions AS session
     ON session.session_id = token.session_id
 `;
+}
 
 /**
  * Resolve the mcode runtime-state SQLite database. Mirrors the precedence used
@@ -109,10 +120,15 @@ export async function parse() {
 
   const entries = [];
   const warnings = [];
+  // Per-session usage stats, so mcode reports sessions like every other
+  // source instead of leaving the dashboard without an active-duration column.
+  const sessionStats = new Map();
   // mcode's own migration can COPY a relocated legacy tree into ~/.minimax, so
   // both copies exist. Collapse rows that reappear unchanged in a later store;
   // duplicates inside one store are left alone — there they are the ledger.
   const seenAcrossStores = new Set();
+  // The same session can live in more than one store; the first store wins.
+  const seenSessions = new Set();
 
   for (const dbPath of dbPaths) {
     if (!existsSync(dbPath)) continue;
@@ -122,10 +138,15 @@ export async function parse() {
     // runtime ever renames / drops a column, fail soft (skipped) so the
     // incremental sync keeps the last good upload state for this source.
     let schemaOk;
+    let hasTurnId = false;
     try {
       schemaOk =
         dbHasColumns(dbPath, 'local_runtime_token_usage', TOKEN_COLUMNS) &&
         dbHasColumns(dbPath, 'local_runtime_sessions', SESSION_COLUMNS);
+      // Optional column: a store without `turn_id` still parses, each token
+      // row then counts as its own turn.
+      hasTurnId = schemaOk &&
+        dbHasColumns(dbPath, 'local_runtime_token_usage', OPTIONAL_TOKEN_COLUMNS);
     } catch (err) {
       if (isSqliteUnavailableError(err)) throw sqliteUnavailableError('mcode');
       schemaOk = false;
@@ -139,7 +160,7 @@ export async function parse() {
     // Read tokens and session project metadata from one statement/snapshot.
     let usageRows;
     try {
-      usageRows = queryDbJsonSnapshotOnLock(dbPath, USAGE_SQL, {
+      usageRows = queryDbJsonSnapshotOnLock(dbPath, usageSql(hasTurnId), {
         tempPrefix: 'vibe-usage-mcode',
       });
     } catch (err) {
@@ -150,6 +171,7 @@ export async function parse() {
     }
 
     const identitiesInStore = new Set();
+    const storeSessionIds = new Set();
     for (const row of usageRows) {
       // Identity covers every selected column; only a byte-identical ledger
       // row can collapse, and only against an earlier store.
@@ -159,6 +181,7 @@ export async function parse() {
 
       const sessionId = row.session_id != null ? String(row.session_id) : '';
       if (!sessionId) continue;
+      storeSessionIds.add(sessionId);
       const ts = tsToDate(row.ts);
       if (!ts) continue;
 
@@ -202,15 +225,100 @@ export async function parse() {
         cachedInputTokens,
         reasoningOutputTokens,
       });
+
+      accumulateSessionStat(sessionStats, {
+        sessionId,
+        project,
+        timestamp: ts,
+        turnId: hasTurnId && row.turn_id != null ? String(row.turn_id) : null,
+      });
     }
     for (const identity of identitiesInStore) seenAcrossStores.add(identity);
+
+    // The same session can live in more than one store; the first store wins.
+    for (const sessionId of storeSessionIds) {
+      if (seenSessions.has(sessionId)) sessionStats.delete(sessionId);
+      else seenSessions.add(sessionId);
+    }
   }
 
   return {
     buckets: aggregateToBuckets(entries),
-    sessions: [],
+    sessions: buildSessions(sessionStats),
     ...(warnings.length > 0 ? { warnings } : {}),
   };
+}
+
+/**
+ * Fold one token row into the per-session stats.
+ *
+ * The token ledger is the only mcode data the privacy allow-list lets us read,
+ * so a session is reconstructed from its usage rows: the first and last row
+ * bound the wall clock, and every row of one `turn_id` belongs to the same
+ * assistant turn (one user prompt can drive several model calls).
+ */
+function accumulateSessionStat(sessionStats, row) {
+  const { sessionId, project, timestamp, turnId } = row;
+
+  let stat = sessionStats.get(sessionId);
+  if (!stat) {
+    stat = {
+      project,
+      first: timestamp,
+      last: timestamp,
+      messageCount: 0,
+      turns: new Map(),
+    };
+    sessionStats.set(sessionId, stat);
+  }
+  if (timestamp < stat.first) stat.first = timestamp;
+  if (timestamp > stat.last) stat.last = timestamp;
+  stat.messageCount += 1;
+
+  // Without a turn id each row is its own turn.
+  const key = turnId ?? `#${stat.messageCount}`;
+  const turn = stat.turns.get(key);
+  if (!turn) {
+    stat.turns.set(key, { first: timestamp, last: timestamp });
+    return;
+  }
+  if (timestamp < turn.first) turn.first = timestamp;
+  if (timestamp > turn.last) turn.last = timestamp;
+}
+
+/**
+ * Build the session records from the per-session stats.
+ *
+ * `activeSeconds` is the sum of the assistant turns' spans: the time between
+ * the first and the last model call of a turn. The gap between two turns is
+ * the user thinking / typing, which is not active time. The token ledger has
+ * no user messages, so `userMessageCount` stays 0 and the prompt hours stay
+ * empty — same shape as the codex parser, whose usage data is equally
+ * user-message-free.
+ */
+function buildSessions(sessionStats) {
+  const sessions = [];
+  for (const [sessionId, stat] of sessionStats) {
+    let activeSeconds = 0;
+    for (const turn of stat.turns.values()) {
+      if (turn.last > turn.first) {
+        activeSeconds += Math.round((turn.last - turn.first) / 1000);
+      }
+    }
+    sessions.push({
+      source: SOURCE,
+      project: stat.project || 'unknown',
+      sessionHash: createHash('sha256').update(sessionId).digest('hex').slice(0, 16),
+      firstMessageAt: stat.first.toISOString(),
+      lastMessageAt: stat.last.toISOString(),
+      durationSeconds: Math.round((stat.last - stat.first) / 1000),
+      activeSeconds,
+      messageCount: stat.messageCount,
+      userMessageCount: 0,
+      userPromptHours: new Array(24).fill(0),
+    });
+  }
+  return sessions;
 }
 
 // Re-export for tests / external consumers.

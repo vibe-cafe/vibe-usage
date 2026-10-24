@@ -1,5 +1,6 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
+import { createHash } from 'node:crypto';
 import { execFileSync } from 'node:child_process';
 import { mkdirSync, mkdtempSync, rmSync, symlinkSync } from 'node:fs';
 import { tmpdir } from 'node:os';
@@ -55,8 +56,12 @@ function value(v) {
   if (v === null || v === undefined) return 'NULL';
   return typeof v === 'string' ? sql(v) : String(v);
 }
-function token(session, ts, input, output, reasoning, read, write, model = 'mcode-model') {
-  return `INSERT INTO local_runtime_token_usage VALUES (NULL,${sql(session)},'agent','pi','turn',${sql(model)},${value(ts)},${value(input)},${value(output)},${value(reasoning)},${value(read)},${value(write)},0,NULL);`;
+function token(session, ts, input, output, reasoning, read, write, model = 'mcode-model', turn = 'turn') {
+  return `INSERT INTO local_runtime_token_usage VALUES (NULL,${sql(session)},'agent','pi',${sql(turn)},${sql(model)},${value(ts)},${value(input)},${value(output)},${value(reasoning)},${value(read)},${value(write)},0,NULL);`;
+}
+
+function sessionHash(sessionId) {
+  return createHash('sha256').update(sessionId).digest('hex').slice(0, 16);
 }
 
 async function withDb(path, fn) {
@@ -170,7 +175,16 @@ test('mcode aggregates milliseconds, basename, cache and separate reasoning', as
     assert.equal(bucket.outputTokens, 13);
     assert.equal(bucket.reasoningOutputTokens, 3);
     assert.equal(bucket.totalTokens, 33);
-    assert.deepEqual(result.sessions, []);
+    // mcode now reports the session its token rows belong to.
+    assert.equal(result.sessions.length, 1);
+    const session = result.sessions[0];
+    assert.equal(session.source, 'mcode');
+    assert.equal(session.project, 'project-a');
+    assert.equal(session.messageCount, 2);
+    assert.equal(session.userMessageCount, 0);
+    assert.equal(session.durationSeconds, 8);
+    // Both rows share one turn id, so the whole span is active time.
+    assert.equal(session.activeSeconds, 8);
   } finally { rmSync(db.root, { recursive: true, force: true }); }
 });
 
@@ -231,4 +245,89 @@ test('mcode query contains only the approved columns', async () => {
   assert.doesNotMatch(source, /SELECT\s+\*/i);
   assert.doesNotMatch(source, /SELECT[^;]*(?:raw|data_json|record_json|extra_data_json)/is);
   assert.match(source, /LEFT JOIN local_runtime_sessions/);
+});
+
+test('mcode reports one session per session id, timed from its usage rows', async () => {
+  const db = await fixtureDb(
+    `${schema}` +
+      `INSERT INTO local_runtime_sessions VALUES ('s1','/work/alpha',NULL);` +
+      `INSERT INTO local_runtime_sessions VALUES ('s2','/work/beta','/projects/beta');` +
+      token('s1', 1787935277463, 10, 2, 0, 0, 0, 'mcode-model', 't1') +
+      token('s1', 1787935287463, 10, 2, 0, 0, 0, 'mcode-model', 't1') +
+      token('s1', 1787935907463, 10, 2, 0, 0, 0, 'mcode-model', 't2') +
+      token('s2', 1787935277463, 5, 1, 0, 0, 0),
+  );
+  try {
+    const result = await withDb(db.path, parse);
+    assert.equal(result.sessions.length, 2);
+
+    const s1 = result.sessions.find(s => s.sessionHash === sessionHash('s1'));
+    assert.ok(s1, 'session for s1');
+    assert.equal(s1.source, 'mcode');
+    assert.equal(s1.project, 'alpha');
+    assert.equal(s1.messageCount, 3);
+    // The token ledger carries no user messages.
+    assert.equal(s1.userMessageCount, 0);
+    assert.deepEqual(s1.userPromptHours, new Array(24).fill(0));
+    assert.equal(s1.firstMessageAt, new Date(1787935277463).toISOString());
+    assert.equal(s1.lastMessageAt, new Date(1787935907463).toISOString());
+    assert.equal(s1.durationSeconds, 630);
+    // Only turn t1 spans more than one row; t2 is a single row.
+    assert.equal(s1.activeSeconds, 10);
+
+    // The project column wins over the workspace scratch dir.
+    const s2 = result.sessions.find(s => s.sessionHash === sessionHash('s2'));
+    assert.equal(s2.project, 'beta');
+    assert.equal(s2.messageCount, 1);
+    assert.equal(s2.activeSeconds, 0);
+  } finally { rmSync(db.root, { recursive: true, force: true }); }
+});
+
+test('mcode keeps one session per session id across stores', async () => {
+  const home = mkdtempSync(join(tmpdir(), 'vibe-usage-mcode-sessions-'));
+  const rel = join('v2', 'sqlite', 'runtime-state.sqlite');
+  const primary = join(home, '.minimax', rel);
+  const legacy = join(home, '.minimax-code', rel);
+  const row = token('s1', 1787935277463, 10, 2, 0, 0, 0);
+  try {
+    await writeDb(primary, `${schema}INSERT INTO local_runtime_sessions VALUES ('s1','/work/alpha',NULL);${row}`);
+    // A pre-npm store keeps a copy of the same session.
+    await writeDb(
+      legacy,
+      `${schema}INSERT INTO local_runtime_sessions VALUES ('s1','/work/alpha',NULL);${row}`,
+    );
+
+    const result = parseInHome(home);
+    assert.equal(result.sessions.length, 1);
+    assert.equal(result.sessions[0].messageCount, 1);
+  } finally { rmSync(home, { recursive: true, force: true }); }
+});
+
+test('mcode still reports sessions when the store has no turn_id column', async () => {
+  const withoutTurn = `
+CREATE TABLE local_runtime_sessions (
+ session_id TEXT PRIMARY KEY, workspace_dir TEXT, project_workspace_dir TEXT
+);
+CREATE TABLE local_runtime_token_usage (
+ id INTEGER PRIMARY KEY, session_id TEXT, agent_name TEXT, framework_type TEXT,
+ model TEXT, ts INTEGER, input_tokens INTEGER, output_tokens INTEGER,
+ reasoning_tokens INTEGER, cache_read_tokens INTEGER, cache_write_tokens INTEGER,
+ cost_usd REAL, raw TEXT
+);
+`;
+  const db = await fixtureDb(
+    withoutTurn +
+      `INSERT INTO local_runtime_sessions VALUES ('s1','/work/alpha',NULL);` +
+      `INSERT INTO local_runtime_token_usage VALUES (NULL,'s1','agent','pi','mcode-model',1787935277463,10,2,0,0,0,0,NULL);` +
+      `INSERT INTO local_runtime_token_usage VALUES (NULL,'s1','agent','pi','mcode-model',1787935287463,10,2,0,0,0,0,NULL);`,
+  );
+  try {
+    const result = await withDb(db.path, parse);
+    assert.equal(result.buckets.length, 1);
+    assert.equal(result.sessions.length, 1);
+    assert.equal(result.sessions[0].messageCount, 2);
+    // Without a turn id every row is its own turn, so no span is active time.
+    assert.equal(result.sessions[0].activeSeconds, 0);
+    assert.equal(result.sessions[0].durationSeconds, 10);
+  } finally { rmSync(db.root, { recursive: true, force: true }); }
 });

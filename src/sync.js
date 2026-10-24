@@ -533,6 +533,14 @@ export async function runSync({
       totalIngested += result.ingested ?? batch.length;
       totalSessionsSynced += result.sessions ?? 0;
       const batchUnknownSources = new Set(result.dropped?.unknownSources || []);
+      // The backend counts the buckets it dropped for an unknown model or an
+      // implausible value, but it does not say which ones. `dropped.keys`,
+      // when the backend provides it, names the exact buckets; until then a
+      // batch with such a drop keeps its hashes uncommitted so the next sync
+      // retries it instead of burying that usage for good.
+      const batchDroppedKeys = new Set(result.dropped?.keys || []);
+      const batchUnattributedDrops = batchDroppedKeys.size === 0 &&
+        ((Number(result.dropped?.unknownModels) || 0) + (Number(result.dropped?.implausible) || 0));
       if (result.dropped) {
         totalDroppedBuckets += Number(result.dropped.buckets) || 0;
         totalDroppedUnknownModels += Number(result.dropped.unknownModels) || 0;
@@ -551,6 +559,13 @@ export async function runSync({
         // of turning a temporary release-order mismatch into permanent loss.
         if (batchUnknownSources.has(b.source)) continue;
         const key = bucketKey(b);
+        // Same rule for the buckets the backend dropped for a reason it did
+        // not attribute to a key (unknown model / implausible value): their
+        // hashes stay uncommitted, so the next sync retries them instead of
+        // losing that usage permanently. The backend upserts by key, so
+        // re-sending an accepted bucket is harmless.
+        if (batchDroppedKeys.has(key)) continue;
+        if (batchUnattributedDrops > 0) continue;
         const entry = pendingBucketState.get(key);
         if (entry) {
           state.buckets[key] = entry;
