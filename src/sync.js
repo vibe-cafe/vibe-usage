@@ -92,13 +92,20 @@ export function reaggregateHiddenProjectBuckets(buckets) {
  * newest event for the same reason.
  */
 export function applyParserInfos(state, parserInfos) {
-  if (!Array.isArray(parserInfos) || parserInfos.length === 0) return false;
-  if (!state.parserMeta || typeof state.parserMeta !== 'object') state.parserMeta = {};
-  let changed = false;
+  reportParserInfoChanges(state, parserInfos);
+  return recordParserInfos(state, parserInfos);
+}
 
+function usableInfo(info) {
+  return !!info && typeof info === 'object' && !Array.isArray(info);
+}
+
+/** Warn about meaningful changes against the recorded info; mutates nothing. */
+export function reportParserInfoChanges(state, parserInfos) {
+  if (!Array.isArray(parserInfos)) return;
   for (const { source, info } of parserInfos) {
-    if (!info || typeof info !== 'object' || Array.isArray(info)) continue;
-    const previous = state.parserMeta[source];
+    if (!usableInfo(info)) continue;
+    const previous = state.parserMeta?.[source];
     if (source === 'cursor') {
       const warnings = [];
       if (previous?.account && info.account && previous.account !== info.account) {
@@ -133,7 +140,27 @@ export function applyParserInfos(state, parserInfos) {
         process.stderr.write(`${dim(`  ${message}`)}\n`);
       }
     }
-    if (JSON.stringify(previous ?? null) !== JSON.stringify(info)) {
+  }
+}
+
+/**
+ * Write parser info into state.parserMeta; returns whether anything changed.
+ *
+ * Parser info is not only diagnostics: Cursor's events fallback asks only for
+ * events newer than the recorded `latestTokenAt`. runSync therefore calls this
+ * for a source only once every item that source changed in the run has been
+ * committed, in the same saveState() as the last of those hashes. Recording it
+ * earlier let any save -- the prune save before the upload, or another
+ * source's batch -- persist the new value, so a failed or killed upload made
+ * the retry skip exactly the events the server never received.
+ */
+export function recordParserInfos(state, parserInfos) {
+  if (!Array.isArray(parserInfos) || parserInfos.length === 0) return false;
+  if (!state.parserMeta || typeof state.parserMeta !== 'object') state.parserMeta = {};
+  let changed = false;
+  for (const { source, info } of parserInfos) {
+    if (!usableInfo(info)) continue;
+    if (JSON.stringify(state.parserMeta[source] ?? null) !== JSON.stringify(info)) {
       state.parserMeta[source] = info;
       changed = true;
     }
@@ -259,6 +286,10 @@ export async function runSync({
   // A sync may run as two passes (see below); these lines print once, and
   // the upload client (one syncId per runSync) is created once.
   let syncClient = null;
+  // What the server accepted so far in this runSync, across both passes. A
+  // pass that uploaded only sessions (e.g. Qoder CLI) counts as an upload too.
+  const uploadedSoFar = { buckets: 0, sessions: 0 };
+  const uploadedAnything = () => uploadedSoFar.buckets > 0 || uploadedSoFar.sessions > 0;
   let identityNoticeShown = false;
   let projectNoticeShown = false;
   const announceIdentityChange = () => {
@@ -332,15 +363,12 @@ export async function runSync({
   status.start(elapsedMs => `正在等待 ${pendingSources}${phaseElapsed(elapsedMs)}`);
   const lateOutcomes = await deferredOutcomes;
   status.stop();
-  return firstPassIngested + await syncOutcomes(lateOutcomes, {
-    final: true,
-    ingestedEarlier: firstPassIngested,
-  });
+  return firstPassIngested + await syncOutcomes(lateOutcomes);
 
   // One diff-and-upload pass over a set of parser outcomes. `final` is false
   // only for the first of two passes (see above): that pass stays quiet about
   // "no new data" and leaves the dashboard link to the last pass.
-  async function syncOutcomes(parserOutcomes, { final = true, ingestedEarlier = 0 } = {}) {
+  async function syncOutcomes(parserOutcomes, { final = true } = {}) {
     let allBuckets = [];
     const allSessions = [];
     const parserResults = [];
@@ -403,7 +431,7 @@ export async function runSync({
           console.log(dim(`  ${p.source}: 正在建立本地索引 ${p.completed}/${p.total}（下次同步继续）`));
         }
       } else if (!quiet && final) {
-        if (ingestedEarlier > 0) printDashboardLink();
+        if (uploadedAnything()) printDashboardLink();
         else console.log(dim('暂无新数据。'));
       }
       return 0;
@@ -456,7 +484,7 @@ export async function runSync({
     // Missing/corrupt state.json => empty maps => one-time full upload, then
     // incremental forever after.
     announceIdentityChange();
-    const metaChanged = applyParserInfos(state, parserInfos);
+    reportParserInfoChanges(state, parserInfos);
     let migration;
     try {
       migration = planKikiMigration(allBuckets, allSessions, state, config.kikiStartAt);
@@ -528,6 +556,37 @@ export async function runSync({
       pendingSessionState.set(key, h);
     }
 
+    // Parser info is written into state.parserMeta only once every item its
+    // source changed this run is committed (see recordParserInfos), and in the
+    // same save as the last of those hashes. "Committed" follows the hash rule
+    // below exactly: a 200 whose `dropped.unknownSources` names the source
+    // leaves its hashes -- and so its info -- uncommitted for a retry; items
+    // dropped for other reasons (unknown model, implausible) are committed
+    // like any accepted item, since resending cannot change the answer.
+    // Sources with nothing to send record their info right away.
+    const unsentBySource = new Map();
+    const noteUnsent = (id) => {
+      const source = id.slice(2, id.indexOf('|'));
+      if (!unsentBySource.has(source)) unsentBySource.set(source, new Set());
+      unsentBySource.get(source).add(id);
+    };
+    for (const key of pendingBucketState.keys()) noteUnsent(`b:${key}`);
+    for (const key of pendingSessionState.keys()) noteUnsent(`s:${key}`);
+    const heldInfos = new Map(parserInfos
+      .filter(({ source }) => unsentBySource.has(source))
+      .map(item => [item.source, item]));
+    const metaChanged = recordParserInfos(
+      state,
+      parserInfos.filter(({ source }) => !unsentBySource.has(source)),
+    );
+    const markCommitted = (id) => {
+      const source = id.slice(2, id.indexOf('|'));
+      const unsent = unsentBySource.get(source);
+      if (!unsent || !unsent.delete(id) || unsent.size > 0) return;
+      const held = heldInfos.get(source);
+      if (held) recordParserInfos(state, [held]);
+    };
+
 
     // Drop entries the parsers no longer emit (deleted logs) so state.json can't
     // grow forever. Done by liveness, never by age — an old bucket's hash never
@@ -544,7 +603,7 @@ export async function runSync({
 
     if (changedBuckets.length === 0 && changedSessions.length === 0) {
       if (!quiet && final) {
-        if (ingestedEarlier > 0) printDashboardLink();
+        if (uploadedAnything()) printDashboardLink();
         else console.log(dim('无新增数据。'));
       }
       return 0;
@@ -608,6 +667,8 @@ export async function runSync({
         uploadedBytes += batchBytes;
         totalIngested += result.ingested ?? batch.length;
         totalSessionsSynced += result.sessions ?? 0;
+        uploadedSoFar.buckets += result.ingested ?? batch.length;
+        uploadedSoFar.sessions += result.sessions ?? 0;
         const batchUnknownSources = new Set(result.dropped?.unknownSources || []);
         if (result.dropped) {
           totalDroppedBuckets += Number(result.dropped.buckets) || 0;
@@ -631,6 +692,7 @@ export async function runSync({
           if (entry) {
             state.buckets[key] = entry;
             batchStateChanged = true;
+            markCommitted(`b:${key}`);
           }
         }
         for (const s of batchSessions) {
@@ -643,6 +705,7 @@ export async function runSync({
           if (entry) {
             state.sessions[key] = entry;
             batchStateChanged = true;
+            markCommitted(`s:${key}`);
           }
         }
         if (batchStateChanged) saveState(state, identity);
@@ -690,11 +753,13 @@ export async function runSync({
         if (throws) throw err;
         process.exit(1);
       }
-      // Count the first pass too: when only the slow source's pass fails, the
-      // other tools did reach the server and the message must say so.
-      const ingestedSoFar = ingestedEarlier + totalIngested;
-      if (ingestedSoFar > 0) {
-        console.error(failure(`部分完成（已上传 ${ingestedSoFar} buckets）: ${err.message}`));
+      // Count everything this runSync already delivered, both passes, buckets
+      // and sessions: when only the slow source's pass fails, the other tools
+      // did reach the server and the message must say so.
+      if (uploadedAnything()) {
+        const parts = [`${uploadedSoFar.buckets} buckets`];
+        if (uploadedSoFar.sessions > 0) parts.push(`${uploadedSoFar.sessions} sessions`);
+        console.error(failure(`部分完成（已上传 ${parts.join(' · ')}）: ${err.message}`));
       } else {
         console.error(failure(`同步失败: ${err.message}`));
       }
