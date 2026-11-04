@@ -1,7 +1,7 @@
 import { existsSync } from 'node:fs';
 import { join, resolve } from 'node:path';
 import { homedir } from 'node:os';
-import { aggregateToBuckets } from './aggregate.js';
+import { aggregateToBuckets, roundToHalfHour } from './aggregate.js';
 import { queryDbJsonSnapshotOnLock, sqliteUnavailableError, isSqliteUnavailableError } from './sqlite.js';
 
 const STATE_DB_RELATIVE = join('User', 'globalStorage', 'state.vscdb');
@@ -683,16 +683,35 @@ export async function parse({ previousInfo } = {}) {
   }
 
   // The CSV parsed but contained no usable usage events. Try the dashboard's
-  // events API before treating the account as empty. Only look at events newer
-  // than the previous sync's newest event: the events API labels many older
-  // rows as model `default`, and re-adding known history under that name would
-  // double-count it as a second set of buckets. On a first run (no previous
-  // info) the fallback is bounded to the last seven days for the same reason.
+  // events API before treating the account as empty. Only events newer than
+  // the previous sync's newest event count as new usage: the events API labels
+  // many older rows as model `default`, and re-adding known history under that
+  // name would double-count it as a second set of buckets. On a first run (no
+  // previous info) the fallback is bounded to the last seven days for the same
+  // reason. Older events are only re-read to rebuild a window that gains a new
+  // event (below).
   const previousLatest = Date.parse(previousInfo?.latestTokenAt ?? previousInfo?.latestEventAt);
   const hasPreviousLatest = Number.isFinite(previousLatest);
+  // Two hours back holds every event of any window a new event lands in: a
+  // window starts at most 90 minutes before its events (roundToHalfHour() on
+  // the night clocks fall back), and a new event is after `previousLatest`.
   const fallbackStart = hasPreviousLatest
-    ? Math.max(0, previousLatest - 60 * 60 * 1000)
+    ? Math.max(0, previousLatest - 2 * 60 * 60 * 1000)
     : Date.now() - 7 * 24 * 60 * 60 * 1000;
+  // The previous newest events stay the anchor until newer ones arrive. sync.js
+  // replaces the recorded info whole, so a run that finds no new event, or
+  // cannot reach the events API, must not return an info without them: the
+  // next run would fall back to "the last 7 days" and re-report history that
+  // was already uploaded under the CSV's model names (`auto` again as
+  // `default`). Not carried across an account switch, which starts like a
+  // first run.
+  const sameAccount = !(previousInfo?.account && account && previousInfo.account !== account);
+  const carried = (value) => {
+    const time = sameAccount ? Date.parse(value) : NaN;
+    return Number.isFinite(time) ? new Date(time) : null;
+  };
+  const previousEventAt = carried(previousInfo?.latestEventAt);
+  const previousTokenAt = carried(previousInfo?.latestTokenAt);
   let events;
   try {
     events = await fetchUsageEvents(token, { startDate: String(fallbackStart) });
@@ -707,8 +726,8 @@ export async function parse({ previousInfo } = {}) {
         ],
         info: resultInfo({
           account,
-          latestEventAt: csvResult.latestEventAt,
-          latestTokenAt: csvResult.latestTokenAt,
+          latestEventAt: laterDate(csvResult.latestEventAt, previousEventAt),
+          latestTokenAt: laterDate(csvResult.latestTokenAt, previousTokenAt),
           events: csvResult.events,
           tokenEvents: csvResult.entries.length,
         }),
@@ -717,20 +736,35 @@ export async function parse({ previousInfo } = {}) {
     throw err;
   }
 
+  const eventTime = event => eventTimestamp(event?.timestamp)?.getTime() ?? NaN;
   const candidateEvents = hasPreviousLatest
-    ? events.events.filter((event) => {
-        const timestamp = eventTimestamp(event?.timestamp);
-        return timestamp && timestamp.getTime() > previousLatest;
-      })
+    ? events.events.filter(event => eventTime(event) > previousLatest)
     : events.events;
   const fallback = entriesFromEvents(candidateEvents);
+  // What is uploaded: every half-hour window that holds a new token event,
+  // rebuilt from all of its events. Rebuilding it from the new events alone
+  // sent a smaller value under the same key -- 20 replacing 10 + 20 -- and the
+  // server's "a smaller total never wins" guard cannot bring the lost 10 back,
+  // because 20 is larger than the 10 it replaces. Windows are judged by
+  // roundToHalfHour(), the function that names the bucket. Windows without a
+  // new event are not resent.
+  //
+  // Known cost: on the run where the CSV first comes back empty, such a window
+  // can also hold events the CSV already uploaded under another model name
+  // (`auto` there, `default` here); that part of the window counts twice. At
+  // most one window per switch from a usable to an empty export.
+  const windowOf = time => roundToHalfHour(new Date(time)).getTime();
+  const newWindows = new Set(fallback.entries.map(entry => windowOf(entry.timestamp)));
+  const windowEntries = hasPreviousLatest
+    ? entriesFromEvents(events.events.filter(event => newWindows.has(windowOf(eventTime(event))))).entries
+    : fallback.entries;
   const windowLabel = hasPreviousLatest
     ? `${new Date(previousLatest).toISOString()} 之后`
     : '最近 7 天';
   const info = resultInfo({
     account,
-    latestEventAt: laterDate(fallback.latestEventAt, csvResult.latestEventAt),
-    latestTokenAt: laterDate(fallback.latestTokenAt, csvResult.latestTokenAt),
+    latestEventAt: laterDate(laterDate(fallback.latestEventAt, csvResult.latestEventAt), previousEventAt),
+    latestTokenAt: laterDate(laterDate(fallback.latestTokenAt, csvResult.latestTokenAt), previousTokenAt),
     events: candidateEvents.length,
     tokenEvents: fallback.tokenEventCount,
   });
@@ -749,7 +783,7 @@ export async function parse({ previousInfo } = {}) {
   }
 
   return {
-    buckets: aggregateToBuckets(fallback.entries),
+    buckets: aggregateToBuckets(windowEntries),
     sessions: [],
     warnings: [
       `cursor: CSV 导出不可用（${csvResult.unusable}），已从仪表盘事件接口补回${windowLabel}的 `

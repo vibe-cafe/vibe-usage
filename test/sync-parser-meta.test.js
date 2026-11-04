@@ -14,6 +14,7 @@ import { join } from 'node:path';
 import { promisify } from 'node:util';
 import { gunzipSync } from 'node:zlib';
 import { bucketHash } from '../src/state.js';
+import { roundToHalfHour } from '../src/parsers/aggregate.js';
 
 const execFileAsync = promisify(execFile);
 const HOUR = 60 * 60 * 1000;
@@ -57,13 +58,20 @@ const bucketKey = b => `${b.source}|${b.model}|${b.project}|${b.hostname}|${b.bu
  */
 async function withBackend(run) {
   // `reply(payload, index)` may answer an ingest itself: { status, json }.
-  const backend = { events: [], table: new Map(), interrupt: null, onHang: null, reply: null, ingestCount: 0 };
+  // `csvRows` (empty = header-only export) and `eventsStatus` (non-200 =
+  // events API failure) let a test switch cursor.com between its states.
+  const backend = { events: [], csvRows: [], eventsStatus: 200, table: new Map(), interrupt: null, onHang: null, reply: null, ingestCount: 0 };
   const server = createServer(async (req, res) => {
     const url = new URL(req.url, 'http://127.0.0.1');
     const body = await readBody(req);
     if (url.pathname === '/api/dashboard/export-usage-events-csv') {
       res.writeHead(200, { 'content-type': 'text/csv' });
-      res.end(CSV_HEADER);
+      res.end([CSV_HEADER, ...backend.csvRows.map(r => `${new Date(r.at).toISOString()},${r.model},0,${r.input},0,1`)].join('\n'));
+      return;
+    }
+    if (url.pathname === '/api/dashboard/get-filtered-usage-events' && backend.eventsStatus !== 200) {
+      res.writeHead(backend.eventsStatus, { 'content-type': 'text/plain' });
+      res.end('busy');
       return;
     }
     if (url.pathname === '/api/dashboard/get-filtered-usage-events') {
@@ -74,7 +82,7 @@ async function withBackend(run) {
       res.end(JSON.stringify({
         totalUsageEventsCount: inRange.length,
         usageEventsDisplay: slice.map(e => ({
-          usageEventId: e.id, timestamp: String(e.at), model: 'm',
+          usageEventId: e.id, timestamp: String(e.at), model: e.model || 'm',
           tokenUsage: { inputTokens: e.input, cacheWriteTokens: 0, cacheReadTokens: 0, outputTokens: 1 },
         })),
       }));
@@ -288,5 +296,81 @@ test('info with nothing to send survives another source\'s failed upload', async
     });
     assert.equal(code, 1);
     assert.deepEqual(state.parserMeta, { alpha: { v: 2 }, beta: { v: 1 } });
+  });
+});
+
+// Two events-fallback counterexamples from the #139 review, reproduced on the
+// #137 baseline: each must hold end to end, server table included.
+async function cursorClient(backend) {
+  const root = mkdtempSync(join(tmpdir(), 'vibe-usage-fallback-'));
+  const configDir = join(root, 'config');
+  const stateDir = join(root, 'state');
+  mkdirSync(configDir, { recursive: true });
+  const dbPath = join(root, 'state.vscdb');
+  await writeTokenDb(dbPath);
+  writeFileSync(join(configDir, 'config.json'), JSON.stringify({ apiKey: 'vbu_fallback', apiUrl: backend.url, hostname: 'fallback-host' }));
+  const env = {
+    ...process.env, HOME: root, VIBE_USAGE_DEV: '0', VIBE_USAGE_CONFIG_DIR: configDir, VIBE_USAGE_STATE_DIR: stateDir,
+    CURSOR_STATE_DB_PATH: dbPath, CURSOR_WEB_BASE_URL: backend.url,
+  };
+  const command = `
+    import { parsers } from './src/parsers/index.js';
+    for (const source of Object.keys(parsers)) if (source !== 'cursor') delete parsers[source];
+    const { runSync } = await import('./src/sync.js');
+    await runSync({ throws: true, quiet: true });
+  `;
+  return {
+    sync: () => execFileAsync(process.execPath, ['--input-type=module', '-e', command], { cwd: process.cwd(), env }),
+    state: () => JSON.parse(readFileSync(join(stateDir, 'state.json'), 'utf8')),
+    cleanup: () => rmSync(root, { recursive: true, force: true }),
+  };
+}
+
+const total = table => [...table.values()].reduce((sum, b) => sum + b.inputTokens, 0);
+
+test('two fallback syncs inside one half hour add up instead of replacing each other', async () => {
+  await withBackend(async (backend) => {
+    const client = await cursorClient(backend);
+    try {
+      const window = roundToHalfHour(new Date(Date.now() - 3 * HOUR)).getTime();
+      backend.events = [{ id: 'a', at: window + 5 * 60 * 1000, input: 10 }];
+      await client.sync();
+      backend.events.push({ id: 'b', at: window + 20 * 60 * 1000, input: 20 });
+      await client.sync();
+      // One key, both events: 30, not the 20 the second upload alone held.
+      assert.deepEqual([...backend.table.values()].map(b => b.inputTokens), [30]);
+    } finally {
+      client.cleanup();
+    }
+  });
+});
+
+test('a soft-skipped fallback run keeps the anchor, so history is not re-reported', async () => {
+  await withBackend(async (backend) => {
+    const client = await cursorClient(backend);
+    try {
+      const seenAt = Date.now() - 3 * HOUR;
+      // Run 1: a usable CSV names the row `auto`.
+      backend.csvRows = [{ at: seenAt, model: 'auto', input: 40 }];
+      await client.sync();
+      const anchor = client.state().parserMeta.cursor.latestTokenAt;
+      assert.equal(anchor, new Date(seenAt).toISOString());
+
+      // Run 2: the export comes back empty and the events API is down.
+      backend.csvRows = [];
+      backend.eventsStatus = 503;
+      await client.sync();
+      assert.equal(client.state().parserMeta.cursor.latestTokenAt, anchor);
+
+      // Run 3: the events API is back and labels that same old event `default`.
+      backend.eventsStatus = 200;
+      backend.events = [{ id: 'same-old-event', at: seenAt, input: 40, model: 'default' }];
+      await client.sync();
+      // Still one copy of those 40 tokens on the server.
+      assert.equal(total(backend.table), 40);
+      assert.deepEqual([...backend.table.values()].map(b => b.model), ['auto']);
+    } finally {
+      client.cleanup();
+    }
   });
 });
