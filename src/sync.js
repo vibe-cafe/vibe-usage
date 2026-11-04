@@ -124,18 +124,9 @@ export function reportParserInfoChanges(state, parserInfos) {
           );
         }
       }
-      if (previous?.tokenEvents > 0 && info.tokenEvents === 0) {
-        warnings.push(
-          `cursor: Cursor 本次没有读到可上传的 token 用量（账号 ${info.account || '未知'}，`
-          + `事件 ${info.events ?? 0}）。如果最近用过 Cursor，请运行 status 确认登录账号；`
-          + 'X 订阅的用量也可能并入 grok.com/dashboard。',
-        );
-      } else if (previous?.events > 0 && info.events === 0) {
-        warnings.push(
-          `cursor: Cursor 本次没有返回任何用量事件（账号 ${info.account || '未知'}）；`
-          + '如果最近用过 Cursor，请确认 Cursor 仍登录该账号。',
-        );
-      }
+      // No warning when the counts drop to zero: since #131 they are what one
+      // run read from a rolling 7-day window, and the last event sliding out
+      // of that window is ordinary idleness, not a lost export.
       for (const message of warnings) {
         process.stderr.write(`${dim(`  ${message}`)}\n`);
       }

@@ -14,6 +14,24 @@ const PAGE_SIZE = 1000;
 // real personal account. Hitting the cap means the fallback is incomplete, so
 // the run is skipped instead of pruning incremental state with a partial view.
 const MAX_PAGES = 200;
+const HOUR_MS = 60 * 60 * 1000;
+const DAY_MS = 24 * HOUR_MS;
+
+// Rolling window (issue #131). cursor.com builds the whole-account export in
+// time proportional to its rows (60k rows / 6.5 MB / 99s measured 2026-11-04),
+// so every sync now re-reads only the last 7 days, and history is filled in
+// weekly blocks when it is missing: first run, Cursor account switch, or no
+// successful Cursor sync for more than 6 days. The export filters on
+// `startDate` / `endDate` in **milliseconds**, both ends inclusive (verified
+// row for row against the whole export); seconds silently return nothing.
+const RECENT_MS = 7 * DAY_MS;
+const GAP_LIMIT_MS = 6 * DAY_MS;
+const BACKFILL_BLOCK_MS = 7 * DAY_MS;
+const BACKFILL_FLOOR = Date.parse('2024-01-01T00:00:00Z');
+// No new history block starts once Cursor has spent this long in one sync
+// (uploads not included); a started block finishes. A heavy week measured
+// ~12k rows, roughly 8-19s.
+const BACKFILL_BUDGET_MS = 40_000;
 
 function getDefaultStateDbPath() {
   if (process.platform === 'darwin') {
@@ -228,8 +246,8 @@ function authRejected(status, statusText) {
   return err;
 }
 
-async function fetchCsv(headers, signal) {
-  const url = `${cursorWebBase()}${CSV_PATH}?strategy=tokens`;
+async function fetchCsv(headers, signal, range) {
+  const url = `${cursorWebBase()}${CSV_PATH}?startDate=${range.startDate}&endDate=${range.endDate}&strategy=tokens`;
   let resp;
   try {
     resp = await fetch(url, { headers: { ...baseHeaders('text/csv,*/*;q=0.8'), ...headers }, signal });
@@ -245,12 +263,12 @@ async function fetchCsv(headers, signal) {
   throw skipped(`Cursor usage export skipped (HTTP ${resp.status} ${resp.statusText})`);
 }
 
-async function fetchUsageCsv(token) {
+async function fetchUsageCsv(token, range) {
   const failures = [];
   for (const headers of credentialAttempts(token)) {
     const signal = AbortSignal.timeout(FETCH_TIMEOUT_MS);
     try {
-      return await fetchCsv(headers, signal);
+      return await fetchCsv(headers, signal, range);
     } catch (err) {
       if (err?.authRejected) {
         failures.push(String(err.message).replace(/^auth rejected /, ''));
@@ -335,6 +353,7 @@ function entriesFromCsv(csv) {
       entries: [],
       events: 0,
       latestEventAt: null,
+      headerMismatch: true,
       unusable: `导出表头与预期不符（当前表头: ${header.slice(0, 8).join(', ')}）`,
     };
   }
@@ -564,7 +583,7 @@ function laterDate(a, b) {
   return a > b ? a : b;
 }
 
-function resultInfo({ account, latestEventAt, latestTokenAt, events, tokenEvents, fallbackLatestAt }) {
+function resultInfo({ account, latestEventAt, latestTokenAt, events, tokenEvents, fallbackLatestAt, syncedAt, backfill }) {
   return {
     ...(account ? { account } : {}),
     ...(latestEventAt ? { latestEventAt: new Date(latestEventAt).toISOString() } : {}),
@@ -572,7 +591,168 @@ function resultInfo({ account, latestEventAt, latestTokenAt, events, tokenEvents
     events,
     tokenEvents,
     ...(fallbackLatestAt ? { fallbackLatestAt } : {}),
+    ...(syncedAt ? { syncedAt: new Date(syncedAt).toISOString() } : {}),
+    ...(backfill ? { backfill: { before: new Date(backfill.before).toISOString(), until: new Date(backfill.until).toISOString() } } : {}),
   };
+}
+
+const windowOf = time => roundToHalfHour(new Date(time)).getTime();
+
+/**
+ * Which history still has to be read, as `{ before, until }` (ms): the weekly
+ * blocks of `[until, before)`, newest first. Without a recorded `syncedAt`
+ * (first run, reset, re-bind, Cursor account switch) that is everything down
+ * to BACKFILL_FLOOR; after more than 6 days without a successful Cursor sync,
+ * the gap since then. Otherwise the recorded progress, or nothing.
+ */
+export function planBackfill(previousInfo, now, recentStart) {
+  const syncedAt = Date.parse(previousInfo?.syncedAt);
+  const before = Date.parse(previousInfo?.backfill?.before);
+  const until = Date.parse(previousInfo?.backfill?.until);
+  const current = Number.isFinite(before) && Number.isFinite(until) ? { before, until } : null;
+  if (!Number.isFinite(syncedAt)) return { before: recentStart, until: BACKFILL_FLOOR };
+  if (now - syncedAt > GAP_LIMIT_MS) {
+    const gapUntil = windowOf(syncedAt - DAY_MS);
+    return { before: recentStart, until: current ? Math.min(current.until, gapUntil) : gapUntil };
+  }
+  return current;
+}
+
+/**
+ * The recent CSV path: windows starting at or after `recentStart`, plus the
+ * existing stale-gap probe. The CSV can be valid but stop growing (observed
+ * after account switches/unification): when its newest token row is 24h-7d
+ * old, take dashboard events newer than that row -- only newer ones, since the
+ * events API labels history `default` and re-adding it would double-count.
+ */
+async function recentFromCsv(csvResult, { token, previousInfo, recentStart }) {
+  let entries = csvResult.entries;
+  let latest = csvResult.latestEventAt;
+  let latestToken = csvResult.latestTokenAt ?? csvResult.latestEventAt;
+  let events = csvResult.events;
+  let fallbackLatestAt = previousInfo?.fallbackLatestAt;
+  const warnings = [];
+
+  const boundaryMs = latestToken ? latestToken.getTime() : NaN;
+  const now = Date.now();
+  if (Number.isFinite(boundaryMs) && now - boundaryMs > DAY_MS && now - boundaryMs <= 7 * DAY_MS) {
+    try {
+      const probe = await fetchUsageEvents(token, { startDate: String(Math.max(0, boundaryMs - HOUR_MS)) });
+      const newer = probe.events.filter((event) => {
+        const timestamp = eventTimestamp(event?.timestamp);
+        return timestamp && timestamp.getTime() > boundaryMs;
+      });
+      const extra = entriesFromEvents(newer);
+      if (extra.entries.length > 0) {
+        entries = entries.concat(extra.entries);
+        if (extra.latestEventAt && (!latest || extra.latestEventAt > latest)) latest = extra.latestEventAt;
+        if (extra.latestTokenAt && (!latestToken || extra.latestTokenAt > latestToken)) latestToken = extra.latestTokenAt;
+        events += newer.length;
+        const probedThrough = Date.parse(fallbackLatestAt);
+        if (!Number.isFinite(probedThrough) || probedThrough < latestToken.getTime()) {
+          warnings.push(
+            `cursor: CSV 最新 token 事件停在 ${new Date(boundaryMs).toISOString()}，`
+            + `已从仪表盘事件接口补回 ${extra.tokenEventCount} 个更新的 token 事件；`
+            + '这些事件的模型名可能不完整（不影响 token 总量）。',
+          );
+        }
+        fallbackLatestAt = latestToken.toISOString();
+      }
+    } catch {
+      // The CSV data is still valid; a failed freshness probe must not
+      // discard it or fail the whole sync.
+    }
+  }
+
+  return {
+    entries: entries.filter(entry => windowOf(entry.timestamp) >= recentStart),
+    latestEventAt: latest,
+    latestTokenAt: latestToken,
+    events,
+    tokenEvents: entries.length,
+    fallbackLatestAt,
+    warnings,
+  };
+}
+
+/**
+ * The events fallback (#140, unchanged rules) for a recent CSV that is empty or
+ * unusable. Its output is not limited to the recent window: an account whose
+ * CSV is always empty may have events older than it after the collector was
+ * off for a while. Only events newer than the previous sync's newest event
+ * count as new usage (the events API labels history `default`); on a first
+ * run it is bounded to the last seven days. Every half-hour window that holds
+ * a new token event is rebuilt from all of its events, so a later upload never
+ * replaces 10 + 20 with 20 under the same key.
+ *
+ * Known cost: on the run where the CSV first comes back empty, a rebuilt
+ * window can hold events the CSV already uploaded under another model name
+ * (`auto` there, `default` here); that part counts twice. At most one window
+ * per switch from a usable to an empty export.
+ */
+async function eventsFallback(csvResult, { token, previousInfo }) {
+  const previousLatest = Date.parse(previousInfo?.latestTokenAt ?? previousInfo?.latestEventAt);
+  const hasPreviousLatest = Number.isFinite(previousLatest);
+  // Two hours back holds every event of any window a new event lands in: a
+  // window starts at most 90 minutes before its events (roundToHalfHour() on
+  // the night clocks fall back), and a new event is after `previousLatest`.
+  const fallbackStart = hasPreviousLatest
+    ? Math.max(0, previousLatest - 2 * HOUR_MS)
+    : Date.now() - 7 * DAY_MS;
+  // An empty export with a recognized header is the normal idle week; only a
+  // changed header or token-less rows mean the export itself is in doubt.
+  const idle = !csvResult.headerMismatch && csvResult.events === 0;
+
+  let events;
+  try {
+    events = await fetchUsageEvents(token, { startDate: String(fallbackStart) });
+  } catch (err) {
+    if (err && err.skip) {
+      return {
+        entries: [],
+        events: 0,
+        warnings: [`cursor: CSV 导出不可用（${csvResult.unusable}）；事件接口也失败：${err.message}`],
+      };
+    }
+    throw err;
+  }
+
+  const eventTime = event => eventTimestamp(event?.timestamp)?.getTime() ?? NaN;
+  const candidateEvents = hasPreviousLatest
+    ? events.events.filter(event => eventTime(event) > previousLatest)
+    : events.events;
+  const fallback = entriesFromEvents(candidateEvents);
+  const newWindows = new Set(fallback.entries.map(entry => windowOf(entry.timestamp)));
+  const windowEntries = hasPreviousLatest
+    ? entriesFromEvents(events.events.filter(event => newWindows.has(windowOf(eventTime(event))))).entries
+    : fallback.entries;
+  const windowLabel = hasPreviousLatest ? `${new Date(previousLatest).toISOString()} 之后` : '最近 7 天';
+
+  const warnings = [];
+  if (fallback.entries.length > 0) {
+    warnings.push(
+      `cursor: CSV 导出不可用（${csvResult.unusable}），已从仪表盘事件接口补回${windowLabel}的 `
+      + `${fallback.tokenEventCount} 个 token 事件；这些事件的模型名可能显示为 default（不影响 token 总量）。`,
+    );
+  } else if (!idle) {
+    warnings.push(
+      `cursor: CSV 导出不可用（${csvResult.unusable}），事件接口在${windowLabel}也没有读到 token 用量。`
+      + '如果刚切换到 X 订阅，Cursor 的用量可能并入 grok.com/dashboard；本次已跳过以保留历史。',
+    );
+  }
+  return {
+    entries: windowEntries,
+    events: candidateEvents.length,
+    latestEventAt: fallback.latestEventAt,
+    latestTokenAt: fallback.latestTokenAt,
+    warnings,
+  };
+}
+
+function exportSkipped(err) {
+  // Network/timeout → skip with diagnostics, no info: sync.js keeps Cursor's
+  // state and the recorded progress for the next run.
+  return { buckets: [], sessions: [], skipped: true, warnings: [`cursor: ${err.message}`] };
 }
 
 export async function parse({ previousInfo } = {}) {
@@ -595,200 +775,103 @@ export async function parse({ previousInfo } = {}) {
 
   const sub = decodeJwtSub(token);
   const account = cursorAccountLabel(sub);
+  // A different Cursor account: forget the old account's times before any
+  // path reads them. Otherwise the events fallback filtered the new account's
+  // events by the old account's newest time and dropped everything before it.
+  const accountChanged = Boolean(previousInfo?.account && account && previousInfo.account !== account);
+  const prev = accountChanged ? {} : (previousInfo ?? {});
 
+  const startedAt = Date.now();
+  const recentStart = windowOf(startedAt - RECENT_MS);
+  let backfill = planBackfill(prev, startedAt, recentStart);
+
+  // 1. Recent CSV: windows from `recentStart` on.
   let csvResult;
   try {
-    csvResult = entriesFromCsv(await fetchUsageCsv(token));
+    csvResult = entriesFromCsv(await fetchUsageCsv(token, { startDate: recentStart, endDate: startedAt }));
   } catch (err) {
-    // Network/timeout → skip with diagnostics (quiet sync suppresses these).
-    // Auth failure → bubble up so user sees they need to re-login in Cursor.
-    // Tell sync.js this was not a successful empty snapshot so it preserves
-    // Cursor's incremental state instead of pruning it as dead history.
-    if (err && err.skip) {
-      return {
-        buckets: [],
-        sessions: [],
-        skipped: true,
-        warnings: [`cursor: ${err.message}`],
-      };
-    }
+    // Auth failure → bubble up so the user sees they need to re-login.
+    if (err && err.skip) return exportSkipped(err);
     throw err;
   }
+  const warnings = [];
+  let csvEntries = [];
+  let fallbackEntries = [];
+  let latestEventAt = null;
+  let latestTokenAt = null;
+  let fallbackLatestAt = prev.fallbackLatestAt;
+  let events = 0;
+  let tokenEvents = 0;
 
   if (!csvResult.unusable) {
-    let entries = csvResult.entries;
-    let latest = csvResult.latestEventAt;
-    let latestToken = csvResult.latestTokenAt ?? csvResult.latestEventAt;
-    let eventCount = csvResult.events;
-    let fallbackLatestAt = previousInfo?.fallbackLatestAt;
-    const warnings = [];
+    const recent = await recentFromCsv(csvResult, { token, previousInfo: prev, recentStart });
+    csvEntries = recent.entries;
+    latestEventAt = recent.latestEventAt;
+    latestTokenAt = recent.latestTokenAt;
+    fallbackLatestAt = recent.fallbackLatestAt;
+    events += recent.events;
+    tokenEvents += recent.tokenEvents;
+    warnings.push(...recent.warnings);
+  } else {
+    // 2. Events fallback: once per sync, output not limited to the window.
+    const fallback = await eventsFallback(csvResult, { token, previousInfo: prev });
+    fallbackEntries = fallback.entries;
+    latestEventAt = laterDate(fallback.latestEventAt, csvResult.latestEventAt);
+    latestTokenAt = laterDate(fallback.latestTokenAt, csvResult.latestTokenAt);
+    events += fallback.events;
+    tokenEvents += fallback.entries.length;
+    warnings.push(...fallback.warnings);
+  }
 
-    // The CSV can be valid but stop growing (observed after account
-    // switches/unification). Probe the dashboard events endpoint for the gap,
-    // but only take events after the CSV's newest *token* row: historical rows
-    // there are labelled `default`, and re-adding them would double-count
-    // history. Bounded to a recent gap so an idle account does not probe
-    // forever.
-    const boundaryMs = latestToken ? latestToken.getTime() : NaN;
-    const now = Date.now();
-    if (Number.isFinite(boundaryMs) && now - boundaryMs > 24 * 60 * 60 * 1000
-      && now - boundaryMs <= 7 * 24 * 60 * 60 * 1000) {
+  // 3. History blocks: `[until, before)`, newest first, within the budget.
+  if (backfill) {
+    let { before } = backfill;
+    while (before > backfill.until && Date.now() - startedAt < BACKFILL_BUDGET_MS) {
+      const start = Math.max(backfill.until, before - BACKFILL_BLOCK_MS);
+      let block;
       try {
-        const probe = await fetchUsageEvents(token, {
-          startDate: String(Math.max(0, boundaryMs - 60 * 60 * 1000)),
-        });
-        const newer = probe.events.filter((event) => {
-          const timestamp = eventTimestamp(event?.timestamp);
-          return timestamp && timestamp.getTime() > boundaryMs;
-        });
-        const extra = entriesFromEvents(newer);
-        if (extra.entries.length > 0) {
-          entries = entries.concat(extra.entries);
-          if (extra.latestEventAt && (!latest || extra.latestEventAt > latest)) {
-            latest = extra.latestEventAt;
-          }
-          if (extra.latestTokenAt && (!latestToken || extra.latestTokenAt > latestToken)) {
-            latestToken = extra.latestTokenAt;
-          }
-          eventCount += newer.length;
-          const probedThrough = Date.parse(fallbackLatestAt);
-          if (!Number.isFinite(probedThrough) || probedThrough < latestToken.getTime()) {
-            warnings.push(
-              `cursor: CSV 最新 token 事件停在 ${new Date(boundaryMs).toISOString()}，`
-              + `已从仪表盘事件接口补回 ${extra.tokenEventCount} 个更新的 token 事件；`
-              + '这些事件的模型名可能不完整（不影响 token 总量）。',
-            );
-          }
-          fallbackLatestAt = latestToken.toISOString();
-        }
-      } catch {
-        // The CSV data is still valid; a failed freshness probe must not
-        // discard it or fail the whole sync.
+        block = entriesFromCsv(await fetchUsageCsv(token, { startDate: start, endDate: before - 1 }));
+      } catch (err) {
+        if (!(err && err.skip)) throw err;
+        warnings.push(`cursor: 历史补齐本次暂停，下次同步继续（${err.message}）`);
+        break;
       }
+      if (block.headerMismatch) break;
+      csvEntries = csvEntries.concat(block.entries.filter((entry) => {
+        const window = windowOf(entry.timestamp);
+        return window >= start && window < before;
+      }));
+      latestEventAt = laterDate(latestEventAt, block.latestEventAt);
+      latestTokenAt = laterDate(latestTokenAt, block.latestTokenAt);
+      events += block.events;
+      tokenEvents += block.entries.length;
+      before = start;
     }
-
-    return {
-      buckets: aggregateToBuckets(entries),
-      sessions: [],
-      warnings,
-      info: resultInfo({
-        account,
-        latestEventAt: latest,
-        latestTokenAt: latestToken,
-        events: eventCount,
-        tokenEvents: entries.length,
-        fallbackLatestAt,
-      }),
-    };
+    backfill = before > backfill.until ? { before, until: backfill.until } : null;
   }
 
-  // The CSV parsed but contained no usable usage events. Try the dashboard's
-  // events API before treating the account as empty. Only events newer than
-  // the previous sync's newest event count as new usage: the events API labels
-  // many older rows as model `default`, and re-adding known history under that
-  // name would double-count it as a second set of buckets. On a first run (no
-  // previous info) the fallback is bounded to the last seven days for the same
-  // reason. Older events are only re-read to rebuild a window that gains a new
-  // event (below).
-  const previousLatest = Date.parse(previousInfo?.latestTokenAt ?? previousInfo?.latestEventAt);
-  const hasPreviousLatest = Number.isFinite(previousLatest);
-  // Two hours back holds every event of any window a new event lands in: a
-  // window starts at most 90 minutes before its events (roundToHalfHour() on
-  // the night clocks fall back), and a new event is after `previousLatest`.
-  const fallbackStart = hasPreviousLatest
-    ? Math.max(0, previousLatest - 2 * 60 * 60 * 1000)
-    : Date.now() - 7 * 24 * 60 * 60 * 1000;
-  // The previous newest events stay the anchor until newer ones arrive. sync.js
-  // replaces the recorded info whole, so a run that finds no new event, or
-  // cannot reach the events API, must not return an info without them: the
-  // next run would fall back to "the last 7 days" and re-report history that
-  // was already uploaded under the CSV's model names (`auto` again as
-  // `default`). Not carried across an account switch, which starts like a
-  // first run.
-  const sameAccount = !(previousInfo?.account && account && previousInfo.account !== account);
-  const carried = (value) => {
-    const time = sameAccount ? Date.parse(value) : NaN;
-    return Number.isFinite(time) ? new Date(time) : null;
-  };
-  const previousEventAt = carried(previousInfo?.latestEventAt);
-  const previousTokenAt = carried(previousInfo?.latestTokenAt);
-  let events;
-  try {
-    events = await fetchUsageEvents(token, { startDate: String(fallbackStart) });
-  } catch (err) {
-    if (err && err.skip) {
-      return {
-        buckets: [],
-        sessions: [],
-        skipped: true,
-        warnings: [
-          `cursor: CSV 导出不可用（${csvResult.unusable}）；事件接口也失败：${err.message}`,
-        ],
-        info: resultInfo({
-          account,
-          latestEventAt: laterDate(csvResult.latestEventAt, previousEventAt),
-          latestTokenAt: laterDate(csvResult.latestTokenAt, previousTokenAt),
-          events: csvResult.events,
-          tokenEvents: csvResult.entries.length,
-        }),
-      };
-    }
-    throw err;
-  }
+  // One source per half-hour window: a window with any CSV row is built from
+  // the CSV alone; the fallback's events for it are dropped, never added.
+  const csvWindows = new Set(csvEntries.map(entry => windowOf(entry.timestamp)));
+  const entries = csvEntries.concat(fallbackEntries.filter(entry => !csvWindows.has(windowOf(entry.timestamp))));
 
-  const eventTime = event => eventTimestamp(event?.timestamp)?.getTime() ?? NaN;
-  const candidateEvents = hasPreviousLatest
-    ? events.events.filter(event => eventTime(event) > previousLatest)
-    : events.events;
-  const fallback = entriesFromEvents(candidateEvents);
-  // What is uploaded: every half-hour window that holds a new token event,
-  // rebuilt from all of its events. Rebuilding it from the new events alone
-  // sent a smaller value under the same key -- 20 replacing 10 + 20 -- and the
-  // server's "a smaller total never wins" guard cannot bring the lost 10 back,
-  // because 20 is larger than the 10 it replaces. Windows are judged by
-  // roundToHalfHour(), the function that names the bucket. Windows without a
-  // new event are not resent.
-  //
-  // Known cost: on the run where the CSV first comes back empty, such a window
-  // can also hold events the CSV already uploaded under another model name
-  // (`auto` there, `default` here); that part of the window counts twice. At
-  // most one window per switch from a usable to an empty export.
-  const windowOf = time => roundToHalfHour(new Date(time)).getTime();
-  const newWindows = new Set(fallback.entries.map(entry => windowOf(entry.timestamp)));
-  const windowEntries = hasPreviousLatest
-    ? entriesFromEvents(events.events.filter(event => newWindows.has(windowOf(eventTime(event))))).entries
-    : fallback.entries;
-  const windowLabel = hasPreviousLatest
-    ? `${new Date(previousLatest).toISOString()} 之后`
-    : '最近 7 天';
-  const info = resultInfo({
-    account,
-    latestEventAt: laterDate(laterDate(fallback.latestEventAt, csvResult.latestEventAt), previousEventAt),
-    latestTokenAt: laterDate(laterDate(fallback.latestTokenAt, csvResult.latestTokenAt), previousTokenAt),
-    events: candidateEvents.length,
-    tokenEvents: fallback.tokenEventCount,
-  });
-
-  if (fallback.entries.length === 0) {
-    return {
-      buckets: [],
-      sessions: [],
-      skipped: true,
-      warnings: [
-        `cursor: CSV 导出不可用（${csvResult.unusable}），事件接口在${windowLabel}也没有读到 token 用量。`
-        + '如果刚切换到 X 订阅，Cursor 的用量可能并入 grok.com/dashboard；本次已跳过以保留历史。',
-      ],
-      info,
-    };
-  }
-
+  const carried = value => (Number.isFinite(Date.parse(value)) ? new Date(Date.parse(value)) : null);
   return {
-    buckets: aggregateToBuckets(windowEntries),
+    buckets: aggregateToBuckets(entries),
     sessions: [],
-    warnings: [
-      `cursor: CSV 导出不可用（${csvResult.unusable}），已从仪表盘事件接口补回${windowLabel}的 `
-      + `${fallback.tokenEventCount} 个 token 事件；这些事件的模型名可能显示为 default（不影响 token 总量）。`,
-    ],
-    info,
+    // Recent windows and history blocks only, never a whole-account view:
+    // upload these, keep every older Cursor state key (no pruning).
+    skipped: true,
+    warnings,
+    info: resultInfo({
+      account,
+      latestEventAt: laterDate(latestEventAt, carried(prev.latestEventAt)),
+      latestTokenAt: laterDate(latestTokenAt, carried(prev.latestTokenAt)),
+      events,
+      tokenEvents,
+      fallbackLatestAt,
+      syncedAt: startedAt,
+      backfill,
+    }),
   };
 }
