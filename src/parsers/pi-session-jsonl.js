@@ -2,6 +2,7 @@ import { readdirSync, readFileSync, realpathSync } from 'node:fs';
 import { basename, join, relative } from 'node:path';
 import { aggregateToBuckets, extractSessions } from './aggregate.js';
 import { projectFromCwd, toCount } from './fs-utils.js';
+import { readMagpieModels, resolveMagpieModel } from './magpie.js';
 
 const MAX_WARNINGS = 20;
 
@@ -58,6 +59,7 @@ export async function parsePiSessionJsonl({
   includeFile = () => true,
   projectFromPath = projectFromFirstDir,
   deduplicateCopiedSessions = false,
+  resolveMagpie = false,
 }) {
   const ctx = { source, warnings: [], incomplete: false };
   const entriesById = new Map();
@@ -66,6 +68,8 @@ export async function parsePiSessionJsonl({
   const anonymousEvents = [];
   const seenFiles = new Set();
   const recordOwners = new Map();
+  let magpieModels;
+  const magpie = { resolved: 0, unresolved: 0 };
 
   for (const sessionsDir of sessionsDirs) {
     for (const filePath of findJsonlFiles(sessionsDir, includeFile, ctx)) {
@@ -155,9 +159,22 @@ export async function parsePiSessionJsonl({
         const score = inputTokens + outputTokens + cachedInputTokens + reasoningOutputTokens;
         if (score === 0) continue;
 
+        let attributedModel = model;
+        if (resolveMagpie && message.provider === 'magpie'
+          && typeof model === 'string' && model.startsWith('group/')) {
+          magpieModels ??= await readMagpieModels(ctx.warnings);
+          const resolved = resolveMagpieModel(magpieModels, message, model);
+          if (resolved) {
+            attributedModel = resolved;
+            magpie.resolved++;
+          } else {
+            magpie.unresolved++;
+          }
+        }
+
         const entry = {
           source,
-          model,
+          model: attributedModel,
           project,
           timestamp,
           inputTokens,
@@ -194,5 +211,6 @@ export async function parsePiSessionJsonl({
     sessions: extractSessions(events),
     ...(ctx.incomplete ? { skipped: true } : {}),
     ...(ctx.warnings.length > 0 ? { warnings: ctx.warnings } : {}),
+    ...(magpie.resolved + magpie.unresolved > 0 ? { info: { magpie } } : {}),
   };
 }

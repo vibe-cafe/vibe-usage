@@ -212,6 +212,50 @@ You can also install via the [open skills ecosystem](https://github.com/vercel-l
 npx skills add vibe-cafe/vibe-usage
 ```
 
+## Magpie model attribution
+
+Pi and Oh My Pi can record a routing alias such as `group/pi` instead of the
+model that handled a request. The parsers resolve these aliases using Magpie's
+local `usage.jsonl` and historical `usage-others/<device>/*.json` ledgers. The
+default directory is `$XDG_CONFIG_HOME/magpie`, or `~/.config/magpie` when unset.
+
+Resolution requires a Magpie assistant message, an exact response ID and request
+alias, matching input/output/cache token counts, and a successful ledger entry
+with an unambiguous model. Missing or conflicting records retain their group
+alias. Original sessions and token counts remain unchanged. Response IDs and
+ledger records stay local; only the resolved model travels in existing usage
+buckets. Cost estimates still depend on the server's model pricing coverage.
+
+For WSL sessions routed through Magpie on Windows, explicitly select that user's
+ledger. The collector does not search other Windows users' directories:
+
+```bash
+export VIBE_USAGE_MAGPIE_USAGE_FILE="/mnt/c/Users/<windows-user>/.config/magpie/usage.jsonl"
+```
+
+Historical daily files default to `usage-others` beside the selected ledger.
+Set `VIBE_USAGE_MAGPIE_OTHERS_DIR` when that directory is stored elsewhere.
+Services capture these paths at installation time; reinstall an existing daemon
+after changing them. Every active collector must run a version with this support.
+Windows and WSL collectors need distinct upload hostnames unless their data is
+combined by a single collector: independent snapshots sharing server bucket keys
+can overwrite each other's totals.
+
+Already-uploaded group windows retain their server values to avoid counting the
+same requests again under resolved model keys. All models in the same
+source/project/hostname/half-hour window are held together; stderr reports the
+withheld windows even in daemon mode. New windows sync normally. The guard also
+protects windows that would revert to a group alias after ledger loss and keeps
+uploaded model keys when sessions disappear temporarily.
+
+Keep `state.json`: this guard relies on local upload history and cannot detect
+old cloud buckets after that state is lost or rebound. It does not delete cloud
+data or rewrite original sessions. Historical reclassification requires a
+separate migration. `reset --local` deletes **all** cloud data for the configured
+hostname before re-uploading available local logs; it cannot restore missing
+logs or the data of another collector sharing that hostname.
+
+
 ## Development
 
 Run the Node test suite locally with `npm test`. CI covers Node 20 and 22 on Ubuntu and macOS.

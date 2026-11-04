@@ -6,5 +6,6 @@ export async function parse() {
   return parsePiSessionJsonl({
     source: 'omp',
     sessionsDirs: getOmpSessionDirs(),
+    resolveMagpie: true,
   });
 }

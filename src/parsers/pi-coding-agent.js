@@ -22,6 +22,7 @@ export async function parse({ extraRoots = [] } = {}) {
   const nativeResult = await parsePiSessionJsonl({
     source: 'pi-coding-agent',
     sessionsDirs: getPiSessionDirs(extraRoots),
+    resolveMagpie: true,
   });
   return mergeCindyHarnessUsage(nativeResult, readCindyHarnessUsage('pi'));
 }
