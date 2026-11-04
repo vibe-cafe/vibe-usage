@@ -10,11 +10,62 @@ import { parsers } from './parsers/index.js';
 import { aggregateToBuckets } from './parsers/aggregate.js';
 import { normalizeParserResult } from './parsers/contract.js';
 import { extraRootList } from './extra-roots.js';
+import { planMagpieMigration } from './magpie-migration.js';
 import { planKikiMigration } from './kiki-migration.js';
 import { success, failure, warn, arrow, link, dim, liveStatus } from './output.js';
 
 const BATCH_SIZE = 100;
 const SESSION_BATCH_SIZE = 500;
+function bucketCoordinate(b) {
+  return `${b.source}|${b.project}|${b.hostname}|${b.bucketStart}`;
+}
+
+export function createBucketBatches(buckets, maxBatchSize = BATCH_SIZE) {
+  if (!Array.isArray(buckets) || buckets.length === 0) return [];
+  const groups = [];
+  let currentGroup = [];
+  let currentCoord = null;
+  for (const b of buckets) {
+    const coord = bucketCoordinate(b);
+    if (currentCoord === null || currentCoord === coord) {
+      currentGroup.push(b);
+      currentCoord = coord;
+    } else {
+      groups.push(currentGroup);
+      currentGroup = [b];
+      currentCoord = coord;
+    }
+  }
+  if (currentGroup.length > 0) groups.push(currentGroup);
+
+  const batches = [];
+  let currentBatch = [];
+  for (const group of groups) {
+    if (group.length <= maxBatchSize) {
+      if (currentBatch.length + group.length <= maxBatchSize) {
+        currentBatch.push(...group);
+      } else {
+        if (currentBatch.length > 0) batches.push(currentBatch);
+        currentBatch = [...group];
+      }
+    } else {
+      if (currentBatch.length > 0) {
+        batches.push(currentBatch);
+        currentBatch = [];
+      }
+      for (let i = 0; i < group.length; i += maxBatchSize) {
+        const chunk = group.slice(i, i + maxBatchSize);
+        if (chunk.length === maxBatchSize) {
+          batches.push(chunk);
+        } else {
+          currentBatch = chunk;
+        }
+      }
+    }
+  }
+  if (currentBatch.length > 0) batches.push(currentBatch);
+  return batches;
+}
 
 /** Coarse human duration: "45s" / "2m10s" / "1h 20m". */
 export function formatDuration(seconds) {
@@ -244,7 +295,7 @@ export async function runSync({
   const allSessions = [];
   const parserResults = [];
   const parserProgress = [];
-  const parserInfos = [];
+  const parserInfos = new Map();
   // Sources whose parser ran to completion this sync. pruneState() below is
   // scoped to these so a transient parser failure doesn't evict that tool's
   // state and force a full re-upload next run.
@@ -295,7 +346,7 @@ export async function runSync({
     if (indexing) {
       parserProgress.push({ source, ...indexing });
     }
-    if (info) parserInfos.push({ source, info });
+    if (info) parserInfos.set(source, info);
     // Parser warnings always reach stderr, including quiet (daemon) runs: the
     // daemon log is the only trail a background failure leaves. Cursor's fetch
     // soft-skip used to be filtered out here to keep that log tidy, which made
@@ -322,10 +373,17 @@ export async function runSync({
     if (state.identityChanged && !quiet) {
       console.log(dim('检测到上传账号已更换，本次全量重传本地历史'));
     }
+    const earlyMagpie = planMagpieMigration([], state, parserInfos);
+    if (earlyMagpie.withheld.length > 0) {
+      for (const w of earlyMagpie.withheld) {
+        const range = w.earliest ? `，时间范围 ${w.earliest} 至 ${w.latest}` : '';
+        process.stderr.write(`${dim(`  ${w.source}: 检测到 Magpie 模型映射，已保留 ${w.windows} 个历史窗口（${w.buckets} 个桶 / ${w.totalTokens} tokens${range}）避免双计；新窗口照常同步。`)}\n`);
+      }
+    }
     const before = Object.keys(state.buckets).length + Object.keys(state.sessions).length;
-    pruneState(state, new Set(), new Set(), okSources);
+    pruneState(state, earlyMagpie.preserveBuckets, new Set(), okSources);
     const pruned = before - (Object.keys(state.buckets).length + Object.keys(state.sessions).length);
-    const metaChanged = applyParserInfos(state, parserInfos);
+    const metaChanged = applyParserInfos(state, [...parserInfos.entries()].map(([source, info]) => ({ source, info })));
     if (pruned > 0 || metaChanged) saveState(state, identity);
     if (!quiet && parserProgress.length > 0) {
       for (const p of parserProgress) {
@@ -385,7 +443,16 @@ export async function runSync({
   if (state.identityChanged && !quiet) {
     console.log(dim('检测到上传账号已更换，本次全量重传本地历史'));
   }
-  const metaChanged = applyParserInfos(state, parserInfos);
+
+  const metaChanged = applyParserInfos(state, [...parserInfos.entries()].map(([source, info]) => ({ source, info })));
+  const magpiePlan = planMagpieMigration(allBuckets, state, parserInfos);
+  allBuckets = magpiePlan.buckets;
+  if (magpiePlan.withheld.length > 0) {
+    for (const w of magpiePlan.withheld) {
+      const range = w.earliest ? `，时间范围 ${w.earliest} 至 ${w.latest}` : '';
+      process.stderr.write(`${dim(`  ${w.source}: 检测到 Magpie 模型映射，已保留 ${w.windows} 个历史窗口（${w.buckets} 个桶 / ${w.totalTokens} tokens${range}）避免双计；新窗口照常同步。`)}\n`);
+    }
+  }
   let migration;
   try {
     migration = planKikiMigration(allBuckets, allSessions, state, config.kikiStartAt);
@@ -433,7 +500,7 @@ export async function runSync({
   const uploadSessions = migration.sessions;
   const changedBuckets = [];
   const changedSessions = [];
-  const liveBucketKeys = new Set(migration.preserveBuckets);
+  const liveBucketKeys = new Set([...magpiePlan.preserveBuckets, ...migration.preserveBuckets]);
   const liveSessionKeys = new Set(migration.preserveSessions);
   // key -> hash, committed to state only after the owning batch's upload
   // succeeds (a failed batch re-sends next sync — no silent gap).
@@ -444,7 +511,7 @@ export async function runSync({
     const key = bucketKey(b);
     const h = bucketHash(b);
     liveBucketKeys.add(key);
-    if (migration.preserveBuckets.has(key) || state.buckets[key] === h) continue;
+    if (magpiePlan.preserveBuckets.has(key) || migration.preserveBuckets.has(key) || state.buckets[key] === h) continue;
     changedBuckets.push(b);
     pendingBucketState.set(key, h);
   }
@@ -471,7 +538,13 @@ export async function runSync({
   if (pruned > 0 || metaChanged) saveState(state, identity);
 
   if (changedBuckets.length === 0 && changedSessions.length === 0) {
-    if (!quiet) console.log(dim('无新增数据。'));
+    if (!quiet) {
+      if (magpiePlan.withheld.length > 0) {
+        console.log(dim('旧窗口已保留，无其他新增数据。'));
+      } else {
+        console.log(dim('无新增数据。'));
+      }
+    }
     return 0;
   }
 
@@ -485,9 +558,12 @@ export async function runSync({
   let totalDroppedImplausible = 0;
   let totalProtectedBuckets = 0;
   const droppedSources = new Set();
-  const bucketBatches = Math.ceil(allBucketsToSend.length / BATCH_SIZE);
-  const sessionBatches = Math.ceil(allSessionsToSend.length / SESSION_BATCH_SIZE);
-  const totalBatches = Math.max(bucketBatches, sessionBatches, 1);
+  const bucketBatches = createBucketBatches(allBucketsToSend, BATCH_SIZE);
+  const sessionBatches = [];
+  for (let i = 0; i < allSessionsToSend.length; i += SESSION_BATCH_SIZE) {
+    sessionBatches.push(allSessionsToSend.slice(i, i + SESSION_BATCH_SIZE));
+  }
+  const totalBatches = Math.max(bucketBatches.length, sessionBatches.length, 1);
   const syncClient = createSyncClient({ defaultSurface: surface, hostname: host });
 
   // Say up front how much is about to go up. A first sync (or one that
@@ -506,8 +582,8 @@ export async function runSync({
 
   try {
     for (let batchIdx = 0; batchIdx < totalBatches; batchIdx++) {
-      const batch = allBucketsToSend.slice(batchIdx * BATCH_SIZE, (batchIdx + 1) * BATCH_SIZE);
-      const batchSessions = allSessionsToSend.slice(batchIdx * SESSION_BATCH_SIZE, (batchIdx + 1) * SESSION_BATCH_SIZE);
+      const batch = bucketBatches[batchIdx] || [];
+      const batchSessions = sessionBatches[batchIdx] || [];
       const batchNum = batchIdx + 1;
       const prefix = totalBatches > 1 ? `  ${dim(`[${batchNum}/${totalBatches}]`)} 上传中 ` : '  上传中 ';
 
@@ -546,9 +622,6 @@ export async function runSync({
       // the next sync retries only the uncommitted suffix.
       let batchStateChanged = false;
       for (const b of batch) {
-        // A source unknown to an older backend may become valid after deploy.
-        // Leave those hashes uncommitted so the next sync retries them instead
-        // of turning a temporary release-order mismatch into permanent loss.
         if (batchUnknownSources.has(b.source)) continue;
         const key = bucketKey(b);
         const entry = pendingBucketState.get(key);
@@ -558,9 +631,6 @@ export async function runSync({
         }
       }
       for (const s of batchSessions) {
-        // Same uncommitted-on-drop rule as buckets: a session the backend
-        // rejected for an unknown source must be retried on the next sync
-        // rather than permanently lost.
         if (batchUnknownSources.has(s.source)) continue;
         const key = sessionKey(s);
         const entry = pendingSessionState.get(key);

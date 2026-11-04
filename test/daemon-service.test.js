@@ -172,6 +172,22 @@ test('services preserve Cline home, data and session directory overrides', () =>
   }
 });
 
+test('services preserve both Magpie overrides and the XDG config locator', () => {
+  for (const key of ['VIBE_USAGE_MAGPIE_USAGE_FILE', 'VIBE_USAGE_MAGPIE_OTHERS_DIR', 'XDG_CONFIG_HOME']) {
+    const env = { [key]: '/tmp/magpie "quoted"&<config>' };
+    const unit = generateSystemdUnit('/usr/bin/node', '/opt/vibe/bin.js', undefined, env);
+    assert.ok(unit.includes(`Environment="${key}=/tmp/magpie \\"quoted\\"&<config>"`));
+    const plist = generateLaunchdPlist('/usr/bin/node', '/opt/vibe/bin.js', undefined, env);
+    assert.ok(plist.includes(`<key>${key}</key>\n        <string>/tmp/magpie &quot;quoted&quot;&amp;&lt;config&gt;</string>`));
+    const cmd = generateWindowsTaskCmd('C:\\node\\node.exe', 'C:\\vibe\\bin.js', undefined,
+      { [key]: 'C:\\Magpie 100%\\config' });
+    assert.ok(cmd.includes(`set "${key}=C:\\Magpie 100%%\\config"`));
+    assert.ok(!generateSystemdUnit('/usr/bin/node', '/opt/vibe/bin.js', undefined, {}).includes(`${key}=`));
+    assert.ok(!generateLaunchdPlist('/usr/bin/node', '/opt/vibe/bin.js', undefined, {}).includes(`<key>${key}</key>`));
+    assert.ok(!generateWindowsTaskCmd('C:\\node\\node.exe', 'C:\\vibe\\bin.js', undefined, {}).includes(`set "${key}=`));
+  }
+});
+
 test('services preserve a custom Hermes home for background sync', () => {
   const env = { HERMES_HOME: '/tmp/hermes&a<b>' };
   const unit = generateSystemdUnit('/usr/bin/node', '/opt/vibe-usage/bin.js', undefined, env);
