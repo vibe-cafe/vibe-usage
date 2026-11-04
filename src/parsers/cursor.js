@@ -656,6 +656,12 @@ function tailContinuesHistory(csvResult, plan) {
   });
 }
 
+function earliest(times) {
+  let min = Infinity;
+  for (const time of times) if (time < min) min = time;
+  return min;
+}
+
 function knownCount(value) {
   return Number.isFinite(value) && value >= 0 ? value : null;
 }
@@ -735,7 +741,28 @@ async function fromUsableCsv(csvResult, { token, account, previousInfo, plan = n
     };
   }
 
-  const emitted = entries.filter(entry => entry.timestamp.getTime() >= plan.emitFrom);
+  // Which windows the tail holds whole. Judged by each entry's window start,
+  // not its raw time: on the night clocks fall back, roundToHalfHour() can
+  // place an event up to 90 minutes before its own timestamp, so an event
+  // just after `emitFrom` can belong to a window that started before it --
+  // and that window's earlier events were never requested.
+  //
+  // A window that starts before the first row the server actually returned is
+  // skipped too: if cursor.com started the range later than asked (beyond the
+  // one-hour margin), that window is cut. Ordinarily the first row lies in the
+  // margin and this changes nothing; when the margin hour was idle, the
+  // skipped window is one an earlier run already uploaded whole. Windows that
+  // hold rows newer than the previous newest token event, and that event's own
+  // window, are always rebuilt -- they hold what this run exists to send.
+  const firstRowAt = earliest(csvResult.eventTimes);
+  const anchorWindow = roundToHalfHour(new Date(plan.anchor)).getTime();
+  const windowOfEntry = entry => roundToHalfHour(entry.timestamp).getTime();
+  const newWindows = new Set(entries.filter(entry => entry.timestamp.getTime() > plan.anchor).map(windowOfEntry));
+  const emitted = entries.filter((entry) => {
+    const start = windowOfEntry(entry);
+    if (start < plan.emitFrom) return false;
+    return start >= anchorWindow || newWindows.has(start) || !(firstRowAt > start);
+  });
   // `status` shows the account's event count. A tail only sees recent rows, so
   // add the rows newer than what the previous run had already counted instead
   // of reporting the tail's size as if the account had shrunk.
@@ -838,19 +865,37 @@ export async function parse({ previousInfo } = {}) {
   }
 
   // The CSV parsed but contained no usable usage events. Try the dashboard's
-  // events API before treating the account as empty. Only events newer than
-  // the previous sync's newest event count as new usage: the events API labels
-  // many older rows as model `default`, and re-adding known history under that
-  // name would double-count it as a second set of buckets. On a first run (no
-  // previous info) the fallback is bounded to the last seven days for the same
-  // reason.
+  // events API before treating the account as empty. "New usage" -- what the
+  // warning reports and what decides whether this run uploads at all -- is
+  // only events newer than the previous sync's newest event: the events API
+  // labels many older rows as model `default`, and re-adding known history
+  // under that name would double-count it as a second set of buckets. On a
+  // first run (no previous info) the fallback is bounded to the last seven
+  // days for the same reason.
+  //
+  // One deliberate exception (#131): the previous newest event's own window
+  // is rebuilt from every event in it. Before, the request started at that
+  // event, so each fallback run rebuilt the window from only the newer events
+  // and the partial value replaced the complete one (or, being smaller, was
+  // refused and the newer events were lost) whenever activity crossed a sync.
+  // The cost: when the CSV first comes back empty, that window was last
+  // uploaded from the CSV; if the events API names its model differently
+  // (`default` vs `auto`), the rebuilt copy is a second key and the part of
+  // that window before the previous newest event counts twice. One window --
+  // and one more each time the export flips between empty and non-empty.
   const previousLatest = Date.parse(previousInfo?.latestTokenAt ?? previousInfo?.latestEventAt);
   const hasPreviousLatest = Number.isFinite(previousLatest);
-  // Buckets are whole half-hour windows. Before #131 the request started at
-  // the previous newest event itself, so on the next fallback run that event's
-  // window was rebuilt from only the newer events: uploaded under the same key,
-  // the partial value either replaced the complete one or (being smaller) was
-  // refused and the newer events were lost. Start at the window boundary.
+  // The newest events the previous run saw stay the anchor until newer ones
+  // arrive. Dropping them on a run without new events sent the next run back
+  // to "the last seven days". Not carried across an account switch: a new
+  // account starts like a first run.
+  const sameAccount = !previousInfo?.account || previousInfo.account === account;
+  const carried = (value) => {
+    const time = sameAccount ? Date.parse(value) : NaN;
+    return Number.isFinite(time) ? new Date(time) : null;
+  };
+  const previousEventAt = carried(previousInfo?.latestEventAt);
+  const previousTokenAt = carried(previousInfo?.latestTokenAt);
   const windowStart = roundToHalfHour(
     new Date(hasPreviousLatest ? previousLatest : Date.now() - 7 * DAY_MS),
   ).getTime();
@@ -869,8 +914,8 @@ export async function parse({ previousInfo } = {}) {
         ],
         info: resultInfo({
           account,
-          latestEventAt: csvResult.latestEventAt,
-          latestTokenAt: csvResult.latestTokenAt,
+          latestEventAt: laterDate(csvResult.latestEventAt, previousEventAt),
+          latestTokenAt: laterDate(csvResult.latestTokenAt, previousTokenAt),
           events: csvResult.events,
           tokenEvents: csvResult.entries.length,
         }),
@@ -885,17 +930,26 @@ export async function parse({ previousInfo } = {}) {
     : events.events;
   const fallback = entriesFromEvents(candidateEvents);
   // What is uploaded: every event of every window from the previous newest
-  // event's window on, so that window is rebuilt whole rather than partially.
+  // event's window on, plus any earlier window that holds a new event, each
+  // rebuilt whole. Judged by window start, not raw time: on the night clocks
+  // fall back a new event can belong to a window that began before the
+  // previous newest event (see the tail filter above). Every such window
+  // starts after `fallbackStart`, so all of its events were requested.
+  const windowOf = (event) => roundToHalfHour(new Date(eventTime(event))).getTime();
+  const newWindows = new Set(candidateEvents.map(windowOf));
   const windowEntries = hasPreviousLatest
-    ? entriesFromEvents(events.events.filter(event => eventTime(event) >= windowStart)).entries
+    ? entriesFromEvents(events.events.filter((event) => {
+      const start = windowOf(event);
+      return start >= windowStart || newWindows.has(start);
+    })).entries
     : fallback.entries;
   const windowLabel = hasPreviousLatest
     ? `${new Date(previousLatest).toISOString()} 之后`
     : '最近 7 天';
   const info = resultInfo({
     account,
-    latestEventAt: laterDate(fallback.latestEventAt, csvResult.latestEventAt),
-    latestTokenAt: laterDate(fallback.latestTokenAt, csvResult.latestTokenAt),
+    latestEventAt: laterDate(laterDate(fallback.latestEventAt, csvResult.latestEventAt), previousEventAt),
+    latestTokenAt: laterDate(laterDate(fallback.latestTokenAt, csvResult.latestTokenAt), previousTokenAt),
     events: candidateEvents.length,
     tokenEvents: fallback.tokenEventCount,
   });

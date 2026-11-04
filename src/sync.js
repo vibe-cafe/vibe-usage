@@ -92,13 +92,20 @@ export function reaggregateHiddenProjectBuckets(buckets) {
  * newest event for the same reason.
  */
 export function applyParserInfos(state, parserInfos) {
-  if (!Array.isArray(parserInfos) || parserInfos.length === 0) return false;
-  if (!state.parserMeta || typeof state.parserMeta !== 'object') state.parserMeta = {};
-  let changed = false;
+  reportParserInfoChanges(state, parserInfos);
+  return recordParserInfos(state, parserInfos);
+}
 
+function usableInfo(info) {
+  return !!info && typeof info === 'object' && !Array.isArray(info);
+}
+
+/** Warn about meaningful changes against the recorded info; mutates nothing. */
+export function reportParserInfoChanges(state, parserInfos) {
+  if (!Array.isArray(parserInfos)) return;
   for (const { source, info } of parserInfos) {
-    if (!info || typeof info !== 'object' || Array.isArray(info)) continue;
-    const previous = state.parserMeta[source];
+    if (!usableInfo(info)) continue;
+    const previous = state.parserMeta?.[source];
     if (source === 'cursor') {
       const warnings = [];
       if (previous?.account && info.account && previous.account !== info.account) {
@@ -133,7 +140,25 @@ export function applyParserInfos(state, parserInfos) {
         process.stderr.write(`${dim(`  ${message}`)}\n`);
       }
     }
-    if (JSON.stringify(previous ?? null) !== JSON.stringify(info)) {
+  }
+}
+
+/**
+ * Record parser info into state.parserMeta; returns whether anything changed.
+ *
+ * Cursor's `latestTokenAt` is also its incremental anchor: the next run only
+ * re-reads the export from 24h before it. runSync therefore records a
+ * source's info only once every item that source changed this run has been
+ * uploaded and committed -- recording it earlier let a failed or killed upload
+ * move the anchor past windows the server never received (issue #131 review).
+ */
+export function recordParserInfos(state, parserInfos) {
+  if (!Array.isArray(parserInfos) || parserInfos.length === 0) return false;
+  if (!state.parserMeta || typeof state.parserMeta !== 'object') state.parserMeta = {};
+  let changed = false;
+  for (const { source, info } of parserInfos) {
+    if (!usableInfo(info)) continue;
+    if (JSON.stringify(state.parserMeta[source] ?? null) !== JSON.stringify(info)) {
       state.parserMeta[source] = info;
       changed = true;
     }
@@ -256,7 +281,9 @@ export async function runSync({
   // and avoid re-uploading already-known history under a different model id).
   const state = loadState(identity);
 
-  // A sync may run as two passes (see below); these lines print once.
+  // A sync may run as two passes (see below); these lines print once, and
+  // the upload client (one syncId per runSync) is created once.
+  let syncClient = null;
   let identityNoticeShown = false;
   let projectNoticeShown = false;
   const announceIdentityChange = () => {
@@ -454,7 +481,7 @@ export async function runSync({
     // Missing/corrupt state.json => empty maps => one-time full upload, then
     // incremental forever after.
     announceIdentityChange();
-    const metaChanged = applyParserInfos(state, parserInfos);
+    reportParserInfoChanges(state, parserInfos);
     let migration;
     try {
       migration = planKikiMigration(allBuckets, allSessions, state, config.kikiStartAt);
@@ -526,6 +553,33 @@ export async function runSync({
       pendingSessionState.set(key, h);
     }
 
+    // A parser's info is recorded only after every item its source changed
+    // this run is committed (see recordParserInfos): Cursor's info carries its
+    // incremental anchor, which must not pass windows the server never got.
+    // Sources with nothing to send record their info right away, as before.
+    const unsentBySource = new Map();
+    const noteUnsent = (id) => {
+      const source = id.slice(2, id.indexOf('|'));
+      if (!unsentBySource.has(source)) unsentBySource.set(source, new Set());
+      unsentBySource.get(source).add(id);
+    };
+    for (const key of pendingBucketState.keys()) noteUnsent(`b:${key}`);
+    for (const key of pendingSessionState.keys()) noteUnsent(`s:${key}`);
+    const heldInfos = new Map(parserInfos
+      .filter(({ source }) => unsentBySource.has(source))
+      .map(item => [item.source, item]));
+    const metaChanged = recordParserInfos(
+      state,
+      parserInfos.filter(({ source }) => !unsentBySource.has(source)),
+    );
+    const markCommitted = (id) => {
+      const source = id.slice(2, id.indexOf('|'));
+      const unsent = unsentBySource.get(source);
+      if (!unsent || !unsent.delete(id) || unsent.size > 0) return false;
+      const held = heldInfos.get(source);
+      return held ? recordParserInfos(state, [held]) : false;
+    };
+
     // Drop entries the parsers no longer emit (deleted logs) so state.json can't
     // grow forever. Done by liveness, never by age — an old bucket's hash never
     // changes, so keeping it is exactly what prevents re-uploading it.
@@ -560,7 +614,8 @@ export async function runSync({
     const bucketBatches = Math.ceil(allBucketsToSend.length / BATCH_SIZE);
     const sessionBatches = Math.ceil(allSessionsToSend.length / SESSION_BATCH_SIZE);
     const totalBatches = Math.max(bucketBatches, sessionBatches, 1);
-    const syncClient = createSyncClient({ defaultSurface: surface, hostname: host });
+    // One syncId per runSync, shared by both passes.
+    syncClient ??= createSyncClient({ defaultSurface: surface, hostname: host });
 
     // Say up front how much is about to go up. A first sync (or one that
     // backfills after a parser was broken) can be thousands of batches, and with
@@ -627,6 +682,7 @@ export async function runSync({
           if (entry) {
             state.buckets[key] = entry;
             batchStateChanged = true;
+            markCommitted(`b:${key}`);
           }
         }
         for (const s of batchSessions) {
@@ -639,6 +695,7 @@ export async function runSync({
           if (entry) {
             state.sessions[key] = entry;
             batchStateChanged = true;
+            markCommitted(`s:${key}`);
           }
         }
         if (batchStateChanged) saveState(state, identity);

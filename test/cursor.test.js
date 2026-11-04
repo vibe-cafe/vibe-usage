@@ -1,6 +1,7 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { execFileSync } from 'node:child_process';
+import { execFile, execFileSync } from 'node:child_process';
+import { promisify } from 'node:util';
 import { mkdtempSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
@@ -592,20 +593,27 @@ test('Cursor never uploads a window the tail did not fetch whole', async (t) => 
   const plan = cursor.incrementalCsvPlan(previousInfo, ACCOUNT);
   const full = csvServer(rows);
 
-  for (const [name, options] of [
-    // The server answers from mid-window, 45 minutes before the first emitted
-    // window: the window holding that start is incomplete and must not ship.
-    ['server starts mid-window', { startOverride: plan.emitFrom - 45 * MINUTE }],
+  const nextWindow = roundToHalfHour(new Date(plan.emitFrom + 30 * MINUTE)).getTime();
+  for (const [name, options, firstWhole] of [
+    // cursor.com starts the range 10 minutes into the first emitted window --
+    // 70 minutes later than asked, more than the one-hour margin absorbs.
+    // That window is cut and must not ship; the next one is whole.
+    ['server starts mid-window, beyond the margin', { startOverride: plan.emitFrom + 10 * MINUTE }, nextWindow],
+    // The server answers from mid-window inside the margin: nothing emitted
+    // is affected.
+    ['server starts mid-window, inside the margin', { startOverride: plan.emitFrom - 45 * MINUTE }, plan.emitFrom],
     // The server ignores the range entirely and returns the whole account.
-    ['server ignores the range', { ignoreRange: true }],
+    ['server ignores the range', { ignoreRange: true }, plan.emitFrom],
   ]) {
     await t.test(name, async (t) => {
       const server = csvServer(rows, options);
       mockFetch(t, { csv: (init, url) => (url.includes('startDate') ? server.handler(init, url) : full.handler(init, url)) });
       const whole = await cursor.parse();
       const tail = await cursor.parse({ previousInfo });
-      assert.ok(tail.buckets.every(b => Date.parse(b.bucketStart) >= plan.emitFrom));
-      assert.deepEqual(tail.buckets, whole.buckets.filter(b => Date.parse(b.bucketStart) >= plan.emitFrom));
+      // The cut window really existed in the data.
+      assert.ok(whole.buckets.some(b => Date.parse(b.bucketStart) === plan.emitFrom));
+      assert.ok(tail.buckets.every(b => Date.parse(b.bucketStart) >= firstWhole));
+      assert.deepEqual(tail.buckets, whole.buckets.filter(b => Date.parse(b.bucketStart) >= firstWhole));
     });
   }
 });
@@ -774,4 +782,95 @@ test('Cursor events fallback rebuilds the previous newest event\'s window whole'
   assert.match(result.warnings[0], /补回.*1 个 token 事件/);
   // Recent windows only: must not prune the older Cursor keys.
   assert.equal(result.skipped, true);
+});
+
+test('Cursor fallback keeps its anchor through a run without new events', async (t) => {
+  await withCursorDb(t);
+  const previousLatest = Date.parse('2026-10-19T10:15:00Z');
+  mockFetch(t, { csv: () => new Response(CSV_HEADER), events: () => new Response('{}') });
+
+  const idle = await cursor.parse({
+    previousInfo: { account: ACCOUNT, latestEventAt: new Date(previousLatest).toISOString(), latestTokenAt: new Date(previousLatest).toISOString() },
+  });
+  assert.equal(idle.skipped, true);
+  // Without these the next run would fall back to "the last seven days".
+  assert.equal(idle.info.latestTokenAt, new Date(previousLatest).toISOString());
+  assert.equal(idle.info.latestEventAt, new Date(previousLatest).toISOString());
+
+  // A different Cursor account starts like a first run instead.
+  const switched = await cursor.parse({
+    previousInfo: { account: 'auth0|othe…user', latestTokenAt: new Date(previousLatest).toISOString() },
+  });
+  assert.equal(switched.info.latestTokenAt, undefined);
+});
+
+// roundToHalfHour() works in local time. On the night US clocks fall back
+// (2026-11-01, 02:00 EDT → 01:00 EST) an event at 01:10 EST (06:10Z) lands in
+// the 01:00 EDT window (05:00Z), 70 minutes before its own timestamp. The tail
+// and the events fallback must judge windows by that start, and must rebuild a
+// window holding a new event whole. CI runs in UTC, so run this in a child
+// process with TZ set.
+test('Cursor judges windows by their start across a DST fall-back', async (t) => {
+  await withCursorDb(t);
+  const script = `
+    const ok = new Date('2026-11-01T05:10:00Z').getTimezoneOffset() === 240
+      && new Date('2026-11-01T06:10:00Z').getTimezoneOffset() === 300;
+    if (!ok) { console.log(JSON.stringify({ skip: true })); process.exit(0); }
+    const cursor = await import('./src/parsers/cursor.js');
+    const HEADER = ${JSON.stringify(CSV_HEADER)};
+    const row = (iso, n) => ({ at: Date.parse(iso), n });
+    const recent = Date.now() - 10 * 60 * 1000;
+    const rows = [
+      row('2026-11-01T05:10:00Z', 1), // 01:10 EDT → window 05:00Z
+      row('2026-11-01T05:45:00Z', 2), // 01:45 EDT → window 05:30Z
+      row('2026-11-01T06:10:00Z', 4), // 01:10 EST → window 05:00Z as well
+      row('2026-11-01T06:40:00Z', 8), // 01:40 EST → window 05:30Z as well
+      row('2026-11-02T05:40:00Z', 16),
+      { at: recent, n: 32 },
+    ];
+    let events = [];
+    globalThis.fetch = async (url) => {
+      const u = new URL(String(url));
+      if (u.pathname.endsWith('export-usage-events-csv')) {
+        const start = u.searchParams.has('startDate') ? Number(u.searchParams.get('startDate')) : -Infinity;
+        const visible = csvRows.filter(r => r.at >= start);
+        return new Response([HEADER, ...visible.map(r => new Date(r.at).toISOString() + ',m,0,' + r.n + ',0,0')].join('\\n'));
+      }
+      return new Response(JSON.stringify({ totalUsageEventsCount: events.length, usageEventsDisplay: events }));
+    };
+    const account = cursor.cursorAccountLabel('auth0|cursor-test-user');
+    let csvRows = rows;
+    const whole = await cursor.parse();
+    const previousInfo = { account, latestTokenAt: '2026-11-02T05:40:00.000Z', latestEventAt: '2026-11-02T05:40:00.000Z', events: 5, tokenEvents: 5 };
+    const plan = cursor.incrementalCsvPlan(previousInfo, account);
+    const tail = await cursor.parse({ previousInfo });
+
+    // Events fallback (empty CSV): the previous newest event is 01:40 EDT.
+    csvRows = [];
+    events = rows.slice(0, 4).map((r, i) => ({ usageEventId: 'e' + i, timestamp: String(r.at), model: 'm',
+      tokenUsage: { inputTokens: r.n, cacheWriteTokens: 0, cacheReadTokens: 0, outputTokens: 0 } }));
+    const fallback = await cursor.parse({ previousInfo: { latestTokenAt: '2026-11-01T05:45:00.000Z' } });
+    console.log(JSON.stringify({ whole: whole.buckets, emitFrom: plan.emitFrom, tail: tail.buckets, fallback: fallback.buckets }));
+  `;
+  const { stdout } = await promisify(execFile)(process.execPath, ['--input-type=module', '-e', script], {
+    cwd: process.cwd(),
+    env: { ...process.env, TZ: 'America/New_York' },
+  });
+  const out = JSON.parse(stdout.trim().split('\n').pop());
+  if (out.skip) return t.skip('this platform does not honor TZ=America/New_York');
+  const input = (buckets, start) => buckets.find(b => b.bucketStart === start)?.inputTokens;
+
+  assert.equal(out.emitFrom, Date.parse('2026-11-01T05:30:00Z'));
+  // Whole export: 05:00Z holds the 1 and the 4, 05:30Z the 2 and the 8.
+  assert.equal(input(out.whole, '2026-11-01T05:00:00.000Z'), 5);
+  assert.equal(input(out.whole, '2026-11-01T05:30:00.000Z'), 10);
+  // Tail: 05:00Z started before the tail and is not re-sent (by raw time the
+  // 06:10Z event would have shipped it as a 4-token partial); 05:30Z is whole.
+  assert.equal(input(out.tail, '2026-11-01T05:00:00.000Z'), undefined);
+  assert.equal(input(out.tail, '2026-11-01T05:30:00.000Z'), 10);
+  assert.deepEqual(out.tail, out.whole.filter(b => Date.parse(b.bucketStart) >= out.emitFrom));
+  // Fallback: the new 01:10 EST event belongs to 05:00Z, so that window is
+  // rebuilt whole (1 + 4), not dropped and not sent as a 4-token partial.
+  assert.equal(input(out.fallback, '2026-11-01T05:00:00.000Z'), 5);
+  assert.equal(input(out.fallback, '2026-11-01T05:30:00.000Z'), 10);
 });

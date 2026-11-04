@@ -67,7 +67,9 @@ const bucketSum = b => b.inputTokens + b.outputTokens + b.cachedInputTokens + b.
 
 /** One fake backend: cursor.com CSV + usage settings/ingest, each with its own table. */
 async function withBackend(run) {
-  const backend = { rows: [], csvRequests: [], ingests: [], table: new Map() };
+  // `interrupt(payload)` may return 'fail' (HTTP 400, nothing stored) or
+  // 'hang' (never answer; `onHang` lets the test kill the client).
+  const backend = { rows: [], csvRequests: [], ingests: [], syncIds: [], table: new Map(), interrupt: null, onHang: null };
   const server = createServer(async (req, res) => {
     const url = new URL(req.url, 'http://127.0.0.1');
     if (req.method === 'GET' && url.pathname === '/api/dashboard/export-usage-events-csv') {
@@ -90,7 +92,18 @@ async function withBackend(run) {
     }
     if (req.method === 'POST' && url.pathname === '/api/usage/ingest') {
       const payload = JSON.parse((await readBody(req)).toString('utf8'));
+      const interruption = backend.interrupt?.(payload);
+      if (interruption === 'fail') {
+        res.writeHead(400, { 'content-type': 'application/json' });
+        res.end(JSON.stringify({ error: 'forced failure' }));
+        return;
+      }
+      if (interruption === 'hang') {
+        backend.onHang?.();
+        return;
+      }
       backend.ingests.push(payload.buckets.map(bucketKey));
+      backend.syncIds.push(payload.client?.syncId);
       for (const b of payload.buckets) {
         const key = bucketKey(b);
         const existing = backend.table.get(key);
@@ -145,6 +158,11 @@ async function makeClient(root, name, backend) {
   return {
     statePath: join(stateDir, 'state.json'),
     sync: () => execFileAsync(process.execPath, ['--input-type=module', '-e', command], { cwd: process.cwd(), env }),
+    start() {
+      const child = execFile(process.execPath, ['--input-type=module', '-e', command], { cwd: process.cwd(), env });
+      const done = new Promise(resolve => child.once('exit', (code, signal) => resolve({ code, signal })));
+      return { child, done };
+    },
     state() { return JSON.parse(readFileSync(join(stateDir, 'state.json'), 'utf8')); },
   };
 }
@@ -264,6 +282,10 @@ test('a slow Cursor export no longer holds back the other tools\' upload', async
       const { stdout } = await execFileAsync(process.execPath, ['--input-type=module', '-e', command], { cwd: process.cwd(), env });
       for (const keys of backend.ingests) received.push(...keys.map(k => k.split('|').slice(0, 2).join('|')));
       assert.deepEqual(received, ['local-fast|m', 'cursor|after-local']);
+      // Two passes, one sync: both final batches carry the same syncId.
+      assert.equal(backend.syncIds.length, 2);
+      assert.ok(backend.syncIds[0]);
+      assert.equal(backend.syncIds[1], backend.syncIds[0]);
       assert.match(stdout, /cursor: 仍在读取用量数据，先上传其他工具/);
       assert.equal(stdout.match(/前往 Dashboard 查看详情/g)?.length, 1);
       assert.equal(stdout.match(/项目名/g)?.length, 1);
@@ -313,3 +335,47 @@ test('a Cursor result inside the grace period keeps one pass and one summary', a
     rmSync(root, { recursive: true, force: true });
   }
 });
+
+// The incremental anchor (parserMeta.cursor.latestTokenAt) must not move past
+// windows that never reached the server. With more than 24h of backlog, a run
+// whose upload fails or is killed half-way used to advance the anchor anyway,
+// and the next tail started after the gap: those windows were never sent.
+for (const [label, mode] of [['an ingest failure', 'fail'], ['a killed process', 'hang']]) {
+  test(`Cursor backlog over 24h is fully uploaded after ${label} mid-upload`, async () => {
+    const root = mkdtempSync(join(tmpdir(), 'vibe-usage-cursor-backlog-'));
+    try {
+      await withBackend(async (backend) => {
+        const now = Date.now();
+        backend.rows = rowsBetween(now - 10 * 24 * HOUR, now - 5 * 24 * HOUR);
+        const client = await makeClient(root, 'backlog', backend);
+        await client.sync();
+
+        // Four days of new usage: far more than the 24h overlap, several batches.
+        backend.rows.push(...rowsBetween(now - 4 * 24 * HOUR, now - MINUTE, 5));
+        let ingestsThisRun = 0;
+        backend.interrupt = () => (++ingestsThisRun === 2 ? (mode === 'fail' ? 'fail' : 'hang') : undefined);
+        const accepted = backend.ingests.length;
+        const run = client.start();
+        if (mode === 'hang') backend.onHang = () => run.child.kill('SIGKILL');
+        const outcome = await run.done;
+        assert.ok(outcome.code !== 0 || outcome.signal, 'the interrupted run must not succeed');
+        assert.equal(backend.ingests.length, accepted + 1, 'exactly one batch landed before the interruption');
+
+        backend.interrupt = null;
+        await client.sync();
+        await client.sync();
+
+        const partial = new Map(backend.table);
+        backend.table = new Map();
+        const fresh = await makeClient(root, 'whole-export', backend);
+        await fresh.sync();
+        const view = table => [...table.entries()].map(([k, b]) => `${k}=${bucketSum(b)}`).sort();
+        const missing = view(backend.table).filter(entry => !view(partial).includes(entry));
+        assert.deepEqual(missing, [], `${missing.length} windows never reached the server`);
+        assert.deepEqual(view(partial), view(backend.table));
+      });
+    } finally {
+      rmSync(root, { recursive: true, force: true });
+    }
+  });
+}
