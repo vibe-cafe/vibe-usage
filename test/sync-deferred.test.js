@@ -29,9 +29,9 @@ function readBody(req) {
 }
 
 /**
- * Settings + ingest stand-in. `fail({ sources, index })` returning true makes
- * that ingest request fail with HTTP 400 (nothing stored); `index` counts
- * every ingest request from 1.
+ * Settings + ingest stand-in. `fail({ sources, index })` returning true (HTTP
+ * 400) or a status code makes that ingest request fail, nothing stored;
+ * `index` counts every ingest request from 1.
  */
 async function withBackend(run, { fail } = {}) {
   const backend = { ingests: [], requests: 0 };
@@ -51,8 +51,9 @@ async function withBackend(run, { fail } = {}) {
       const payload = JSON.parse((await readBody(req)).toString('utf8'));
       const sources = [...payload.buckets, ...(payload.sessions || [])].map(item => item.source);
       backend.requests++;
-      if (fail?.({ sources, index: backend.requests })) {
-        res.writeHead(400, { 'content-type': 'application/json' });
+      const failure = fail?.({ sources, index: backend.requests });
+      if (failure) {
+        res.writeHead(failure === true ? 400 : failure, { 'content-type': 'application/json' });
         res.end(JSON.stringify({ error: 'forced failure' }));
         return;
       }
@@ -242,6 +243,29 @@ test('when only the slow source\'s pass fails, the other tools stay uploaded and
       assert.deepEqual(backend.ingests.map(i => i.sources), [['local-fast']]);
     });
   }, { fail: ({ sources }) => sources.includes('cursor') });
+});
+
+test('a 401 in the slow source\'s pass still reports what the first pass delivered', async () => {
+  await withBackend(async (backend) => {
+    await inSandbox(backend, async ({ fails, state }) => {
+      const error = await fails(script(LOCAL_FAST + slowCursor()));
+      assert.equal(error.code, 1);
+      // One stderr line carries both facts: the Windows app shows the last one.
+      const line = error.stderr.split('\n').find(l => l.includes('API Key 无效'));
+      assert.match(line, /部分完成（已上传 1 buckets）: API Key 无效/);
+      assert.deepEqual(keySources(state()), ['local-fast']);
+    });
+  }, { fail: ({ sources }) => (sources.includes('cursor') ? 401 : false) });
+});
+
+test('a 401 before anything was uploaded keeps the plain key message', async () => {
+  await withBackend(async (backend) => {
+    await inSandbox(backend, async ({ fails }) => {
+      const error = await fails(script(LOCAL_FAST + slowCursor()));
+      assert.match(error.stderr, /API Key 无效/);
+      assert.doesNotMatch(error.stderr, /部分完成/);
+    });
+  }, { fail: () => 401 });
 });
 
 test('a first pass that uploaded only sessions still counts as partial success', async () => {

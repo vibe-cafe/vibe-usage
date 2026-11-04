@@ -13,6 +13,7 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { promisify } from 'node:util';
 import { gunzipSync } from 'node:zlib';
+import { bucketHash } from '../src/state.js';
 
 const execFileAsync = promisify(execFile);
 const HOUR = 60 * 60 * 1000;
@@ -55,7 +56,8 @@ const bucketKey = b => `${b.source}|${b.model}|${b.project}|${b.hostname}|${b.bu
  * nothing stored) or 'hang' (never answer; `onHang` lets the test kill the client).
  */
 async function withBackend(run) {
-  const backend = { events: [], table: new Map(), interrupt: null, onHang: null };
+  // `reply(payload, index)` may answer an ingest itself: { status, json }.
+  const backend = { events: [], table: new Map(), interrupt: null, onHang: null, reply: null, ingestCount: 0 };
   const server = createServer(async (req, res) => {
     const url = new URL(req.url, 'http://127.0.0.1');
     const body = await readBody(req);
@@ -85,6 +87,13 @@ async function withBackend(run) {
     }
     if (url.pathname === '/api/usage/ingest') {
       const payload = JSON.parse(body.toString('utf8'));
+      const custom = backend.reply?.(payload, ++backend.ingestCount);
+      if (custom) {
+        if (custom.status === 200) for (const b of payload.buckets) backend.table.set(bucketKey(b), b);
+        res.writeHead(custom.status, { 'content-type': 'application/json' });
+        res.end(JSON.stringify(custom.json));
+        return;
+      }
       const interruption = backend.interrupt?.(payload);
       if (interruption === 'fail') {
         res.writeHead(400, { 'content-type': 'application/json' });
@@ -179,3 +188,105 @@ for (const [label, mode] of [['fails', 'fail'], ['is killed after the state was 
     }
   });
 }
+
+// Several sources in one pass, each returning parser info. A source's info may
+// only reach state.json together with the last of its own hashes -- not in the
+// prune save before the upload, and not in another source's batch save.
+const HOST = 'meta-host';
+const START = '2026-11-01T00:00:00.000Z';
+const keyOf = (source, model) => `${source}|${model}|p|${HOST}|${START}`;
+const fakeBuckets = (source, count) => `Array.from({ length: ${count} }, (_, i) => ({ source: '${source}', model: 'm' + i,
+  project: 'p', bucketStart: '${START}', inputTokens: 1, outputTokens: 1, cachedInputTokens: 0,
+  reasoningOutputTokens: 0, totalTokens: 2 }))`;
+
+async function runFakeSources(backend, { parsersCode, initialState }) {
+  const root = mkdtempSync(join(tmpdir(), 'vibe-usage-parser-meta-multi-'));
+  const configDir = join(root, 'config');
+  const stateDir = join(root, 'state');
+  mkdirSync(configDir, { recursive: true });
+  mkdirSync(stateDir, { recursive: true });
+  writeFileSync(join(configDir, 'config.json'), JSON.stringify({ apiKey: 'vbu_meta_multi', apiUrl: backend.url, hostname: HOST }));
+  writeFileSync(join(stateDir, 'state.json'), JSON.stringify(initialState));
+  const command = `
+    import { parsers } from './src/parsers/index.js';
+    for (const source of Object.keys(parsers)) delete parsers[source];
+    ${parsersCode}
+    const { runSync } = await import('./src/sync.js');
+    await runSync({ throws: true, quiet: true });
+  `;
+  try {
+    const outcome = await execFileAsync(process.execPath, ['--input-type=module', '-e', command], {
+      cwd: process.cwd(),
+      env: { ...process.env, HOME: root, VIBE_USAGE_DEV: '0', VIBE_USAGE_CONFIG_DIR: configDir, VIBE_USAGE_STATE_DIR: stateDir },
+    }).then(() => ({ code: 0 }), err => ({ code: err.code }));
+    return { ...outcome, state: JSON.parse(readFileSync(join(stateDir, 'state.json'), 'utf8')) };
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+}
+
+test('a pending source\'s info stays out of the prune save and of another source\'s batch save', async () => {
+  await withBackend(async (backend) => {
+    // alpha: 100 buckets = batch 1 (succeeds). beta: 1 bucket = batch 2 (fails).
+    backend.reply = (payload, index) => (index === 2 ? { status: 400, json: { error: 'forced' } } : undefined);
+    const { code, state } = await runFakeSources(backend, {
+      parsersCode: `
+        parsers['alpha'] = async () => ({ buckets: ${fakeBuckets('alpha', 100)}, sessions: [], info: { v: 2 } });
+        parsers['beta'] = async () => ({ buckets: ${fakeBuckets('beta', 1)}, sessions: [], info: { v: 2 } });
+      `,
+      // A dead beta key forces the prune save before any upload.
+      initialState: { buckets: { [keyOf('beta', 'gone')]: 'x' }, sessions: {}, parserMeta: { alpha: { v: 1 }, beta: { v: 1 } } },
+    });
+    assert.equal(code, 1);
+    assert.equal(state.buckets[keyOf('beta', 'gone')], undefined, 'the prune itself is persisted');
+    assert.equal(Object.keys(state.buckets).filter(k => k.startsWith('alpha|')).length, 100);
+    assert.equal(state.buckets[keyOf('beta', 'm0')], undefined);
+    // alpha's items all committed → its info landed with batch 1. beta's did
+    // not: neither the prune save nor alpha's batch save carried beta's new info.
+    assert.deepEqual(state.parserMeta, { alpha: { v: 2 }, beta: { v: 1 } });
+  });
+});
+
+test('info with nothing to send is recorded at once; a source dropped as unknown keeps its old info', async () => {
+  await withBackend(async (backend) => {
+    // One batch holds beta and gamma; the server accepts it but drops beta as
+    // an unknown source, so beta's hash -- and info -- stay uncommitted.
+    backend.reply = payload => ({
+      status: 200,
+      json: { ingested: payload.buckets.length - 1, sessions: 0, dropped: { buckets: 1, unknownSources: ['beta'] } },
+    });
+    const sameHash = bucketHash({ inputTokens: 1, outputTokens: 1, cachedInputTokens: 0, reasoningOutputTokens: 0, totalTokens: 2 });
+    const { code, state } = await runFakeSources(backend, {
+      parsersCode: `
+        parsers['alpha'] = async () => ({ buckets: ${fakeBuckets('alpha', 1)}, sessions: [], info: { v: 2 } });
+        parsers['beta'] = async () => ({ buckets: ${fakeBuckets('beta', 1)}, sessions: [], info: { v: 2 } });
+        parsers['gamma'] = async () => ({ buckets: ${fakeBuckets('gamma', 1)}, sessions: [], info: { v: 2 } });
+      `,
+      initialState: {
+        buckets: { [keyOf('alpha', 'm0')]: sameHash },
+        sessions: {},
+        parserMeta: { alpha: { v: 1 }, beta: { v: 1 }, gamma: { v: 1 } },
+      },
+    });
+    assert.equal(code, 0);
+    assert.equal(state.buckets[keyOf('beta', 'm0')], undefined);
+    assert.ok(state.buckets[keyOf('gamma', 'm0')]);
+    assert.deepEqual(state.parserMeta, { alpha: { v: 2 }, beta: { v: 1 }, gamma: { v: 2 } });
+  });
+});
+
+test('info with nothing to send survives another source\'s failed upload', async () => {
+  await withBackend(async (backend) => {
+    backend.reply = () => ({ status: 400, json: { error: 'forced' } });
+    const sameHash = bucketHash({ inputTokens: 1, outputTokens: 1, cachedInputTokens: 0, reasoningOutputTokens: 0, totalTokens: 2 });
+    const { code, state } = await runFakeSources(backend, {
+      parsersCode: `
+        parsers['alpha'] = async () => ({ buckets: ${fakeBuckets('alpha', 1)}, sessions: [], info: { v: 2 } });
+        parsers['beta'] = async () => ({ buckets: ${fakeBuckets('beta', 1)}, sessions: [], info: { v: 2 } });
+      `,
+      initialState: { buckets: { [keyOf('alpha', 'm0')]: sameHash }, sessions: {}, parserMeta: { alpha: { v: 1 }, beta: { v: 1 } } },
+    });
+    assert.equal(code, 1);
+    assert.deepEqual(state.parserMeta, { alpha: { v: 2 }, beta: { v: 1 } });
+  });
+});

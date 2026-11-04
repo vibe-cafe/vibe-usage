@@ -290,6 +290,11 @@ export async function runSync({
   // pass that uploaded only sessions (e.g. Qoder CLI) counts as an upload too.
   const uploadedSoFar = { buckets: 0, sessions: 0 };
   const uploadedAnything = () => uploadedSoFar.buckets > 0 || uploadedSoFar.sessions > 0;
+  const partialLabel = () => {
+    const parts = [`${uploadedSoFar.buckets} buckets`];
+    if (uploadedSoFar.sessions > 0) parts.push(`${uploadedSoFar.sessions} sessions`);
+    return `部分完成（已上传 ${parts.join(' · ')}）`;
+  };
   let identityNoticeShown = false;
   let projectNoticeShown = false;
   const announceIdentityChange = () => {
@@ -748,18 +753,18 @@ export async function runSync({
 
       return totalIngested;
     } catch (err) {
+      // Every failure line says what this runSync already delivered (both
+      // passes, buckets and sessions): when only the slow source's pass fails,
+      // the other tools did reach the server. It goes to stderr on one line,
+      // because the Windows app shows the last error line of stderr.
       if (err.message === 'UNAUTHORIZED') {
-        console.error(failure('API Key 无效，请运行 `npx @vibe-cafe/vibe-usage init` 重新配置。'));
+        const keyHint = 'API Key 无效，请运行 `npx @vibe-cafe/vibe-usage init` 重新配置。';
+        console.error(failure(uploadedAnything() ? `${partialLabel()}: ${keyHint}` : keyHint));
         if (throws) throw err;
         process.exit(1);
       }
-      // Count everything this runSync already delivered, both passes, buckets
-      // and sessions: when only the slow source's pass fails, the other tools
-      // did reach the server and the message must say so.
       if (uploadedAnything()) {
-        const parts = [`${uploadedSoFar.buckets} buckets`];
-        if (uploadedSoFar.sessions > 0) parts.push(`${uploadedSoFar.sessions} sessions`);
-        console.error(failure(`部分完成（已上传 ${parts.join(' · ')}）: ${err.message}`));
+        console.error(failure(`${partialLabel()}: ${err.message}`));
       } else {
         console.error(failure(`同步失败: ${err.message}`));
       }
