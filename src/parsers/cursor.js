@@ -1,7 +1,7 @@
 import { existsSync } from 'node:fs';
 import { join, resolve } from 'node:path';
 import { homedir } from 'node:os';
-import { aggregateToBuckets } from './aggregate.js';
+import { aggregateToBuckets, roundToHalfHour } from './aggregate.js';
 import { queryDbJsonSnapshotOnLock, sqliteUnavailableError, isSqliteUnavailableError } from './sqlite.js';
 
 const STATE_DB_RELATIVE = join('User', 'globalStorage', 'state.vscdb');
@@ -14,6 +14,22 @@ const PAGE_SIZE = 1000;
 // real personal account. Hitting the cap means the fallback is incomplete, so
 // the run is skipped instead of pruning incremental state with a partial view.
 const MAX_PAGES = 200;
+const HOUR_MS = 60 * 60 * 1000;
+const DAY_MS = 24 * HOUR_MS;
+
+// Incremental CSV (issue #131). cursor.com builds the export over the whole
+// account, so a heavy account's full CSV (9.5 MB / 84k rows / 137s observed)
+// outgrows any fixed timeout and its download held every other tool's upload
+// hostage. Once a run has seen this account's newest token event, the next run
+// asks only for the tail after it.
+//
+// Re-read this much history before the previous newest token event, so an
+// event that reached the export after the last sync but carries an earlier
+// timestamp (a long agent request) still lands in its window.
+const INCREMENTAL_OVERLAP_MS = DAY_MS;
+// Requested before the first emitted window and then discarded, so a server
+// that rounds `startDate` a little later still returns the first window whole.
+const INCREMENTAL_MARGIN_MS = HOUR_MS;
 
 function getDefaultStateDbPath() {
   if (process.platform === 'darwin') {
@@ -228,8 +244,17 @@ function authRejected(status, statusText) {
   return err;
 }
 
-async function fetchCsv(headers, signal) {
-  const url = `${cursorWebBase()}${CSV_PATH}?strategy=tokens`;
+function csvUrl(range) {
+  // Same `startDate` / `endDate` (Unix ms) filter the dashboard's own date
+  // picker sends. Without a range this is the unchanged whole-account export.
+  const params = range
+    ? `startDate=${range.startDate}&endDate=${range.endDate}&strategy=tokens`
+    : 'strategy=tokens';
+  return `${cursorWebBase()}${CSV_PATH}?${params}`;
+}
+
+async function fetchCsv(headers, signal, range) {
+  const url = csvUrl(range);
   let resp;
   try {
     resp = await fetch(url, { headers: { ...baseHeaders('text/csv,*/*;q=0.8'), ...headers }, signal });
@@ -242,15 +267,25 @@ async function fetchCsv(headers, signal) {
   if (resp.status === 401 || resp.status === 403) throw authRejected(resp.status, resp.statusText);
   // 429/5xx are transient server-side states — soft-skip like network errors
   // instead of surfacing them as auth failures every daemon cycle.
-  throw skipped(`Cursor usage export skipped (HTTP ${resp.status} ${resp.statusText})`);
+  const err = skipped(`Cursor usage export skipped (HTTP ${resp.status} ${resp.statusText})`);
+  err.status = resp.status;
+  throw err;
 }
 
-async function fetchUsageCsv(token) {
+// A ranged request the server refuses outright (4xx other than auth and rate
+// limiting) says nothing about the whole export: if cursor.com ever stops
+// accepting the date range, take the whole export instead of skipping Cursor
+// on every run.
+function rangeRejected(err) {
+  return Number.isInteger(err?.status) && err.status >= 400 && err.status < 500 && err.status !== 429;
+}
+
+async function fetchUsageCsv(token, range) {
   const failures = [];
   for (const headers of credentialAttempts(token)) {
     const signal = AbortSignal.timeout(FETCH_TIMEOUT_MS);
     try {
-      return await fetchCsv(headers, signal);
+      return await fetchCsv(headers, signal, range);
     } catch (err) {
       if (err?.authRejected) {
         failures.push(String(err.message).replace(/^auth rejected /, ''));
@@ -340,6 +375,9 @@ function entriesFromCsv(csv) {
   }
 
   const entries = [];
+  // Every dated row's time, token-bearing or not. The incremental path counts
+  // the rows it has not seen before so `status` keeps an account-wide total.
+  const eventTimes = [];
   let latestEventAt = null;
   let latestTokenAt = null;
   let eventCount = 0;
@@ -350,6 +388,7 @@ function entriesFromCsv(csv) {
     const model = row[modelIdx]?.trim();
     if (!timestamp || !model) continue;
     eventCount++;
+    eventTimes.push(timestamp.getTime());
     if (!latestEventAt || timestamp > latestEventAt) latestEventAt = timestamp;
 
     const inputCacheWrite = inputCacheWriteIdx >= 0 ? parseInt0(row[inputCacheWriteIdx]) : 0;
@@ -380,12 +419,13 @@ function entriesFromCsv(csv) {
     return {
       entries,
       events: eventCount,
+      eventTimes,
       latestEventAt,
       latestTokenAt,
       unusable: eventCount > 0 ? `返回了 ${eventCount} 行，但没有任何 token 计数` : '没有返回任何用量行',
     };
   }
-  return { entries, events: eventCount, latestEventAt, latestTokenAt };
+  return { entries, events: eventCount, eventTimes, latestEventAt, latestTokenAt };
 }
 
 function tokenCount(value) {
@@ -575,6 +615,175 @@ function resultInfo({ account, latestEventAt, latestTokenAt, events, tokenEvents
   };
 }
 
+/**
+ * Plan an incremental CSV request from the previous run's diagnostics, or
+ * return null for the unchanged whole-account export. The tail needs the same
+ * signed-in account and the newest token event that run already saw, so a
+ * first run, a reset (state.json cleared), a re-bind (parserMeta dropped with
+ * the old identity) and an account switch all take the full export.
+ *
+ * Only whole half-hour windows starting at `emitFrom` are emitted. Earlier
+ * windows are not requested completely, and the server upserts by bucket key:
+ * a partial window would replace the complete value it already holds.
+ */
+export function incrementalCsvPlan(previousInfo, account, now = Date.now()) {
+  if (!account || previousInfo?.account !== account) return null;
+  const anchor = Date.parse(previousInfo?.latestTokenAt);
+  if (!Number.isFinite(anchor) || anchor > now) return null;
+  // Same window function as aggregateToBuckets(), so `emitFrom` is always a
+  // real bucket boundary on this machine.
+  const emitFrom = roundToHalfHour(new Date(anchor - INCREMENTAL_OVERLAP_MS)).getTime();
+  return {
+    anchor,
+    emitFrom,
+    range: { startDate: emitFrom - INCREMENTAL_MARGIN_MS, endDate: now },
+  };
+}
+
+/**
+ * A tail may stand in for the whole export only when it overlaps history a
+ * previous run already saw: at least one token row between `emitFrom` and the
+ * previous newest token event. Anything else is ambiguous -- an idle account
+ * and an X Subscription account whose export went empty look the same; so do a
+ * CSV that stopped growing and a server that answered a different range -- so
+ * the caller takes the full export and the 0.14.5 rules for those cases.
+ */
+function tailContinuesHistory(csvResult, plan) {
+  if (csvResult.unusable) return false;
+  return csvResult.entries.some((entry) => {
+    const time = entry.timestamp.getTime();
+    return time >= plan.emitFrom && time <= plan.anchor;
+  });
+}
+
+function knownCount(value) {
+  return Number.isFinite(value) && value >= 0 ? value : null;
+}
+
+/**
+ * A usable CSV -- the whole export, or (with `plan`) a tail that continues
+ * known history. The stale-gap probe below runs identically for both: a tail
+ * that overlaps known history contains the export's newest token row, so the
+ * probe sees the same boundary the full export would have given it.
+ */
+async function fromUsableCsv(csvResult, { token, account, previousInfo, plan = null }) {
+  let entries = csvResult.entries;
+  let eventTimes = csvResult.eventTimes;
+  let latest = csvResult.latestEventAt;
+  let latestToken = csvResult.latestTokenAt ?? csvResult.latestEventAt;
+  let eventCount = csvResult.events;
+  let fallbackLatestAt = previousInfo?.fallbackLatestAt;
+  const warnings = [];
+
+  // The CSV can be valid but stop growing (observed after account
+  // switches/unification). Probe the dashboard events endpoint for the gap,
+  // but only take events after the CSV's newest *token* row: historical rows
+  // there are labelled `default`, and re-adding them would double-count
+  // history. Bounded to a recent gap so an idle account does not probe
+  // forever.
+  const boundaryMs = latestToken ? latestToken.getTime() : NaN;
+  const now = Date.now();
+  if (Number.isFinite(boundaryMs) && now - boundaryMs > DAY_MS && now - boundaryMs <= 7 * DAY_MS) {
+    try {
+      const probe = await fetchUsageEvents(token, {
+        startDate: String(Math.max(0, boundaryMs - HOUR_MS)),
+      });
+      const newer = probe.events.filter((event) => {
+        const timestamp = eventTimestamp(event?.timestamp);
+        return timestamp && timestamp.getTime() > boundaryMs;
+      });
+      const extra = entriesFromEvents(newer);
+      if (extra.entries.length > 0) {
+        entries = entries.concat(extra.entries);
+        eventTimes = eventTimes.concat(newer.map(event => eventTimestamp(event.timestamp).getTime()));
+        if (extra.latestEventAt && (!latest || extra.latestEventAt > latest)) {
+          latest = extra.latestEventAt;
+        }
+        if (extra.latestTokenAt && (!latestToken || extra.latestTokenAt > latestToken)) {
+          latestToken = extra.latestTokenAt;
+        }
+        eventCount += newer.length;
+        const probedThrough = Date.parse(fallbackLatestAt);
+        if (!Number.isFinite(probedThrough) || probedThrough < latestToken.getTime()) {
+          warnings.push(
+            `cursor: CSV 最新 token 事件停在 ${new Date(boundaryMs).toISOString()}，`
+            + `已从仪表盘事件接口补回 ${extra.tokenEventCount} 个更新的 token 事件；`
+            + '这些事件的模型名可能不完整（不影响 token 总量）。',
+          );
+        }
+        fallbackLatestAt = latestToken.toISOString();
+      }
+    } catch {
+      // The CSV data is still valid; a failed freshness probe must not
+      // discard it or fail the whole sync.
+    }
+  }
+
+  if (!plan) {
+    return {
+      buckets: aggregateToBuckets(entries),
+      sessions: [],
+      warnings,
+      info: resultInfo({
+        account,
+        latestEventAt: latest,
+        latestTokenAt: latestToken,
+        events: eventCount,
+        tokenEvents: entries.length,
+        fallbackLatestAt,
+      }),
+    };
+  }
+
+  const emitted = entries.filter(entry => entry.timestamp.getTime() >= plan.emitFrom);
+  // `status` shows the account's event count. A tail only sees recent rows, so
+  // add the rows newer than what the previous run had already counted instead
+  // of reporting the tail's size as if the account had shrunk.
+  const previousEvents = knownCount(previousInfo?.events);
+  const previousTokenEvents = knownCount(previousInfo?.tokenEvents);
+  const countedThrough = Date.parse(previousInfo?.latestEventAt);
+  const eventFloor = Number.isFinite(countedThrough) ? countedThrough : plan.anchor;
+  const events = previousEvents === null
+    ? eventTimes.filter(time => time >= plan.emitFrom).length
+    : previousEvents + eventTimes.filter(time => time > eventFloor).length;
+  const tokenEvents = previousTokenEvents === null
+    ? emitted.length
+    : previousTokenEvents + entries.filter(entry => entry.timestamp.getTime() > plan.anchor).length;
+
+  return {
+    buckets: aggregateToBuckets(emitted),
+    sessions: [],
+    // A tail is a partial view by construction. `skipped` keeps sync.js from
+    // pruning Cursor's older state keys -- the windows this run did not ask
+    // for -- so they are neither forgotten nor re-sent later; every bucket
+    // above is still diffed and uploaded as usual. The next full export
+    // (account switch, reset, re-bind, ambiguous tail) is a complete view and
+    // prunes normally.
+    skipped: true,
+    warnings,
+    info: resultInfo({
+      account,
+      latestEventAt: latest,
+      latestTokenAt: latestToken,
+      events,
+      tokenEvents,
+      fallbackLatestAt,
+    }),
+  };
+}
+
+function exportSkipped(err) {
+  // Network/timeout → skip with diagnostics. Tell sync.js this was not a
+  // successful empty snapshot so it preserves Cursor's incremental state
+  // instead of pruning it as dead history.
+  return {
+    buckets: [],
+    sessions: [],
+    skipped: true,
+    warnings: [`cursor: ${err.message}`],
+  };
+}
+
 export async function parse({ previousInfo } = {}) {
   const dbPath = getCursorStateDbPath();
   let token = null;
@@ -596,103 +805,56 @@ export async function parse({ previousInfo } = {}) {
   const sub = decodeJwtSub(token);
   const account = cursorAccountLabel(sub);
 
+  const plan = incrementalCsvPlan(previousInfo, account);
+  if (plan) {
+    let tail;
+    try {
+      tail = entriesFromCsv(await fetchUsageCsv(token, plan.range));
+    } catch (err) {
+      // Auth failure → bubble up so the user sees they need to re-login.
+      if (!rangeRejected(err)) {
+        if (err && err.skip) return exportSkipped(err);
+        throw err;
+      }
+      tail = null;
+    }
+    if (tail && tailContinuesHistory(tail, plan)) {
+      return fromUsableCsv(tail, { token, account, previousInfo, plan });
+    }
+    // Ambiguous tail: fall through to the whole-account export, unchanged.
+  }
+
   let csvResult;
   try {
     csvResult = entriesFromCsv(await fetchUsageCsv(token));
   } catch (err) {
-    // Network/timeout → skip with diagnostics (quiet sync suppresses these).
     // Auth failure → bubble up so user sees they need to re-login in Cursor.
-    // Tell sync.js this was not a successful empty snapshot so it preserves
-    // Cursor's incremental state instead of pruning it as dead history.
-    if (err && err.skip) {
-      return {
-        buckets: [],
-        sessions: [],
-        skipped: true,
-        warnings: [`cursor: ${err.message}`],
-      };
-    }
+    if (err && err.skip) return exportSkipped(err);
     throw err;
   }
 
   if (!csvResult.unusable) {
-    let entries = csvResult.entries;
-    let latest = csvResult.latestEventAt;
-    let latestToken = csvResult.latestTokenAt ?? csvResult.latestEventAt;
-    let eventCount = csvResult.events;
-    let fallbackLatestAt = previousInfo?.fallbackLatestAt;
-    const warnings = [];
-
-    // The CSV can be valid but stop growing (observed after account
-    // switches/unification). Probe the dashboard events endpoint for the gap,
-    // but only take events after the CSV's newest *token* row: historical rows
-    // there are labelled `default`, and re-adding them would double-count
-    // history. Bounded to a recent gap so an idle account does not probe
-    // forever.
-    const boundaryMs = latestToken ? latestToken.getTime() : NaN;
-    const now = Date.now();
-    if (Number.isFinite(boundaryMs) && now - boundaryMs > 24 * 60 * 60 * 1000
-      && now - boundaryMs <= 7 * 24 * 60 * 60 * 1000) {
-      try {
-        const probe = await fetchUsageEvents(token, {
-          startDate: String(Math.max(0, boundaryMs - 60 * 60 * 1000)),
-        });
-        const newer = probe.events.filter((event) => {
-          const timestamp = eventTimestamp(event?.timestamp);
-          return timestamp && timestamp.getTime() > boundaryMs;
-        });
-        const extra = entriesFromEvents(newer);
-        if (extra.entries.length > 0) {
-          entries = entries.concat(extra.entries);
-          if (extra.latestEventAt && (!latest || extra.latestEventAt > latest)) {
-            latest = extra.latestEventAt;
-          }
-          if (extra.latestTokenAt && (!latestToken || extra.latestTokenAt > latestToken)) {
-            latestToken = extra.latestTokenAt;
-          }
-          eventCount += newer.length;
-          const probedThrough = Date.parse(fallbackLatestAt);
-          if (!Number.isFinite(probedThrough) || probedThrough < latestToken.getTime()) {
-            warnings.push(
-              `cursor: CSV 最新 token 事件停在 ${new Date(boundaryMs).toISOString()}，`
-              + `已从仪表盘事件接口补回 ${extra.tokenEventCount} 个更新的 token 事件；`
-              + '这些事件的模型名可能不完整（不影响 token 总量）。',
-            );
-          }
-          fallbackLatestAt = latestToken.toISOString();
-        }
-      } catch {
-        // The CSV data is still valid; a failed freshness probe must not
-        // discard it or fail the whole sync.
-      }
-    }
-
-    return {
-      buckets: aggregateToBuckets(entries),
-      sessions: [],
-      warnings,
-      info: resultInfo({
-        account,
-        latestEventAt: latest,
-        latestTokenAt: latestToken,
-        events: eventCount,
-        tokenEvents: entries.length,
-        fallbackLatestAt,
-      }),
-    };
+    return fromUsableCsv(csvResult, { token, account, previousInfo });
   }
 
   // The CSV parsed but contained no usable usage events. Try the dashboard's
-  // events API before treating the account as empty. Only look at events newer
-  // than the previous sync's newest event: the events API labels many older
-  // rows as model `default`, and re-adding known history under that name would
-  // double-count it as a second set of buckets. On a first run (no previous
-  // info) the fallback is bounded to the last seven days for the same reason.
+  // events API before treating the account as empty. Only events newer than
+  // the previous sync's newest event count as new usage: the events API labels
+  // many older rows as model `default`, and re-adding known history under that
+  // name would double-count it as a second set of buckets. On a first run (no
+  // previous info) the fallback is bounded to the last seven days for the same
+  // reason.
   const previousLatest = Date.parse(previousInfo?.latestTokenAt ?? previousInfo?.latestEventAt);
   const hasPreviousLatest = Number.isFinite(previousLatest);
-  const fallbackStart = hasPreviousLatest
-    ? Math.max(0, previousLatest - 60 * 60 * 1000)
-    : Date.now() - 7 * 24 * 60 * 60 * 1000;
+  // Buckets are whole half-hour windows. Before #131 the request started at
+  // the previous newest event itself, so on the next fallback run that event's
+  // window was rebuilt from only the newer events: uploaded under the same key,
+  // the partial value either replaced the complete one or (being smaller) was
+  // refused and the newer events were lost. Start at the window boundary.
+  const windowStart = roundToHalfHour(
+    new Date(hasPreviousLatest ? previousLatest : Date.now() - 7 * DAY_MS),
+  ).getTime();
+  const fallbackStart = hasPreviousLatest ? Math.max(0, windowStart - HOUR_MS) : windowStart;
   let events;
   try {
     events = await fetchUsageEvents(token, { startDate: String(fallbackStart) });
@@ -717,13 +879,16 @@ export async function parse({ previousInfo } = {}) {
     throw err;
   }
 
+  const eventTime = (event) => eventTimestamp(event?.timestamp)?.getTime() ?? NaN;
   const candidateEvents = hasPreviousLatest
-    ? events.events.filter((event) => {
-        const timestamp = eventTimestamp(event?.timestamp);
-        return timestamp && timestamp.getTime() > previousLatest;
-      })
+    ? events.events.filter(event => eventTime(event) > previousLatest)
     : events.events;
   const fallback = entriesFromEvents(candidateEvents);
+  // What is uploaded: every event of every window from the previous newest
+  // event's window on, so that window is rebuilt whole rather than partially.
+  const windowEntries = hasPreviousLatest
+    ? entriesFromEvents(events.events.filter(event => eventTime(event) >= windowStart)).entries
+    : fallback.entries;
   const windowLabel = hasPreviousLatest
     ? `${new Date(previousLatest).toISOString()} 之后`
     : '最近 7 天';
@@ -749,8 +914,12 @@ export async function parse({ previousInfo } = {}) {
   }
 
   return {
-    buckets: aggregateToBuckets(fallback.entries),
+    buckets: aggregateToBuckets(windowEntries),
     sessions: [],
+    // Recent windows only, never the whole history: keep sync.js from pruning
+    // Cursor's older state keys, which would re-send all of them the next time
+    // the CSV is usable again.
+    skipped: true,
     warnings: [
       `cursor: CSV 导出不可用（${csvResult.unusable}），已从仪表盘事件接口补回${windowLabel}的 `
       + `${fallback.tokenEventCount} 个 token 事件；这些事件的模型名可能显示为 default（不影响 token 总量）。`,

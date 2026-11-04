@@ -5,6 +5,7 @@ import { mkdtempSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import * as cursor from '../src/parsers/cursor.js';
+import { roundToHalfHour } from '../src/parsers/aggregate.js';
 
 const TOKEN = `header.${Buffer.from(JSON.stringify({ sub: 'auth0|cursor-test-user' })).toString('base64url')}.test-signature`;
 const TS = Date.parse('2026-09-07T01:02:00Z');
@@ -73,10 +74,10 @@ function networkError(code) {
 function mockFetch(t, { csv, events } = {}) {
   return t.mock.method(globalThis, 'fetch', async (url, init) => {
     if (String(url).includes('/api/dashboard/export-usage-events-csv')) {
-      return typeof csv === 'function' ? csv(init) : csv;
+      return typeof csv === 'function' ? csv(init, String(url)) : csv;
     }
     if (String(url).includes('/api/dashboard/get-filtered-usage-events')) {
-      return typeof events === 'function' ? events(init) : events;
+      return typeof events === 'function' ? events(init, String(url)) : events;
     }
     throw new Error(`unexpected URL ${url}`);
   });
@@ -466,4 +467,311 @@ test('Cursor still surfaces expired credentials and soft-skips server failures',
       assert.equal(fetchMock.mock.callCount(), 1);
     });
   }
+});
+
+// --- Incremental CSV (issue #131) ------------------------------------------
+
+const MINUTE = 60 * 1000;
+const HOUR = 60 * MINUTE;
+const ACCOUNT = cursor.cursorAccountLabel('auth0|cursor-test-user');
+
+function csvOf(rows) {
+  return [
+    CSV_HEADER,
+    ...rows.map(r => `${new Date(r.at).toISOString()},${r.model},${r.cw ?? 0},${r.input ?? 0},${r.cr ?? 0},${r.out ?? 0}`),
+  ].join('\n');
+}
+
+/**
+ * A cursor.com stand-in that honors `startDate` / `endDate` the way the
+ * dashboard's own date picker uses them. `requests` records every CSV URL.
+ */
+function csvServer(rows, { ignoreRange = false, startOverride } = {}) {
+  const requests = [];
+  const handler = (init, url) => {
+    requests.push(url);
+    const params = new URL(url).searchParams;
+    const start = startOverride ?? (params.has('startDate') ? Number(params.get('startDate')) : -Infinity);
+    const end = params.has('endDate') ? Number(params.get('endDate')) : Infinity;
+    const visible = ignoreRange ? rows : rows.filter(r => r.at >= start && r.at <= end);
+    return new Response(csvOf(visible));
+  };
+  return { handler, requests };
+}
+
+/** Deterministic synthetic history: a row every 7 minutes, two models. */
+function syntheticRows(from, to) {
+  const rows = [];
+  let i = 0;
+  for (let at = from; at <= to; at += 7 * MINUTE, i++) {
+    rows.push({
+      at,
+      model: i % 3 === 0 ? 'model-b' : 'model-a',
+      cw: (i * 7) % 50,
+      input: 100 + (i % 13),
+      cr: (i * 11) % 200,
+      out: 20 + (i % 5),
+    });
+  }
+  return rows;
+}
+
+/** What a whole-account run at `at` would have recorded in parserMeta. */
+function infoAsOf(rows, at) {
+  const seen = rows.filter(r => r.at <= at);
+  const tokens = seen.filter(r => (r.cw || 0) + (r.input || 0) + (r.cr || 0) + (r.out || 0) > 0);
+  return {
+    account: ACCOUNT,
+    latestEventAt: new Date(Math.max(...seen.map(r => r.at))).toISOString(),
+    latestTokenAt: new Date(Math.max(...tokens.map(r => r.at))).toISOString(),
+    events: seen.length,
+    tokenEvents: tokens.length,
+  };
+}
+
+test('Cursor plans an incremental tail only for the same account with a known newest token event', () => {
+  const now = Date.parse('2026-11-04T08:00:00Z');
+  const anchor = Date.parse('2026-11-04T07:10:00Z');
+  const info = { account: ACCOUNT, latestTokenAt: new Date(anchor).toISOString() };
+
+  assert.equal(cursor.incrementalCsvPlan(undefined, ACCOUNT, now), null);
+  assert.equal(cursor.incrementalCsvPlan(info, null, now), null);
+  assert.equal(cursor.incrementalCsvPlan({ ...info, account: 'auth0|othe…user' }, ACCOUNT, now), null);
+  assert.equal(cursor.incrementalCsvPlan({ account: ACCOUNT }, ACCOUNT, now), null);
+  assert.equal(cursor.incrementalCsvPlan({ ...info, latestTokenAt: 'garbage' }, ACCOUNT, now), null);
+  assert.equal(cursor.incrementalCsvPlan({ ...info, latestTokenAt: new Date(now + HOUR).toISOString() }, ACCOUNT, now), null);
+
+  const plan = cursor.incrementalCsvPlan(info, ACCOUNT, now);
+  assert.equal(plan.anchor, anchor);
+  // A real bucket boundary on this machine, at least 24h before the anchor.
+  assert.equal(plan.emitFrom, roundToHalfHour(new Date(anchor - 24 * HOUR)).getTime());
+  assert.ok(plan.emitFrom <= anchor - 24 * HOUR);
+  assert.equal(plan.range.startDate, plan.emitFrom - HOUR);
+  assert.equal(plan.range.endDate, now);
+});
+
+test('Cursor incremental tail uploads exactly the whole export\'s windows from its start on', async (t) => {
+  await withCursorDb(t);
+  const now = Date.now();
+  const rows = syntheticRows(now - 5 * 24 * HOUR, now - 2 * MINUTE);
+  const server = csvServer(rows);
+  mockFetch(t, { csv: server.handler, events: async () => { throw new Error('events must not be called'); } });
+
+  const full = await cursor.parse();
+  assert.equal(server.requests.length, 1);
+  assert.doesNotMatch(server.requests[0], /startDate/);
+
+  // The previous sync ran six hours ago.
+  const previousInfo = infoAsOf(rows, now - 6 * HOUR);
+  const plan = cursor.incrementalCsvPlan(previousInfo, ACCOUNT);
+  const tail = await cursor.parse({ previousInfo });
+  assert.equal(server.requests.length, 2);
+  const tailUrl = new URL(server.requests[1]);
+  assert.equal(tailUrl.searchParams.get('startDate'), String(plan.range.startDate));
+  assert.ok(Number(tailUrl.searchParams.get('endDate')) >= now);
+  assert.equal(tailUrl.searchParams.get('strategy'), 'tokens');
+
+  // Same keys and same numbers as the whole export, for every window the tail
+  // covers -- and nothing older.
+  const expected = full.buckets.filter(b => Date.parse(b.bucketStart) >= plan.emitFrom);
+  assert.ok(expected.length > 40);
+  assert.ok(expected.length < full.buckets.length);
+  assert.deepEqual(tail.buckets, expected);
+  // A tail is a partial view: sync.js must not prune Cursor's older keys.
+  assert.equal(tail.skipped, true);
+  assert.deepEqual(tail.warnings, []);
+  // Diagnostics continue the whole-account numbers instead of shrinking.
+  assert.deepEqual(tail.info, full.info);
+});
+
+test('Cursor never uploads a window the tail did not fetch whole', async (t) => {
+  await withCursorDb(t);
+  const now = Date.now();
+  const rows = syntheticRows(now - 4 * 24 * HOUR, now - 2 * MINUTE);
+  const previousInfo = infoAsOf(rows, now - 3 * HOUR);
+  const plan = cursor.incrementalCsvPlan(previousInfo, ACCOUNT);
+  const full = csvServer(rows);
+
+  for (const [name, options] of [
+    // The server answers from mid-window, 45 minutes before the first emitted
+    // window: the window holding that start is incomplete and must not ship.
+    ['server starts mid-window', { startOverride: plan.emitFrom - 45 * MINUTE }],
+    // The server ignores the range entirely and returns the whole account.
+    ['server ignores the range', { ignoreRange: true }],
+  ]) {
+    await t.test(name, async (t) => {
+      const server = csvServer(rows, options);
+      mockFetch(t, { csv: (init, url) => (url.includes('startDate') ? server.handler(init, url) : full.handler(init, url)) });
+      const whole = await cursor.parse();
+      const tail = await cursor.parse({ previousInfo });
+      assert.ok(tail.buckets.every(b => Date.parse(b.bucketStart) >= plan.emitFrom));
+      assert.deepEqual(tail.buckets, whole.buckets.filter(b => Date.parse(b.bucketStart) >= plan.emitFrom));
+    });
+  }
+});
+
+test('Cursor takes the whole export when the tail cannot be tied to known history', async (t) => {
+  const now = Date.now();
+  const rows = syntheticRows(now - 3 * 24 * HOUR, now - 2 * MINUTE);
+  const previousInfo = infoAsOf(rows, now - 2 * HOUR);
+
+  await t.test('account switched', async (t) => {
+    await withCursorDb(t);
+    const server = csvServer(rows);
+    mockFetch(t, { csv: server.handler });
+    const result = await cursor.parse({ previousInfo: { ...previousInfo, account: 'auth0|othe…user' } });
+    assert.equal(server.requests.length, 1);
+    assert.doesNotMatch(server.requests[0], /startDate/);
+    assert.equal(result.skipped, undefined);
+  });
+
+  await t.test('empty tail (idle vs. emptied export look the same)', async (t) => {
+    await withCursorDb(t);
+    const requests = [];
+    mockFetch(t, {
+      csv: (init, url) => {
+        requests.push(url);
+        return new Response(url.includes('startDate') ? CSV_HEADER : csvOf(rows));
+      },
+    });
+    const result = await cursor.parse({ previousInfo });
+    assert.equal(requests.length, 2);
+    assert.match(requests[0], /startDate=/);
+    assert.doesNotMatch(requests[1], /startDate/);
+    // The whole export is a complete view again: prunes normally.
+    assert.equal(result.skipped, undefined);
+    assert.equal(result.info.events, rows.length);
+  });
+
+  await t.test('tail only has rows newer than anything seen before', async (t) => {
+    await withCursorDb(t);
+    const requests = [];
+    mockFetch(t, {
+      csv: (init, url) => {
+        requests.push(url);
+        const visible = url.includes('startDate') ? rows.filter(r => r.at > Date.parse(previousInfo.latestTokenAt)) : rows;
+        return new Response(csvOf(visible));
+      },
+    });
+    const result = await cursor.parse({ previousInfo });
+    assert.equal(requests.length, 2);
+    assert.equal(result.skipped, undefined);
+  });
+
+  await t.test('an emptied export still reaches the events fallback', async (t) => {
+    await withCursorDb(t);
+    // Both the tail and the whole export come back empty (X Subscription).
+    mockFetch(t, {
+      csv: () => new Response(CSV_HEADER),
+      events: eventsPage([event({ usageEventId: 'after', timestamp: String(now - 30 * MINUTE) })]),
+    });
+    const result = await cursor.parse({ previousInfo });
+    assert.equal(result.buckets.length, 1);
+    assert.match(result.warnings[0], /CSV 导出不可用/);
+  });
+});
+
+test('Cursor takes the whole export if cursor.com refuses the date range', async (t) => {
+  await withCursorDb(t);
+  const now = Date.now();
+  const rows = syntheticRows(now - 2 * 24 * HOUR, now - 2 * MINUTE);
+  const requests = [];
+  mockFetch(t, {
+    csv: (init, url) => {
+      requests.push(url);
+      return url.includes('startDate')
+        ? new Response('bad request', { status: 400, statusText: 'Bad Request' })
+        : new Response(csvOf(rows));
+    },
+  });
+  const result = await cursor.parse({ previousInfo: infoAsOf(rows, now - HOUR) });
+  assert.equal(requests.length, 2);
+  assert.doesNotMatch(requests[1], /startDate/);
+  assert.equal(result.skipped, undefined);
+  assert.equal(result.info.events, rows.length);
+});
+
+test('Cursor keeps the previous state when the tail request fails', async (t) => {
+  await withCursorDb(t);
+  const now = Date.now();
+  const rows = syntheticRows(now - 2 * 24 * HOUR, now - 2 * MINUTE);
+  const fetchMock = mockFetch(t, { csv: async () => { throw networkError('ECONNRESET'); } });
+  const result = await cursor.parse({ previousInfo: infoAsOf(rows, now - HOUR) });
+  assert.equal(result.skipped, true);
+  assert.deepEqual(result.buckets, []);
+  assert.match(result.warnings[0], /ECONNRESET/);
+  // No second, whole-account attempt after a network failure.
+  assert.equal(fetchMock.mock.callCount(), 1);
+
+  // Same for a transient server state (rate limit / 5xx).
+  for (const status of [429, 503]) {
+    let calls = 0;
+    t.mock.method(globalThis, 'fetch', async () => {
+      calls++;
+      return new Response('busy', { status, statusText: 'Busy' });
+    });
+    const busy = await cursor.parse({ previousInfo: infoAsOf(rows, now - HOUR) });
+    assert.equal(busy.skipped, true);
+    assert.equal(calls, 1);
+  }
+});
+
+test('Cursor tail still fills a stale CSV gap from the events API', async (t) => {
+  await withCursorDb(t);
+  const now = Date.now();
+  // The export stopped two days ago; the previous run already saw its newest row.
+  const rows = syntheticRows(now - 5 * 24 * HOUR, now - 2 * 24 * HOUR);
+  const previousInfo = infoAsOf(rows, now - 2 * 24 * HOUR);
+  const gapEvent = now - HOUR;
+  const server = csvServer(rows);
+  mockFetch(t, {
+    csv: server.handler,
+    events: eventsPage([event({ usageEventId: 'gap', timestamp: String(gapEvent), model: 'new-model' })]),
+  });
+
+  const result = await cursor.parse({ previousInfo });
+  assert.match(server.requests[0], /startDate=/);
+  assert.equal(result.skipped, true);
+  assert.ok(result.buckets.some(b => b.model === 'new-model'));
+  assert.match(result.warnings[0], /CSV 最新 token 事件停在/);
+  assert.equal(result.info.latestTokenAt, new Date(gapEvent).toISOString());
+  assert.equal(result.info.events, previousInfo.events + 1);
+});
+
+test('Cursor events fallback rebuilds the previous newest event\'s window whole', async (t) => {
+  await withCursorDb(t);
+  // Previous sync saw an event at 10:15; this run's newer event lands at 10:20
+  // in the same 10:00 window. Uploading only the 10:20 event under the 10:00
+  // key would replace (or, being smaller, be refused in favour of) the value
+  // already holding the 10:05 and 10:15 events.
+  const previousLatest = Date.parse('2026-10-19T10:15:00Z');
+  const windowStart = roundToHalfHour(new Date(previousLatest)).getTime();
+  let requestBody;
+  mockFetch(t, {
+    csv: new Response(CSV_HEADER),
+    events: async (init) => {
+      requestBody = JSON.parse(init.body);
+      return eventsPage([
+        event({ usageEventId: 'before-window', timestamp: String(windowStart - 10 * MINUTE) }),
+        event({ usageEventId: 'a', timestamp: String(windowStart + 5 * MINUTE) }),
+        event({ usageEventId: 'b', timestamp: String(previousLatest) }),
+        event({ usageEventId: 'c', timestamp: String(previousLatest + 5 * MINUTE) }),
+      ]);
+    },
+  });
+
+  const result = await cursor.parse({
+    previousInfo: { latestTokenAt: new Date(previousLatest).toISOString() },
+  });
+  assert.equal(requestBody.startDate, String(windowStart - HOUR));
+  assert.equal(result.buckets.length, 1);
+  assert.equal(result.buckets[0].bucketStart, new Date(windowStart).toISOString());
+  // a + b + c, each 30 input / 30 cache read / 40 output.
+  assert.equal(result.buckets[0].inputTokens, 90);
+  assert.equal(result.buckets[0].totalTokens, 3 * 70);
+  // "New usage" is still judged strictly after the previous newest event.
+  assert.equal(result.info.events, 1);
+  assert.match(result.warnings[0], /补回.*1 个 token 事件/);
+  // Recent windows only: must not prune the older Cursor keys.
+  assert.equal(result.skipped, true);
 });
