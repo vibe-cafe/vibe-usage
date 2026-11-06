@@ -230,7 +230,10 @@ test('Cursor does not probe events while the CSV is fresh', async (t) => {
 
 test('Cursor reads a token stored as a SQLite BLOB', async (t) => {
   await withCursorDb(t, { value: Buffer.from(TOKEN, 'utf16le') });
-  mockFetch(t, { csv: new Response(CSV) });
+  mockFetch(t, { csv: (init) => {
+    assert.ok(init.headers.Cookie.includes(encodeURIComponent(TOKEN)));
+    return new Response(CSV);
+  } });
   const result = await cursor.parse();
   assert.equal(result.buckets.length, 1);
   assert.match(result.info.account, /^auth0\|/);

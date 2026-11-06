@@ -93,12 +93,15 @@ export function decodeTokenValue(value) {
 function readAccessToken(dbPath) {
   // Cursor app holds a write lock; queryDbJsonSnapshotOnLock copies the WAL set
   // to a temp dir and retries on "database is locked".
-  const sql = `SELECT value FROM ItemTable WHERE key = '${ACCESS_TOKEN_KEY}' LIMIT 1`;
+  // Older sqlite3 CLIs truncate BLOB JSON strings at the first NUL. Hex keeps
+  // UTF-16 bytes intact on both the CLI fallback and node:sqlite.
+  const sql = `SELECT hex(value) AS tokenHex FROM ItemTable WHERE key = '${ACCESS_TOKEN_KEY}' LIMIT 1`;
   const rows = queryDbJsonSnapshotOnLock(dbPath, sql, {
     tempPrefix: 'vibe-usage-cursor-',
     opts: { maxBuffer: 4 * 1024 * 1024, timeout: 15000 },
   });
-  return decodeTokenValue(rows[0]?.value);
+  const tokenHex = rows[0]?.tokenHex;
+  return typeof tokenHex === 'string' ? decodeTokenValue(Buffer.from(tokenHex, 'hex')) : null;
 }
 
 function decodeJwtPayload(token) {
