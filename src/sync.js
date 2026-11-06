@@ -20,8 +20,20 @@ const BATCH_SIZE = 100;
 const SESSION_BATCH_SIZE = 500;
 
 function reportMagpieWithheld(plan) {
+  const reasons = new Map();
   for (const { window, reason } of plan.withheld) {
-    process.stderr.write(`${dim(`  Magpie: 暂停上传窗口 ${window}：${reason}。已上传记录保持原值。`)}\n`);
+    const source = window.slice(0, window.indexOf('|'));
+    const start = window.slice(window.lastIndexOf('|') + 1);
+    if (!reasons.has(reason)) reasons.set(reason, { count: 0, sources: new Set(), earliest: start, latest: start });
+    const summary = reasons.get(reason);
+    summary.count++;
+    summary.sources.add(source);
+    if (start < summary.earliest) summary.earliest = start;
+    if (start > summary.latest) summary.latest = start;
+  }
+  for (const [reason, { count, sources, earliest, latest }] of reasons) {
+    const [cause, remedy] = reason.split('；');
+    process.stderr.write(`${dim(`  Magpie: ${cause}；暂停上传 ${count} 个窗口，涉及工具 ${[...sources].sort().join('、')}，窗口起始时间 ${earliest} 至 ${latest}；${remedy}。已上传记录保持原值。`)}\n`);
   }
 }
 

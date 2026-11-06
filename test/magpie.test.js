@@ -246,13 +246,68 @@ test('ledger tolerates malformed lines, retries partial tails and never reads us
   assert.equal((await omp({ magpie: context() })).buckets[0].model, 'group/lab');
 });
 
-test('ledger filters failed, fallback, backfilled and remote rows independently', async t => {
+test('ledger filters failed, handed-on, reported and other-computer rows independently', async t => {
   const f = fixture(t);
   synthetic(f, 'omp');
-  for (const extra of [{ status: 500 }, { fallback: true }, { backfill: true }, { remote: true }]) {
-    f.ledger([row(extra)]);
-    assert.equal((await omp({ magpie: context() })).buckets[0].model, 'group/lab');
+  for (const extra of [{ status: 500 }, { handed_on: true }, { source: 'reported' }, { computer: 'other-computer' }]) {
+    f.ledger([row({ provider: 'claude', rid: 'request-1', ...extra })]);
+    const magpie = context();
+    assert.equal((await omp({ magpie })).buckets[0].model, 'group/lab');
+    assert.equal(magpie.isBridge(new Set(['request-1'])), false);
   }
+  f.ledger([row({ handed_on: false, source: '', computer: '' })]);
+  assert.equal((await omp({ magpie: context() })).buckets[0].model, 'magpie/deepseek/deepseek-flash');
+});
+
+test('cut eligibility is checked once per context even when the cut remains undefined', t => {
+  const f = fixture(t);
+  for (const result of [undefined, 'none']) {
+    let calls = 0;
+    const magpie = createMagpieContext({ onPossible: () => { calls++; return result; } });
+    magpie.discover();
+    assert.equal(calls, 0, 'no ledger or response model yet');
+    magpie.discover(true);
+    f.ledger([row()]);
+    magpie.prepare();
+    magpie.discover(true);
+    assert.equal(calls, 1);
+    assert.equal(magpie.startAt, result);
+    rmSync(f.file);
+  }
+});
+
+test('Claude collects deduplicated bridge ids only when the ledger exists at initial discovery', async t => {
+  const f = fixture(t);
+  synthetic(f, 'claude', { requestId: 'request-1' });
+  const path = join(f.paths.claude, 'projects', 'fixture', 'session.jsonl');
+  appendFileSync(path, readFileSync(path));
+  jsonl(join(f.paths.claude, 'transcripts', 'timing.jsonl'), [
+    { type: 'user', timestamp: T, requestId: 'timing-request' },
+    { type: 'assistant', timestamp: T, requestId: 'timing-request' },
+  ]);
+  const baseline = await claude();
+  const absent = context();
+  absent.discover();
+  assert.equal(absent.ledgerExists, false);
+  for (const method of ['prepare', 'isBridge', 'attribute']) {
+    absent[method] = () => assert.fail(`absent ledger must not call ${method}`);
+  }
+  assert.deepEqual(await claude({ magpie: absent }), baseline);
+  f.ledger([row()]);
+  assert.deepEqual(await claude({ magpie: absent }), baseline, 'initial discovery stays fixed for this sync');
+
+  const present = context();
+  const requests = [];
+  present.isBridge = ids => {
+    assert.ok(ids instanceof Set);
+    requests.push([...ids]);
+    return false;
+  };
+  const result = await claude({ magpie: present });
+  assert.equal(present.ledgerExists, true);
+  assert.deepEqual(requests, [['request-1'], ['timing-request']]);
+  assert.equal(result.buckets[0].model, 'magpie/deepseek/deepseek-flash');
+  assert.deepEqual(result.sessions, baseline.sessions);
 });
 
 test('dated cuts read only a recent ledger suffix; XDG and default paths stay isolated', async t => {
@@ -313,6 +368,7 @@ test('subscription bridge skips the entire Claude session only for exact rid, Cl
 
 test('recent unmatched calls wait ten minutes for all five tools, only after the cut', async t => {
   const f = fixture(t);
+  f.ledger([]);
   for (const [tool, parse] of Object.entries(parsers)) {
     synthetic(f, tool);
     const recent = context('none', Date.parse(T) + 599_999);

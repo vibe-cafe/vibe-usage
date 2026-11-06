@@ -56,7 +56,9 @@ export function planMagpieMigration(buckets, state, { startAt, failed = false, p
   const held = new Map();
   const isMagpie = key => splitKey(key).model?.startsWith('magpie/');
   for (const [coord, oldKeys] of previous) {
-    const nextKeys = current.get(coord) || new Set();
+    const nextKeys = current.get(coord);
+    // Entirely vanished windows follow ordinary source-scoped pruning.
+    if (!nextKeys) continue;
     const missing = [...oldKeys].filter(key => !nextKeys.has(key));
     if (missing.some(isMagpie)
       || (missing.length && [...nextKeys].some(key => isMagpie(key) && !oldKeys.has(key)))) {

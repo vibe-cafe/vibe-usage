@@ -229,7 +229,7 @@ async function finalizeCandidateSession(
   return extractSessions(events)[0] || null;
 }
 
-async function scanProjectCandidate(candidate) {
+async function scanProjectCandidate(candidate, collectMagpie) {
   const usageEntries = {
     entriesByKey: new Map(),
     anonymousEntries: [],
@@ -238,10 +238,10 @@ async function scanProjectCandidate(candidate) {
   let lastModel = null;
   let sessionProject = candidate.fallbackProject;
   let foundSessionCwd = false;
-  const requestIds = [];
+  const requestIds = collectMagpie ? new Set() : null;
 
   await readJsonl(candidate, (obj) => {
-    if (typeof obj.requestId === 'string') requestIds.push(obj.requestId);
+    if (requestIds && typeof obj.requestId === 'string') requestIds.add(obj.requestId);
     // cwd can change after Claude runs `cd`; project attribution should remain
     // the directory where this session started, not fragment into subfolders.
     if (!foundSessionCwd && typeof obj.cwd === 'string' && obj.cwd.trim()) {
@@ -292,8 +292,8 @@ async function scanProjectCandidate(candidate) {
       reasoningOutputTokens: 0,
       cacheCreation5mTokens,
       cacheCreation1hTokens,
-      magpie: { responseId: obj.message.id, fast: isFastMode(usage, obj.message),
-        counts: [inputTokens, outputTokens, cachedInputTokens, cacheCreation5mTokens + cacheCreation1hTokens] },
+      ...(collectMagpie ? { magpie: { responseId: obj.message.id, fast: isFastMode(usage, obj.message),
+        counts: [inputTokens, outputTokens, cachedInputTokens, cacheCreation5mTokens + cacheCreation1hTokens] } } : {}),
     });
   });
 
@@ -310,12 +310,12 @@ async function scanProjectCandidate(candidate) {
   return { usageEntries, session, requestIds };
 }
 
-async function scanTranscriptCandidate(candidate) {
+async function scanTranscriptCandidate(candidate, collectMagpie) {
   const sessionAccumulator = createSessionAccumulator();
-  const requestIds = [];
+  const requestIds = collectMagpie ? new Set() : null;
   const projectForObject = (obj) => projectFromCwd(obj.cwd, 'unknown');
   await readJsonl(candidate, (obj) => {
-    if (typeof obj.requestId === 'string') requestIds.push(obj.requestId);
+    if (requestIds && typeof obj.requestId === 'string') requestIds.add(obj.requestId);
     const event = timingEvent(
       obj,
       candidate.sessionId,
@@ -334,7 +334,7 @@ async function scanTranscriptCandidate(candidate) {
 async function scanBestCandidate(candidates, scanner, ctx) {
   for (const candidate of candidates) {
     try {
-      return await scanner(candidate);
+      return await scanner(candidate, ctx.collectMagpie);
     } catch (err) {
       addWarning(ctx, `Claude Code: cannot read ${candidate.filePath}: ${err.message}`);
     }
@@ -380,7 +380,9 @@ function* iterateUsageEntries(ctx) {
 }
 
 export async function parse({ extraRoots = [], magpie } = {}) {
+  if (magpie?.ledgerExists === undefined) magpie?.discover();
   const ctx = {
+    collectMagpie: !!magpie?.ledgerExists,
     entriesByKey: new Map(),
     anonymousEntries: [],
     sessions: [],
@@ -424,16 +426,16 @@ export async function parse({ extraRoots = [], magpie } = {}) {
 
   // Read the ledger after all transcript snapshots. A bridge match excludes
   // both tracks of the entire physical session, before cross-copy selection.
-  if (parsedSessions.length) magpie?.prepare();
+  if (ctx.collectMagpie && parsedSessions.length) magpie.prepare();
   for (const parsed of parsedSessions) {
-    if (magpie?.isBridge(parsed.requestIds)) continue;
+    if (ctx.collectMagpie && magpie.isBridge(parsed.requestIds)) continue;
     if (parsed.session) ctx.sessions.push(parsed.session);
     if (parsed.usageEntries) mergeUsageEntries(ctx, parsed.usageEntries);
   }
   const entries = [...iterateUsageEntries(ctx)];
 
   return {
-    buckets: aggregateToBuckets(magpie ? magpie.attribute(entries, 'claude') : entries),
+    buckets: aggregateToBuckets(ctx.collectMagpie ? magpie.attribute(entries, 'claude') : entries),
     sessions: ctx.sessions,
     ...(ctx.incomplete ? { skipped: true } : {}),
     ...(ctx.warnings.length > 0 ? { warnings: ctx.warnings } : {}),

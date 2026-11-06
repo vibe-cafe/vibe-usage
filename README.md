@@ -222,9 +222,11 @@ unambiguous match. Correct concrete names, including reasoning suffixes such
 as `:high`, stay unchanged. Missing or conflicting matches keep the original
 name. Magpie is not a separate usage source.
 
-The reader keeps only timing, caller/provider/model, requested and served model,
-served tier, token counts, status, response/request/session identifiers, and
-fallback/backfill/remote flags. It does not retain account details, key names,
+The reader uses only timing, caller/provider/model, served model/tier, token
+counts, status, response/request/session identifiers, and the exclusion fields
+`handed_on`, `source`, and `computer`. It excludes handed-on attempts
+(`handed_on: true`), reported calls (`source: "reported"`), and other computers'
+calls (nonempty `computer`). It does not retain account details, key names,
 or error text, and never uploads ledger records or identifiers. Only the model
 name changes in existing usage buckets. Other computers' `usage-others/`
 ledgers and portable Magpie installations are not read.
@@ -265,11 +267,14 @@ history, `reset` first deletes cloud data, then clears local upload state and
 the cut, and finally re-uploads available logs. With an installed service, the
 immediate re-upload uses original names until the daemon sets a new cut.
 
-If a previously uploaded `magpie/` row disappears, or a new one would replace a
-missing original row, the whole tool/project/device/half-hour window is held
-at its last uploaded value. Recent unmatched Magpie requests wait up to ten
-minutes; ledger read failures hold post-cut windows until a later sync.
-Reasons and recovery steps appear on stderr, including in daemon logs.
+For windows that still contain at least one current row, if a previously
+uploaded `magpie/` row disappears, or a new one would replace a missing original
+row, the whole tool/project/device/half-hour window is held at its last uploaded
+value. Entirely vanished windows follow normal local-state pruning. Recent
+unmatched Magpie requests wait up to ten minutes; ledger read failures hold
+post-cut windows until a later sync.
+One summary per reason reports the window count, tools, earliest/latest window
+starts, and recovery steps on stderr, including in daemon logs.
 Restore the ledger, upgrade all collectors, and check its location. In
 particular, a service may not inherit your `XDG_CONFIG_HOME`; this can cause
 held windows until the service can see the same ledger. Uninstalling Magpie

@@ -50,18 +50,34 @@ test('UTC half-hour validation rejects local times, invalid dates and fractional
     '2026-11-05T09:30:00+00:00', '2026-02-30T09:30:00Z', '', null]) assert.throws(() => magpieStartTime(value));
 });
 
-test('flip guard one preserves every old row when a Magpie row disappears, including empty scans', () => {
+test('flip guard one preserves every old row when a Magpie row disappears from a still-live window', () => {
   const old = bucket({ model: 'magpie/deepseek/deepseek-flash' });
   const direct = bucket({ model: 'deepseek/deepseek-flash' });
   const state = stateOf(old, direct);
   const unchanged = bucket({ bucketStart: NEXT });
-  for (const current of [[bucket(), direct, unchanged], [direct, unchanged], []]) {
+  for (const current of [[bucket(), direct, unchanged], [direct, unchanged]]) {
     const plan = planMagpieMigration(current, state);
     assert.deepEqual(plan.buckets, current.filter(b => b.bucketStart === NEXT));
     assert.equal(plan.preserveBuckets.size, 2);
     const copy = structuredClone(state);
     pruneState(copy, plan.preserveBuckets, new Set(), new Set(['omp']));
     assert.deepEqual(copy, state);
+  }
+});
+
+test('vanished windows and old project/hostname coordinates follow ordinary source-scoped pruning', () => {
+  const old = bucket({ model: 'magpie/deepseek/deepseek-flash' });
+  const state = stateOf(old);
+  for (const current of [[], [bucket({ project: 'unknown' })], [bucket({ hostname: 'new-host' })]]) {
+    const plan = planMagpieMigration(current, state);
+    assert.deepEqual(plan.buckets, current);
+    assert.equal(plan.withheld.length, 0);
+    assert.equal(plan.preserveBuckets.size, 0);
+    const copy = structuredClone(state);
+    pruneState(copy, plan.preserveBuckets, new Set(), new Set());
+    assert.deepEqual(copy, state, 'failed parsers remain protected by okSources');
+    pruneState(copy, plan.preserveBuckets, new Set(), new Set(['omp']));
+    assert.deepEqual(copy.buckets, {});
   }
 });
 
@@ -90,6 +106,8 @@ test('pending and failed reads hold entire affected windows, retain hashes and a
   assert.equal(failed.preserveBuckets.size, 5);
   assert.equal(failed.buckets.length, 6);
   assert.ok(failed.buckets.every(b => b.source === 'grok' || b.bucketStart === T));
+  const failedEmpty = planMagpieMigration([], state, { startAt: NEXT, failed: true });
+  assert.equal(failedEmpty.preserveBuckets.size, 5, 'ledger read failures still hold vanished post-cut windows');
   const pending = planMagpieMigration([bucket(), bucket({ model: 'direct' }), bucket({ bucketStart: NEXT })], state,
     { startAt: 'none', pending: [bucket()] });
   assert.deepEqual(pending.buckets, [bucket({ bucketStart: NEXT })]);
@@ -174,7 +192,7 @@ test('config persists none, canonicalizes time, refuses moving an established cu
   assert.equal('kikiStartAt' in f.read('config.json'), false);
 });
 
-test('sync is incremental, maps hidden projects before flip guards and preserves vanished Magpie state in quiet mode', async t => {
+test('quiet sync guards live windows after privacy mapping and prunes entirely vanished windows', async t => {
   const f = fixture(t);
   const { apiUrl, received } = await server(t, f);
   f.write('config.json', { apiKey: 'vbu_fixture', apiUrl, hostname: 'fixture-host', magpieStartAt: 'none' });
@@ -191,13 +209,21 @@ test('sync is incremental, maps hidden projects before flip guards and preserves
   assert.equal(received.length, 1);
   rmSync(f.env.VIBE_USAGE_MAGPIE_TEST_FILE);
   const lost = await f.run(command);
-  assert.match(lost.stderr, /暂停上传窗口.*模型归属发生翻转/);
+  assert.match(lost.stderr, /模型归属发生翻转.*暂停上传 1 个窗口/);
   assert.equal(received.length, 1);
   assert.deepEqual(f.read('state.json'), state);
+  // The ledger exists, but its only response no longer matches this call.
+  seedLedger(f, '2026-11-05T09:10:00Z');
+  const ledger = JSON.parse(readFileSync(f.env.VIBE_USAGE_MAGPIE_TEST_FILE));
+  ledger.response_id = 'other-reply';
+  writeFileSync(f.env.VIBE_USAGE_MAGPIE_TEST_FILE, JSON.stringify(ledger) + '\n');
+  const live = await f.run(command);
+  assert.match(live.stderr, /模型归属发生翻转.*暂停上传 1 个窗口/);
+  assert.deepEqual(f.read('state.json').buckets, state.buckets);
   rmSync(f.env.VIBE_USAGE_OMP_SESSION_DIRS, { recursive: true });
   const vanished = await f.run(command);
-  assert.match(vanished.stderr, /暂停上传窗口/);
-  assert.deepEqual(f.read('state.json').buckets, state.buckets);
+  assert.doesNotMatch(vanished.stderr, /暂停上传/);
+  assert.deepEqual(f.read('state.json').buckets, {});
   assert.deepEqual(f.read('state.json').sessions, {}, 'ordinary session pruning is unchanged');
 });
 
@@ -293,6 +319,33 @@ test('quiet sync reports recent unmatched windows and ledger failures without up
   const failed = await f.run(command);
   assert.match(failed.stderr, /本机账本读取失败.*读取权限/);
   assert.equal(received.flatMap(p => p.buckets).length, 0);
+});
+
+test('quiet daemon sync summarizes withheld windows once per reason on stderr', async t => {
+  const f = fixture(t);
+  const { apiUrl, received } = await server(t, f);
+  f.write('config.json', { apiKey: 'vbu_fixture', apiUrl, hostname: 'fixture-host', magpieStartAt: 'none' });
+  const old = ['omp', 'pi-coding-agent'].flatMap(source => [T, NEXT].map(bucketStart =>
+    bucket({ source, bucketStart, project: 'unknown', model: 'magpie/deepseek/deepseek-flash' })));
+  const waiting = bucket({ project: 'unknown', bucketStart: '2026-11-05T10:00:00.000Z' });
+  const current = [...old.map(b => ({ ...b, model: 'group/lab' })), waiting];
+  f.write('state.json', stateOf(...old));
+  const result = await f.run(restrict(['omp', 'pi-coding-agent']) + `
+    const current = ${JSON.stringify(current)};
+    for (const source of Object.keys(parsers)) parsers[source] = async ({ magpie }) => {
+      if (source === 'omp') magpie.pending.push(${JSON.stringify(waiting)});
+      return { buckets: current.filter(b => b.source === source), sessions: [] };
+    };
+    const { runSync } = await import('./src/sync.js');
+    await runSync({ quiet: true, surface: 'daemon', throws: true });
+  `);
+  const lines = result.stderr.split('\n').filter(line => line.includes('Magpie:'));
+  assert.equal(lines.length, 2);
+  assert.match(lines[0], /模型归属发生翻转.*暂停上传 4 个窗口.*omp、pi-coding-agent.*2026-11-05T09:00:00.000Z 至 2026-11-05T09:30:00.000Z.*请恢复本机账本/);
+  assert.match(lines[1], /最近 10 分钟.*暂停上传 1 个窗口.*工具 omp.*2026-11-05T10:00:00.000Z 至 2026-11-05T10:00:00.000Z.*等待下次同步/);
+  assert.doesNotMatch(result.stdout, /Magpie|暂停上传/);
+  assert.equal(received.length, 0);
+  assert.deepEqual(f.read('state.json').buckets, stateOf(...old).buckets);
 });
 
 test('no Magpie installation leaves config and ordinary parser output unchanged', async t => {

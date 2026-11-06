@@ -53,14 +53,19 @@ export function createMagpieContext({ startAt, onPossible, now = Date.now() } = 
   const sessions = new Map();
   const bridgeRequests = new Set();
   let offset = null;
+  let possibleChecked = false;
   const ctx = {
-    startAt, failed: false, pending: [], bytesRead: 0,
+    startAt, failed: false, pending: [], bytesRead: 0, ledgerExists: undefined,
     discover(hasResponseModel = false) {
       let snapshot;
       try { snapshot = statSync(file); }
       catch (err) { if (err.code !== 'ENOENT') ctx.failed = true; }
+      ctx.ledgerExists ??= !!snapshot;
       if (snapshot || ctx.failed || hasResponseModel) {
-        if (ctx.startAt === undefined && onPossible) ctx.startAt = onPossible();
+        if (ctx.startAt === undefined && onPossible && !possibleChecked) {
+          possibleChecked = true;
+          ctx.startAt = onPossible();
+        }
       }
       return snapshot;
     },
@@ -100,7 +105,9 @@ export function createMagpieContext({ startAt, onPossible, now = Date.now() } = 
       }
     },
     isBridge(requestIds) {
-      return !ctx.failed && requestIds.some(id => id && bridgeRequests.has(id));
+      if (ctx.failed) return false;
+      for (const id of requestIds) if (id && bridgeRequests.has(id)) return true;
+      return false;
     },
     attribute(entries, kind) {
       const candidates = entries.filter(e => e.magpie);
@@ -156,7 +163,8 @@ export function createMagpieContext({ startAt, onPossible, now = Date.now() } = 
 
   function addRow(row) {
     if (!Number.isInteger(row.status) || row.status < 200 || row.status >= 300
-      || row.fallback || row.backfill || row.remote) return;
+      || row.handed_on === true || row.source === 'reported'
+      || (typeof row.computer === 'string' && row.computer.length > 0)) return;
     if (row.provider === 'claude' && typeof row.rid === 'string' && row.rid
       && BRIDGE_AGENTS.has(row.agent)) bridgeRequests.add(row.rid);
     const counts = [row.in, row.out, row.cache_read, row.cache_write];
