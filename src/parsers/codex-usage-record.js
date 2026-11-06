@@ -18,6 +18,7 @@ export function normalizeUsageRecord(obj) {
   }
   return { ...obj, type: 'event_msg', payload: {
     type: 'token_count', usage_record: true,
+    ...(typeof p.response_id === 'string' ? { response_id: p.response_id } : {}),
     info: { last_token_usage: pickUsage(usage), total_token_usage: pickUsage(total) },
   }};
 }

@@ -13,6 +13,7 @@ import { loadState } from './state.js';
 import { fetchAccount } from './api.js';
 import { COLLECTOR_VERSION } from './client-meta.js';
 import { kikiStartTime } from './kiki-migration.js';
+import { magpieStartTime } from './magpie-migration.js';
 
 function printSmallHeader() {
   console.log();
@@ -139,7 +140,7 @@ async function printBoundAccount(apiUrl, apiKey) {
   }
 }
 
-const VALID_CONFIG_KEYS = ['apiKey', 'apiUrl', 'hostname', 'codexExtraHome', 'kikiStartAt'];
+const VALID_CONFIG_KEYS = ['apiKey', 'apiUrl', 'hostname', 'codexExtraHome', 'kikiStartAt', 'magpieStartAt'];
 
 function handleConfig(args) {
   const sub = args[0];
@@ -181,6 +182,20 @@ function handleConfig(args) {
         value = validation.path;
       }
       const config = loadConfig() || {};
+      if (key === 'magpieStartAt') {
+        try {
+          const time = magpieStartTime(value);
+          if (value !== 'none' && config.magpieStartAt !== undefined
+            && magpieStartTime(config.magpieStartAt) !== time) {
+            throw new Error('已保存的 Magpie 切点不能直接更改；如需重建历史，请先 reset 删除云端数据并重传。');
+          }
+          value = value === 'none' ? 'none' : new Date(time).toISOString();
+          if (value === 'none') console.error(warn('Magpie 将对全部历史还原模型；仅适合确认这台机器从未按原名上传过的人，否则可能双计。'));
+        } catch (err) {
+          console.error(failure(err.message));
+          process.exit(1);
+        }
+      }
       if (key === 'kikiStartAt') {
         // `none` is the documented escape hatch for a user who asserts no
         // compatibility collector ever ran. It clears the cut (deleting the

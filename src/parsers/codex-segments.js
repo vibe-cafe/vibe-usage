@@ -15,7 +15,7 @@ function accountingRecord(obj, context) {
   const next = { type: obj.type, timestamp: obj.timestamp };
   const p = obj.payload;
   if (obj.type === 'session_meta' && p) {
-    next.payload = pick(p, ['id', 'timestamp', 'cwd', 'forked_from_id', 'parent_thread_id', 'thread_source']);
+    next.payload = pick(p, ['id', 'timestamp', 'cwd', 'forked_from_id', 'parent_thread_id', 'thread_source', 'model_provider']);
     if (p.git) next.payload.git = pick(p.git, ['repository_url']);
     if (typeof p.source === 'string') next.payload.source = p.source;
     else if (p.source && typeof p.source === 'object' && 'subagent' in p.source) {
@@ -24,7 +24,7 @@ function accountingRecord(obj, context) {
   } else if (obj.type === 'turn_context') {
     next.payload = pick(p, ['model', 'service_tier']);
   } else if (obj.type === 'event_msg' && p) {
-    next.payload = pick(p, ['type', 'started_at', 'model', 'usage_record']);
+    next.payload = pick(p, ['type', 'started_at', 'model', 'usage_record', 'response_id']);
     if (p.type === 'token_count') {
       next._tokenFingerprint = hash(p).slice(0, 16);
       next._segmentContext = { ...context };

@@ -1,6 +1,6 @@
 import { createInterface } from 'node:readline';
 import { hostname as getHostname } from 'node:os';
-import { loadConfig } from './config.js';
+import { loadConfig, saveConfig } from './config.js';
 import { deleteAllData } from './api.js';
 import { runSync } from './sync.js';
 import { clearState } from './state.js';
@@ -85,6 +85,10 @@ export async function runReset(args = [], deps = {}) {
   // item against state.json and uploads zero bytes — the deleted data would
   // never come back.
   clearState();
+  if (config.magpieStartAt !== undefined) {
+    delete config.magpieStartAt;
+    saveConfig(config);
+  }
 
   console.log();
   console.log(dim('  从本地日志重新同步...'));

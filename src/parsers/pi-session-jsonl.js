@@ -58,6 +58,7 @@ export async function parsePiSessionJsonl({
   includeFile = () => true,
   projectFromPath = projectFromFirstDir,
   deduplicateCopiedSessions = false,
+  magpie,
 }) {
   const ctx = { source, warnings: [], incomplete: false };
   const entriesById = new Map();
@@ -164,6 +165,10 @@ export async function parsePiSessionJsonl({
           outputTokens,
           cachedInputTokens,
           reasoningOutputTokens,
+          ...(magpie && message.provider === 'magpie' ? { magpie: {
+            responseId: message.responseId, responseModel: message.responseModel,
+            counts: [toCount(usage.input), toCount(usage.output), toCount(usage.cacheRead), toCount(usage.cacheWrite)],
+          } } : {}),
         };
         if (!recordId) {
           anonymousEntries.push(entry);
@@ -190,7 +195,7 @@ export async function parsePiSessionJsonl({
     }),
   ];
   return {
-    buckets: aggregateToBuckets(entries),
+    buckets: aggregateToBuckets(magpie ? magpie.attribute(entries, source === 'pi-coding-agent' ? 'pi' : 'omp') : entries),
     sessions: extractSessions(events),
     ...(ctx.incomplete ? { skipped: true } : {}),
     ...(ctx.warnings.length > 0 ? { warnings: ctx.warnings } : {}),
