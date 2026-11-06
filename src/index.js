@@ -94,8 +94,12 @@ async function showStatus() {
         if (cursorInfo.latestEventAt) {
           detail.push(`最新事件 ${String(cursorInfo.latestEventAt).slice(0, 16).replace('T', ' ')}Z`);
         }
-        if (Number.isFinite(cursorInfo.events)) detail.push(`${cursorInfo.events} 个事件`);
+        if (Number.isFinite(cursorInfo.events)) detail.push(`本次读到 ${cursorInfo.events} 个事件`);
         if (detail.length > 0) console.log(dimText(`       ${detail.join(' · ')}`));
+        const backfillBefore = cursorInfo.backfill?.before;
+        if (typeof backfillBefore === 'string') {
+          console.log(dimText(`       历史补到 ${backfillBefore.slice(0, 10)}（每次同步继续往前补）`));
+        }
         const latest = Date.parse(cursorInfo.latestEventAt);
         if (Number.isFinite(latest) && Date.now() - latest > 48 * 60 * 60 * 1000) {
           console.log(dimText('       已超过 48 小时没有新的 Cursor 事件；如最近用过 Cursor，请确认 Cursor 登录的是这个账号'));
