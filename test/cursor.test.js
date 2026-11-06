@@ -1,6 +1,7 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { execFileSync } from 'node:child_process';
+import { execFile, execFileSync } from 'node:child_process';
+import { promisify } from 'node:util';
 import { mkdtempSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
@@ -273,7 +274,8 @@ test('Cursor fallback only adds events newer than the previous sync', async (t) 
   const result = await cursor.parse({
     previousInfo: { latestEventAt: new Date(previousLatest).toISOString() },
   });
-  assert.equal(requestBody.startDate, String(previousLatest - 3600_000));
+  // Two hours back: every event of a window a new event lands in.
+  assert.equal(requestBody.startDate, String(previousLatest - 2 * 3600_000));
   assert.equal(result.buckets.length, 1);
   assert.equal(result.buckets[0].model, 'new-model');
   assert.match(result.warnings[0], /2026-10-19T00:00:00.000Z 之后/);
@@ -466,4 +468,119 @@ test('Cursor still surfaces expired credentials and soft-skips server failures',
       assert.equal(fetchMock.mock.callCount(), 1);
     });
   }
+});
+
+// --- Events fallback (#131 follow-up): count each event once, keep no gap ----
+
+const FALLBACK_ACCOUNT = cursor.cursorAccountLabel('auth0|cursor-test-user');
+const usage = input => ({ inputTokens: input, cacheWriteTokens: 0, cacheReadTokens: 0, outputTokens: 0 });
+
+test('Cursor events fallback rebuilds a half-hour window that gains a new event whole', async (t) => {
+  await withCursorDb(t);
+  // The previous sync already uploaded the 10:05 event (10 tokens) in the
+  // 10:00 window. A 10:20 event (20) arrives. Rebuilding that window from the
+  // new event alone uploads 20 under the same key and replaces 10 -> the
+  // window must go up as 30. The 09:50 window gains nothing and is not resent.
+  const previousLatest = Date.parse('2026-10-19T10:05:00Z');
+  const HOUR_MS = 60 * 60 * 1000;
+  let requestBody;
+  mockFetch(t, {
+    csv: () => new Response(CSV_HEADER),
+    events: async (init) => {
+      requestBody = JSON.parse(init.body);
+      return eventsPage([
+        event({ usageEventId: 'earlier-window', timestamp: String(Date.parse('2026-10-19T09:50:00Z')), tokenUsage: usage(5) }),
+        event({ usageEventId: 'seen', timestamp: String(previousLatest), tokenUsage: usage(10) }),
+        event({ usageEventId: 'new', timestamp: String(Date.parse('2026-10-19T10:20:00Z')), tokenUsage: usage(20) }),
+      ]);
+    },
+  });
+
+  const result = await cursor.parse({
+    previousInfo: { account: FALLBACK_ACCOUNT, latestTokenAt: new Date(previousLatest).toISOString() },
+  });
+  // Fetched far enough back to hold every event of the windows it rebuilds.
+  assert.ok(Number(requestBody.startDate) <= previousLatest - 2 * HOUR_MS);
+  assert.deepEqual(result.buckets.map(b => [b.bucketStart, b.inputTokens]), [['2026-10-19T10:00:00.000Z', 30]]);
+  // "New usage" is still only the event after the previous sync.
+  assert.equal(result.info.events, 1);
+  assert.match(result.warnings[0], /补回.*1 个 token 事件/);
+});
+
+test('Cursor events fallback keeps the previous anchor when it finds nothing or fails', async (t) => {
+  const previousLatest = '2026-10-19T10:05:00.000Z';
+  const previousInfo = { account: FALLBACK_ACCOUNT, latestTokenAt: previousLatest, latestEventAt: previousLatest };
+
+  await t.test('no new events', async (t) => {
+    await withCursorDb(t);
+    mockFetch(t, { csv: () => new Response(CSV_HEADER), events: () => new Response('{}') });
+    const result = await cursor.parse({ previousInfo });
+    assert.equal(result.skipped, true);
+    assert.equal(result.info.latestTokenAt, previousLatest);
+    assert.equal(result.info.latestEventAt, previousLatest);
+  });
+
+  await t.test('events API soft-fails', async (t) => {
+    await withCursorDb(t);
+    mockFetch(t, {
+      csv: () => new Response(CSV_HEADER),
+      events: () => new Response('busy', { status: 503, statusText: 'Service Unavailable' }),
+    });
+    const result = await cursor.parse({ previousInfo });
+    assert.equal(result.skipped, true);
+    assert.match(result.warnings[0], /事件接口也失败/);
+    // Without the anchor the next run would fall back to "the last 7 days"
+    // and re-report history already uploaded under the CSV's model names.
+    assert.equal(result.info.latestTokenAt, previousLatest);
+    assert.equal(result.info.latestEventAt, previousLatest);
+  });
+
+  await t.test('a different Cursor account starts like a first run', async (t) => {
+    await withCursorDb(t);
+    mockFetch(t, { csv: () => new Response(CSV_HEADER), events: () => new Response('{}') });
+    const result = await cursor.parse({ previousInfo: { ...previousInfo, account: 'auth0|othe…user' } });
+    assert.equal(result.info.latestTokenAt, undefined);
+  });
+});
+
+// roundToHalfHour() works in local time: on the night US clocks fall back
+// (2026-11-01, 02:00 EDT → 01:00 EST) a 01:10 EST event (06:10Z) belongs to
+// the 01:00 EDT window (05:00Z), 70 minutes before its timestamp. A new event
+// there must still rebuild its whole window, which needs the request to reach
+// two hours back. CI runs in UTC, so run this in a child process with TZ set.
+test('Cursor events fallback rebuilds whole windows across a DST fall-back', async (t) => {
+  await withCursorDb(t);
+  const script = `
+    const ok = new Date('2026-11-01T05:10:00Z').getTimezoneOffset() === 240
+      && new Date('2026-11-01T06:10:00Z').getTimezoneOffset() === 300;
+    if (!ok) { console.log(JSON.stringify({ skip: true })); process.exit(0); }
+    const cursor = await import('./src/parsers/cursor.js');
+    const at = iso => String(Date.parse(iso));
+    const events = [
+      ['r1', '2026-11-01T05:10:00Z', 1], // 01:10 EDT → window 05:00Z (seen)
+      ['r2', '2026-11-01T05:45:00Z', 2], // 01:45 EDT → window 05:30Z (seen, newest)
+      ['r3', '2026-11-01T06:10:00Z', 4], // 01:10 EST → window 05:00Z (new)
+      ['r4', '2026-11-01T06:40:00Z', 8], // 01:40 EST → window 05:30Z (new)
+    ];
+    let startDate;
+    globalThis.fetch = async (url, init) => {
+      if (String(url).includes('export-usage-events-csv')) return new Response(${JSON.stringify(CSV_HEADER)});
+      startDate = Number(JSON.parse(init.body).startDate);
+      const visible = events.filter(([, iso]) => Date.parse(iso) >= startDate);
+      return new Response(JSON.stringify({ totalUsageEventsCount: visible.length, usageEventsDisplay: visible.map(([id, iso, n]) => ({
+        usageEventId: id, timestamp: at(iso), model: 'm',
+        tokenUsage: { inputTokens: n, cacheWriteTokens: 0, cacheReadTokens: 0, outputTokens: 0 } })) }));
+    };
+    const result = await cursor.parse({ previousInfo: { latestTokenAt: '2026-11-01T05:45:00.000Z' } });
+    console.log(JSON.stringify({ buckets: result.buckets.map(b => [b.bucketStart, b.inputTokens]).sort(), startDate }));
+  `;
+  const { stdout } = await promisify(execFile)(process.execPath, ['--input-type=module', '-e', script], {
+    cwd: process.cwd(),
+    env: { ...process.env, TZ: 'America/New_York' },
+  });
+  const out = JSON.parse(stdout.trim().split('\n').pop());
+  if (out.skip) return t.skip('this platform does not honor TZ=America/New_York');
+  assert.ok(out.startDate <= Date.parse('2026-11-01T05:10:00Z'));
+  // Each window that gained a new event goes up whole: 1 + 4 and 2 + 8.
+  assert.deepEqual(out.buckets, [['2026-11-01T05:00:00.000Z', 5], ['2026-11-01T05:30:00.000Z', 10]]);
 });
