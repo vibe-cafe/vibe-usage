@@ -238,8 +238,10 @@ async function scanProjectCandidate(candidate) {
   let lastModel = null;
   let sessionProject = candidate.fallbackProject;
   let foundSessionCwd = false;
+  const requestIds = [];
 
   await readJsonl(candidate, (obj) => {
+    if (typeof obj.requestId === 'string') requestIds.push(obj.requestId);
     // cwd can change after Claude runs `cd`; project attribution should remain
     // the directory where this session started, not fragment into subfolders.
     if (!foundSessionCwd && typeof obj.cwd === 'string' && obj.cwd.trim()) {
@@ -290,6 +292,8 @@ async function scanProjectCandidate(candidate) {
       reasoningOutputTokens: 0,
       cacheCreation5mTokens,
       cacheCreation1hTokens,
+      magpie: { responseId: obj.message.id, fast: isFastMode(usage, obj.message),
+        counts: [inputTokens, outputTokens, cachedInputTokens, cacheCreation5mTokens + cacheCreation1hTokens] },
     });
   });
 
@@ -303,13 +307,15 @@ async function scanProjectCandidate(candidate) {
     () => sessionProject,
     sessionProject,
   );
-  return { usageEntries, session };
+  return { usageEntries, session, requestIds };
 }
 
 async function scanTranscriptCandidate(candidate) {
   const sessionAccumulator = createSessionAccumulator();
+  const requestIds = [];
   const projectForObject = (obj) => projectFromCwd(obj.cwd, 'unknown');
   await readJsonl(candidate, (obj) => {
+    if (typeof obj.requestId === 'string') requestIds.push(obj.requestId);
     const event = timingEvent(
       obj,
       candidate.sessionId,
@@ -322,7 +328,7 @@ async function scanTranscriptCandidate(candidate) {
     sessionAccumulator,
     projectForObject,
   );
-  return { session };
+  return { session, requestIds };
 }
 
 async function scanBestCandidate(candidates, scanner, ctx) {
@@ -373,7 +379,7 @@ function* iterateUsageEntries(ctx) {
   for (const entry of ctx.entriesByKey.values()) yield entry;
 }
 
-export async function parse({ extraRoots = [] } = {}) {
+export async function parse({ extraRoots = [], magpie } = {}) {
   const ctx = {
     entriesByKey: new Map(),
     anonymousEntries: [],
@@ -400,24 +406,34 @@ export async function parse({ extraRoots = [] } = {}) {
   });
   const projectGroups = collectCandidates(roots, 'projects', ctx);
   const projectSessionIds = new Set();
+  const parsedSessions = [];
 
   for (const [sessionId, candidates] of projectGroups) {
     const parsed = await scanBestCandidate(candidates, scanProjectCandidate, ctx);
     if (!parsed) continue;
     projectSessionIds.add(sessionId);
-    if (parsed.session) ctx.sessions.push(parsed.session);
-    mergeUsageEntries(ctx, parsed.usageEntries);
+    parsedSessions.push(parsed);
   }
 
   const transcriptGroups = collectCandidates(roots, 'transcripts', ctx);
   for (const [sessionId, candidates] of transcriptGroups) {
     if (projectSessionIds.has(sessionId)) continue;
     const parsed = await scanBestCandidate(candidates, scanTranscriptCandidate, ctx);
-    if (parsed?.session) ctx.sessions.push(parsed.session);
+    if (parsed) parsedSessions.push(parsed);
   }
 
+  // Read the ledger after all transcript snapshots. A bridge match excludes
+  // both tracks of the entire physical session, before cross-copy selection.
+  if (parsedSessions.length) magpie?.prepare();
+  for (const parsed of parsedSessions) {
+    if (magpie?.isBridge(parsed.requestIds)) continue;
+    if (parsed.session) ctx.sessions.push(parsed.session);
+    if (parsed.usageEntries) mergeUsageEntries(ctx, parsed.usageEntries);
+  }
+  const entries = [...iterateUsageEntries(ctx)];
+
   return {
-    buckets: aggregateToBuckets(iterateUsageEntries(ctx)),
+    buckets: aggregateToBuckets(magpie ? magpie.attribute(entries, 'claude') : entries),
     sessions: ctx.sessions,
     ...(ctx.incomplete ? { skipped: true } : {}),
     ...(ctx.warnings.length > 0 ? { warnings: ctx.warnings } : {}),

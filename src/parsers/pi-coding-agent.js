@@ -4,7 +4,7 @@ import { mergeCindyHarnessUsage, readCindyHarnessUsage } from './cindy-ledger.js
 import { parsePiSessionJsonl } from './pi-session-jsonl.js';
 
 /** Parse the official Pi agent's Pi-compatible JSONL sessions. */
-export async function parse({ extraRoots = [] } = {}) {
+export async function parse({ extraRoots = [], magpie } = {}) {
   for (const root of extraRoots) {
     // piSessionsDir re-resolves the root's shape, so an agent home that lost
     // its `sessions/` child is caught here too, not just a root that vanished.
@@ -22,6 +22,7 @@ export async function parse({ extraRoots = [] } = {}) {
   const nativeResult = await parsePiSessionJsonl({
     source: 'pi-coding-agent',
     sessionsDirs: getPiSessionDirs(extraRoots),
+    magpie,
   });
   return mergeCindyHarnessUsage(nativeResult, readCindyHarnessUsage('pi'));
 }
