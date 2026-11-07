@@ -42,12 +42,26 @@ const BACKFILL_BUDGET_MS = 40_000;
 // Keychain); recognize the whole prefix family, skip Cursor with a notice,
 // and keep its recorded progress.
 const ENCRYPTED_TOKEN_PREFIX = 'cursor-safe-storage:';
-const ENCRYPTED_TOKEN_WARNING =
-  'cursor: 新版 Cursor 已加密保存登录凭证，vibe-usage 暂不支持读取，Cursor 用量暂停同步，其他工具照常同步。'
+export const ENCRYPTED_TOKEN_NOTICE =
+  '新版 Cursor 已加密保存登录凭证，vibe-usage 暂不支持读取，Cursor 用量暂停同步，其他工具照常同步。'
   + '重新登录 Cursor 无法解决，进展见 https://github.com/vibe-cafe/vibe-usage/issues/144';
+const ENCRYPTED_TOKEN_WARNING = `cursor: ${ENCRYPTED_TOKEN_NOTICE}`;
 
 export function isEncryptedCursorToken(token) {
   return typeof token === 'string' && token.startsWith(ENCRYPTED_TOKEN_PREFIX);
+}
+
+// For `status` (issue #144): the same read `parse()` does, reduced to one
+// yes/no. The token never leaves this function; a missing database, missing
+// SQLite or unreadable value answers false, so `status` keeps its old hint.
+export function localCursorTokenEncrypted() {
+  const dbPath = getCursorStateDbPath();
+  if (!dbPath) return false;
+  try {
+    return isEncryptedCursorToken(readAccessToken(dbPath));
+  } catch {
+    return false;
+  }
 }
 
 function getDefaultStateDbPath() {
