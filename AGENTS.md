@@ -32,6 +32,7 @@ vibe-usage/
 │   │   ├── pi-session-jsonl.js # Shared Pi/CraftAgent/OMP reader + copied-record dedup
 │   │   ├── craft-agent.js
 │   │   ├── qwen-code.js
+│   │   ├── kilo.js             # Kilo CLI/Desktop shared SQLite; routed step models + conservative fork dedup
 │   │   ├── kimi-code.js          # Every Kimi Code home merged: CLI ($KIMI_CODE_HOME / ~/.kimi-code) + Kimi Work desktop + legacy ~/.kimi
 │   │   ├── amp.js
 │   │   ├── droid.js           # ~/.factory/sessions sidecar tokenUsage; custom: slot ids resolve to API model
@@ -53,6 +54,7 @@ vibe-usage/
 │   ├── cola-roots.js          # Cola sessions discovery, including COLA_DATA_DIR
 │   ├── cindy-roots.js          # Cindy Global/CN Electron roots + per-owner DB discovery
 │   ├── craft-roots.js         # CraftAgent root resolution and detection
+│   ├── kilo-roots.js          # Kilo XDG/KILO_DB discovery; isolated fixture roots
 │   ├── kimi-roots.js          # Kimi Code CLI home ($KIMI_CODE_HOME / ~/.kimi-code) + Kimi Work desktop embedded home; additive, de-duplicated roots
 │   ├── hermes-roots.js        # Shared Hermes CLI/Desktop home + profile discovery; Windows LOCALAPPDATA with legacy fallback
 │   ├── qoder-roots.js         # Qoder / Qoder CN edition table, CLI config dir + IDE data dir resolution, detection
@@ -392,6 +394,13 @@ CodeBuddy parser (`codebuddy.js`):
 - Verified end to end without an account: official CLI 2.151.0 pointed at a local OpenAI-compatible mock (`CODEBUDDY_BASE_URL` + `CODEBUDDY_API_KEY`, `/chat/completions`) wrote a real transcript; the parser then reproduced its counters exactly (input 100, output 20, cache read 30, project from `cwd`).
 - Human prompts are local `role:"user"` turns that are not injected: skip `providerData.isMeta` / `skipRun` / `isSessionSeparator` / `isCompactSummary`. Project comes from the record's `cwd`, falling back to the last segment of the compressed project folder.
 - A transcript that cannot be read marks the whole source `skipped` so its previous upload state survives; the parser streams each file line-by-line and keeps only accounting/timing fields (no prompt text, thinking signatures, or tool payloads). Regression coverage: `test/codebuddy.test.js`.
+
+Kilo parser (`kilo.js`):
+- `kilo` covers Kilo CLI and Kilo Desktop together: both use the embedded server's `$XDG_DATA_HOME/kilo/kilo.db` (default `~/.local/share/kilo/kilo.db`, also on Windows). `$KILO_DB` may be absolute or relative to the Kilo data root; `:memory:` cannot be read from another process and skips with a warning. `VIBE_USAGE_KILO_DIRS` replaces discovery with a path-delimited list of directories/database files for fixtures or relocated stores.
+- Read only allow-listed columns/JSON scalars from `session`, `message`, and `part`, in one SQLite statement through the shared snapshot-on-lock helper. Never select entire JSON payloads, `event`, credentials, costs, account or quota data. A corrupt/incompatible/unreadable discovered store skips the whole source to preserve upload state.
+- Positive `step-finish` token records are authoritative per message, with that message's assistant usage as fallback when no positive step exists. Prefer the step's routed `model.modelID`; preserve concrete provider/model ids and namespace only generic routing labels. Kilo already separates cached input and reasoning, so do not subtract them again; untyped cache writes use `cacheCreation5mTokens`. Attribute each step to its start time (column/message time fallback) and projects to cwd/session-directory basenames.
+- Canonical paths and session/message/part ids deduplicate copied stores, keeping the richest payload. Forks regenerate ids but retain request ids/time/token metadata: only a call predating its session and matching an earlier visible copy is replay. Pair occurrences rather than globally dropping equal calls; retain the sole history when no earlier match exists. Replay request ids stay parser-local and are never uploaded. Suppress copied timing only when replay is proved. Child-agent calls count, but child user prompts fold into root assistant activity; cyclic/orphan ancestry fails open.
+- **Release prerequisite:** the source proposal is tracked in [#129](https://github.com/vibe-cafe/vibe-usage/issues/129). This fork implementation is for review; it does not establish upstream architecture approval or backend support. The maintainer must register `kilo` in web `USAGE_SOURCES` and verify model-pricing matches before release. No reset, migration, privacy-policy change or version bump is included. Regression coverage: `test/kilo.test.js` and `test/daemon-service.test.js`.
 
 CodeArts Agent parser (`codearts-agent.js`):
 - Source `codearts-agent` is Huawei Cloud CodeArts Agent / CodeArts Doer for Coding, not generic OpenCode. Verified against CodeArts Agent 26.9.101: its embedded kernel writes `~/.codeartsdoer/codearts-data/opencode.db` in WAL mode. `VIBE_USAGE_CODEARTS_AGENT_DIRS` replaces discovery for fixtures/relocated profiles; each entry may be `opencode.db`, the `codearts-data` directory, or its `.codeartsdoer` parent. Canonical database paths prevent a symlinked profile from being read twice.
