@@ -13,6 +13,7 @@ import { loadState } from './state.js';
 import { fetchAccount } from './api.js';
 import { COLLECTOR_VERSION } from './client-meta.js';
 import { kikiStartTime } from './kiki-migration.js';
+import { ENCRYPTED_TOKEN_NOTICE, localCursorTokenEncrypted } from './parsers/cursor.js';
 
 function printSmallHeader() {
   console.log();
@@ -102,7 +103,12 @@ async function showStatus() {
         }
         const latest = Date.parse(cursorInfo.latestEventAt);
         if (Number.isFinite(latest) && Date.now() - latest > 48 * 60 * 60 * 1000) {
-          console.log(dimText('       已超过 48 小时没有新的 Cursor 事件；如最近用过 Cursor，请确认 Cursor 登录的是这个账号'));
+          // An encrypted token (issue #144) also stops new events, and then
+          // checking the account is the wrong advice. Read only here, through
+          // the parser's own read; only a yes/no comes back.
+          console.log(dimText(localCursorTokenEncrypted()
+            ? `       ${ENCRYPTED_TOKEN_NOTICE}`
+            : '       已超过 48 小时没有新的 Cursor 事件；如最近用过 Cursor，请确认 Cursor 登录的是这个账号'));
         }
       }
     }

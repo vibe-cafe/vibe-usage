@@ -1,6 +1,6 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { execFile } from 'node:child_process';
+import { execFile, spawn } from 'node:child_process';
 import { mkdtempSync, mkdirSync, writeFileSync, readFileSync, rmSync, chmodSync } from 'node:fs';
 import { createServer } from 'node:http';
 import { tmpdir } from 'node:os';
@@ -8,7 +8,7 @@ import { join } from 'node:path';
 import { promisify } from 'node:util';
 import { gunzipSync } from 'node:zlib';
 import { planKikiMigration, kikiStartTime } from '../src/kiki-migration.js';
-import { bucketKey, bucketHash } from '../src/state.js';
+import { bucketKey, bucketHash, stateIdentity } from '../src/state.js';
 
 const exec = promisify(execFile);
 const T = '2026-10-05T12:30:00.000Z';
@@ -313,6 +313,101 @@ test('clearing kikiStartAt re-admits withheld pre-cut history and a different cu
     assert.ok(kikiBuckets().some(([start, tokens]) => start === oldTime && tokens === 13));
     // Independent uploads recorded: a different cut is still refused.
     await assert.rejects(exec(process.execPath, ['bin/vibe-usage.js', 'config', 'set', 'kikiStartAt', T], { cwd: process.cwd(), env }), /切点不能直接更改/);
+  } finally {
+    await new Promise(resolve => server.close(resolve));
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
+// Issue #142: `init` rebuilds config.json from scratch and used to drop the
+// cut. Re-running it is what the CLI tells a user with a dead key to do, and
+// the device flow always mints a new key, so the re-bound state.json starts
+// empty. Without the cut that first sync re-sent pre-cut Kiki history the
+// compatibility collector had already uploaded as kimi-code (double count);
+// with a pre-0.11.1 state file still carrying the collector row, it paused
+// Kiki instead.
+test('re-running init keeps kikiStartAt, so Kiki is neither paused nor re-uploaded before the cut (#142)', async () => {
+  const root = mkdtempSync(join(tmpdir(), 'vibe-kiki-reinit-'));
+  const configDir = join(root, 'config');
+  const stateDir = join(root, 'state');
+  const home = join(root, 'home');
+  for (const dir of [configDir, stateDir, home]) mkdirSync(dir, { recursive: true });
+  const kikiHome = join(root, 'kiki');
+  const sessionDir = join(kikiHome, 'sessions', 'wd_fixture_abcd', 'session_fixture');
+  mkdirSync(join(sessionDir, 'agents', 'main'), { recursive: true });
+  writeFileSync(join(kikiHome, 'session_index.jsonl'), JSON.stringify({ sessionDir, workDir: join(root, 'fixture') }) + '\n');
+  writeFileSync(join(sessionDir, 'agents', 'main', 'wire.jsonl'), [
+    { type: 'usage.record', time: Date.parse(T) - 1, model: 'gpt-6.1-sol', usageScope: 'turn', usage: { inputOther: 13, inputCacheRead: 0, inputCacheCreation: 0, output: 0 } },
+    { type: 'usage.record', time: Date.parse(T), model: 'gpt-6.1-sol', usageScope: 'session', usage: { inputOther: 17, inputCacheRead: 0, inputCacheCreation: 0, output: 0 } },
+  ].map(JSON.stringify).join('\n') + '\n');
+  const kimiHome = join(root, 'kimi');
+  mkdirSync(join(kimiHome, 'sessions'), { recursive: true });
+  // What Kiki's kap-server collector left behind: a pre-cut kimi-code row
+  // under coordinates this CLI never writes, in a state file old enough
+  // (no `identity`) to be adopted by any key.
+  const collectorKey = bucketKey({ ...bucket('kimi-code', oldTime, 13), project: 'unknown', hostname: 'kiki-stream' });
+  writeFileSync(join(stateDir, 'state.json'), JSON.stringify({ buckets: { [collectorKey]: 'collector-hash' }, sessions: {} }));
+  const received = [];
+  const server = createServer((req, res) => {
+    if (req.url === '/api/usage/settings') { res.end(JSON.stringify({ uploadProject: true })); return; }
+    if (req.method === 'GET') { res.end('{}'); return; }
+    const chunks = [];
+    req.on('data', chunk => chunks.push(chunk));
+    req.on('end', () => {
+      const payload = JSON.parse(gunzipSync(Buffer.concat(chunks)));
+      received.push(payload);
+      res.end(JSON.stringify({ ingested: payload.buckets.length, sessions: payload.sessions?.length ?? 0 }));
+    });
+  });
+  await new Promise(resolve => server.listen(0, '127.0.0.1', resolve));
+  const apiUrl = `http://127.0.0.1:${server.address().port}`;
+  const env = { ...process.env, HOME: home, USERPROFILE: home, APPDATA: home, LOCALAPPDATA: home,
+    VIBE_USAGE_DEV: '0', VIBE_USAGE_API_URL: apiUrl, VIBE_USAGE_CONFIG_DIR: configDir, VIBE_USAGE_STATE_DIR: stateDir,
+    VIBE_USAGE_KIKI_DIR: kikiHome, VIBE_USAGE_KIMI_CODE_DIR: kimiHome, VIBE_USAGE_KIMI_DIR: join(root, 'legacy') };
+  const command = `
+    import { parsers } from './src/parsers/index.js';
+    for (const source of Object.keys(parsers)) if (!['kiki', 'kimi-code'].includes(source)) delete parsers[source];
+    const { runInit } = await import('./src/init.js');
+    await runInit({ apiKey: process.env.TEST_INIT_KEY, noDaemon: true });
+  `;
+  // Answers the "覆盖已有配置?" prompt with y, as a user re-binding would.
+  const init = apiKey => new Promise((resolve, reject) => {
+    const child = spawn(process.execPath, ['--input-type=module', '-e', command],
+      { cwd: process.cwd(), env: { ...env, TEST_INIT_KEY: apiKey } });
+    let stdout = '';
+    let stderr = '';
+    child.stdout.on('data', chunk => { stdout += chunk; });
+    child.stderr.on('data', chunk => { stderr += chunk; });
+    child.on('error', reject);
+    child.on('close', code => (code === 0 ? resolve({ stdout, stderr }) : reject(new Error(`init exited ${code}: ${stderr}`))));
+    child.stdin.end('y\n');
+  });
+  const kikiSince = index => received.slice(index).flatMap(p => p.buckets)
+    .filter(b => b.source === 'kiki').map(b => [b.bucketStart, b.inputTokens]);
+  try {
+    writeFileSync(join(configDir, 'config.json'), JSON.stringify({ apiKey: 'vbu_old_fixture', apiUrl, hostname: 'fixture-host', kikiStartAt: T }));
+    // Old state adopted as-is: the collector row is still visible.
+    const adopted = await init('vbu_reinit_one_fixture');
+    assert.doesNotMatch(adopted.stderr, /暂停 Kiki/);
+    assert.deepEqual(kikiSince(0), [[T, 17]]);
+    let config = JSON.parse(readFileSync(join(configDir, 'config.json')));
+    assert.equal(config.apiKey, 'vbu_reinit_one_fixture');
+    assert.equal(config.kikiStartAt, T);
+    assert.equal(JSON.parse(readFileSync(join(stateDir, 'state.json'))).buckets[collectorKey], 'collector-hash');
+    // A second re-bind from the state.json every sync since 0.11.1 writes,
+    // bound to the previous key: it is discarded, so the collector row is
+    // gone and the cut alone keeps pre-cut Kiki history off the server.
+    writeFileSync(join(stateDir, 'state.json'), JSON.stringify({ identity: stateIdentity({ apiUrl, apiKey: 'vbu_reinit_one_fixture' }),
+      buckets: { [collectorKey]: 'collector-hash' }, sessions: {} }));
+    const index = received.length;
+    const rebound = await init('vbu_reinit_two_fixture');
+    assert.doesNotMatch(rebound.stderr, /暂停 Kiki|冻结/);
+    assert.deepEqual(kikiSince(index), [[T, 17]]);
+    assert.match(rebound.stderr, /未上传 1 个桶/);
+    assert.deepEqual(kikiSince(index), [[T, 17]]);
+    config = JSON.parse(readFileSync(join(configDir, 'config.json')));
+    assert.equal(config.apiKey, 'vbu_reinit_two_fixture');
+    assert.equal(config.kikiStartAt, T);
   } finally {
     await new Promise(resolve => server.close(resolve));
     rmSync(root, { recursive: true, force: true });
