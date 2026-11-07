@@ -52,15 +52,15 @@ test('quota discover prints a versioned JSON-only contract', () => {
   const payload = JSON.parse(result.stdout);
   assert.equal(payload.schemaVersion, 1);
   assert.deepEqual(payload.products.map(product => product.id), [
-    'kimi-code', 'zcode', 'grok', 'opencode-go', 'cursor',
+    'kimi-code', 'zcode', 'grok', 'opencode-go', 'cursor', 'antigravity',
   ]);
 });
 
 test('quota fetch rejects unsupported products as a contract error', () => {
-  const result = run('quota', 'fetch', '--product', 'cursor', '--json');
+  const result = run('quota', 'fetch', '--product', 'unknown-product', '--json');
   assert.equal(result.status, 1);
   assert.equal(result.stdout, '');
-  assert.match(result.stderr, /Unsupported quota product: cursor/);
+  assert.match(result.stderr, /Unsupported quota product: unknown-product/);
 });
 
 test('unknown daemon subcommand fails instead of starting the foreground loop', () => {

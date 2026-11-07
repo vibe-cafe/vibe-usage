@@ -2,6 +2,8 @@ import { accessSync, constants, existsSync } from 'node:fs';
 import { homedir } from 'node:os';
 import { delimiter, join } from 'node:path';
 import { loadCachedQuota, saveCachedQuota } from './cache.js';
+import { fetchCursorQuota } from './providers/cursor.js';
+import { fetchAntigravityQuota } from './providers/antigravity.js';
 import { fetchGrokQuota } from './providers/grok.js';
 import { fetchKimiCodeQuota } from './providers/kimi-code.js';
 import { fetchOpenCodeGoQuota } from './providers/opencode-go.js';
@@ -13,6 +15,8 @@ const providers = new Map([
   ['zcode', fetchZaiQuota],
   ['grok', fetchGrokQuota],
   ['opencode-go', fetchOpenCodeGoQuota],
+  ['cursor', fetchCursorQuota],
+  ['antigravity', fetchAntigravityQuota],
 ]);
 
 function executableExists(name, environment, platform) {
@@ -86,7 +90,16 @@ export function discoverQuotaProducts({
       detected: existsAny([join(home, '.cursor'),
         ...applications.map(path => join(path, 'Cursor.app'))])
         || executableExists('cursor', environment, platform),
-      fetchable: false,
+      fetchable: true,
+    },
+    {
+      id: 'antigravity',
+      detected: existsAny([join(home, '.gemini', 'antigravity-cli'),
+        join(home, '.gemini', 'antigravity'), join(home, '.local', 'bin', platform === 'win32' ? 'agy.exe' : 'agy'),
+        ...applications.map(path => join(path, 'Antigravity.app'))])
+        || executableExists('agy', environment, platform)
+        || !!environment.ANTIGRAVITY_CLI_PATH && existsSync(environment.ANTIGRAVITY_CLI_PATH),
+      fetchable: true,
     },
   ]);
 }
