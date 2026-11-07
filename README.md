@@ -236,7 +236,7 @@ Config stored at `~/.vibe-usage/config.json` (dev: `config.dev.json`).
 | `apiUrl` | Server URL (default: `https://vibecafe.ai`) |
 | `hostname` | Stable device name for usage tracking (set at init, reused across syncs) |
 | `codexExtraHome` | Optional additional Codex Home scanned together with `$CODEX_HOME` / `~/.codex` |
-| `kikiStartAt` | Explicit UTC half-hour cut for migrating a collector that reported Kiki as `kimi-code`; see the Kiki migration steps above. Unset for new installations; `config set kikiStartAt none` clears an existing cut |
+| `kikiStartAt` | Explicit UTC half-hour cut for migrating a collector that reported Kiki as `kimi-code`; see the Kiki migration steps above. Unset for new installations; `config set kikiStartAt none` clears an existing cut. Re-running `init` keeps it: a re-bind starts from an empty `state.json`, so the cut is then the only thing keeping pre-cut Kiki history from being sent again |
 | `extraRoots` | Tool-specific additional roots managed by the commands below; currently supports `antigravity`, `claude-code`, `codex`, `grok`, `hermes`, `opencode`, and `pi-coding-agent` |
 
 The `hostname` is captured once during `init` and reused for all future syncs. This prevents macOS mDNS hostname changes (e.g., `MacBook-Pro` → `MacBook-Pro-2`) from creating duplicate device entries. To change it manually:

@@ -178,7 +178,10 @@ is a UTC half-hour boundary: old mixed keys remain untouched, new Kiki buckets
 start at the cut, straddling sessions are not re-keyed. `config set kikiStartAt
 none` clears the cut at any time (the documented escape hatch for a user who
 asserts no collector ran); changing to a *different* time once `kiki|` state
-exists is still refused. `planKikiMigration` also returns `withheld`
+exists is still refused. `init` carries an existing `kikiStartAt` into the
+config it rewrites (issue #142): the device flow mints a new key, the re-bound
+`state.json` starts empty, and without the cut that first sync re-sent pre-cut
+Kiki history as `kiki`. `planKikiMigration` also returns `withheld`
 (bucket/session counts, `totalTokens`, `earliest`/`latest` ISO starts) for
 everything the plan drops and `frozenBuckets`/`frozenSessions` for the
 `kimi-code` rows held at their recorded hash; `sync.js` reports all of it on

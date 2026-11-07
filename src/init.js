@@ -95,6 +95,7 @@ export async function runInit(options = {}) {
     hostname: host,
     ...(existing?.codexExtraHome ? { codexExtraHome: existing.codexExtraHome } : {}),
     ...(existing?.extraRoots ? { extraRoots: existing.extraRoots } : {}),
+    ...(existing?.kikiStartAt !== undefined ? { kikiStartAt: existing.kikiStartAt } : {}),
   };
   saveConfig(config);
 
