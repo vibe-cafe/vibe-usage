@@ -22,9 +22,10 @@ const FLOOR = Date.parse('2024-01-01T00:00:00Z');
 const TOKEN = `header.${Buffer.from(JSON.stringify({ sub: 'auth0|rolling-user' })).toString('base64url')}.sig`;
 const CSV_HEADER = 'Date,Model,Input (w/ Cache Write),Input (w/o Cache Write),Cache Read,Output Tokens';
 
-async function writeTokenDb(dbPath) {
-  const sql = `CREATE TABLE ItemTable (key TEXT PRIMARY KEY, value TEXT);
-    INSERT INTO ItemTable VALUES ('cursorAuth/accessToken', '${TOKEN}');`;
+// Re-run with another value to swap the token Cursor holds (issue #144).
+async function writeTokenDb(dbPath, token = TOKEN) {
+  const sql = `CREATE TABLE IF NOT EXISTS ItemTable (key TEXT PRIMARY KEY, value TEXT);
+    INSERT OR REPLACE INTO ItemTable VALUES ('cursorAuth/accessToken', '${token}');`;
   let DatabaseSync;
   try {
     ({ DatabaseSync } = await import('node:sqlite'));
@@ -53,7 +54,7 @@ function readBody(req) {
 const sumOf = b => b.inputTokens + b.outputTokens + b.cachedInputTokens + b.reasoningOutputTokens;
 
 async function withBackend(run) {
-  const backend = { rows: [], csvRequests: 0, table: new Map() };
+  const backend = { rows: [], csvRequests: 0, eventsRequests: 0, table: new Map() };
   const server = createServer(async (req, res) => {
     const url = new URL(req.url, 'http://127.0.0.1');
     const body = await readBody(req);
@@ -67,6 +68,7 @@ async function withBackend(run) {
       return;
     }
     if (url.pathname === '/api/dashboard/get-filtered-usage-events') {
+      backend.eventsRequests++;
       res.writeHead(200, { 'content-type': 'application/json' });
       res.end('{}');
       return;
@@ -168,6 +170,78 @@ test('rolling Cursor syncs keep the server equal to a whole export across first 
       backend.rows.push({ at: now - 9 * DAY, input: 7, model: 'gap' });
       await sync();
       assert.deepEqual(server(), truth(backend.rows));
+      assert.equal(state().parserMeta.cursor.backfill, undefined);
+    });
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
+// Issue #144: Cursor 3.27+ rewrites its token as `cursor-safe-storage:…`. While
+// it is encrypted, Cursor pauses without any request to cursor.com and keeps
+// both its state keys and its recorded progress; once a readable token is back,
+// the paused weeks are filled from that progress like any other gap.
+test('an encrypted Cursor token pauses Cursor, keeps its progress, and the gap fills once a readable token returns', async () => {
+  const root = mkdtempSync(join(tmpdir(), 'vibe-usage-cursor-encrypted-'));
+  const configDir = join(root, 'config');
+  const stateDir = join(root, 'state');
+  mkdirSync(configDir, { recursive: true });
+  const dbPath = join(root, 'state.vscdb');
+  await writeTokenDb(dbPath);
+  try {
+    await withBackend(async (backend) => {
+      writeFileSync(join(configDir, 'config.json'), JSON.stringify({ apiKey: 'vbu_encrypted', apiUrl: backend.url, hostname: 'encrypted-host' }));
+      const env = {
+        ...process.env, HOME: root, VIBE_USAGE_DEV: '0', VIBE_USAGE_CONFIG_DIR: configDir, VIBE_USAGE_STATE_DIR: stateDir,
+        CURSOR_STATE_DB_PATH: dbPath, CURSOR_WEB_BASE_URL: backend.url,
+      };
+      const command = `
+        import { parsers } from './src/parsers/index.js';
+        for (const source of Object.keys(parsers)) if (source !== 'cursor') delete parsers[source];
+        const { runSync } = await import('./src/sync.js');
+        await runSync({ throws: true, quiet: true });
+      `;
+      const sync = () => execFileAsync(process.execPath, ['--input-type=module', '-e', command], { cwd: process.cwd(), env });
+      const statePath = join(stateDir, 'state.json');
+      const state = () => JSON.parse(readFileSync(statePath, 'utf8'));
+      const server = () => new Map([...backend.table].map(([k, b]) => [k, b.inputTokens]));
+      const now = Date.now();
+
+      // Run 1, readable token: a month of usage.
+      for (let at = now - 30 * DAY, i = 0; at < now - 11 * DAY; at += 17 * HOUR, i++) {
+        backend.rows.push({ at, input: 1 + (i % 5), model: 'a' });
+      }
+      await sync();
+      assert.deepEqual(server(), truth(backend.rows));
+
+      // Cursor encrypts its token; the last good sync was 10 days ago and
+      // Cursor kept being used since then.
+      const saved = state();
+      saved.parserMeta.cursor.syncedAt = new Date(now - 10 * DAY).toISOString();
+      writeFileSync(statePath, JSON.stringify(saved));
+      const cipher = Buffer.from('v10 synthetic-not-a-real-ciphertext').toString('base64');
+      await writeTokenDb(dbPath, `cursor-safe-storage:v1:${cipher}`);
+      backend.rows.push({ at: now - 9 * DAY, input: 7, model: 'paused' });
+      backend.rows.push({ at: now - 2 * DAY, input: 8, model: 'paused' });
+
+      // Run 2, encrypted token: no request, exit 0, a notice, nothing lost.
+      const tableBefore = server();
+      const requestsBefore = backend.csvRequests + backend.eventsRequests;
+      const { stderr } = await sync();
+      assert.equal(backend.csvRequests + backend.eventsRequests, requestsBefore, 'no request reaches cursor.com');
+      assert.match(stderr, /cursor: 新版 Cursor 已加密保存登录凭证/);
+      assert.match(stderr, /issues\/144/);
+      assert.doesNotMatch(stderr, /sign in again/);
+      assert.ok(!stderr.includes(cipher));
+      assert.deepEqual(state().buckets, saved.buckets, 'no Cursor state key is pruned or rewritten');
+      assert.deepEqual(state().parserMeta.cursor, saved.parserMeta.cursor, 'recorded progress is kept as is');
+      assert.deepEqual(server(), tableBefore);
+
+      // Run 3, readable token again: the 10 paused days are filled.
+      await writeTokenDb(dbPath);
+      await sync();
+      assert.deepEqual(server(), truth(backend.rows));
+      assert.ok(Date.parse(state().parserMeta.cursor.syncedAt) >= now);
       assert.equal(state().parserMeta.cursor.backfill, undefined);
     });
   } finally {

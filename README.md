@@ -158,6 +158,7 @@ Cursor 用量优先读取 `cursor.com` 的 CSV 导出（模型名最准确）。
 - `CERT_*` / `UNABLE_TO_VERIFY_LEAF_SIGNATURE` 等：检查系统时间和代理或公司网络的 CA 证书配置；自定义 CA 可通过 `NODE_EXTRA_CA_CERTS` 指定。
 - `timeout after …ms`：请求超时（每页默认 120 秒）。可用 `VIBE_USAGE_CURSOR_FETCH_TIMEOUT_MS=300000` 调大，然后重跑一次 `sync` 补传历史。
 - `Cursor session rejected`：在 Cursor 的 Account 设置中重新登录，再同步。
+- `新版 Cursor 已加密保存登录凭证`：Cursor 3.27 起会分批把本地登录凭证改为加密保存（`cursor-safe-storage:` 开头），当前版本暂不支持读取。Cursor 用量暂停同步，已同步的记录和进度保留，其他工具照常同步；重新登录不能解决。进展见 [#144](https://github.com/vibe-cafe/vibe-usage/issues/144)。
 - 数据停在某一天、或刚换过 Cursor 账号：运行 `npx @vibe-cafe/vibe-usage status`。它会显示 Cursor 当前登录账号（本地脱敏标签）和最新事件时间；如果最新事件超过 48 小时且你最近用过 Cursor，通常是客户端仍登录旧账号。切换账号后 Cursor 的本地 `state.vscdb` 会更新，重新同步即可。
 - X 订阅（The X Subscription）账号的用量由 Cursor 与 Grok 共享：如果 Cursor 仪表盘本身没有新事件，请到 `grok.com/dashboard` 的 Usage 查看；CLI 只能读取 Cursor 仪表盘返回的 Cursor 事件。
 - 只有 X Premium+ / Grok 订阅、但 Cursor 里显示 `Free`：X Premium+ 不会自动把 Cursor 计划升级，需要在 `cursor.com/unify` 合并到 The X Subscription 后，Cursor 用量才进入共享池。`cursor.com/api/dashboard/get-sand-usage-status` 返回 `includedUsageSuperGrokPlan: "x-premium-plus"` 且 `cursorPlanName: "Free"` 就是这种状态。

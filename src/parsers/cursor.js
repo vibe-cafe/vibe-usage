@@ -33,6 +33,23 @@ const BACKFILL_FLOOR = Date.parse('2024-01-01T00:00:00Z');
 // ~12k rows, roughly 8-19s.
 const BACKFILL_BUDGET_MS = 40_000;
 
+// Cursor 3.27+ (behind its remote flag `cursor_auth_token_encryption_at_rest`,
+// rolled out in batches, on every platform) rewrites `cursorAuth/*` in
+// state.vscdb as `cursor-safe-storage:<version>:<base64>` on its next start.
+// Sent as a cookie that is a guaranteed 401, which then told the user to sign
+// in again -- useless, since signing in writes the same ciphertext. Decided
+// 2026-11-07 (issue #144): no local decryption (no `Local State`, DPAPI or
+// Keychain); recognize the whole prefix family, skip Cursor with a notice,
+// and keep its recorded progress.
+const ENCRYPTED_TOKEN_PREFIX = 'cursor-safe-storage:';
+const ENCRYPTED_TOKEN_WARNING =
+  'cursor: 新版 Cursor 已加密保存登录凭证，vibe-usage 暂不支持读取，Cursor 用量暂停同步，其他工具照常同步。'
+  + '重新登录 Cursor 无法解决，进展见 https://github.com/vibe-cafe/vibe-usage/issues/144';
+
+export function isEncryptedCursorToken(token) {
+  return typeof token === 'string' && token.startsWith(ENCRYPTED_TOKEN_PREFIX);
+}
+
 function getDefaultStateDbPath() {
   if (process.platform === 'darwin') {
     return join(homedir(), 'Library', 'Application Support', 'Cursor', STATE_DB_RELATIVE);
@@ -771,6 +788,14 @@ export async function parse({ previousInfo } = {}) {
   if (!token) {
     if (sqliteUnavailable) throw sqliteUnavailableError('Cursor');
     return { buckets: [], sessions: [] };
+  }
+  if (isEncryptedCursorToken(token)) {
+    // No request and no info: sync.js then keeps every Cursor state key and
+    // the recorded parserMeta (syncedAt, backfill) untouched, so once a
+    // readable token is back, planBackfill() fills the paused weeks. Printed
+    // on every run (parser warnings are never filtered); nothing from the
+    // token itself goes into the message.
+    return { buckets: [], sessions: [], skipped: true, warnings: [ENCRYPTED_TOKEN_WARNING] };
   }
 
   const sub = decodeJwtSub(token);
