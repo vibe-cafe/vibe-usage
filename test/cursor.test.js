@@ -254,6 +254,50 @@ test('Cursor reads a token stored as a SQLite BLOB', async (t) => {
   assert.match(result.info.account, /^auth0\|/);
 });
 
+// Issue #144: Cursor 3.27+ stores `cursor-safe-storage:<version>:<base64>`.
+// Synthetic ciphertext stand-in; nothing here is a real credential.
+const CIPHER_PAYLOAD = Buffer.from('v10 synthetic-not-a-real-ciphertext').toString('base64');
+
+test('Cursor recognizes the whole cursor-safe-storage prefix family, not only v1', () => {
+  assert.equal(cursor.isEncryptedCursorToken(`cursor-safe-storage:v1:${CIPHER_PAYLOAD}`), true);
+  assert.equal(cursor.isEncryptedCursorToken(`cursor-safe-storage:v2:${CIPHER_PAYLOAD}`), true);
+  assert.equal(cursor.isEncryptedCursorToken(TOKEN), false);
+  assert.equal(cursor.isEncryptedCursorToken(null), false);
+});
+
+for (const [label, value] of [
+  ['v1 TEXT', `cursor-safe-storage:v1:${CIPHER_PAYLOAD}`],
+  ['a later version stored as a UTF-16LE BLOB', Buffer.from(`cursor-safe-storage:v9:${CIPHER_PAYLOAD}`, 'utf16le')],
+]) {
+  test(`Cursor skips an encrypted token (${label}) without any request, info or re-login advice`, async (t) => {
+    await withCursorDb(t, { value });
+    const fetchMock = t.mock.method(globalThis, 'fetch', async () => {
+      throw new Error('an encrypted token must not reach cursor.com');
+    });
+    const previousInfo = {
+      ...RECENT_INFO(),
+      backfill: { before: '2026-01-08T00:00:00.000Z', until: '2024-01-01T00:00:00.000Z' },
+    };
+
+    const result = await cursor.parse({ previousInfo });
+    assert.equal(fetchMock.mock.callCount(), 0);
+    // No `info`: sync.js keeps the recorded parserMeta (syncedAt, backfill)
+    // and, with `skipped`, every Cursor state key.
+    assert.deepEqual(Object.keys(result).sort(), ['buckets', 'sessions', 'skipped', 'warnings']);
+    assert.deepEqual(result.buckets, []);
+    assert.deepEqual(result.sessions, []);
+    assert.equal(result.skipped, true);
+    assert.equal(result.warnings.length, 1);
+    const [warning] = result.warnings;
+    assert.match(warning, /^cursor: 新版 Cursor 已加密保存登录凭证/);
+    assert.match(warning, /其他工具照常同步/);
+    assert.match(warning, /重新登录 Cursor 无法解决/);
+    assert.match(warning, /https:\/\/github\.com\/vibe-cafe\/vibe-usage\/issues\/144/);
+    assert.doesNotMatch(warning, /sign in again|cursor-safe-storage/);
+    assert.ok(!warning.includes(CIPHER_PAYLOAD));
+  });
+}
+
 test('Cursor falls back to the events API when the CSV is empty', async (t) => {
   await withCursorDb(t);
   const fetchMock = mockFetch(t, {
