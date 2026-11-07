@@ -474,7 +474,7 @@ Test hooks (env vars honored at module load, set them before importing):
   (`npm version <x.y.z> --no-git-tag-version` updates both; hand-editing one is how they drift)
 - Published as `@vibe-cafe/vibe-usage` on npm
 - Users run via `npx @vibe-cafe/vibe-usage`
-- **Release entry point: `scripts/release.sh`** — run it from a real terminal, never behind a pipe. `scripts/release.sh --dry-run` runs every preflight and stops before publishing; `scripts/release.sh [<expected-version>]` publishes the version in `package.json`, asserting it equals the argument when one is given. It mechanises the rules in this section and the next: main branch, clean tree, `--ff-only` pull, `package.json`/`package-lock.json` version agreement, the version not already on the registry (`npm view --prefer-online` — the cached form reports the *previous* release), a green `node --test`, a logged-in npm, `script(1)` instead of a pipe so passkey 2FA still opens a browser, and post-publish verification by unpacking the published tarball and running `npx` from a temporary directory. The prose below is *why* each check exists — read it before weakening one. The script is not shipped to npm (`files` is `bin/` + `src/`). Verified through the login check on a machine with no npm credentials; the publish and post-publish steps have not been exercised end-to-end.
+- **Release entry point: `scripts/release.sh`** — run it from a real terminal, never behind a pipe. `scripts/release.sh --dry-run` runs every preflight and stops before publishing; `scripts/release.sh [<expected-version>]` publishes the version in `package.json`, asserting it equals the argument when one is given. It mechanises the rules in this section and the next: main branch, clean tree, `--ff-only` pull, `package.json`/`package-lock.json` version agreement, the version not already on the registry (`npm view --prefer-online` — the cached form reports the *previous* release), a green `node --test`, a logged-in npm, `script(1)` instead of a pipe so passkey 2FA still opens a browser, and post-publish verification by unpacking the published tarball and running `npx` from a temporary directory. The prose below is *why* each check exists — read it before weakening one. The script is not shipped to npm (`files` is `bin/` + `src/`). Verified through the login check on a machine with no npm credentials. 0.14.6 (2026-11-07) went through the publish step, but the registry took about 5.5 minutes to show it and the script, then waiting only 150s, stopped there as a failure; it now polls up to ~10 minutes, and on timeout exits 3 with instructions to confirm (`PUT … 202` in the logs, `npm view --prefer-online` later) instead of re-publishing. The tarball and `npx` checks after it have not been exercised end-to-end.
 
 ### Publishing with 2FA on the account
 
@@ -505,7 +505,7 @@ script -q publish.log npm publish --access public
   click. A login failure says nothing about registry reachability.
 - **A successful publish is async: `PUT 202` + "Your package is being processed".**
   `npm view` and the version endpoint (`/<pkg>/<version>` → 404) keep showing the old
-  release for a few minutes. Exit code 0 with `info ok` in `~/.npm/_logs/` is the real
+  release for a few minutes (about 5.5 for 0.14.6). Exit code 0 with `info ok` in `~/.npm/_logs/` is the real
   signal; a `202` is acceptance, not failure.
 - **Those log filenames are UTC** (`2026-09-09T17_16_54_269Z`). Convert before deciding a
   log is stale — a success two minutes old reads as eight hours old at UTC+8.
