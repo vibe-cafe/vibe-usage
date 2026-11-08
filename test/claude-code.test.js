@@ -9,6 +9,17 @@ import {
   findClaudeDesktopRoots,
 } from '../src/claude-roots.js';
 
+// The parser keeps a disposable per-transcript cache. Every test in this file
+// writes it under this temporary directory, never under the real ~/.vibe-usage.
+const suiteCacheDir = mkdtempSync(join(tmpdir(), 'vibe-usage-claude-cache-'));
+const previousCacheDir = process.env.VIBE_USAGE_CACHE_DIR;
+process.env.VIBE_USAGE_CACHE_DIR = suiteCacheDir;
+test.after(() => {
+  if (previousCacheDir === undefined) delete process.env.VIBE_USAGE_CACHE_DIR;
+  else process.env.VIBE_USAGE_CACHE_DIR = previousCacheDir;
+  rmSync(suiteCacheDir, { recursive: true, force: true });
+});
+
 function record({
   type = 'assistant',
   timestamp = '2026-07-21T10:05:00.000Z',

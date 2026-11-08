@@ -455,7 +455,7 @@ test('Claude Code and OpenCode added roots route from saved config into their pa
   mkdirSync(join(opencode, 'storage', 'message', 'ses_one'), { recursive: true });
   writeFileSync(join(opencode, 'storage', 'message', 'ses_one', 'reply.json'), JSON.stringify({ id: 'reply',
     role: 'assistant', time: { created: 1789171200000 }, modelID: 'test-model', tokens: { input: 10, output: 2 } }));
-  const env = { ...process.env, VIBE_USAGE_CONFIG_DIR: configDir,
+  const env = { ...process.env, VIBE_USAGE_CONFIG_DIR: configDir, VIBE_USAGE_CACHE_DIR: join(root, 'cache'),
     VIBE_USAGE_CLAUDE_DIRS: join(root, 'no-default-claude'), VIBE_USAGE_OPENCODE_DIRS: join(root, 'no-default-opencode') };
   try {
     for (const [source, path] of [['claude-code', claude], ['opencode', opencode]]) {
