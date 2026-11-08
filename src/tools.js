@@ -19,6 +19,7 @@ import { findCraftDataDirs } from './craft-roots.js';
 import { findHermesDataDirs, getHermesHome } from './hermes-roots.js';
 import { findKimiCodeDataDirs } from './kimi-roots.js';
 import { findKikiDataDirs, KIKI_SOURCE_ID, resolveKikiRoots } from './kiki-roots.js';
+import { findKiloDbs, resolveKiloDataRoot } from './kilo-roots.js';
 import { findOmpDataDirs, findPiDataDirs } from './pi-roots.js';
 import { findQoderDataDirs, getQoderProjectsDir } from './qoder-roots.js';
 import { findWorkbuddyDataDirs } from './workbuddy-roots.js';
@@ -472,6 +473,14 @@ export const TOOLS = [
     id: KIKI_SOURCE_ID,
     dataDir: join(resolveKikiRoots()[0], 'sessions'),
     detectDataDirs: findKikiDataDirs,
+  },
+  {
+    name: 'Kilo',
+    id: 'kilo',
+    // Kilo CLI and Kilo Desktop share one store: the embedded Kilo server's
+    // database in Kilo's XDG data directory.
+    dataDir: resolveKiloDataRoot(),
+    detectDataDirs: () => findKiloDbs(),
   },
   {
     name: 'Kimi Code',
