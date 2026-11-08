@@ -32,8 +32,9 @@ export function resolveKiloDbPath(env = process.env, home = homedir(), platform 
   return paths.join(resolveKiloDataRoot(env, home, platform), configured || KILO_DB_NAME);
 }
 
-// Fixture/relocation overrides replace discovery, so tests never open a real
-// user's store. Each entry is a database file or its containing directory.
+// Test-fixture override (not for users: the background service does not keep
+// it; relocate a store with KILO_DB). It replaces discovery, so tests never
+// open a real user's store. Each entry is a database file or its directory.
 export function resolveKiloStoreCandidates(env = process.env, home = homedir(), platform = process.platform) {
   const override = env.VIBE_USAGE_KILO_DIRS?.trim();
   if (override) {
