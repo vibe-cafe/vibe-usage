@@ -12,10 +12,31 @@ import { aggregateToBuckets } from './parsers/aggregate.js';
 import { normalizeParserResult } from './parsers/contract.js';
 import { extraRootList } from './extra-roots.js';
 import { planKikiMigration } from './kiki-migration.js';
+import { MAGPIE_SOURCES, chooseMagpieStartAt, planMagpieMigration } from './magpie-migration.js';
+import { createMagpieContext } from './parsers/magpie.js';
+import { isDaemonInstalled } from './daemon-service.js';
 import { success, failure, warn, arrow, link, dim, liveStatus } from './output.js';
 
 const BATCH_SIZE = 100;
 const SESSION_BATCH_SIZE = 500;
+
+function reportMagpieWithheld(plan) {
+  const reasons = new Map();
+  for (const { window, reason } of plan.withheld) {
+    const source = window.slice(0, window.indexOf('|'));
+    const start = window.slice(window.lastIndexOf('|') + 1);
+    if (!reasons.has(reason)) reasons.set(reason, { count: 0, sources: new Set(), earliest: start, latest: start });
+    const summary = reasons.get(reason);
+    summary.count++;
+    summary.sources.add(source);
+    if (start < summary.earliest) summary.earliest = start;
+    if (start > summary.latest) summary.latest = start;
+  }
+  for (const [reason, { count, sources, earliest, latest }] of reasons) {
+    const [cause, remedy] = reason.split('；');
+    process.stderr.write(`${dim(`  Magpie: ${cause}；暂停上传 ${count} 个窗口，涉及工具 ${[...sources].sort().join('、')}，窗口起始时间 ${earliest} 至 ${latest}；${remedy}。已上传记录保持原值。`)}\n`);
+  }
+}
 
 /** Coarse human duration: "45s" / "2m10s" / "1h 20m". */
 export function formatDuration(seconds) {
@@ -273,6 +294,19 @@ export async function runSync({
   // diagnostics (Cursor uses the last event time to gate its events fallback
   // and avoid re-uploading already-known history under a different model id).
   const state = loadState(identity);
+  const magpie = createMagpieContext({
+    startAt: config.magpieStartAt,
+    onPossible() {
+      const startAt = chooseMagpieStartAt(state, { daemonInstalled: isDaemonInstalled(), surface });
+      if (startAt !== undefined) {
+        config.magpieStartAt = startAt;
+        saveConfig(config);
+        process.stderr.write(`${dim(`  Magpie: 已确定切点 ${startAt}，${startAt === 'none' ? '全部本地历史可还原模型' : '切点之前保持原名，之后的新用量可还原模型'}。`)}\n`);
+      }
+      return startAt;
+    },
+  });
+  magpie.discover();
 
   // A sync may run as two passes (see below); these lines print once, and
   // the upload client (one syncId per runSync) is created once.
@@ -308,6 +342,7 @@ export async function runSync({
       const result = await parse({
         extraRoots: extraRootList(config.extraRoots?.[source]),
         previousInfo: state.parserMeta?.[source],
+        magpie,
         ...(source === 'codex' ? {
           codexExtraHome: resolveCodexExtraHome(config.codexExtraHome, codexExtraHome),
         } : {}),
@@ -412,13 +447,24 @@ export async function runSync({
       }
     }
 
+    // Magpie's window guards cover only the five Magpie sources, all of which
+    // are local parsers. In a two-pass sync they run in the first pass; the
+    // deferred pass (Cursor) has nothing for them to guard and must not report
+    // the same withheld windows a second time.
+    const magpieInPass = parserOutcomes.some(({ source }) => MAGPIE_SOURCES.has(source));
+    const planMagpie = (buckets, options) => (magpieInPass
+      ? planMagpieMigration(buckets, state, options)
+      : { buckets, preserveBuckets: new Set(), withheld: [] });
+
     if (allBuckets.length === 0 && allSessions.length === 0) {
       // Successful parsers emitted no live items. Prune their old keys even on
       // this fast path; otherwise deleting the final local log would leave dead
       // state entries forever. Failed-parser sources remain protected.
       announceIdentityChange();
       const before = Object.keys(state.buckets).length + Object.keys(state.sessions).length;
-      pruneState(state, new Set(), new Set(), okSources);
+      const magpiePlan = planMagpie([], magpie);
+      reportMagpieWithheld(magpiePlan);
+      pruneState(state, magpiePlan.preserveBuckets, new Set(), okSources);
       const pruned = before - (Object.keys(state.buckets).length + Object.keys(state.sessions).length);
       const metaChanged = applyParserInfos(state, parserInfos);
       if (pruned > 0 || metaChanged) saveState(state, identity);
@@ -481,6 +527,12 @@ export async function runSync({
     // incremental forever after.
     announceIdentityChange();
     reportParserInfoChanges(state, parserInfos);
+    const magpiePlan = planMagpie(allBuckets, {
+      ...magpie,
+      pending: magpie.pending.map(b => ({ ...b, hostname: host, project: uploadProject ? b.project : 'unknown' })),
+    });
+    allBuckets = magpiePlan.buckets;
+    reportMagpieWithheld(magpiePlan);
     let migration;
     try {
       migration = planKikiMigration(allBuckets, allSessions, state, config.kikiStartAt);
@@ -528,7 +580,7 @@ export async function runSync({
     const uploadSessions = migration.sessions;
     const changedBuckets = [];
     const changedSessions = [];
-    const liveBucketKeys = new Set(migration.preserveBuckets);
+    const liveBucketKeys = new Set([...magpiePlan.preserveBuckets, ...migration.preserveBuckets]);
     const liveSessionKeys = new Set(migration.preserveSessions);
     // key -> hash, committed to state only after the owning batch's upload
     // succeeds (a failed batch re-sends next sync — no silent gap).

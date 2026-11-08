@@ -221,6 +221,85 @@ You can also install via the [open skills ecosystem](https://github.com/vercel-l
 npx skills add vibe-cafe/vibe-usage
 ```
 
+## Magpie model attribution
+
+Claude Code, Codex, Pi, Oh My Pi, and OpenCode can record a Magpie routing
+group instead of the model that answered. Vibe Usage matches their calls to
+Magpie's local `$XDG_CONFIG_HOME/magpie/usage.jsonl` (default:
+`~/.config/magpie/usage.jsonl`) and restores the model only on an exact,
+unambiguous match. Correct concrete names, including reasoning suffixes such
+as `:high`, stay unchanged. Missing or conflicting matches keep the original
+name. Magpie is not a separate usage source.
+
+The reader uses only timing, caller/provider/model, served model/tier, token
+counts, status, response/request/session identifiers, and the exclusion fields
+`handed_on`, `source`, and `computer`. It excludes handed-on attempts
+(`handed_on: true`), reported calls (`source: "reported"`), and other computers'
+calls (nonempty `computer`). It does not retain account details, key names,
+or error text, and never uploads ledger records or identifiers. Only the model
+name changes in existing usage buckets. Other computers' `usage-others/`
+ledgers and portable Magpie installations are not read.
+
+Restored names use `magpie/<provider>/<model>`, with `-priority`, `-fast`, or
+`-flex` when Magpie reports that served tier. The dashboard may therefore show
+two names for the same model; their costs and model families use the actual
+model. With Claude subscription bridging, a background Claude Code session is
+excluded only when a ledger row has provider `claude`, an exact nonempty request
+ID in that session, and caller `claude`, `codex`, `pi`, `omp`, or `opencode`.
+Other callers, such as Zed, retain the Claude Code session. If you manually
+take over a background bridge session, that entire session remains excluded,
+including your later work.
+
+`magpieStartAt` protects uploaded history. An absent key means attribution has
+not started. On first use, Vibe Usage saves the end of the latest uploaded
+half-hour for these tools, or the literal `none` if they have no uploaded
+history. A Key/account rebound that clears upload state uses the end of the
+current half-hour instead. Records before a dated cut retain their original
+names and continue updating; records at or after it can be restored. `init`
+preserves the cut. An established cut cannot be moved to another time.
+
+**Upgrade every collector and keep `state.json` before upgrading.** If a
+background service is installed, only a sync from the daemon itself can set
+the automatic cut. After upgrading, restart it or reboot your computer:
+
+```bash
+npx @vibe-cafe/vibe-usage daemon restart
+
+# Optional explicit cut: must be a UTC half-hour boundary
+npx @vibe-cafe/vibe-usage config set magpieStartAt 2026-11-06T12:30:00Z
+```
+
+`config set magpieStartAt none` is always allowed and saves `none` as a value.
+Use it only if this machine has never uploaded the original model names:
+otherwise restoring historical names can double-count usage. To rebuild
+history, `reset` first deletes cloud data, then clears local upload state and
+the cut, and finally re-uploads available logs. With an installed service, the
+immediate re-upload uses original names until the daemon sets a new cut.
+
+For windows that still contain at least one current row, if a previously
+uploaded `magpie/` row disappears, or a new one would replace a missing original
+row, the whole tool/project/device/half-hour window is held at its last uploaded
+value. Entirely vanished windows follow normal local-state pruning. Recent
+unmatched Magpie requests wait up to ten minutes; ledger read failures hold
+post-cut windows until a later sync.
+One summary per reason reports the window count, tools, earliest/latest window
+starts, and recovery steps on stderr, including in daemon logs.
+Restore the ledger, upgrade all collectors, and check its location. In
+particular, a service may not inherit your `XDG_CONFIG_HOME`; this can cause
+held windows until the service can see the same ledger. Uninstalling Magpie
+with ledger deletion also holds already-restored windows; new windows retain
+their original names.
+
+For less reliance on the ledger, set Magpie's `replyModel` to `member`. Claude
+Code records the actual provider/model directly, and Pi records it in
+`responseModel`, which Vibe Usage prefers. These paths work without a ledger.
+We verified this in command-line (`-p`) mode without warnings; Claude Code's
+interactive UI has not been verified. Codex, Oh My Pi, and OpenCode are
+unaffected by this setting and still need the ledger. Changing it does not
+double-count: Claude Code's new usage uses the concrete name without the
+`magpie/` prefix and may appear as another model row; a conflicting existing
+window is held by the guard.
+
 ## Development
 
 Run the Node test suite locally with `npm test`. CI covers Node 20 and 22 on Ubuntu and macOS.
@@ -245,6 +324,7 @@ Config stored at `~/.vibe-usage/config.json` (dev: `config.dev.json`).
 | `hostname` | Stable device name for usage tracking (set at init, reused across syncs) |
 | `codexExtraHome` | Optional additional Codex Home scanned together with `$CODEX_HOME` / `~/.codex` |
 | `kikiStartAt` | Explicit UTC half-hour cut for migrating a collector that reported Kiki as `kimi-code`; see the Kiki migration steps above. Unset for new installations; `config set kikiStartAt none` clears an existing cut. Re-running `init` keeps it: a re-bind starts from an empty `state.json`, so the cut is then the only thing keeping pre-cut Kiki history from being sent again |
+| `magpieStartAt` | UTC half-hour cut for Magpie model attribution, or literal `none`; absent means attribution has not started. See Magpie model attribution above |
 | `extraRoots` | Tool-specific additional roots managed by the commands below; currently supports `antigravity`, `claude-code`, `codex`, `grok`, `hermes`, `opencode`, and `pi-coding-agent` |
 
 The `hostname` is captured once during `init` and reused for all future syncs. This prevents macOS mDNS hostname changes (e.g., `MacBook-Pro` → `MacBook-Pro-2`) from creating duplicate device entries. To change it manually:

@@ -148,6 +148,7 @@ async function readSessionHeader(filePath, snapshotSize) {
         forkedFromId: meta.forked_from_id || null,
         parentThreadId: extractParentThreadId(meta),
         sessionProject: extractProject(meta),
+        modelProvider: meta.model_provider,
         sessionStartedAtMs: timestampMs(meta.timestamp) ?? timestampMs(obj.timestamp),
         isSubagent: isSubagentMeta(meta),
       };
@@ -323,6 +324,7 @@ async function indexSessionFile(filePath, snapshotSize, lines = null) {
   let forkedFromId = null;
   let parentThreadId = null;
   let sessionProject = 'unknown';
+  let modelProvider;
   let sessionStartedAtMs = null;
   let isSubagent = false;
   let sessionMetaCount = 0;
@@ -361,6 +363,7 @@ async function indexSessionFile(filePath, snapshotSize, lines = null) {
           parentThreadId = extractParentThreadId(meta);
           isSubagent = isSubagentMeta(meta);
           sessionProject = extractProject(meta);
+          modelProvider = meta.model_provider;
           sessionStartedAtMs = timestampMs(meta.timestamp) ?? recordTimestamp;
         }
       } else if (obj.type === 'event_msg' && obj.payload?.type === 'token_count') {
@@ -400,6 +403,7 @@ async function indexSessionFile(filePath, snapshotSize, lines = null) {
     forkedFromId,
     parentThreadId,
     sessionProject,
+    modelProvider,
     sessionStartedAtMs,
     isSubagent,
     sessionMetaCount,
@@ -619,6 +623,7 @@ async function parseSessionFile(filePath, snapshotSize, fm, boundary, {
   lines = null,
 } = {}) {
   const entries = [];
+  const magpieEntries = [...(previousTail?.magpieEntries || [])];
   const sessionEvents = [];
   let rawTokenSeen = previousTail?.rawTokenSeen || 0;
   let parsedRecordIndex = previousTail?.parsedRecordIndex || 0;
@@ -783,7 +788,7 @@ async function parseSessionFile(filePath, snapshotSize, fm, boundary, {
         // Normalize to Anthropic-style semantics where each field is non-overlapping.
       const cachedInput = usage.cached_input_tokens || usage.cache_read_input_tokens || 0;
       const reasoningOutput = usage.reasoning_output_tokens || 0;
-      entries.push({
+      const entry = {
         source: 'codex',
         model,
         project: sessionProject,
@@ -792,7 +797,13 @@ async function parseSessionFile(filePath, snapshotSize, fm, boundary, {
         outputTokens: (usage.output_tokens || 0) - reasoningOutput,
         cachedInputTokens: cachedInput,
         reasoningOutputTokens: reasoningOutput,
-      });
+      };
+      if (fm.modelProvider === 'magpie') {
+        // Keep raw attribution in both summary and append caches. The cut and
+        // ledger are evaluated only after all cached/raw results are assembled.
+        magpieEntries.push({ ...entry, magpie: { responseId: payload.response_id,
+          counts: [usage.input_tokens || 0, usage.output_tokens || 0, cachedInput] } });
+      } else entries.push(entry);
     } catch {
       continue;
     }
@@ -823,7 +834,7 @@ async function parseSessionFile(filePath, snapshotSize, fm, boundary, {
     return parseSessionFile(filePath, snapshotSize, fm, boundary, { captureTail });
   }
   const session = sessionFromAccumulator(sessionAccumulator);
-  const result = { buckets, sessions: session ? [session] : [] };
+  const result = { buckets, magpieEntries, sessions: session ? [session] : [] };
   if (captureTail) {
     const guard = snapshotGuard(filePath, snapshotSize);
     result.tail = {
@@ -838,6 +849,7 @@ async function parseSessionFile(filePath, snapshotSize, fm, boundary, {
       prevRecordTotal,
       pendingUsageMirror,
       buckets,
+      magpieEntries,
       sessionAccumulator,
       guardHash: guard.hash,
       endsWithNewline: guard.endsWithNewline,
@@ -846,10 +858,12 @@ async function parseSessionFile(filePath, snapshotSize, fm, boundary, {
   return result;
 }
 
-function mergeFileResults(results) {
+function mergeFileResults(results, magpie) {
   const entries = [];
+  const magpieEntries = [];
   const sessions = [];
   for (const result of results) {
+    for (const entry of result.magpieEntries || []) magpieEntries.push(entry);
     for (const bucket of result.buckets || []) {
       entries.push({
         source: bucket.source,
@@ -865,10 +879,11 @@ function mergeFileResults(results) {
     }
     for (const session of result.sessions || []) sessions.push(session);
   }
+  for (const entry of magpie ? magpie.attribute(magpieEntries, 'codex') : magpieEntries) entries.push(entry);
   return { buckets: aggregateToBuckets(entries), sessions };
 }
 
-async function parseNativeCodex({ codexExtraHome, extraRoots = [] } = {}) {
+async function parseNativeCodex({ codexExtraHome, extraRoots = [], magpie } = {}) {
   let extraCodexHomePath = null;
   if (codexExtraHome?.trim()) {
     const validation = validateExtraCodexHome(codexExtraHome);
@@ -1189,7 +1204,7 @@ async function parseNativeCodex({ codexExtraHome, extraRoots = [] } = {}) {
     }
   }
 
-  return { ...mergeFileResults(results), cache: cacheStats };
+  return { ...mergeFileResults(results, magpie), cache: cacheStats };
 }
 
 function sameRequestUsage(left, right) {

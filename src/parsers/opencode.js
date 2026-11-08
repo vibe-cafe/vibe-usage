@@ -9,6 +9,8 @@ import { getOpenCodeStores } from '../opencode-roots.js';
 const V1_QUERY = `SELECT id, session_id AS sessionID,
     json_extract(data, '$.role') AS role,
     json_extract(data, '$.time.created') AS created,
+    json_extract(data, '$.time.completed') AS completed,
+    coalesce(json_extract(data, '$.providerID'), json_extract(data, '$.model.providerID')) AS providerID,
     coalesce(json_extract(data, '$.modelID'), json_extract(data, '$.model.modelID')) AS modelID,
     json_extract(data, '$.tokens') AS tokens,
     json_extract(data, '$.path.root') AS rootPath
@@ -25,6 +27,8 @@ function v2Query(sessionTable) {
   return `SELECT m.id AS id, m.session_id AS sessionID,
     m.type AS role,
     coalesce(json_extract(m.data, '$.time.created'), m.time_created) AS created,
+    json_extract(m.data, '$.time.completed') AS completed,
+    coalesce(json_extract(m.data, '$.providerID'), json_extract(m.data, '$.model.providerID'), json_extract(m.data, '$.model.provider')) AS providerID,
     coalesce(json_extract(m.data, '$.model.id'), json_extract(m.data, '$.modelID')) AS modelID,
     json_extract(m.data, '$.tokens') AS tokens,
     s.directory AS directory
@@ -70,6 +74,7 @@ function readJson(path) {
       const data = JSON.parse(readFileSync(join(sessionPath, file), 'utf8'));
       rows.push({ id: data.id || basename(file, '.json'), sessionID: dir.name,
         role: data.role, created: data.time?.created,
+        completed: data.time?.completed, providerID: data.providerID || data.model?.providerID,
         modelID: data.modelID || data.model?.modelID,
         tokens: data.tokens, rootPath: data.path?.root });
     }
@@ -83,7 +88,7 @@ function tokenSize(row) {
     + (Number(t?.cache?.read) || 0);
 }
 
-export async function parse({ extraRoots = [] } = {}) {
+export async function parse({ extraRoots = [], magpie } = {}) {
   const warnings = [];
   const stores = getOpenCodeStores({ extraRoots, onWarning: message => warnings.push(message) });
   const records = new Map();
@@ -120,6 +125,10 @@ export async function parse({ extraRoots = [] } = {}) {
     const tokens = row.tokens;
     if (!row.modelID || !tokens || (!tokens.input && !tokens.output)) continue;
     entries.push({ ...base, model: row.modelID,
+      ...(magpie && row.providerID === 'magpie' ? { magpie: {
+        sessionId: row.sessionId, completed: row.completed,
+        counts: [tokens.input || 0, (tokens.output || 0) + (tokens.reasoning || 0), tokens.cache?.read || 0, tokens.cache?.write || 0],
+      } } : {}),
       inputTokens: tokens.input || 0, outputTokens: tokens.output || 0,
       cachedInputTokens: tokens.cache?.read || 0, reasoningOutputTokens: tokens.reasoning || 0,
       // The store writes one cache-write total with no per-TTL breakdown and no
@@ -129,5 +138,5 @@ export async function parse({ extraRoots = [] } = {}) {
       // 2026-09-26) under-billed every Claude/Anthropic run through OpenCode.
       cacheCreation5mTokens: tokens.cache?.write || 0 });
   }
-  return { buckets: aggregateToBuckets(entries), sessions: extractSessions(events) };
+  return { buckets: aggregateToBuckets(magpie ? magpie.attribute(entries, 'opencode') : entries), sessions: extractSessions(events) };
 }
