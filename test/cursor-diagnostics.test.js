@@ -59,7 +59,7 @@ test('Cursor data moving backwards warns that the old account may still be signe
   assert.match(warnings[0], /最新事件从 2026-10-23T01:00:00.000Z 回退到 2026-10-19T09:00:00.000Z/);
 });
 
-test('a Cursor sync that loses all token events is reported once', (t) => {
+test('Cursor counts dropping to zero stay quiet (an idle week, not a lost export)', (t) => {
   const warnings = captureWarnings(t);
   const state = {
     buckets: {},
@@ -68,16 +68,8 @@ test('a Cursor sync that loses all token events is reported once', (t) => {
   };
   applyParserInfos(state, [{
     source: 'cursor',
-    info: { account: 'x|user…NEW2', events: 4, tokenEvents: 0 },
-  }]);
-  assert.equal(warnings.length, 1);
-  assert.match(warnings[0], /没有读到可上传的 token 用量/);
-
-  // The updated record means the same condition does not warn every run.
-  warnings.length = 0;
-  applyParserInfos(state, [{
-    source: 'cursor',
-    info: { account: 'x|user…NEW2', events: 4, tokenEvents: 0 },
+    info: { account: 'x|user…NEW2', latestEventAt: '2026-10-23T01:00:00.000Z', events: 0, tokenEvents: 0 },
   }]);
   assert.deepEqual(warnings, []);
+  assert.equal(state.parserMeta.cursor.events, 0);
 });
