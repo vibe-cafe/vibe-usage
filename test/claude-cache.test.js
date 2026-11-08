@@ -289,9 +289,17 @@ test('a non-interactive cold build stops at its work budget and resumes mid-file
 
 test('an unwritable cache finishes the run instead of stalling at the budget', async (t) => {
   const f = fixture(t);
-  for (const name of ['w1', 'w2', 'w3']) {
-    writeTranscript(f.path(name), [user(0, { note: 'z'.repeat(2_000_000) }),
-      assistant(1, { id: `${name}-call`, input: 4, output: 1 })]);
+  // Several read chunks per file, each with complete lines, so the budget
+  // stops a read part-way through and the failed checkpoint write must lead
+  // to reading on (as well as the failed writes after a finished file).
+  for (const name of ['w1', 'w2']) {
+    const records = [user(0)];
+    for (let i = 0; i < 12; i++) {
+      records.push(user(1 + i, { note: new Array(150_000).fill(1) }));
+      records.push(assistant(1 + i, { id: `${name}-${i}`, input: 4, output: 1 }));
+    }
+    writeTranscript(f.path(name), records);
+    assert.ok(statSync(f.path(name)).size > 3 * 1024 * 1024);
   }
   const expected = normalize(await f.uncached());
   // A regular file where the cache directory should be: every write fails.
