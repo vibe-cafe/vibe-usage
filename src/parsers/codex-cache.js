@@ -15,6 +15,19 @@ import { join } from 'node:path';
 // record of successful uploads and must remain backward-compatible.
 export const CODEX_CACHE_SCHEMA_VERSION = 1;
 export const CODEX_PARSER_ALGORITHM_VERSION = 6;
+// Version 6 (#143) only started keeping raw Magpie attribution data (the
+// session's model provider and per-response ids). Where Magpie has never been
+// active (no ledger, no cut), attribution is a no-op and a version-5 entry
+// yields exactly the same buckets and sessions. Accepting it there avoids
+// re-reading every rollout: 0.14.8 discarded all version-5 entries, and on a
+// large history the desktop apps killed sync at 120s on every run until the
+// rebuild finished. Magpie machines still rebuild so attribution stays exact.
+const MAGPIE_FREE_COMPATIBLE_ALGORITHM_VERSIONS = new Set([5]);
+
+function acceptedAlgorithm(version, magpieFree) {
+  return version === CODEX_PARSER_ALGORITHM_VERSION
+    || (magpieFree === true && MAGPIE_FREE_COMPATIBLE_ALGORITHM_VERSIONS.has(version));
+}
 
 function hash(value, length = 24) {
   return createHash('sha256').update(value).digest('hex').slice(0, length);
@@ -54,14 +67,14 @@ function tailPath(codexHome, filePath) {
   return join(codexCacheDir(codexHome), `${hash(filePath, 32)}.tail.json`);
 }
 
-export function loadCodexFileCache(codexHome, filePath, signature) {
+export function loadCodexFileCache(codexHome, filePath, signature, { magpieFree = false } = {}) {
   if (!codexCacheEnabled()) return null;
   const path = entryPath(codexHome, filePath);
   if (!existsSync(path)) return null;
   try {
     const parsed = JSON.parse(readFileSync(path, 'utf8'));
     if (parsed.schemaVersion !== CODEX_CACHE_SCHEMA_VERSION) return null;
-    if (parsed.algorithmVersion !== CODEX_PARSER_ALGORITHM_VERSION) return null;
+    if (!acceptedAlgorithm(parsed.algorithmVersion, magpieFree)) return null;
     if (parsed.filePath !== filePath) return null;
     if (signature && !sameSignature(parsed.signature, signature)) return null;
     return parsed;
@@ -95,14 +108,14 @@ export function saveCodexFileCache(codexHome, filePath, signature, data) {
   }
 }
 
-export function loadCodexFileTail(codexHome, filePath) {
+export function loadCodexFileTail(codexHome, filePath, { magpieFree = false } = {}) {
   if (!codexCacheEnabled()) return null;
   const path = tailPath(codexHome, filePath);
   if (!existsSync(path)) return null;
   try {
     const parsed = JSON.parse(readFileSync(path, 'utf8'));
     if (parsed.schemaVersion !== CODEX_CACHE_SCHEMA_VERSION) return null;
-    if (parsed.algorithmVersion !== CODEX_PARSER_ALGORITHM_VERSION) return null;
+    if (!acceptedAlgorithm(parsed.algorithmVersion, magpieFree)) return null;
     if (parsed.filePath !== filePath || !parsed.signature || !parsed.tail) return null;
     return parsed;
   } catch {

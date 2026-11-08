@@ -500,11 +500,16 @@ function updateFileCache(file, changes) {
 function workBudgetMs() {
   const configured = Number(process.env.VIBE_USAGE_CODEX_WORK_BUDGET_MS);
   if (Number.isFinite(configured) && configured > 0) return configured;
-  // The macOS app terminates its child after 120 seconds. Cache-building work
-  // in a non-interactive child therefore checkpoints before that wall so the
-  // next invocation resumes instead of starting from zero. Interactive users
-  // can let a cold build finish in one run (and can interrupt it safely).
-  if (codexCacheEnabled() && !process.stdout.isTTY) return 105_000;
+  // The macOS and Windows apps terminate their child after 120 seconds.
+  // Cache-building work in a non-interactive child therefore checkpoints well
+  // before that wall so the rest of the sync (other parsers sharing this event
+  // loop, then the upload) still finishes, and the next invocation resumes
+  // instead of starting from zero. 105s was not enough: on a maintainer's Mac
+  // during the 0.14.8 rebuild, Claude Code parsing alone ran to 94s alongside
+  // a 45s Codex budget, and a 105s budget made every app sync time out before
+  // uploading anything. Interactive users can let a cold build finish in one
+  // run (and can interrupt it safely).
+  if (codexCacheEnabled() && !process.stdout.isTTY) return 45_000;
   return Number.POSITIVE_INFINITY;
 }
 
@@ -923,6 +928,13 @@ async function parseNativeCodex({ codexExtraHome, extraRoots = [], magpie } = {}
   ));
   if (!dirs.some(({ dir }) => existsSync(dir))) return { buckets: [], sessions: [] };
 
+  // Without a Magpie ledger or cut, attribution leaves every entry unchanged,
+  // so pre-#143 cache entries are still exact (see codex-cache.js). A context
+  // whose ledger was never checked counts as Magpie-active.
+  const cacheOptions = {
+    magpieFree: !magpie || (magpie.startAt === undefined
+      && magpie.ledgerExists === false && !magpie.failed),
+  };
   const startedAt = Date.now();
   const budget = workBudgetMs();
   const overBudget = () => Date.now() - startedAt >= budget;
@@ -950,9 +962,9 @@ async function parseNativeCodex({ codexExtraHome, extraRoots = [], magpie } = {}
         const stat = statSync(filePath);
         if (stat.size <= 0) continue;
         const signature = fileSignature(stat);
-        const cache = loadCodexFileCache(codexHome, filePath, signature);
-        const priorCache = cache || loadCodexFileCache(codexHome, filePath);
-        const priorTail = cache ? null : loadCodexFileTail(codexHome, filePath);
+        const cache = loadCodexFileCache(codexHome, filePath, signature, cacheOptions);
+        const priorCache = cache || loadCodexFileCache(codexHome, filePath, undefined, cacheOptions);
+        const priorTail = cache ? null : loadCodexFileTail(codexHome, filePath, cacheOptions);
         const file = {
           codexHome,
           filePath,
@@ -1103,7 +1115,7 @@ async function parseNativeCodex({ codexExtraHome, extraRoots = [], magpie } = {}
     const filePath = `${selected.codexHome}/.vibe-usage-session-${createHash('sha256').update(id).digest('hex')}`;
     const signature = codexSegmentSignature(members);
     let cache = members.some(file => auditPaths.has(file.filePath)) ? null
-      : loadCodexFileCache(selected.codexHome, filePath, signature);
+      : loadCodexFileCache(selected.codexHome, filePath, signature, cacheOptions);
     if (cache?.result && !groupAudited && auditPaths.size === 0
       && signature.size <= auditMaxBytes()
       && (cache.lastAuditedAt || 0) <= Date.now() - auditIntervalMs()) {

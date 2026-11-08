@@ -5,6 +5,7 @@ import { join } from 'node:path';
 import { tmpdir } from 'node:os';
 import { parse } from '../src/parsers/codex.js';
 import { codexCacheDir } from '../src/parsers/codex-cache.js';
+import { createMagpieContext } from '../src/parsers/magpie.js';
 
 const previousCindyDirs = process.env.VIBE_USAGE_CINDY_DIRS;
 process.env.VIBE_USAGE_CINDY_DIRS = join(tmpdir(), 'vibe-usage-cindy-disabled');
@@ -1500,5 +1501,98 @@ test('the durable usage cache keeps numeric accounting fields only', async () =>
     });
   } finally {
     rmSync(fixture.root, { recursive: true, force: true });
+  }
+});
+
+// Rewrite every cache entry the way 0.14.7 (algorithm 5) stored it: no raw
+// Magpie fields in headers, results or append tails.
+function downgradeCacheToAlgorithm5(cacheDir) {
+  const visit = (dir) => {
+    for (const entry of readdirSync(dir, { withFileTypes: true })) {
+      const path = join(dir, entry.name);
+      if (entry.isDirectory()) { visit(path); continue; }
+      if (!entry.name.endsWith('.json')) continue;
+      const data = JSON.parse(readFileSync(path, 'utf8'));
+      data.algorithmVersion = 5;
+      if (data.header) delete data.header.modelProvider;
+      if (data.result) delete data.result.magpieEntries;
+      if (data.tail) delete data.tail.magpieEntries;
+      writeFileSync(path, `${JSON.stringify(data)}\n`);
+    }
+  };
+  visit(cacheDir);
+}
+
+async function withMagpieLedger(fixture, { ledger, startAt }, fn) {
+  const prevLedger = process.env.VIBE_USAGE_MAGPIE_TEST_FILE;
+  const file = join(fixture.root, 'magpie', 'usage.jsonl');
+  if (ledger) {
+    mkdirSync(join(fixture.root, 'magpie'), { recursive: true });
+    writeFileSync(file, '');
+  }
+  process.env.VIBE_USAGE_MAGPIE_TEST_FILE = file;
+  try {
+    const magpie = createMagpieContext({ startAt });
+    magpie.discover();
+    return await fn(magpie);
+  } finally {
+    if (prevLedger === undefined) delete process.env.VIBE_USAGE_MAGPIE_TEST_FILE;
+    else process.env.VIBE_USAGE_MAGPIE_TEST_FILE = prevLedger;
+  }
+}
+
+test('algorithm-5 caches stay valid where Magpie has never been active', async () => {
+  const t = '2026-07-10T08:00:00.000Z';
+  const fixture = createPersistentFixture({
+    'rollout-a.jsonl': [sessionMeta(t, 'legacy-a'), tokenCount(t, usage(100, 20, 10, 2), 110)],
+    'rollout-b.jsonl': [sessionMeta(t, 'legacy-b'), tokenCount(t, usage(20, 0, 2, 0), 22)],
+  });
+  try {
+    await withCodexEnv(fixture, async () => {
+      const cold = await parse();
+      downgradeCacheToAlgorithm5(fixture.cacheDir);
+      await withMagpieLedger(fixture, { ledger: false }, async (magpie) => {
+        const warm = await parse({ magpie });
+        assert.deepEqual(warm.buckets, cold.buckets);
+        assert.deepEqual(warm.sessions, cold.sessions);
+        assert.equal(warm.cache.filesRead, 0);
+        assert.equal(warm.cache.resultHits, 2);
+
+        // An append still resumes from the algorithm-5 tail.
+        appendFileSync(
+          join(fixture.dir, 'rollout-a.jsonl'),
+          JSON.stringify(tokenCount('2026-07-10T08:05:00.000Z', usage(5, 0, 3, 0), 118)) + '\n'
+        );
+        const appended = await parse({ magpie });
+        assert.equal(appended.cache.tailHits, 1);
+        assert.equal(appended.cache.filesRead, 1);
+        assert.deepEqual(sumBuckets(appended.buckets), { input: 105, output: 13, cached: 20, reasoning: 2 });
+      });
+    });
+  } finally {
+    rmSync(fixture.root, { recursive: true, force: true });
+  }
+});
+
+test('algorithm-5 caches are rebuilt once Magpie has a ledger or a cut', async () => {
+  const t = '2026-07-10T08:00:00.000Z';
+  for (const magpieState of [{ ledger: true }, { ledger: false, startAt: 'none' }]) {
+    const fixture = createPersistentFixture({
+      'rollout-a.jsonl': [sessionMeta(t, 'magpie-a'), tokenCount(t, usage(100, 20, 10, 2), 110)],
+    });
+    try {
+      await withCodexEnv(fixture, async () => {
+        const cold = await parse();
+        downgradeCacheToAlgorithm5(fixture.cacheDir);
+        await withMagpieLedger(fixture, magpieState, async (magpie) => {
+          const rebuilt = await parse({ magpie });
+          assert.deepEqual(rebuilt.buckets, cold.buckets);
+          assert.equal(rebuilt.cache.resultHits, 0, JSON.stringify(magpieState));
+          assert.equal(rebuilt.cache.filesRead, 2, JSON.stringify(magpieState));
+        });
+      });
+    } finally {
+      rmSync(fixture.root, { recursive: true, force: true });
+    }
   }
 });
