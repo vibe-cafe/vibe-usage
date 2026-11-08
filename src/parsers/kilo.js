@@ -254,7 +254,13 @@ export async function parse() {
     };
     const steps = (partsByMessage.get(message.key) || []).filter(part => rowFootprint(part) > 0);
     if (steps.length) {
-      for (const step of steps) add(step, timestampFrom(step.stepStart, step.columnCreated, message.dataCreated, message.columnCreated), true);
+      // step-finish gained `time` only on 2026-07-23 (Kilo dcc0d64, #12434).
+      // Older steps fall back to the message's own time.created before the
+      // part row's time_created: the JSON→SQLite migration stamps that column
+      // with the migration instant and a fork with the fork instant, while both
+      // keep the message time. Ranking the column first piled migrated history
+      // into one half-hour and let forked copies escape replay dedup.
+      for (const step of steps) add(step, timestampFrom(step.stepStart, message.dataCreated, step.columnCreated, message.columnCreated), true);
     } else {
       add(message, message.timestamp, false);
     }

@@ -33,14 +33,17 @@ function sql(path, query) {
 function session(id, { parent = null, created = T - 1000, directory = '/work/project' } = {}) {
   return `INSERT INTO session VALUES(${literal(id)},${literal(parent)},${literal(directory)},${created},${created});`;
 }
-function message(id, s, time, role, extra = {}) {
+// `created` is the row's time_created column; it defaults to the payload time.
+function message(id, s, time, role, extra = {}, created = time) {
   const data = { role, time: { created: time }, modelID: 'kilo-auto/balanced', path: { root: '/', cwd: '/work/project' }, content: CANARY, ...extra };
-  return `INSERT INTO message VALUES(${literal(id)},${literal(s)},${time},${time},${literal(JSON.stringify(data))});`;
+  return `INSERT INTO message VALUES(${literal(id)},${literal(s)},${created},${created},${literal(JSON.stringify(data))});`;
 }
-function step(id, m, s, time, extra = {}) {
+function step(id, m, s, time, extra = {}, created = time) {
   const data = { type: 'step-finish', tokens, time: { start: time, end: time + 200 }, model: { modelID: 'openai/gpt-6-luna' }, text: CANARY, ...extra };
-  return `INSERT INTO part VALUES(${literal(id)},${literal(m)},${literal(s)},${time},${time},${literal(JSON.stringify(data))});`;
+  return `INSERT INTO part VALUES(${literal(id)},${literal(m)},${literal(s)},${created},${created},${literal(JSON.stringify(data))});`;
 }
+// Kilo wrote step-finish parts without `time` before 2026-07-23.
+const noStepTime = { time: undefined };
 function fixture(t, name, rows = '') {
   const root = mkdtempSync(join(tmpdir(), `vibe-kilo-${name}-`));
   t.after(() => rmSync(root, { recursive: true, force: true }));
@@ -176,6 +179,49 @@ test('Kilo keeps the richer proven fork copy once', async t => {
   const r = await withRoots([root]);
   assert.equal(total(r), 61);
   assert.equal(humans(r), 2);
+});
+
+const byBucket = r => r.buckets.map(b => [b.bucketStart, b.totalTokens]).sort();
+
+test('Kilo counts a fork of a pre-time-step session once, despite fork-time part rows', async t => {
+  // A fork copies parts with time_created = the fork instant but keeps each
+  // message's time.created. Without step `time`, only the message time still
+  // matches the source call; the part column made the copy look like new work.
+  const forkedAt = T + 3600000;
+  for (const identity of [true, false]) {
+    const legacy = { ...noStepTime, ...(identity ? { generationID: 'generation', vercelID: 'request' } : {}) };
+    const { root } = fixture(t, `legacy-fork-${identity}`, session('source')
+      + message('u', 'source', T, 'user')
+      + message('a', 'source', T + 1000, 'assistant')
+      + step('p', 'a', 'source', T + 1000, legacy, T + 1200)
+      + session('fork', { created: forkedAt })
+      + message('copied-u', 'fork', T, 'user', {}, forkedAt)
+      + message('copied-a', 'fork', T + 1000, 'assistant', {}, forkedAt)
+      + step('copied-p', 'copied-a', 'fork', T + 1000, legacy, forkedAt)
+      + message('new-u', 'fork', forkedAt + 1000, 'user')
+      + message('new-a', 'fork', forkedAt + 2000, 'assistant')
+      + step('new-p', 'new-a', 'fork', forkedAt + 2000, { vercelID: 'new-request' }));
+    const r = await withRoots([root]);
+    assert.equal(total(r), 52);
+    assert.deepEqual(byBucket(r), [['2026-10-20T01:00:00.000Z', 26], ['2026-10-20T02:00:00.000Z', 26]]);
+    assert.equal(humans(r), 2);
+  }
+});
+
+test('Kilo dates pre-time steps of a JSON-migrated session by their message, not the migration', async t => {
+  // The JSON→SQLite migration keeps session/message times but stamps a
+  // step-finish part (no time.created) with the migration instant.
+  const old = Date.parse('2026-05-04T03:10:00Z');
+  const migratedAt = Date.parse('2026-06-15T08:00:00Z');
+  const { root } = fixture(t, 'legacy-migrated', session('old', { created: old - 1000 })
+    + message('u', 'old', old, 'user')
+    + message('a1', 'old', old + 1000, 'assistant')
+    + step('p1', 'a1', 'old', old + 1000, noStepTime, migratedAt)
+    + message('a2', 'old', old + 2400000, 'assistant')
+    + step('p2', 'a2', 'old', old + 2400000, { ...noStepTime, tokens: { input: 2 } }, migratedAt));
+  const r = await withRoots([root]);
+  assert.deepEqual(byBucket(r), [['2026-05-04T03:00:00.000Z', 26], ['2026-05-04T03:30:00.000Z', 2]]);
+  assert.equal(humans(r), 1);
 });
 
 test('Kilo never deduplicates unrelated equal calls or repeated local request-id collisions', async t => {
