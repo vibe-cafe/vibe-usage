@@ -67,9 +67,13 @@ export function loadClaudeFileCache(filePath) {
   }
 }
 
-/** Write one entry atomically. Failures are swallowed: the cache is optional. */
+/**
+ * Write one entry atomically. Never throws: the cache is optional. Returns
+ * whether the entry was written, because a budget-limited build may only stop
+ * once its progress is actually saved.
+ */
 export function saveClaudeFileCache(filePath, data) {
-  if (!claudeCacheEnabled()) return;
+  if (!claudeCacheEnabled()) return false;
   const dir = claudeCacheDir();
   const path = join(dir, entryName(filePath));
   const tempPath = `${path}.${process.pid}.${randomBytes(6).toString('hex')}.tmp`;
@@ -83,11 +87,16 @@ export function saveClaudeFileCache(filePath, data) {
     mkdirSync(dir, { recursive: true, mode: 0o700 });
     writeFileSync(tempPath, `${JSON.stringify(payload)}\n`, { encoding: 'utf8', mode: 0o600 });
     renameSync(tempPath, path);
+    return true;
   } catch {
-    // Read-only home, full disk, a concurrent sync winning the rename: the
-    // next run simply reads the transcript again.
-  } finally {
-    rmSync(tempPath, { force: true });
+    // Read-only home, full disk, a Windows rename onto an entry another sync
+    // holds open: the next run simply reads the transcript again.
+    try {
+      rmSync(tempPath, { force: true });
+    } catch {
+      // Left for pruneClaudeFileCache() to remove once it is stale.
+    }
+    return false;
   }
 }
 

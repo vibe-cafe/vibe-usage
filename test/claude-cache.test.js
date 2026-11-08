@@ -39,18 +39,24 @@ function fixture(t) {
     }
     rmSync(base, { recursive: true, force: true });
   });
-  const run = async (env = {}, options = {}) => {
-    const settings = {
-      VIBE_USAGE_CLAUDE_DIRS: root,
-      VIBE_USAGE_CLAUDE_DESKTOP_DIRS: join(base, 'no-desktop'),
-      VIBE_USAGE_CACHE_DIR: cacheDir,
-      VIBE_USAGE_MAGPIE_TEST_FILE: join(base, 'magpie', 'usage.jsonl'),
-      ...env,
-    };
+  const isolated = {
+    VIBE_USAGE_CLAUDE_DIRS: root,
+    VIBE_USAGE_CLAUDE_DESKTOP_DIRS: join(base, 'no-desktop'),
+    VIBE_USAGE_CACHE_DIR: cacheDir,
+    VIBE_USAGE_MAGPIE_TEST_FILE: join(base, 'magpie', 'usage.jsonl'),
+  };
+  const applyEnv = (env = {}) => {
+    const settings = { ...isolated, ...env };
     for (const key of ENV_KEYS) {
       if (settings[key] === undefined) delete process.env[key];
       else process.env[key] = settings[key];
     }
+  };
+  // Isolate right away: a Magpie context captures its ledger path when it is
+  // created, which can be before the first run() call.
+  applyEnv();
+  const run = async (env = {}, options = {}) => {
+    applyEnv(env);
     return parse(options);
   };
   return {
@@ -106,11 +112,12 @@ function blankRange(path, start, end) {
   }
 }
 
+// Code-point order, so the pinned lists below do not depend on ICU collation.
+const byKey = (key) => (a, b) => (key(a) < key(b) ? -1 : key(a) > key(b) ? 1 : 0);
 const normalize = (result) => ({
   skipped: !!result.skipped,
-  buckets: [...result.buckets].sort((a, b) =>
-    `${a.model}|${a.project}|${a.bucketStart}`.localeCompare(`${b.model}|${b.project}|${b.bucketStart}`)),
-  sessions: [...result.sessions].sort((a, b) => a.sessionHash.localeCompare(b.sessionHash)),
+  buckets: [...result.buckets].sort(byKey((b) => `${b.model}|${b.project}|${b.bucketStart}`)),
+  sessions: [...result.sessions].sort(byKey((s) => s.sessionHash)),
 });
 
 // A session that exercises every field the cache has to carry: a cwd that
@@ -146,8 +153,21 @@ test('a warm run serves unchanged transcripts from the cache without opening the
 
   const expected = normalize(await f.uncached());
   assert.equal(f.cacheEntries().length, 0, 'VIBE_USAGE_CLAUDE_CACHE=0 writes nothing');
-  assert.ok(expected.buckets.length >= 4);
-  assert.equal(expected.sessions.length, 2);
+  // Pinned numbers, so a regression shared by the cached and uncached paths
+  // still fails: m1 counts once at its final payload, m2 inherits the last
+  // real model, m3 carries the fast marker, the zero-usage copy of m4 loses.
+  assert.deepEqual(expected.buckets.map((b) => [b.model, b.project, b.bucketStart.slice(11, 16),
+    b.inputTokens, b.outputTokens, b.cachedInputTokens, b.cacheCreation5mTokens]), [
+    ['claude-opus-4-8-fast', 'app', '10:00', 9, 3, 0, 50],
+    ['claude-opus-4-8', 'app', '10:00', 107, 42, 0, 0],
+    ['claude-opus-4-8', 'app', '10:30', 4, 4, 11, 0],
+    ['claude-opus-4-8', 'other', '10:00', 3, 1, 0, 0],
+    ['claude-sonnet-5', 'app', '10:00', 20, 8, 0, 0],
+  ]);
+  const rich = expected.sessions.find((session) => session.project === 'app');
+  // Out of order (the 10:35 line precedes 10:05): sorted, 10:00 → 10:35.
+  assert.deepEqual([rich.firstMessageAt, rich.lastMessageAt, rich.messageCount, rich.userMessageCount,
+    rich.activeSeconds], [ts(0), ts(35), 9, 2, 180 + 1740]);
 
   assert.deepEqual(normalize(await f.run()), expected, 'cold run builds the cache');
   assert.equal(f.cacheEntries().length, 2);
@@ -228,33 +248,58 @@ test('a final line without a newline counts now and is not counted twice later',
 
 test('a non-interactive cold build stops at its work budget and resumes mid-file', async (t) => {
   const f = fixture(t);
-  // One transcript larger than three read chunks, plus a few small ones.
+  // One transcript of several read chunks, plus a few small ones. Number
+  // arrays make every 1 MiB chunk take well over the 1 ms budget to parse, so
+  // a run that reaches the big file stops inside it.
   const big = [user(0)];
   for (let i = 0; i < 40; i++) {
-    big.push(user(1 + (i % 50), { note: 'y'.repeat(100_000) }));
+    big.push(user(1 + (i % 50), { note: new Array(15_000).fill(123456) }));
     big.push(assistant(1 + (i % 50), { id: `b${i}`, input: i + 1, output: 1 }));
   }
   writeTranscript(f.path('big'), big);
+  const bigSize = statSync(f.path('big')).size;
   for (const name of ['s1', 's2', 's3']) {
     writeTranscript(f.path(name), [user(20), assistant(21, { id: `${name}-call`, input: 2, output: 2 })]);
   }
   const expected = normalize(await f.uncached());
+  const bigCheckpoint = () => f.cacheEntries()
+    .map((name) => JSON.parse(readFileSync(join(f.cacheDir, 'claude-code', name), 'utf8')))
+    .find((entry) => entry.filePath === f.path('big'))?.parsedBytes;
 
   const budget = { VIBE_USAGE_CLAUDE_WORK_BUDGET_MS: '1' };
-  const progress = [];
+  let skippedRuns = 0;
+  let midFile = false;
   let result;
   for (let i = 0; i < 50; i++) {
     result = await f.run(budget);
     if (!result.skipped) break;
+    skippedRuns++;
     assert.deepEqual(result.buckets, [], 'a partial build uploads nothing');
     assert.deepEqual(result.sessions, []);
     assert.equal(result.indexing.phase, 'transcripts');
     assert.equal(result.indexing.total, 4);
-    progress.push(result.indexing.completed);
+    const offset = bigCheckpoint();
+    if (offset > 0 && offset < bigSize) midFile = true;
   }
-  assert.ok(progress.length >= 4, `expected several checkpointed runs, got ${progress.length}`);
+  assert.ok(skippedRuns >= 2, `expected several checkpointed runs, got ${skippedRuns}`);
+  assert.ok(midFile, 'the big transcript was checkpointed part-way through');
   assert.deepEqual(normalize(result), expected);
   assert.deepEqual(normalize(await f.run(budget)), expected, 'a warm cache ignores the budget');
+});
+
+test('an unwritable cache finishes the run instead of stalling at the budget', async (t) => {
+  const f = fixture(t);
+  for (const name of ['w1', 'w2', 'w3']) {
+    writeTranscript(f.path(name), [user(0, { note: 'z'.repeat(2_000_000) }),
+      assistant(1, { id: `${name}-call`, input: 4, output: 1 })]);
+  }
+  const expected = normalize(await f.uncached());
+  // A regular file where the cache directory should be: every write fails.
+  const blocked = join(f.base, 'blocked');
+  writeFileSync(blocked, '');
+  const result = await f.run({ VIBE_USAGE_CACHE_DIR: blocked, VIBE_USAGE_CLAUDE_WORK_BUDGET_MS: '1' });
+  assert.equal(result.indexing, undefined);
+  assert.deepEqual(normalize(result), expected);
 });
 
 test('Magpie bridge and attribution work on cached transcripts built without a ledger', async (t) => {

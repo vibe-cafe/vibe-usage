@@ -513,7 +513,7 @@ function auditIntervalMs() {
 
 // One bounded re-read per run of a transcript whose cache was last built from
 // byte 0 more than 30 days ago, so a cache that drifted for any unforeseen
-// reason heals within a month without anyone noticing a slow sync.
+// reason heals over time without anyone noticing a slow sync.
 const AUDIT_MAX_BYTES = 64 * 1024 * 1024;
 
 async function scanProjectCandidate(candidate, ctx) {
@@ -543,46 +543,55 @@ async function scanProjectCandidate(candidate, ctx) {
   if (!resume && ctx.progressed && ctx.shouldStop?.()) return { stopped: true };
   const state = resume ? cachedState : createScanState(candidate.fallbackProject);
   const start = resume ? cache.parsedBytes : 0;
-  const read = await readJsonlRange(
-    candidate.filePath,
-    start,
-    candidate.size,
-    (obj) => scanProjectLine(state, obj),
-    ctx.shouldStop,
-  );
-  const advanced = read.parsedBytes > start;
-  if (advanced) ctx.progressed = true;
+  const onObject = (obj) => scanProjectLine(state, obj);
 
   // The saved state covers exactly [0, parsedBytes): complete lines only.
-  const complete = !read.stopped && read.trailing === null;
+  const save = (parsedBytes, completed) => {
+    if (!ctx.cacheEnabled || ctx.saveFailed) return false;
+    let guardHash = null;
+    try {
+      guardHash = readGuard(candidate.filePath, parsedBytes)?.hash ?? null;
+    } catch {
+      // No guard, no resume: treated like a failed write below.
+    }
+    const saved = !!guardHash && saveClaudeFileCache(candidate.filePath, {
+      signature: candidate.signature,
+      parsedBytes,
+      guardHash,
+      fullReadAt: resume ? cache.fullReadAt : Date.now(),
+      state: serializeState(state),
+      ...(completed ? { session: completed.session } : {}),
+    });
+    if (!saved) {
+      // Stopping at the budget is only progress if the work is on disk. With
+      // an unwritable cache (full disk, read-only home) every run would redo
+      // and abandon the same work, so this run finishes without a budget.
+      ctx.saveFailed = true;
+      ctx.shouldStop = null;
+    }
+    return saved;
+  };
+
+  let read = await readJsonlRange(candidate.filePath, start, candidate.size, onObject, ctx.shouldStop);
+  if (read.stopped && !save(read.parsedBytes, null)) {
+    read = await readJsonlRange(candidate.filePath, read.parsedBytes, candidate.size, onObject);
+  }
+  if (read.parsedBytes > start) ctx.progressed = true;
+  if (read.stopped) return { stopped: true };
+
+  const complete = read.trailing === null;
   const session = complete ? sessionFromState(state, candidate.sessionId) : null;
   // Nothing new parsed (only a still-unterminated last line) leaves the saved
   // entry valid as it is; a completed file whose mtime moved refreshes it.
-  if (ctx.cacheEnabled && (advanced || (complete && resume))) {
-    let guardHash = null;
-    try {
-      guardHash = readGuard(candidate.filePath, read.parsedBytes)?.hash ?? null;
-    } catch {
-      // No guard, no resume: the next run reads this file from the start.
-    }
-    if (guardHash) {
-      saveClaudeFileCache(candidate.filePath, {
-        signature: candidate.signature,
-        parsedBytes: read.parsedBytes,
-        guardHash,
-        fullReadAt: resume ? cache.fullReadAt : Date.now(),
-        state: serializeState(state),
-        ...(complete ? { session } : {}),
-      });
-    }
+  if (read.parsedBytes > start || (complete && resume)) {
+    save(read.parsedBytes, complete ? { session } : null);
   }
-  if (read.stopped) return { stopped: true };
   if (complete) return scanResult(state, session, ctx.collectMagpie);
 
   // Count a final line without a newline the way the old reader did, but
   // only in this run's result, never in the saved state: Claude may still be
   // writing it, and the next run re-reads it from parsedBytes.
-  emitLine(read.trailing, (obj) => scanProjectLine(state, obj));
+  emitLine(read.trailing, onObject);
   return scanResult(state, sessionFromState(state, candidate.sessionId), ctx.collectMagpie);
 }
 
@@ -664,6 +673,7 @@ export async function parse({ extraRoots = [], magpie } = {}) {
     cacheEnabled: claudeCacheEnabled(),
     shouldStop: Number.isFinite(budget) ? () => Date.now() - startedAt >= budget : null,
     progressed: false,
+    saveFailed: false,
     audited: false,
     auditIntervalMs: auditIntervalMs(),
     entriesByKey: new Map(),
