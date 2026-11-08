@@ -6,6 +6,7 @@ export const QUOTA_PRODUCT_IDS = Object.freeze([
   'grok',
   'opencode-go',
   'cursor',
+  'antigravity',
 ]);
 
 export const FETCHABLE_QUOTA_PRODUCT_IDS = Object.freeze([
@@ -13,6 +14,8 @@ export const FETCHABLE_QUOTA_PRODUCT_IDS = Object.freeze([
   'zcode',
   'grok',
   'opencode-go',
+  'cursor',
+  'antigravity',
 ]);
 
 /**
@@ -70,6 +73,18 @@ export function normalizeMeter(raw, index = 0) {
   if (raw.windowSeconds !== undefined && raw.windowSeconds !== null) {
     const seconds = finiteNumber(raw.windowSeconds, `meters[${index}].windowSeconds`);
     if (seconds > 0) meter.windowSeconds = seconds;
+  }
+  // Optional split of this meter's allowance (e.g. Cursor's Auto vs API),
+  // shown only in the row's tooltip. Additive within schema v1.
+  if (Array.isArray(raw.breakdown)) {
+    const breakdown = raw.breakdown.flatMap((item, part) => {
+      const partId = String(item?.id || '').trim();
+      const partLabel = String(item?.label || '').trim();
+      if (!partId || !partLabel) return [];
+      return [{ id: partId, label: partLabel, utilization: Math.max(0, Math.min(100,
+        finiteNumber(item.utilization, `meters[${index}].breakdown[${part}].utilization`))) }];
+    });
+    if (breakdown.length) meter.breakdown = breakdown;
   }
   return meter;
 }
