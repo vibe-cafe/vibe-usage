@@ -52,15 +52,15 @@ test('quota discover prints a versioned JSON-only contract', () => {
   const payload = JSON.parse(result.stdout);
   assert.equal(payload.schemaVersion, 1);
   assert.deepEqual(payload.products.map(product => product.id), [
-    'kimi-code', 'zcode', 'grok', 'opencode-go', 'cursor',
+    'kimi-code', 'zcode', 'grok', 'opencode-go', 'cursor', 'antigravity',
   ]);
 });
 
 test('quota fetch rejects unsupported products as a contract error', () => {
-  const result = run('quota', 'fetch', '--product', 'cursor', '--json');
+  const result = run('quota', 'fetch', '--product', 'unknown-product', '--json');
   assert.equal(result.status, 1);
   assert.equal(result.stdout, '');
-  assert.match(result.stderr, /Unsupported quota product: cursor/);
+  assert.match(result.stderr, /Unsupported quota product: unknown-product/);
 });
 
 test('unknown daemon subcommand fails instead of starting the foreground loop', () => {
@@ -273,6 +273,79 @@ test('status separates "detected but never uploaded" from a syncing tool', () =>
     assert.match(result.stdout, /Kimi Code {2}· {2}已上传 1 buckets \/ 1 sessions/);
     assert.match(result.stdout, /Cola {2}· {2}尚未上传过数据/);
     assert.match(result.stdout, /本机检测到数据，但本地没有这条工具的上传记录/);
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
+// Issue #144: once Cursor encrypts its token, sync skips Cursor and the
+// recorded newest event goes stale. `status` used to blame the signed-in
+// account for that; with an encrypted token it now says what #145 says.
+// Synthetic token database only, at the default path under a temporary home.
+test('status explains a stale Cursor by its encrypted token instead of the account', async () => {
+  const root = mkdtempSync(join(tmpdir(), 'vibe-usage-cli-status-cursor-'));
+  const home = join(root, 'home');
+  const configDir = join(root, 'config');
+  const stateDir = join(root, 'state');
+  const env = {
+    HOME: home,
+    USERPROFILE: home,
+    APPDATA: join(home, 'appdata'),
+    XDG_CONFIG_HOME: join(home, 'config'),
+    XDG_DATA_HOME: join(home, 'data'),
+    VIBE_USAGE_KIKI_DIR: join(home, '.kiki'),
+    VIBE_USAGE_CONFIG_DIR: configDir,
+    VIBE_USAGE_STATE_DIR: stateDir,
+  };
+  const cursorDir = process.platform === 'darwin'
+    ? join(home, 'Library', 'Application Support', 'Cursor')
+    : join(process.platform === 'win32' ? env.APPDATA : env.XDG_CONFIG_HOME, 'Cursor');
+  const dbPath = join(cursorDir, 'User', 'globalStorage', 'state.vscdb');
+  // The parser follows this override first; pin it so it reads the fixture.
+  env.CURSOR_STATE_DB_PATH = dbPath;
+  mkdirSync(dirname(dbPath), { recursive: true });
+  mkdirSync(configDir, { recursive: true });
+  mkdirSync(stateDir, { recursive: true });
+  writeFileSync(join(configDir, 'config.json'), JSON.stringify({ apiKey: 'vbu_test', apiUrl: 'http://127.0.0.1:1' }));
+  writeFileSync(join(stateDir, 'state.json'), JSON.stringify({
+    buckets: { 'cursor|auto|unknown|cursor|2026-11-01T00:00:00.000Z': 'hash' },
+    sessions: {},
+    parserMeta: { cursor: { account: 'github|user…A1B2', latestEventAt: new Date(Date.now() - 3 * 24 * 60 * 60 * 1000).toISOString() } },
+  }));
+  let DatabaseSync;
+  try {
+    ({ DatabaseSync } = await import('node:sqlite'));
+  } catch {
+    // Node 20: same sqlite3 CLI fallback as the parser.
+  }
+  const writeToken = (token) => {
+    const sql = `CREATE TABLE IF NOT EXISTS ItemTable (key TEXT PRIMARY KEY, value TEXT);
+      INSERT OR REPLACE INTO ItemTable VALUES ('cursorAuth/accessToken', '${token}');`;
+    if (DatabaseSync) {
+      const db = new DatabaseSync(dbPath);
+      try { db.exec(sql); } finally { db.close(); }
+    } else {
+      spawnSync('sqlite3', [dbPath, sql]);
+    }
+  };
+  const cipher = Buffer.from('synthetic-not-a-real-ciphertext').toString('base64');
+  try {
+    writeToken(`cursor-safe-storage:v1:${cipher}`);
+    const encrypted = runWithEnv(['status'], env);
+    assert.equal(encrypted.status, 0, encrypted.stderr);
+    assert.match(encrypted.stdout, /Cursor {2}· {2}已上传 1 buckets/);
+    assert.match(encrypted.stdout, /新版 Cursor 已加密保存登录凭证，vibe-usage 暂不支持读取，Cursor 用量暂停同步/);
+    assert.match(encrypted.stdout, /重新登录 Cursor 无法解决，进展见 https:\/\/github\.com\/vibe-cafe\/vibe-usage\/issues\/144/);
+    assert.doesNotMatch(encrypted.stdout, /请确认 Cursor 登录的是这个账号/);
+    assert.ok(!`${encrypted.stdout}${encrypted.stderr}`.includes(cipher));
+    assert.doesNotMatch(`${encrypted.stdout}${encrypted.stderr}`, /cursor-safe-storage/);
+
+    // A readable token keeps the old advice: then the account is the suspect.
+    writeToken(`header.${Buffer.from('{"sub":"auth0|status-user"}').toString('base64url')}.sig`);
+    const readable = runWithEnv(['status'], env);
+    assert.equal(readable.status, 0, readable.stderr);
+    assert.match(readable.stdout, /已超过 48 小时没有新的 Cursor 事件；如最近用过 Cursor，请确认 Cursor 登录的是这个账号/);
+    assert.doesNotMatch(readable.stdout, /已加密/);
   } finally {
     rmSync(root, { recursive: true, force: true });
   }

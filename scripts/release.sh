@@ -70,7 +70,7 @@ step "7/7 npm publish"
 LOG="npm-publish-${VER}.log"
 cat <<EOF
 现在会弹浏览器要 passkey。成功判据：输出里有 PUT … 202、本命令 exit 0。
-「Your package is being processed」是异步接受，不是失败；registry 几分钟内仍可能显示旧版本。
+「Your package is being processed」是异步接受，不是失败；registry 几分钟内仍可能显示旧版本，脚本最多等 10 分钟。
 完整输出留在 ${LOG}（用 script(1) 保 pty，不用管道——管道会让 npm 跳过浏览器）。
 EOF
 echo
@@ -80,12 +80,30 @@ rc=$?
 [ ${rc} -eq 0 ] || die "npm publish 退出码 ${rc}，详见 ${LOG} 与 ~/.npm/_logs/（文件名是 UTC，换算后再判断新旧）"
 
 step "验收：registry"
-for i in $(seq 1 10); do
+# publish 是异步的：0.14.6（2026-11-07）过了约 5 分半才在 registry 上可见，
+# 原来只等 150s 就报失败。现在最多等 10 分钟。
+WAIT_INTERVAL=15
+WAIT_TRIES=40
+got=""
+for i in $(seq 1 "${WAIT_TRIES}"); do
   got=$(npm view --prefer-online "${PKG}" version 2>/dev/null)
   [ "${got}" = "${VER}" ] && break
-  echo "  registry 还是 ${got:-空}，15s 后再看 (${i}/10)"; sleep 15
+  [ "${i}" -lt "${WAIT_TRIES}" ] || break
+  echo "  registry 还是 ${got:-空}，${WAIT_INTERVAL}s 后再看（已等 $(( (i - 1) * WAIT_INTERVAL ))s，最多 $(( WAIT_TRIES * WAIT_INTERVAL ))s）"
+  sleep "${WAIT_INTERVAL}"
 done
-[ "${got:-}" = "${VER}" ] || die "等了 150s，registry 仍是 ${got:-空}。publish 是异步的，再等几分钟手动跑：npm view --prefer-online ${PKG} version"
+if [ "${got:-}" != "${VER}" ]; then
+  cat <<EOF
+
+⚠️  等了约 $(( WAIT_TRIES * WAIT_INTERVAL / 60 )) 分钟，registry 仍显示 ${got:-空}。但 npm publish 已经退出码 0，
+   发布很可能已经成功，只是 registry 还没处理完。不要重发，也不要换个版本号再发一次。
+   这样核对：
+   1. 在 ${LOG} 或 ~/.npm/_logs/ 最新的日志里找 PUT … 202（日志文件名是 UTC 时间）；
+   2. 过几分钟再跑：npm view --prefer-online ${PKG} version，直到显示 ${VER}。
+   显示 ${VER} 之后，手动补做本脚本最后两步验收：npm pack 解包看 src/，在临时目录里 npx -y ${PKG}@${VER} --version。
+EOF
+  exit 3
+fi
 echo "registry version = ${got} ✓"
 
 step "验收：解包看真正发出去的东西"

@@ -288,3 +288,16 @@ test('all service templates preserve KIKI_HOME independently of Kimi Code', () =
   assert.ok(cmd.includes('set "KIKI_HOME=C:\\fixture\\kiki"'));
   assert.ok(cmd.includes('set "KIMI_CODE_HOME=C:\\fixture\\kimi"'));
 });
+
+
+test('all service templates preserve Kilo database and XDG location overrides', () => {
+  const env = { KILO_DB: '/data/kilo & usage.db', XDG_DATA_HOME: '/data/xdg' };
+  const unit = generateSystemdUnit('/usr/bin/node', '/opt/vibe/bin.js', undefined, env);
+  assert.ok(unit.includes('KILO_DB=/data/kilo & usage.db'));
+  assert.ok(unit.includes('XDG_DATA_HOME=/data/xdg'));
+  const plist = generateLaunchdPlist('/usr/bin/node', '/opt/vibe/bin.js', undefined, env);
+  assert.match(plist, /<key>KILO_DB<\/key>\s*<string>\/data\/kilo &amp; usage.db<\/string>/);
+  const cmd = generateWindowsTaskCmd('C:\\node\\node.exe', 'C:\\vibe\\bin.js', undefined, { KILO_DB: 'D:\\kilo\\custom.db', XDG_DATA_HOME: 'D:\\data' });
+  assert.ok(cmd.includes('set "KILO_DB=D:\\kilo\\custom.db"'));
+  assert.ok(cmd.includes('set "XDG_DATA_HOME=D:\\data"'));
+});

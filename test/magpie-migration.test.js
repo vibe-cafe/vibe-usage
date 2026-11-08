@@ -348,6 +348,38 @@ test('quiet daemon sync summarizes withheld windows once per reason on stderr', 
   assert.deepEqual(f.read('state.json').buckets, stateOf(...old).buckets);
 });
 
+test('a deferred Cursor pass neither re-runs nor re-reports the Magpie window guards', async t => {
+  const f = fixture(t);
+  const { apiUrl, received } = await server(t, f);
+  f.env.VIBE_USAGE_DEFERRED_GRACE_MS = '0';
+  f.write('config.json', { apiKey: 'vbu_fixture', apiUrl, hostname: 'fixture-host', magpieStartAt: 'none' });
+  const old = bucket({ project: 'unknown', model: 'magpie/deepseek/deepseek-flash' });
+  const waiting = bucket({ project: 'unknown', bucketStart: NEXT });
+  const cursor = bucket({ source: 'cursor', project: 'unknown', model: 'auto', bucketStart: NEXT });
+  f.write('state.json', stateOf(old));
+  const result = await f.run(restrict(['omp', 'cursor']) + `
+    parsers.omp = async ({ magpie }) => {
+      magpie.pending.push(${JSON.stringify(waiting)});
+      return { buckets: [${JSON.stringify({ ...old, model: 'group/lab' })}, ${JSON.stringify(waiting)}], sessions: [] };
+    };
+    parsers.cursor = async () => {
+      await new Promise(resolve => setTimeout(resolve, 300));
+      return { buckets: [${JSON.stringify(cursor)}], sessions: [] };
+    };
+    const { runSync } = await import('./src/sync.js');
+    await runSync({ quiet: true, surface: 'daemon', throws: true });
+  `);
+  const lines = result.stderr.split('\n').filter(line => line.includes('Magpie:'));
+  assert.equal(lines.length, 2, 'one summary per reason, from the first pass only');
+  assert.match(lines[0], /模型归属发生翻转.*暂停上传 1 个窗口.*工具 omp/);
+  assert.match(lines[1], /最近 10 分钟.*暂停上传 1 个窗口.*工具 omp/);
+  const uploaded = received.flatMap(p => p.buckets);
+  assert.deepEqual(uploaded.map(b => b.source), ['cursor'], 'the second pass still uploads Cursor');
+  const state = f.read('state.json').buckets;
+  assert.ok(bucketKey(old) in state, 'the held Magpie hash survives both passes');
+  assert.ok(bucketKey({ ...cursor, hostname: 'fixture-host' }) in state);
+});
+
 test('no Magpie installation leaves config and ordinary parser output unchanged', async t => {
   const f = fixture(t);
   const { apiUrl, received } = await server(t, f);

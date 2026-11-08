@@ -95,6 +95,7 @@ export async function runInit(options = {}) {
     hostname: host,
     ...(existing?.codexExtraHome ? { codexExtraHome: existing.codexExtraHome } : {}),
     ...(existing?.extraRoots ? { extraRoots: existing.extraRoots } : {}),
+    ...(existing?.kikiStartAt !== undefined ? { kikiStartAt: existing.kikiStartAt } : {}),
     ...(existing?.magpieStartAt !== undefined ? { magpieStartAt: existing.magpieStartAt } : {}),
   };
   saveConfig(config);

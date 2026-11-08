@@ -15,6 +15,7 @@ import { parse as parseOmp } from './omp.js';
 import { parse as parseQwenCode } from './qwen-code.js';
 import { parse as parseKimiCode } from './kimi-code.js';
 import { parse as parseKiki } from './kiki.js';
+import { parse as parseKilo } from './kilo.js';
 import { parse as parseAmp } from './amp.js';
 import { parse as parseAlma } from './alma.js';
 import { parse as parseDroid } from './droid.js';
@@ -52,6 +53,7 @@ export const parsers = {
   'qoder-cn': parseQoderCn,
   'qwen-code': parseQwenCode,
   'kiki': parseKiki,
+  'kilo': parseKilo,
   'kimi-code': parseKimiCode,
   'amp': parseAmp,
   'alma': parseAlma,
