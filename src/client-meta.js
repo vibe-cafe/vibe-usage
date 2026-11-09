@@ -5,7 +5,7 @@ const pkg = JSON.parse(
   readFileSync(new URL('../package.json', import.meta.url), 'utf-8'),
 );
 
-const SURFACES = new Set(['cli', 'daemon', 'mac-app', 'windows-app']);
+export const SURFACES = new Set(['cli', 'daemon', 'mac-app', 'windows-app']);
 
 export const COLLECTOR_VERSION = String(pkg.version);
 
@@ -15,11 +15,16 @@ function cleanEnv(value, maxLength = 50) {
   return cleaned || null;
 }
 
-export function createSyncClient({ defaultSurface = 'cli', hostname } = {}) {
+/** Who started this run: a desktop app's VIBE_USAGE_SURFACE wins over the caller's default. */
+export function resolveSurface(defaultSurface = 'cli') {
   const requestedSurface = cleanEnv(process.env.VIBE_USAGE_SURFACE, 30);
-  const surface = requestedSurface && SURFACES.has(requestedSurface)
+  return requestedSurface && SURFACES.has(requestedSurface)
     ? requestedSurface
     : defaultSurface;
+}
+
+export function createSyncClient({ defaultSurface = 'cli', hostname } = {}) {
+  const surface = resolveSurface(defaultSurface);
   const runtime = process.versions.bun ? 'bun' : 'node';
   const runtimeVersion = process.versions.bun || process.versions.node;
 
