@@ -53,9 +53,13 @@ export function probeErrorCode(err) {
 }
 
 /**
- * One unauthenticated GET through the same `https` module the sync uses (so a
- * proxy-only machine fails here exactly like its uploads do). Any HTTP
- * response counts as reachable; only the time to the response is kept.
+ * One unauthenticated GET through the same `https` module and default global
+ * agent the sync uses, so it takes the same route as an upload: through the
+ * environment proxy when NODE_USE_ENV_PROXY is set (Node 22.21+ / 24.5+, what
+ * the Windows app sets when the system has a proxy), directly otherwise. Any
+ * HTTP response counts as reachable; only the time to the response is kept.
+ * The request is destroyed after the response, so no keep-alive socket holds
+ * the process open.
  */
 export function probeUrl(url, { timeoutMs = PROBE_TIMEOUT_MS } = {}) {
   return new Promise((resolve) => {
@@ -70,7 +74,6 @@ export function probeUrl(url, { timeoutMs = PROBE_TIMEOUT_MS } = {}) {
     const mod = target.protocol === 'http:' ? http : https;
     const req = mod.request(target, {
       method: 'GET',
-      agent: false,
       headers: { 'User-Agent': `vibe-usage/${COLLECTOR_VERSION} doctor` },
     }, (res) => {
       clearTimeout(timer);
@@ -151,10 +154,17 @@ function historySummary(entry) {
   };
 }
 
+/**
+ * The tool in the newest sync whose parsers finished for it. A tool that ran
+ * there but is absent from `tools` produced nothing and warned about nothing:
+ * zeros, i.e. healthy -- so a tool that recovered no longer shows an older
+ * entry's error. Entries that never got to parse (or wrote no `parsed` flag)
+ * count only where they mention the tool.
+ */
 function lastToolSync(entries, source) {
-  const entry = entries.find(item => item.tools[source]);
+  const entry = entries.find(item => item.tools[source] || (item.parsed && !item.pending.includes(source)));
   if (!entry) return null;
-  const tool = entry.tools[source];
+  const tool = entry.tools[source] ?? { buckets: 0, sessions: 0 };
   return {
     startedAt: entry.startedAt,
     buckets: tool.buckets,
@@ -165,6 +175,11 @@ function lastToolSync(entries, source) {
     error: tool.error ?? null,
     serverDropped: tool.serverDropped ?? 0,
   };
+}
+
+function lastSyncHasData(last) {
+  return Boolean(last && (last.buckets || last.sessions || last.error || last.indexing
+    || last.serverDropped || Object.keys(last.warnings).length > 0));
 }
 
 /**
@@ -208,7 +223,9 @@ export async function collectDoctorReport({
     const detected = toolDetected(tool, toolOptions);
     const lastSync = lastToolSync(history.entries, tool.id);
     const counts = uploaded.get(tool.id) ?? { buckets: 0, sessions: 0 };
-    if (!detected && !lastSync && !counts.buckets && !counts.sessions) continue;
+    // Every installed parser "runs" each sync, so a zero lastSync alone does
+    // not make an absent tool worth listing.
+    if (!detected && !lastSyncHasData(lastSync) && !counts.buckets && !counts.sessions) continue;
     tools.push({
       id: tool.id,
       name: tool.name,
@@ -378,9 +395,10 @@ function toolLine(tool, nameWidth) {
   } else if (last.error) {
     parts.push(`出错：${WARNING_CODES[last.error] ?? last.error}（${last.error}）`);
   } else {
-    parts.push(`上次 ${counts(last)}`);
-    if (last.indexing) parts.push(`正在建立本地索引 ${last.indexing.completed}/${last.indexing.total}`);
     const warnings = Object.entries(last.warnings);
+    const quiet = !last.buckets && !last.sessions && !last.indexing && warnings.length === 0;
+    parts.push(quiet ? '上次无新数据' : `上次 ${counts(last)}`);
+    if (last.indexing) parts.push(`正在建立本地索引 ${last.indexing.completed}/${last.indexing.total}`);
     for (const [code, n] of warnings) parts.push(`${WARNING_CODES[code] ?? code} ×${n}（${code}）`);
     if (!last.indexing && warnings.length === 0) parts.push('正常');
   }

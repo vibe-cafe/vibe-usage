@@ -26,6 +26,116 @@ const { inspectStateIdentity, stateIdentity, getStatePath } = await import('../s
 const { sqliteImplementation } = await import('../src/parsers/sqlite.js');
 test.after(() => rmSync(scratch, { recursive: true, force: true }));
 
+// ---------------------------------------------------------------------------
+// The --json contract as data: exact keys (nothing undocumented, nothing
+// missing) and types/enums, checked against real reports below.
+const { WARNING_CODES: CODES } = await import('../src/warning-codes.js');
+const { SYNC_FAILURE_CODES: FAILURES } = await import('../src/sync-history.js');
+const { PROBE_ERRORS: PROBES } = await import('../src/doctor.js');
+const S = 'string';
+const N = 'number';
+const B = 'boolean';
+const oneOf = (...shapes) => ({ oneOf: shapes });
+const enumOf = (...values) => ({ enum: values });
+const optional = shape => ({ optional: shape });
+const SURFACE = enumOf('cli', 'daemon', 'mac-app', 'windows-app');
+const COUNTS = { buckets: N, sessions: N };
+const PROBE = { reachable: B, latencyMs: oneOf(N, null), error: oneOf(enumOf(...Object.keys(PROBES)), null) };
+const SYNC = {
+  startedAt: S,
+  endedAt: oneOf(S, null),
+  surface: oneOf(SURFACE, null),
+  cliVersion: oneOf(S, null),
+  runtime: oneOf({ name: enumOf('node', 'bun'), version: oneOf(S, null) }, null),
+  result: oneOf(enumOf('success', 'failed', 'partial'), null),
+  durationMs: oneOf(N, null),
+  uploaded: COUNTS,
+  failure: oneOf({ code: enumOf(...Object.keys(FAILURES)), status: optional(N) }, null),
+};
+const LAST_SYNC = {
+  startedAt: S,
+  buckets: N,
+  sessions: N,
+  skipped: B,
+  indexing: oneOf({ completed: N, total: N }, null),
+  warnings: { mapOf: N, keys: Object.keys(CODES) },
+  error: oneOf(enumOf(...Object.keys(CODES)), null),
+  serverDropped: N,
+};
+const TOOL = { id: S, name: S, detected: B, extraRoots: N, uploaded: COUNTS, lastSync: oneOf(LAST_SYNC, null) };
+const CONTRACT = {
+  schemaVersion: enumOf(1),
+  generatedAt: S,
+  cli: { version: S, surface: SURFACE },
+  system: { platform: S, arch: S, release: S },
+  runtime: { name: enumOf('node', 'bun'), version: S },
+  sqlite: enumOf('node:sqlite', 'sqlite3-cli', 'none'),
+  account: {
+    configured: B,
+    server: enumOf('default', 'custom'),
+    uploadState: enumOf('match', 'mismatch', 'unrecorded', 'none'),
+    lastSyncRejected: oneOf(B, null),
+    deviceTag: oneOf(S, null),
+  },
+  network: { server: PROBE, npmRegistry: { registry: enumOf('official', 'custom'), ...PROBE } },
+  daemon: {
+    platform: oneOf(enumOf('launchd', 'systemd', 'taskscheduler'), null),
+    installed: B,
+    mode: oneOf(enumOf('npx', 'pinned'), null),
+  },
+  settings: {
+    uploadProject: oneOf(B, null),
+    extraRoots: N,
+    kikiStartAt: enumOf('set', 'unset'),
+    magpieStartAt: enumOf('set', 'none', 'unset'),
+  },
+  syncHistory: { available: B, entries: { arrayOf: SYNC } },
+  tools: { arrayOf: TOOL },
+};
+
+function contractErrors(value, shape, path = '$') {
+  if (shape === null) return value === null ? [] : [`${path}: expected null`];
+  if (typeof shape === 'string') return typeof value === shape ? [] : [`${path}: expected ${shape}, got ${JSON.stringify(value)}`];
+  if (shape.enum) return shape.enum.includes(value) ? [] : [`${path}: ${JSON.stringify(value)} not in ${shape.enum.join('|')}`];
+  if (shape.oneOf) {
+    return shape.oneOf.some(branch => contractErrors(value, branch, path).length === 0) ? [] : [`${path}: matches no allowed shape (${JSON.stringify(value)})`];
+  }
+  if (shape.arrayOf) {
+    if (!Array.isArray(value)) return [`${path}: expected array`];
+    return value.flatMap((item, index) => contractErrors(item, shape.arrayOf, `${path}[${index}]`));
+  }
+  if (!value || typeof value !== 'object' || Array.isArray(value)) return [`${path}: expected object`];
+  if (shape.mapOf) {
+    return Object.entries(value).flatMap(([key, item]) => [
+      ...(shape.keys.includes(key) ? [] : [`${path}.${key}: unknown key`]),
+      ...contractErrors(item, shape.mapOf, `${path}.${key}`),
+    ]);
+  }
+  const errors = [];
+  for (const key of Object.keys(value)) if (!(key in shape)) errors.push(`${path}.${key}: undocumented field`);
+  for (const [key, child] of Object.entries(shape)) {
+    if (!(key in value)) {
+      if (!child?.optional) errors.push(`${path}.${key}: missing`);
+      continue;
+    }
+    errors.push(...contractErrors(value[key], child?.optional ?? child, `${path}.${key}`));
+  }
+  return errors;
+}
+
+function assertContract(report) {
+  assert.deepEqual(contractErrors(report, CONTRACT), []);
+}
+
+test('the contract checker rejects extra fields, wrong types and unknown codes', () => {
+  assert.deepEqual(contractErrors({ a: 1 }, { a: N }), []);
+  assert.match(contractErrors({ a: 1, b: 2 }, { a: N })[0], /undocumented field/);
+  assert.match(contractErrors({ a: '1' }, { a: N })[0], /expected number/);
+  assert.match(contractErrors({}, { a: N })[0], /missing/);
+  assert.deepEqual(contractErrors({}, { a: optional(N) }), []);
+  assert.match(contractErrors({ w: { nope: 1 } }, { w: LAST_SYNC.warnings })[0], /unknown key/);
+});
+
 // Synthetic sensitive values. None may appear in any doctor output.
 const KEY = 'vbu_doctor_secret_key_0123456789';
 const SECRETS = [KEY, '张 三', '秘密项目', '-Users-张-三-Coding', 'MacBook', 'sk-ant-api03-fake', 'proxy-password'];
@@ -158,6 +268,7 @@ test('doctor --json emits the versioned contract and reads nothing it may not', 
       assert.deepEqual(snapshot(root), before, 'doctor writes nothing');
 
       const report = JSON.parse(stdout);
+      assertContract(report);
       assert.equal(report.schemaVersion, 1);
       assert.equal(DOCTOR_SCHEMA_VERSION, 1);
       assert.match(report.generatedAt, /^\d{4}-\d{2}-\d{2}T/);
@@ -236,6 +347,48 @@ test('doctor prints a pasteable text report with only fixed fields', async () =>
   });
 });
 
+test('a tool that recovered shows as healthy, a still-pending one keeps its last result', async () => {
+  const { handler } = recordingServer();
+  await withServer(handler, async (apiUrl) => {
+    const { root, env } = setupMachine(apiUrl);
+    try {
+      writeFileSync(join(env.VIBE_USAGE_STATE_DIR, 'sync-history.json'), JSON.stringify({
+        schemaVersion: 1,
+        entries: [
+          historyEntry({
+            id: 'old', startedAt: '2026-11-09T04:00:00.000Z', parsed: true, pending: [],
+            tools: {
+              codex: { buckets: 0, sessions: 0, error: 'parser_error' },
+              cursor: { buckets: 0, sessions: 0, skipped: true, warnings: { auth_rejected: 1 } },
+            },
+          }),
+          // Newest: codex ran and had nothing to say; Cursor was still exporting
+          // when the process ended.
+          historyEntry({ id: 'new', startedAt: '2026-11-09T05:00:00.000Z', result: null, endedAt: null, durationMs: null, parsed: true, pending: ['cursor'], tools: {} }),
+        ],
+      }));
+      const { stdout } = await execFileAsync(process.execPath, [bin, 'doctor', '--json'], { env });
+      const report = JSON.parse(stdout);
+      assertContract(report);
+      const codex = report.tools.find(tool => tool.id === 'codex');
+      assert.deepEqual(codex.lastSync, {
+        startedAt: '2026-11-09T05:00:00.000Z', buckets: 0, sessions: 0, skipped: false,
+        indexing: null, warnings: {}, error: null, serverDropped: 0,
+      });
+      const cursor = report.tools.find(tool => tool.id === 'cursor');
+      assert.equal(cursor.lastSync.startedAt, '2026-11-09T04:00:00.000Z');
+      assert.deepEqual(cursor.lastSync.warnings, { auth_rejected: 1 });
+      assert.equal(report.tools.some(tool => tool.id === 'gemini-cli'), false, 'an absent tool with nothing to report is not listed');
+
+      const text = renderDoctorText(report);
+      assert.match(text, /Codex CLI\s+已检测 · 上次无新数据 · 正常/);
+      assert.match(text, /Cursor\s+未检测到数据目录 · 上次 0 buckets · 登录凭证被拒绝/);
+    } finally {
+      rmSync(root, { recursive: true, force: true });
+    }
+  });
+});
+
 test('doctor on an unconfigured machine without history still reports', async () => {
   const root = mkdtempSync(join(tmpdir(), 'vibe-usage-doctor-empty-'));
   try {
@@ -256,6 +409,7 @@ test('doctor on an unconfigured machine without history still reports', async ()
       };
       const { stdout } = await execFileAsync(process.execPath, [bin, 'doctor', '--json'], { env });
       const report = JSON.parse(stdout);
+      assertContract(report);
       assert.equal(report.account.configured, false);
       assert.equal(report.account.uploadState, 'none');
       assert.equal(report.account.lastSyncRejected, null);
@@ -307,6 +461,73 @@ test('a refused, silent or unresolvable host maps to a fixed probe error', async
   assert.equal(codeOf('UNABLE_TO_VERIFY_LEAF_SIGNATURE'), 'tls_failed');
   assert.equal(codeOf('ETIMEDOUT'), 'timeout');
   assert.equal(codeOf(undefined), 'network_failed');
+});
+
+test('probes go through the default global agent, like uploads', async () => {
+  const { default: http } = await import('node:http');
+  const original = http.globalAgent;
+  const spy = new http.Agent();
+  let connections = 0;
+  const create = spy.createConnection.bind(spy);
+  spy.createConnection = (...args) => { connections++; return create(...args); };
+  http.globalAgent = spy;
+  try {
+    await withServer((req, res) => { req.resume(); res.writeHead(401).end(); }, async (apiUrl) => {
+      const result = await probeUrl(`${apiUrl}/api/usage/settings`);
+      assert.equal(result.reachable, true);
+    });
+  } finally {
+    http.globalAgent = original;
+    spy.destroy();
+  }
+  assert.equal(connections, 1, 'a private agent would bypass NODE_USE_ENV_PROXY');
+});
+
+// NODE_USE_ENV_PROXY exists from Node 22.21 / 24.5 (CI runs the latest 22.x
+// and 24.x); older runtimes skip this end-to-end check.
+function supportsEnvProxy(version = process.versions.node) {
+  const [major, minor] = version.split('.').map(Number);
+  return major > 24 || (major === 24 && minor >= 5) || (major === 22 && minor >= 21);
+}
+
+test('with NODE_USE_ENV_PROXY both probes go through the environment proxy', { skip: !supportsEnvProxy() && 'needs Node 22.21+ / 24.5+' }, async () => {
+  const seen = [];
+  // A plain HTTP proxy: it receives absolute-form requests for hosts that do
+  // not resolve, so a direct connection could never succeed.
+  await withServer((req, res) => {
+    seen.push(`${req.method} ${req.url}`);
+    req.resume();
+    res.writeHead(req.url.endsWith('/api/usage/settings') ? 401 : 200).end('{}');
+  }, async (proxyUrl) => {
+    const root = mkdtempSync(join(tmpdir(), 'vibe-usage-doctor-proxy-'));
+    try {
+      mkdirSync(join(root, 'config'));
+      writeFileSync(join(root, 'config', 'config.json'), JSON.stringify({ apiUrl: 'http://doctor-target.invalid' }));
+      const env = {
+        ...process.env,
+        HOME: root,
+        USERPROFILE: root,
+        VIBE_USAGE_DEV: '0',
+        VIBE_USAGE_CONFIG_DIR: join(root, 'config'),
+        VIBE_USAGE_STATE_DIR: join(root, 'state'),
+        npm_config_registry: 'http://doctor-registry.invalid/',
+        NODE_USE_ENV_PROXY: '1',
+        HTTP_PROXY: proxyUrl,
+        http_proxy: proxyUrl,
+      };
+      for (const name of ['NO_PROXY', 'no_proxy', 'HTTPS_PROXY', 'https_proxy']) delete env[name];
+      const { stdout } = await execFileAsync(process.execPath, [bin, 'doctor', '--json'], { env });
+      const report = JSON.parse(stdout);
+      assert.equal(report.network.server.reachable, true);
+      assert.equal(report.network.npmRegistry.reachable, true);
+      assert.deepEqual(seen.sort(), [
+        'GET http://doctor-registry.invalid/-/ping',
+        'GET http://doctor-target.invalid/api/usage/settings',
+      ]);
+    } finally {
+      rmSync(root, { recursive: true, force: true });
+    }
+  });
 });
 
 test('the last-line scrub replaces home, keys, tokens, emails and long strings', () => {
@@ -368,5 +589,11 @@ test('docs/doctor-json.md documents every code the report can contain', async ()
     'settings.magpieStartAt', 'syncHistory.available', 'syncHistory.entries[]', 'tools[]',
   ]) {
     assert.ok(doc.includes(`| \`${field}\` |`), `undocumented field ${field}`);
+  }
+  for (const key of [...Object.keys(SYNC), ...Object.keys(TOOL)]) {
+    assert.ok(doc.includes(`| \`${key}\` |`), `undocumented field ${key}`);
+  }
+  for (const key of Object.keys(LAST_SYNC)) {
+    assert.ok(doc.includes(`\`lastSync.${key}\``) || doc.includes(`\`.${key}\``), `undocumented field lastSync.${key}`);
   }
 });

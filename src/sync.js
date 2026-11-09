@@ -425,6 +425,7 @@ async function runSyncPasses({
   // only their order changes. A desktop app that kills the process at its own
   // timeout now loses at most the slow source, not every tool's upload.
   status.stop();
+  record.notePending(deferredEntries.map(([source]) => source));
   const pendingSources = deferredEntries.map(([source]) => source).join(', ');
   if (!quiet) console.log(dim(`  ${pendingSources}: 仍在读取用量数据，先上传其他工具`));
   const firstPassIngested = await syncOutcomes(localOutcomes, { final: false });
@@ -496,6 +497,7 @@ async function runSyncPasses({
     }
     // Saved before any upload, so a sync a desktop app kills at its 120s
     // timeout still leaves this pass's per-tool counts and index progress.
+    record.notePassDone(parserOutcomes.map(({ source }) => source));
     record.flush();
     const noteHeld = sources => sources.forEach(source => record.noteWarning(source, 'upload_withheld'));
 

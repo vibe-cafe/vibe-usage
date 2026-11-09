@@ -145,6 +145,21 @@ test('per-tool counts keep codes only and leave out tools with nothing to say', 
   for (const secret of SECRETS) assert.ok(!text.includes(secret), secret);
 });
 
+test('an entry says which parser passes finished and which deferred sources are pending', () => {
+  resetHistory();
+  const record = beginSyncRecord();
+  assert.equal(rawEntries()[0].parsed, false);
+  record.notePending(['cursor']);
+  record.notePassDone(['claude-code', 'codex']);
+  record.flush();
+  assert.equal(rawEntries()[0].parsed, true);
+  assert.deepEqual(rawEntries()[0].pending, ['cursor']);
+  record.notePassDone(['cursor']);
+  record.finish();
+  assert.deepEqual(rawEntries()[0].pending, []);
+  assert.deepEqual(readSyncHistory().entries[0].pending, []);
+});
+
 test('reading re-validates every field, so a hand-edited file cannot inject text', () => {
   mkdirSync(stateDir, { recursive: true });
   writeFileSync(getSyncHistoryPath(), JSON.stringify({
@@ -163,6 +178,8 @@ test('reading re-validates every field, so a hand-edited file cannot inject text
         uploaded: { buckets: -1, sessions: 'many' },
         failure: { code: 'server_error', status: 502, body: 'sk-ant-api03-fake' },
         note: 'eyJhbGciOiJIUzI1NiJ9.fake',
+        parsed: 'yes',
+        pending: ['cursor', '/Users/张 三', 42],
         tools: {
           'claude-code': { buckets: 3, warnings: { read_failed: 1, '秘密项目': 4 }, path: '/Users/张 三' },
           '../../etc': { buckets: 1 },
@@ -178,6 +195,8 @@ test('reading re-validates every field, so a hand-edited file cannot inject text
   assert.deepEqual(entry.uploaded, { buckets: 0, sessions: 0 });
   assert.deepEqual(entry.failure, { code: 'server_error', status: 502 });
   assert.deepEqual(entry.tools, { 'claude-code': { buckets: 3, sessions: 0, warnings: { read_failed: 1 } } });
+  assert.equal(entry.parsed, false);
+  assert.deepEqual(entry.pending, ['cursor']);
   const text = JSON.stringify(entries);
   for (const secret of SECRETS) assert.ok(!text.includes(secret), secret);
 });
@@ -350,6 +369,8 @@ test('runSync records counts, warning codes and server drops, but no warning tex
   });
   assert.deepEqual(entry.tools.kilo, { buckets: 2, sessions: 0, serverDropped: 2 });
   assert.deepEqual(entry.tools.cursor, { buckets: 0, sessions: 0, error: 'sqlite_unavailable' });
+  assert.equal(entry.parsed, true);
+  assert.deepEqual(entry.pending, []);
   for (const secret of [...SECRETS, 'MacBook']) assert.ok(!text.includes(secret), secret);
 });
 
@@ -563,6 +584,8 @@ test('a sync killed while waiting for Cursor keeps the first pass upload', async
   });
   assert.deepEqual(entries[0].uploaded, { buckets: 2, sessions: 0 });
   assert.equal(entries[0].result, null);
+  assert.equal(entries[0].parsed, true);
+  assert.deepEqual(entries[0].pending, ['cursor'], 'Cursor never finished, so the entry says nothing about it');
 });
 
 test('an unwritable history changes neither the upload, the output nor the exit code', async () => {

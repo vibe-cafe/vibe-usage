@@ -14,9 +14,13 @@ maintainer (Hogan), 一键诊断 plan, step 2.
 - **Network:** exactly two unauthenticated `GET`s, in parallel, each capped at
   10 s: `<apiUrl>/api/usage/settings` (no `Authorization` header; any HTTP
   answer, including 401, means reachable) and `<registry>/-/ping`. They use the
-  same Node `https` module as uploads, so a machine that can only go out
-  through a proxy fails here the way its sync does. Budget about 12 s; the
-  apps should give the whole command 30 s.
+  same Node `https` module and default global agent as uploads, so they take
+  the same route: through the environment proxy when `NODE_USE_ENV_PROXY=1`
+  is set (Node 22.21+ / 24.5+; the Windows app sets it with `HTTPS_PROXY`
+  when the system has a proxy), directly otherwise. A machine whose sync
+  cannot get out fails here too, and one whose sync works through the proxy
+  is reported reachable. Budget about 12 s; the apps should give the whole
+  command 30 s.
 - **Whitelist only.** Every value is a fixed enum, a code from the tables
   below, a number, a boolean, an ISO timestamp, a version string, or a tool's
   fixed id/display name. No path, directory or project name, hostname, account
@@ -69,7 +73,7 @@ maintainer (Hogan), 一键诊断 plan, step 2.
 | `settings.magpieStartAt` | `set` \| `none` \| `unset` | Magpie cut: a time, the literal `none` (all history), or absent. |
 | `syncHistory.available` | boolean | A readable sync-history file exists. |
 | `syncHistory.entries[]` | sync | Up to 10 recorded syncs, **newest first**. |
-| `tools[]` | tool | Every tool that is detected, appears in the history, or has upload state; registry order. |
+| `tools[]` | tool | Every tool that is detected, has something in its `lastSync` (data, a warning, an error, index progress, a server drop), or has upload state; registry order. |
 
 **probe** — `{ reachable: boolean, latencyMs: number | null, error: <probe error> | null }`.
 `latencyMs` is the time to the first HTTP response.
@@ -97,7 +101,7 @@ maintainer (Hogan), 一键诊断 plan, step 2.
 | `detected` | boolean | A data directory or store exists on this machine. |
 | `extraRoots` | number | Additional roots configured for this tool. |
 | `uploaded` | `{ buckets: number, sessions: number }` | Items `state.json` records as uploaded, all time. |
-| `lastSync` | object \| null | This tool in the newest history entry that mentions it; `null` = none. |
+| `lastSync` | object \| null | This tool in the newest recorded sync whose parsers finished for it. A tool that ran there with nothing to report (no data, no warning) shows zeros and no warnings, i.e. healthy — so a tool that recovered no longer shows an older error. A sync that ended before its parsers finished, or while this tool (a deferred source such as Cursor) was still running, is skipped for it. `null` = no such sync. |
 | `lastSync.startedAt` | ISO string | That sync's start. |
 | `lastSync.buckets` / `.sessions` | number | What the parser produced in that sync (not what was uploaded). |
 | `lastSync.skipped` | boolean | The parser marked its result partial, so the sync kept its old state. Cursor is always `true` (it only re-reads recent windows); not a problem by itself. |
@@ -209,7 +213,9 @@ maintainer (Hogan), 一键诊断 plan, step 2.
 
 `{ "schemaVersion": 1, "entries": [ … oldest first, at most 10 … ] }`. Each
 entry has the **sync** fields above plus a random local `id` (matches the start
-write with the end write) and `tools: { <source>: { buckets, sessions,
-skipped?, indexing?, warnings?, error?, serverDropped? } }`. Mode 0600; dev
+write with the end write), `parsed` (a parser pass finished), `pending`
+(deferred sources still running at the last save) and `tools: { <source>: {
+buckets, sessions, skipped?, indexing?, warnings?, error?, serverDropped? } }`,
+which leaves out tools that ran with nothing to report. Mode 0600; dev
 mode uses `sync-history.dev.json`; `VIBE_USAGE_STATE_DIR` relocates it with
 `state.json`. Deleting it is always safe.
