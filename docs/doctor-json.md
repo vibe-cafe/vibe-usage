@@ -26,8 +26,10 @@ maintainer (Hogan), 一键诊断 plan, step 2.
   fixed id/display name. No path, directory or project name, hostname, account
   handle, warning text, response body, proxy address or key ever appears. A
   last-line scrub (home directory → `~`; `vbu_…`, `sk-…`, `Bearer …`, `eyJ…`,
-  emails and 40+ character tokens → `***`) runs over every string before
-  printing.
+  emails and 40+ character tokens → `***`, except a bare environment-variable
+  name made only of `A–Z`, `0–9` and `_`, such as the 40-character
+  `CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC`) runs over every string before
+  printing. The desktop apps apply the same rule.
 - **stdout carries only the JSON document; exit code 0.** A non-zero exit or
   unparsable stdout means the CLI failed.
 
@@ -60,7 +62,7 @@ maintainer (Hogan), 一键诊断 plan, step 2.
 | `account.configured` | boolean | An API key is configured. |
 | `account.server` | `default` \| `custom` | `apiUrl` is `https://vibecafe.ai` or something else (the URL itself is not reported). |
 | `account.uploadState` | `match` \| `mismatch` \| `unrecorded` \| `none` | Whether `state.json` belongs to the current key: `mismatch` = the next sync re-uploads the full local history; `unrecorded` = written by a CLI older than 0.11.1 (adopted on the next save); `none` = no upload state yet (or not configured). |
-| `account.lastSyncRejected` | boolean \| null | The most recent *finished* sync in the history failed with `unauthorized`. `null` = no finished sync recorded. |
+| `account.lastSyncRejected` | boolean \| null | Read from the **newest** sync record only: `false` when it succeeded (「最近一次同步未被服务器拒绝」), `true` when it failed with `unauthorized` (「最近一次同步被服务器拒绝（Key 无效）」), `null` for anything else — no end recorded, a timeout, a network or server failure (e.g. 502), any other failure (「无法判断 Key 是否被拒」), or no record at all (then say nothing, or 「暂无同步记录」). The desktop apps use the same rule. |
 | `account.deviceTag` | string \| null | First 4 hex chars of `sha256(hostname)`, where hostname is the upload hostname saved in `config.json` (`hostname`), or `os.hostname()` without a trailing `.local` before the first sync. Distinguishes one person's machines; reveals nothing. |
 | `network.server` | probe | Reachability of the configured server. |
 | `network.npmRegistry` | probe + `registry` | Reachability of the npm registry: `npm_config_registry` (npx passes the user's registry down) or `https://registry.npmjs.org/`. `registry` is `official` (registry.npmjs.org) or `custom`; the URL is not reported. |
@@ -72,7 +74,7 @@ maintainer (Hogan), 一键诊断 plan, step 2.
 | `settings.kikiStartAt` | `set` \| `unset` | Whether a Kiki cut is configured. |
 | `settings.magpieStartAt` | `set` \| `none` \| `unset` | Magpie cut: a time, the literal `none` (all history), or absent. |
 | `syncHistory.available` | boolean | A readable sync-history file exists. |
-| `syncHistory.entries[]` | sync | Up to 10 recorded syncs, **newest first**. |
+| `syncHistory.entries[]` | sync | Up to 10 recorded syncs, **newest first**. For an entry without an end, show what it already uploaded (「未记录结束，原因未知 · 已上传 N buckets / M sessions」). |
 | `tools[]` | tool | Every tool that is detected, has something in its `lastSync` (data, a warning, an error, index progress, a server drop), or has upload state; registry order. |
 
 **probe** — `{ reachable: boolean, latencyMs: number | null, error: <probe error> | null }`.
@@ -100,11 +102,13 @@ maintainer (Hogan), 一键诊断 plan, step 2.
 | `name` | string | Display name (`Claude Code`, `Codex CLI`, …). |
 | `detected` | boolean | A data directory or store exists on this machine. |
 | `extraRoots` | number | Additional roots configured for this tool. |
+| `mergedInto` | string[] \| null | For a tool with no parser of its own, the sources its data is uploaded under; `lastSync` is then always `null`. Currently only `cindy` → `["codex", "pi-coding-agent"]` (show 「数据并入 Codex / Pi」). `null` for every other tool. |
 | `uploaded` | `{ buckets: number, sessions: number }` | Items `state.json` records as uploaded, all time. |
-| `lastSync` | object \| null | This tool in the newest recorded sync whose parsers finished for it. A tool that ran there with nothing to report (no data, no warning) shows zeros and no warnings, i.e. healthy — so a tool that recovered no longer shows an older error. A sync that ended before its parsers finished, or while this tool (a deferred source such as Cursor) was still running, is skipped for it. `null` = no such sync. |
+| `lastSync` | object \| null | This tool in the newest recorded sync whose parsers finished for it. A tool with a parser that ran there with nothing to report (no data, no warning, no skip) shows zeros, i.e. healthy — so a tool that recovered no longer shows an older error. A sync that ended before its parsers finished, or while this tool (a deferred source such as Cursor) was still running, is skipped for it. `null` = no such sync. |
 | `lastSync.startedAt` | ISO string | That sync's start. |
 | `lastSync.buckets` / `.sessions` | number | What the parser produced in that sync (not what was uploaded). |
-| `lastSync.skipped` | boolean | The parser marked its result partial, so the sync kept its old state. Cursor is always `true` (it only re-reads recent windows); not a problem by itself. |
+| `lastSync.skipped` | boolean | The parser marked its result partial, so the sync kept its old state. Cursor is always `true` (it only re-reads recent windows); use `incomplete` to decide whether it is a problem. |
+| `lastSync.incomplete` | boolean | `skipped` and not one of the normal cases (Cursor's partial view, an index still being built): the parser gave up and this tool's data is incomplete. Some parsers do this without any warning (an incompatible MiniMax Code / Devin database), so never show such a tool as healthy: 「已跳过，结果不完整」. |
 | `lastSync.indexing` | `{ completed: number, total: number }` \| null | Building a local index (Claude Code / Codex cold cache); continues next sync. |
 | `lastSync.warnings` | `{ <warning code>: number }` | How many warnings of each code (parsers cap their own warning lists, typically at 20). |
 | `lastSync.error` | warning code \| null | The parser threw instead of returning; usually `parser_error`, `sqlite_unavailable` or `auth_rejected`. |
@@ -199,10 +203,10 @@ maintainer (Hogan), 一键诊断 plan, step 2.
   "tools": [
     {
       "id": "cursor", "name": "Cursor", "detected": true, "extraRoots": 0,
-      "uploaded": { "buckets": 840, "sessions": 0 },
+      "uploaded": { "buckets": 840, "sessions": 0 }, "mergedInto": null,
       "lastSync": {
         "startedAt": "2026-11-09T06:00:00.000Z", "buckets": 0, "sessions": 0, "skipped": true,
-        "indexing": null, "warnings": { "cursor_token_encrypted": 1 }, "error": null, "serverDropped": 0
+        "incomplete": false, "indexing": null, "warnings": { "cursor_token_encrypted": 1 }, "error": null, "serverDropped": 0
       }
     }
   ]

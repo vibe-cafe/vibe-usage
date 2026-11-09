@@ -33,6 +33,16 @@ const DEFAULT_API_URL = 'https://vibecafe.ai';
 const OFFICIAL_REGISTRY = 'https://registry.npmjs.org/';
 const PROBE_TIMEOUT_MS = 10_000;
 
+// Cursor re-reads only recent windows and marks every result `skipped` by
+// design (#131): for it a skip is the normal partial view, not a failure.
+const PARTIAL_VIEW_SOURCES = new Set(['cursor']);
+
+// Tools without a parser of their own: their rows are merged into these
+// sources' uploads (cindy-ledger.js). Never zero-filled as "ran, no data".
+export const MERGED_SOURCES = Object.freeze({ cindy: Object.freeze(['codex', 'pi-coding-agent']) });
+
+const TOOL_NAMES = new Map(TOOLS.map(tool => [tool.id, tool.name]));
+
 export const PROBE_ERRORS = Object.freeze({
   timeout: '超时',
   dns_failed: '域名解析失败',
@@ -165,11 +175,16 @@ function lastToolSync(entries, source) {
   const entry = entries.find(item => item.tools[source] || (item.parsed && !item.pending.includes(source)));
   if (!entry) return null;
   const tool = entry.tools[source] ?? { buckets: 0, sessions: 0 };
+  const skipped = tool.skipped === true;
   return {
     startedAt: entry.startedAt,
     buckets: tool.buckets,
     sessions: tool.sessions,
-    skipped: tool.skipped === true,
+    skipped,
+    // A skip that is not Cursor's by-design partial view and not an index
+    // still being built: the parser gave up (some return no warning at all,
+    // e.g. an incompatible MiniMax Code / Devin database).
+    incomplete: skipped && !tool.indexing && !PARTIAL_VIEW_SOURCES.has(source),
     indexing: tool.indexing ?? null,
     warnings: tool.warnings ?? {},
     error: tool.error ?? null,
@@ -178,8 +193,21 @@ function lastToolSync(entries, source) {
 }
 
 function lastSyncHasData(last) {
-  return Boolean(last && (last.buckets || last.sessions || last.error || last.indexing
+  return Boolean(last && (last.buckets || last.sessions || last.error || last.indexing || last.incomplete
     || last.serverDropped || Object.keys(last.warnings).length > 0));
+}
+
+/**
+ * Whether the newest recorded sync tells us the key was rejected: `false`
+ * after a success, `true` after `unauthorized`, `null` for anything else (no
+ * end recorded, a network or server failure, no record at all) -- those say
+ * nothing about the key. Same rule in both desktop apps.
+ */
+export function lastSyncRejected(entries) {
+  const newest = entries[0];
+  if (newest?.result === 'success') return false;
+  if (newest?.failure?.code === 'unauthorized') return true;
+  return null;
 }
 
 /**
@@ -212,8 +240,6 @@ export async function collectDoctorReport({
   ]);
 
   const history = readSyncHistory();
-  const finished = history.entries.find(entry => entry.result);
-  const lastSyncRejected = finished ? finished.failure?.code === 'unauthorized' : null;
 
   const state = loadState();
   const uploaded = uploadedBySource(state);
@@ -221,7 +247,8 @@ export async function collectDoctorReport({
   const tools = [];
   for (const tool of TOOLS) {
     const detected = toolDetected(tool, toolOptions);
-    const lastSync = lastToolSync(history.entries, tool.id);
+    const mergedInto = MERGED_SOURCES[tool.id] ?? null;
+    const lastSync = mergedInto ? null : lastToolSync(history.entries, tool.id);
     const counts = uploaded.get(tool.id) ?? { buckets: 0, sessions: 0 };
     // Every installed parser "runs" each sync, so a zero lastSync alone does
     // not make an absent tool worth listing.
@@ -232,6 +259,7 @@ export async function collectDoctorReport({
       detected,
       extraRoots: extraRootCount(config, tool.id),
       uploaded: counts,
+      mergedInto: mergedInto ? [...mergedInto] : null,
       lastSync,
     });
   }
@@ -253,7 +281,7 @@ export async function collectDoctorReport({
       configured,
       server: apiUrl.replace(/\/+$/, '') === DEFAULT_API_URL ? 'default' : 'custom',
       uploadState: configured ? inspectStateIdentity(stateIdentity({ apiUrl, apiKey: config.apiKey })) : 'none',
-      lastSyncRejected,
+      lastSyncRejected: lastSyncRejected(history.entries),
       deviceTag: deviceTag(config?.hostname || osHostname().replace(/\.local$/, '')),
     },
     network: {
@@ -288,14 +316,18 @@ const SECRET_PATTERNS = [
   /\bsk-[A-Za-z0-9_-]+/g,
   /\beyJ[A-Za-z0-9_-]+(?:\.[A-Za-z0-9_-]+)*/g,
   /[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}/g,
-  /[A-Za-z0-9_\-.=+/]{40,}/g,
 ];
+// 40+ characters of token alphabet, except a bare environment-variable name
+// (upper case, digits, underscore): CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC
+// is exactly 40. Same rule in both desktop apps.
+const LONG_TOKEN = /[A-Za-z0-9_\-.=+/]{40,}/g;
+const ENV_NAME = /^[A-Z0-9_]+$/;
 
 export function scrubText(text, home = homedir()) {
   let out = String(text);
   if (home && home.length > 1) out = out.replace(new RegExp(escapeRegExp(home), 'g'), '~');
   for (const pattern of SECRET_PATTERNS) out = out.replace(pattern, '***');
-  return out;
+  return out.replace(LONG_TOKEN, match => (ENV_NAME.test(match) ? match : '***'));
 }
 
 export function scrubDeep(value, home = homedir()) {
@@ -367,7 +399,8 @@ function syncLine(entry) {
   const who = SURFACE_LABELS[entry.surface] ?? '未知发起方';
   let result;
   if (!entry.result) {
-    result = '未记录结束，原因未知';
+    const sent = entry.uploaded.buckets || entry.uploaded.sessions ? ` · 已上传 ${counts(entry.uploaded)}` : '';
+    result = `未记录结束，原因未知${sent}`;
   } else if (entry.result === 'success') {
     const sent = entry.uploaded.buckets || entry.uploaded.sessions ? `上传 ${counts(entry.uploaded)}` : '无新数据';
     result = `成功 ${formatDuration(entry.durationMs)} · ${sent}`;
@@ -390,17 +423,20 @@ function toolLine(tool, nameWidth) {
   const parts = [tool.detected ? '已检测' : '未检测到数据目录'];
   if (tool.extraRoots > 0) parts.push(`额外目录 ${tool.extraRoots} 个`);
   const last = tool.lastSync;
-  if (!last) {
+  if (tool.mergedInto) {
+    parts.push(`数据并入 ${tool.mergedInto.map(id => TOOL_NAMES.get(id) ?? id).join(' / ')}`);
+  } else if (!last) {
     parts.push('暂无同步记录');
   } else if (last.error) {
     parts.push(`出错：${WARNING_CODES[last.error] ?? last.error}（${last.error}）`);
   } else {
     const warnings = Object.entries(last.warnings);
-    const quiet = !last.buckets && !last.sessions && !last.indexing && warnings.length === 0;
-    parts.push(quiet ? '上次无新数据' : `上次 ${counts(last)}`);
+    const healthy = !last.indexing && !last.incomplete && warnings.length === 0;
+    parts.push(healthy && !last.buckets && !last.sessions ? '上次无新数据' : `上次 ${counts(last)}`);
     if (last.indexing) parts.push(`正在建立本地索引 ${last.indexing.completed}/${last.indexing.total}`);
+    if (last.incomplete) parts.push('已跳过，结果不完整');
     for (const [code, n] of warnings) parts.push(`${WARNING_CODES[code] ?? code} ×${n}（${code}）`);
-    if (!last.indexing && warnings.length === 0) parts.push('正常');
+    if (healthy) parts.push('正常');
   }
   if (last?.serverDropped) parts.push(`服务端丢弃 ${formatCount(last.serverDropped)}（服务端还没收录这个来源）`);
   if (tool.uploaded.buckets || tool.uploaded.sessions) parts.push(`累计已上传 ${counts(tool.uploaded)}`);
@@ -409,7 +445,8 @@ function toolLine(tool, nameWidth) {
 
 function hasProblem(tool) {
   const last = tool.lastSync;
-  return Boolean(last && (last.error || last.indexing || last.serverDropped || Object.keys(last.warnings).length > 0));
+  return Boolean(last && (last.error || last.indexing || last.incomplete || last.serverDropped
+    || Object.keys(last.warnings).length > 0));
 }
 
 export function renderDoctorText(report) {
@@ -427,6 +464,7 @@ export function renderDoctorText(report) {
   if (account.configured) accountParts.push(UPLOAD_STATE_LABELS[account.uploadState] ?? account.uploadState);
   if (account.lastSyncRejected === true) accountParts.push('最近一次同步被服务器拒绝（Key 无效）');
   else if (account.lastSyncRejected === false) accountParts.push('最近一次同步未被服务器拒绝');
+  else if (report.syncHistory.entries.length > 0) accountParts.push('无法判断 Key 是否被拒');
   if (account.deviceTag) accountParts.push(`设备标签 ${account.deviceTag}`);
   lines.push(`账号：${accountParts.join(' · ')}`);
 

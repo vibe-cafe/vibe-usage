@@ -20,7 +20,7 @@ process.env.VIBE_USAGE_STATE_DIR = join(scratch, 'state');
 process.env.VIBE_USAGE_CONFIG_DIR = join(scratch, 'config');
 process.env.VIBE_USAGE_DEV = '0';
 const {
-  DOCTOR_SCHEMA_VERSION, deviceTag, probeErrorCode, probeUrl, renderDoctorText, scrubDeep, scrubText,
+  DOCTOR_SCHEMA_VERSION, MERGED_SOURCES, deviceTag, lastSyncRejected, probeErrorCode, probeUrl, renderDoctorText, scrubDeep, scrubText,
 } = await import('../src/doctor.js');
 const { inspectStateIdentity, stateIdentity, getStatePath } = await import('../src/state.js');
 const { sqliteImplementation } = await import('../src/parsers/sqlite.js');
@@ -57,12 +57,15 @@ const LAST_SYNC = {
   buckets: N,
   sessions: N,
   skipped: B,
+  incomplete: B,
   indexing: oneOf({ completed: N, total: N }, null),
   warnings: { mapOf: N, keys: Object.keys(CODES) },
   error: oneOf(enumOf(...Object.keys(CODES)), null),
   serverDropped: N,
 };
-const TOOL = { id: S, name: S, detected: B, extraRoots: N, uploaded: COUNTS, lastSync: oneOf(LAST_SYNC, null) };
+const TOOL = {
+  id: S, name: S, detected: B, extraRoots: N, uploaded: COUNTS, mergedInto: oneOf({ arrayOf: S }, null), lastSync: oneOf(LAST_SYNC, null),
+};
 const CONTRACT = {
   schemaVersion: enumOf(1),
   generatedAt: S,
@@ -192,7 +195,9 @@ function setupMachine(apiUrl) {
   const configDir = join(root, 'config');
   const stateDir = join(root, 'state');
   const codexHome = join(root, 'codex 张 三');
-  for (const dir of [home, configDir, stateDir, join(codexHome, 'sessions')]) mkdirSync(dir, { recursive: true });
+  const cindyDir = join(root, 'cindy');
+  for (const dir of [home, configDir, stateDir, join(codexHome, 'sessions'), cindyDir]) mkdirSync(dir, { recursive: true });
+  writeFileSync(join(cindyDir, 'cindy-owner.db'), '');
   const extraClaude = join(root, '备份', '.claude');
   mkdirSync(join(extraClaude, 'projects'), { recursive: true });
   writeFileSync(join(configDir, 'config.json'), JSON.stringify({
@@ -227,6 +232,7 @@ function setupMachine(apiUrl) {
           'kimi-code': { buckets: 0, sessions: 0, skipped: true, warnings: { read_failed: 2 } },
           cursor: { buckets: 0, sessions: 0, skipped: true, warnings: { cursor_token_encrypted: 1 } },
           kilo: { buckets: 30, sessions: 0, serverDropped: 30 },
+          mcode: { buckets: 0, sessions: 0, skipped: true },
         },
       }),
     ],
@@ -239,6 +245,7 @@ function setupMachine(apiUrl) {
     VIBE_USAGE_CONFIG_DIR: configDir,
     VIBE_USAGE_STATE_DIR: stateDir,
     CODEX_HOME: codexHome,
+    VIBE_USAGE_CINDY_DIRS: cindyDir,
     npm_config_registry: `${apiUrl}/registry/`,
     VIBE_USAGE_SURFACE: '',
     HTTPS_PROXY: 'http://user:proxy-password@127.0.0.1:9',
@@ -305,6 +312,14 @@ test('doctor --json emits the versioned contract and reads nothing it may not', 
       assert.equal(report.tools.find(tool => tool.id === 'kilo').lastSync.serverDropped, 30);
       const claude = report.tools.find(tool => tool.id === 'claude-code');
       assert.equal(claude.extraRoots, 1);
+      // A skip with no warning is a failure; Cursor's skip is its normal partial view.
+      assert.equal(report.tools.find(tool => tool.id === 'mcode').lastSync.incomplete, true);
+      assert.equal(report.tools.find(tool => tool.id === 'cursor').lastSync.incomplete, false);
+      assert.equal(codex.lastSync.incomplete, false, 'an index being built is reported as such');
+      const cindy = report.tools.find(tool => tool.id === 'cindy');
+      assert.equal(cindy.detected, true);
+      assert.deepEqual(cindy.mergedInto, ['codex', 'pi-coding-agent']);
+      assert.equal(cindy.lastSync, null);
 
       for (const secret of SECRETS) assert.ok(!stdout.includes(secret), secret);
       assert.ok(!stdout.includes(root), 'no temporary path');
@@ -331,10 +346,13 @@ test('doctor prints a pasteable text report with only fixed fields', async () =>
       assert.match(stdout, /设置：项目名：已隐藏 · 额外数据目录 1 个 · Kiki 切点：未设 · Magpie 切点：全部历史/);
       assert.match(stdout, /Mac App · 成功 18s · 上传 12 buckets \/ 3 sessions · CLI 0\.14\.11/);
       assert.match(stdout, /终端 · 失败 18s · 服务器错误 502/);
-      assert.match(stdout, /后台服务 · 未记录结束，原因未知/);
+      assert.match(stdout, /后台服务 · 未记录结束，原因未知 · 已上传 12 buckets \/ 3 sessions/);
+      assert.match(stdout, /MiniMax Code\s+未检测到数据目录 · 上次 0 buckets · 已跳过，结果不完整/);
+      assert.doesNotMatch(stdout, /MiniMax Code[^\n]*正常/);
+      assert.match(stdout, /Cindy\s+已检测 · 数据并入 Codex CLI \/ pi/);
       assert.match(stdout, /最近一次后台同步 \d{2}-\d{2} \d{2}:\d{2} 未记录结束/);
       assert.match(stdout, /Codex CLI\s+已检测 · 上次 0 buckets · 正在建立本地索引 120\/400 · 累计已上传 2 buckets \/ 1 sessions/);
-      assert.match(stdout, /Kimi Code\s+未检测到数据目录 · 上次 0 buckets · 读文件失败 ×2（read_failed）/);
+      assert.match(stdout, /Kimi Code\s+未检测到数据目录 · 上次 0 buckets · 已跳过，结果不完整 · 读文件失败 ×2（read_failed）/);
       assert.match(stdout, /本地登录令牌已加密 ×1（cursor_token_encrypted）/);
       assert.match(stdout, /服务端丢弃 30（服务端还没收录这个来源）/);
       assert.match(stdout, /—— 只含固定字段和错误码/);
@@ -372,16 +390,18 @@ test('a tool that recovered shows as healthy, a still-pending one keeps its last
       assertContract(report);
       const codex = report.tools.find(tool => tool.id === 'codex');
       assert.deepEqual(codex.lastSync, {
-        startedAt: '2026-11-09T05:00:00.000Z', buckets: 0, sessions: 0, skipped: false,
+        startedAt: '2026-11-09T05:00:00.000Z', buckets: 0, sessions: 0, skipped: false, incomplete: false,
         indexing: null, warnings: {}, error: null, serverDropped: 0,
       });
       const cursor = report.tools.find(tool => tool.id === 'cursor');
       assert.equal(cursor.lastSync.startedAt, '2026-11-09T04:00:00.000Z');
       assert.deepEqual(cursor.lastSync.warnings, { auth_rejected: 1 });
       assert.equal(report.tools.some(tool => tool.id === 'gemini-cli'), false, 'an absent tool with nothing to report is not listed');
+      assert.equal(report.account.lastSyncRejected, null, 'an unfinished newest sync says nothing about the key');
 
       const text = renderDoctorText(report);
       assert.match(text, /Codex CLI\s+已检测 · 上次无新数据 · 正常/);
+      assert.match(text, /账号：已配置 Key · [^\n]*无法判断 Key 是否被拒/);
       assert.match(text, /Cursor\s+未检测到数据目录 · 上次 0 buckets · 登录凭证被拒绝/);
     } finally {
       rmSync(root, { recursive: true, force: true });
@@ -535,11 +555,17 @@ test('the last-line scrub replaces home, keys, tokens, emails and long strings',
   const text = [
     `${home}/.claude/projects/-Users-张-三-Coding-秘密项目`,
     'vbu_abcdef123', 'sk-ant-api03-xyz', 'Bearer abc.def', 'eyJhbGciOiJIUzI1NiJ9.eyJzdWIiOiIxIn0.sig',
-    'zhang.san@example.com', 'A'.repeat(40), 'task-runner risk-free',
+    'zhang.san@example.com', 'Ab'.repeat(20), 'task-runner risk-free',
   ].join(' | ');
   const scrubbed = scrubText(text, home);
   assert.equal(scrubbed, '~/.claude/projects/-Users-张-三-Coding-秘密项目 | *** | *** | *** | *** | *** | *** | task-runner risk-free');
   assert.deepEqual(scrubDeep({ a: ['vbu_x', 1, null, { b: 'sk-1' }] }, home), { a: ['***', 1, null, { b: '***' }] });
+  // A bare environment-variable name is not a secret, even at 40+ characters;
+  // anything else of that length still is.
+  assert.equal(scrubText('设了 CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC、ANTHROPIC_BASE_URL', home),
+    '设了 CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC、ANTHROPIC_BASE_URL');
+  assert.equal(scrubText(`X ${'A'.repeat(50)}b Y`, home), 'X *** Y');
+  assert.equal(scrubText(`X ${'A1_'.repeat(20)}= Y`, home), 'X *** Y');
 });
 
 test('device tags are 4 hex chars of the hostname hash', () => {
@@ -595,5 +621,33 @@ test('docs/doctor-json.md documents every code the report can contain', async ()
   }
   for (const key of Object.keys(LAST_SYNC)) {
     assert.ok(doc.includes(`\`lastSync.${key}\``) || doc.includes(`\`.${key}\``), `undocumented field lastSync.${key}`);
+  }
+});
+
+test('the account line reads only the newest sync record', () => {
+  const entry = (result, failure = null) => ({ result, failure });
+  assert.equal(lastSyncRejected([]), null);
+  assert.equal(lastSyncRejected([entry('success'), entry('failed', { code: 'unauthorized' })]), false);
+  assert.equal(lastSyncRejected([entry('failed', { code: 'unauthorized' }), entry('success')]), true);
+  assert.equal(lastSyncRejected([entry('partial', { code: 'unauthorized' })]), true);
+  for (const newest of [
+    entry(null),
+    entry('failed', { code: 'server_error', status: 502 }),
+    entry('failed', { code: 'network_failed' }),
+    entry('failed', { code: 'settings_unavailable' }),
+    entry('partial', { code: 'unexpected_error' }),
+  ]) {
+    assert.equal(lastSyncRejected([newest, entry('success')]), null, JSON.stringify(newest));
+  }
+});
+
+test('every tool has a parser except the ones merged into another source', async () => {
+  const { TOOLS } = await import('../src/tools.js');
+  const { parsers } = await import('../src/parsers/index.js');
+  const withParser = TOOLS.map(tool => tool.id).filter(id => !MERGED_SOURCES[id]).sort();
+  assert.deepEqual(withParser, Object.keys(parsers).sort(),
+    'doctor zero-fills "ran, no data" for every tool with a parser; a tool without one must be listed in MERGED_SOURCES');
+  for (const targets of Object.values(MERGED_SOURCES)) {
+    for (const id of targets) assert.ok(parsers[id], id);
   }
 });
