@@ -815,6 +815,11 @@ async function runSyncPasses({
           }
         }
         if (batchStateChanged) saveState(state, identity);
+        // Same moment the batch is committed to state.json: if a desktop app
+        // kills the process later (its 120s timeout while Cursor is still
+        // exporting), the history still shows what reached the server, and
+        // the entry stays unfinished.
+        record.flush();
       }
 
       if (totalBatches > 1 || allBucketsToSend.length > 0) {

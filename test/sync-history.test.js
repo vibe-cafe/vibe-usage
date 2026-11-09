@@ -1,6 +1,6 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { execFile } from 'node:child_process';
+import { execFile, spawn } from 'node:child_process';
 import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, statSync, writeFileSync } from 'node:fs';
 import { createServer } from 'node:http';
 import { tmpdir } from 'node:os';
@@ -436,5 +436,175 @@ test('an unconfigured machine records nothing', async () => {
     assert.equal(existsSync(join(dir, 'state', 'sync-history.json')), false);
   } finally {
     rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+// ---------------------------------------------------------------------------
+// Killed mid-sync (a desktop app's 120s timeout) and an unwritable history.
+
+function childSetup(apiUrl) {
+  const dir = mkdtempSync(join(tmpdir(), 'vibe-usage-sync-history-kill-'));
+  const configDir = join(dir, 'config');
+  const childState = join(dir, 'state');
+  const homeDir = join(dir, 'home');
+  for (const path of [configDir, childState, homeDir]) mkdirSync(path, { recursive: true });
+  writeFileSync(join(configDir, 'config.json'), JSON.stringify({
+    apiKey: 'vbu_history_secret_key',
+    apiUrl,
+    hostname: 'history-kill-test',
+  }));
+  const env = {
+    ...process.env,
+    HOME: homeDir,
+    VIBE_USAGE_DEV: '0',
+    VIBE_USAGE_CONFIG_DIR: configDir,
+    VIBE_USAGE_STATE_DIR: childState,
+    VIBE_USAGE_DEFERRED_GRACE_MS: '0',
+  };
+  return { dir, childState, env };
+}
+
+function syncScript(parsers, runOptions) {
+  return `
+    import { parsers } from './src/parsers/index.js';
+    for (const source of Object.keys(parsers)) delete parsers[source];
+    const bucket = ${bucket.toString()};
+    ${parsers}
+    const { runSync } = await import('./src/sync.js');
+    await runSync(${runOptions});
+  `;
+}
+
+async function waitFor(predicate, timeoutMs = 10_000) {
+  const deadline = Date.now() + timeoutMs;
+  while (Date.now() < deadline) {
+    const value = predicate();
+    if (value) return value;
+    await new Promise(resolve => setTimeout(resolve, 20));
+  }
+  throw new Error('timed out waiting for the condition');
+}
+
+function readEntries(childState) {
+  try {
+    return JSON.parse(readFileSync(join(childState, 'sync-history.json'), 'utf8')).entries;
+  } catch {
+    return [];
+  }
+}
+
+async function killedAfterUpload({ parsers, handler }) {
+  return withServer(handler, async (apiUrl) => {
+    const { dir, childState, env } = childSetup(apiUrl);
+    const child = spawn(process.execPath, ['--input-type=module', '-e', syncScript(parsers, '{ throws: true, quiet: true }')], {
+      cwd: process.cwd(), env, stdio: 'ignore',
+    });
+    const exited = new Promise(resolve => child.once('exit', resolve));
+    try {
+      // The history file is the only signal: kill as soon as it shows the
+      // accepted batch, like an app whose timeout fires mid-sync.
+      await waitFor(() => readEntries(childState)[0]?.uploaded?.buckets > 0);
+      child.kill('SIGKILL');
+      await exited;
+      return readEntries(childState);
+    } finally {
+      child.kill('SIGKILL');
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+}
+
+test('a sync killed after its first batch keeps the uploaded count and no result', async () => {
+  let posts = 0;
+  const entries = await killedAfterUpload({
+    handler(req, res) {
+      if (settingsOk(req, res)) return;
+      if (req.method === 'POST' && req.url === '/api/usage/ingest') {
+        req.on('data', () => {});
+        req.on('end', () => {
+          posts++;
+          if (posts > 1) return; // later batches hang until the process is killed
+          res.writeHead(200, { 'content-type': 'application/json' });
+          res.end(JSON.stringify({ ingested: 100, sessions: 0 }));
+        });
+        return;
+      }
+      res.writeHead(404).end();
+    },
+    parsers: `parsers['claude-code'] = async () => ({ buckets: Array.from({ length: 250 }, (_, i) => bucket('claude-code', i)), sessions: [] });`,
+  });
+  assert.equal(entries.length, 1);
+  assert.deepEqual(entries[0].uploaded, { buckets: 100, sessions: 0 });
+  assert.equal(entries[0].result, null);
+  assert.equal(entries[0].endedAt, null);
+  assert.equal(entries[0].tools['claude-code'].buckets, 250);
+});
+
+test('a sync killed while waiting for Cursor keeps the first pass upload', async () => {
+  const entries = await killedAfterUpload({
+    handler(req, res) {
+      if (settingsOk(req, res)) return;
+      if (req.method === 'POST' && req.url === '/api/usage/ingest') {
+        req.on('data', () => {});
+        req.on('end', () => {
+          res.writeHead(200, { 'content-type': 'application/json' });
+          res.end(JSON.stringify({ ingested: 2, sessions: 0 }));
+        });
+        return;
+      }
+      res.writeHead(404).end();
+    },
+    parsers: `
+      parsers['claude-code'] = async () => ({ buckets: [bucket('claude-code', 0), bucket('claude-code', 1)], sessions: [] });
+      // A whole-account export that never finishes; the timer stands in for
+      // its open socket, which keeps a real process alive.
+      parsers.cursor = () => new Promise(() => { setInterval(() => {}, 1000); });
+    `,
+  });
+  assert.deepEqual(entries[0].uploaded, { buckets: 2, sessions: 0 });
+  assert.equal(entries[0].result, null);
+});
+
+test('an unwritable history changes neither the upload, the output nor the exit code', async () => {
+  for (const status of [200, 422]) {
+    const received = [];
+    await withServer((req, res) => {
+      if (settingsOk(req, res)) return;
+      if (req.method === 'POST' && req.url === '/api/usage/ingest') {
+        req.on('data', () => {});
+        req.on('end', () => {
+          received.push(req.url);
+          res.writeHead(status, { 'content-type': 'application/json' });
+          res.end(status === 200 ? JSON.stringify({ ingested: 1, sessions: 0 }) : '{"error":"rejected"}');
+        });
+        return;
+      }
+      res.writeHead(404).end();
+    }, async (apiUrl) => {
+      const { dir, childState, env } = childSetup(apiUrl);
+      // A directory where the history file belongs: every history write fails.
+      mkdirSync(join(childState, 'sync-history.json'));
+      try {
+        const script = syncScript(`parsers['claude-code'] = async () => ({ buckets: [bucket('claude-code', 0)], sessions: [] });`, '{}');
+        const result = await new Promise((resolve) => {
+          execFile(process.execPath, ['--input-type=module', '-e', script], { cwd: process.cwd(), env }, (error, stdout, stderr) => {
+            resolve({ code: error ? error.code : 0, stdout, stderr });
+          });
+        });
+        assert.equal(received.length, 1, 'the batch was uploaded');
+        if (status === 200) {
+          assert.equal(result.code, 0);
+          assert.match(result.stdout, /已同步 1 buckets/);
+          assert.equal(result.stderr, '');
+          assert.ok(existsSync(join(childState, 'state.json')), 'upload state still committed');
+        } else {
+          assert.equal(result.code, 1);
+          assert.match(result.stderr, /同步失败: HTTP 422/);
+          assert.doesNotMatch(result.stderr, /history|sync-history|EISDIR/);
+        }
+      } finally {
+        rmSync(dir, { recursive: true, force: true });
+      }
+    });
   }
 });

@@ -10,7 +10,8 @@ import { isWarningCode } from './warning-codes.js';
  * (approved 2026-11-09 by the maintainer, Hogan; 一键诊断 plan, behaviour B).
  *
  * Every runSync writes an entry when it starts, adds per-tool counts once the
- * parsers finish, and fills in the result when it ends. An entry without an
+ * parsers finish, saves the upload counts after every committed batch, and
+ * fills in the result when it ends. An entry without an
  * end means the process never got there -- killed by a desktop app's 120s
  * timeout, the machine slept, or the sync is still running -- and is reported
  * as "未记录结束，原因未知", never guessed.
