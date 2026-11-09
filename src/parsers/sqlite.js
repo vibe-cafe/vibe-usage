@@ -90,6 +90,29 @@ function queryViaCli(dbPath, sql, { timeout, maxBuffer }) {
   return JSON.parse(trimmed);
 }
 
+function sqliteCliAvailable() {
+  try {
+    execFileSync('sqlite3', ['-version'], { stdio: ['ignore', 'pipe', 'ignore'], timeout: 5000 });
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+/**
+ * Which SQLite implementation queryDbJson() would use on this runtime:
+ * `node:sqlite` (Node >= 22.5), the `sqlite3` CLI as fallback, or `none` --
+ * then Cursor, OpenCode, Kiro and the other SQLite-backed tools cannot be
+ * read. The CLI is probed only when node:sqlite is missing. For `doctor`.
+ */
+export function sqliteImplementation({
+  nodeSqliteAvailable = () => Boolean(getNodeSqlite()?.DatabaseSync),
+  cliAvailable = sqliteCliAvailable,
+} = {}) {
+  if (nodeSqliteAvailable()) return 'node:sqlite';
+  return cliAvailable() ? 'sqlite3-cli' : 'none';
+}
+
 /** Standard "sqlite3 unavailable" hint, reused by every SQLite-backed parser. */
 export function sqliteUnavailableError(label) {
   return new Error(`sqlite3 CLI not found. Install sqlite3 (or use Node >= 22.5) to sync ${label} data.`);

@@ -91,6 +91,24 @@ export function loadState(identity) {
   }
 }
 
+/**
+ * Whether state.json belongs to the given upload target, without loading or
+ * changing anything (`doctor`): `match`, `mismatch` (the next sync re-uploads
+ * the local history), `unrecorded` (written before 0.11.1; adopted on the next
+ * save) or `none` (no readable file yet).
+ */
+export function inspectStateIdentity(identity) {
+  let parsed;
+  try {
+    parsed = JSON.parse(readFileSync(STATE_FILE, 'utf-8'));
+  } catch {
+    return 'none';
+  }
+  if (!parsed || typeof parsed !== 'object') return 'none';
+  if (!isIdentity(parsed.identity) || !isIdentity(identity)) return 'unrecorded';
+  return sameIdentity(parsed.identity, identity) ? 'match' : 'mismatch';
+}
+
 export function saveState(state, identity) {
   mkdirSync(STATE_DIR, { recursive: true });
   // Same EISDIR repair as config: a directory where the state file belongs
