@@ -16,10 +16,13 @@ import { MAGPIE_SOURCES, chooseMagpieStartAt, planMagpieMigration } from './magp
 import { createMagpieContext } from './parsers/magpie.js';
 import { isDaemonInstalled } from './daemon-service.js';
 import { success, failure, warn, arrow, link, dim, liveStatus } from './output.js';
+import { beginSyncRecord, syncFailureFromError } from './sync-history.js';
+import { classifyParserError, countWarningCodes } from './warning-codes.js';
 
 const BATCH_SIZE = 100;
 const SESSION_BATCH_SIZE = 500;
 
+/** Print one stderr summary per hold reason; returns one `source` per (reason, source) line. */
 function reportMagpieWithheld(plan) {
   const reasons = new Map();
   for (const { window, reason } of plan.withheld) {
@@ -32,10 +35,13 @@ function reportMagpieWithheld(plan) {
     if (start < summary.earliest) summary.earliest = start;
     if (start > summary.latest) summary.latest = start;
   }
+  const held = [];
   for (const [reason, { count, sources, earliest, latest }] of reasons) {
     const [cause, remedy] = reason.split('；');
     process.stderr.write(`${dim(`  Magpie: ${cause}；暂停上传 ${count} 个窗口，涉及工具 ${[...sources].sort().join('、')}，窗口起始时间 ${earliest} 至 ${latest}；${remedy}。已上传记录保持原值。`)}\n`);
+    held.push(...sources);
   }
+  return held;
 }
 
 /** Coarse human duration: "45s" / "2m10s" / "1h 20m". */
@@ -121,15 +127,21 @@ function usableInfo(info) {
   return !!info && typeof info === 'object' && !Array.isArray(info);
 }
 
-/** Warn about meaningful changes against the recorded info; mutates nothing. */
+/**
+ * Warn about meaningful changes against the recorded info; mutates nothing.
+ * Returns the fixed codes of what it warned about (`{ source, code }`), for
+ * the local sync history.
+ */
 export function reportParserInfoChanges(state, parserInfos) {
-  if (!Array.isArray(parserInfos)) return;
+  const reported = [];
+  if (!Array.isArray(parserInfos)) return reported;
   for (const { source, info } of parserInfos) {
     if (!usableInfo(info)) continue;
     const previous = state.parserMeta?.[source];
     if (source === 'cursor') {
       const warnings = [];
       if (previous?.account && info.account && previous.account !== info.account) {
+        reported.push({ source, code: 'account_changed' });
         warnings.push(
           `cursor: Cursor 登录账号已从 ${previous.account} 更换为 ${info.account}；`
           + '如果这不是你刚切换的账号，请在 Cursor 设置中重新登录。',
@@ -139,6 +151,7 @@ export function reportParserInfoChanges(state, parserInfos) {
         const before = Date.parse(previous.latestEventAt);
         const after = Date.parse(info.latestEventAt);
         if (Number.isFinite(before) && Number.isFinite(after) && after < before) {
+          reported.push({ source, code: 'events_regressed' });
           warnings.push(
             `cursor: Cursor 最新事件从 ${previous.latestEventAt} 回退到 ${info.latestEventAt}；`
             + '这通常意味着当前登录的是另一个（更旧的）Cursor 账号。',
@@ -153,6 +166,7 @@ export function reportParserInfoChanges(state, parserInfos) {
       }
     }
   }
+  return reported;
 }
 
 /**
@@ -216,18 +230,38 @@ export async function mapWithConcurrency(items, limit, fn) {
   return results;
 }
 
-export async function runSync({
+/**
+ * One sync. Also keeps the local sync history (sync-history.js): an entry is
+ * written when the sync starts, per-tool counts once the parsers finish, and
+ * the result when it ends -- including every failure path, which records its
+ * fixed failure code before it throws or exits.
+ */
+export async function runSync(options = {}) {
+  const config = loadConfig();
+  if (!config?.apiKey) {
+    // Not a sync attempt yet: nothing is recorded for an unconfigured machine.
+    console.error(failure('尚未配置，请先运行 `npx @vibe-cafe/vibe-usage`。'));
+    if (options.throws) throw new Error('NOT_CONFIGURED');
+    process.exit(1);
+  }
+  const record = beginSyncRecord({ surface: options.surface ?? 'cli' });
+  try {
+    const ingested = await runSyncPasses(options, config, record);
+    record.finish();
+    return ingested;
+  } catch (err) {
+    // No-op when a failure path below already finished the record.
+    record.finish({ failure: syncFailureFromError(err) });
+    throw err;
+  }
+}
+
+async function runSyncPasses({
   throws = false,
   quiet = false,
   surface = 'cli',
   codexExtraHome,
-} = {}) {
-  const config = loadConfig();
-  if (!config?.apiKey) {
-    console.error(failure('尚未配置，请先运行 `npx @vibe-cafe/vibe-usage`。'));
-    if (throws) throw new Error('NOT_CONFIGURED');
-    process.exit(1);
-  }
+} = {}, config, record) {
 
   // Migration: remove deprecated lastSync field from config
   if ('lastSync' in config) {
@@ -274,6 +308,7 @@ export async function runSync({
     status.stop();
     if (err.message === 'UNAUTHORIZED') {
       console.error(failure('API Key 无效，请运行 `npx @vibe-cafe/vibe-usage init` 重新配置。'));
+      record.finish({ failure: { code: 'unauthorized' } });
       if (throws) throw err;
       process.exit(1);
     }
@@ -285,6 +320,7 @@ export async function runSync({
       if (!quiet) console.log(warn('设置接口不可用，沿用上次的项目名设置。'));
     } else {
       console.error(failure('暂时无法读取上传设置，本次同步已安全取消（未上传数据）。请稍后重试。'));
+      record.finish({ failure: { code: 'settings_unavailable' } });
       if (throws) throw err;
       process.exit(1);
     }
@@ -313,7 +349,8 @@ export async function runSync({
   let syncClient = null;
   // What the server accepted so far in this runSync, across both passes. A
   // pass that uploaded only sessions (e.g. Qoder CLI) counts as an upload too.
-  const uploadedSoFar = { buckets: 0, sessions: 0 };
+  // The sync record owns the counter, so every failure records it as well.
+  const uploadedSoFar = record.uploaded;
   const uploadedAnything = () => uploadedSoFar.buckets > 0 || uploadedSoFar.sessions > 0;
   const partialLabel = () => {
     const parts = [`${uploadedSoFar.buckets} buckets`];
@@ -414,6 +451,7 @@ export async function runSync({
       if (error) {
         // Parser errors are non-fatal — pass-through in dim gray (no translation).
         process.stderr.write(`${dim(`  ${source}: ${error.message}`)}\n`);
+        record.noteParser(source, { error: classifyParserError(error?.message) });
         continue;
       }
       let normalized;
@@ -421,9 +459,19 @@ export async function runSync({
         normalized = normalizeParserResult(source, result);
       } catch (err) {
         process.stderr.write(`${dim(`  ${source}: ${err.message}`)}\n`);
+        record.noteParser(source, { error: 'invalid_result' });
         continue;
       }
       const { buckets, sessions, skipped, warnings, indexing, info } = normalized;
+      // The history keeps counts and fixed warning codes only; the warning
+      // text (paths, exception messages) stays on stderr below.
+      record.noteParser(source, {
+        buckets: buckets.length,
+        sessions: sessions.length,
+        skipped,
+        indexing,
+        warnings: countWarningCodes(warnings),
+      });
       if (indexing) {
         parserProgress.push({ source, ...indexing });
       }
@@ -446,6 +494,10 @@ export async function runSync({
         parserResults.push({ source, buckets: buckets.length, sessions: sessions.length });
       }
     }
+    // Saved before any upload, so a sync a desktop app kills at its 120s
+    // timeout still leaves this pass's per-tool counts and index progress.
+    record.flush();
+    const noteHeld = sources => sources.forEach(source => record.noteWarning(source, 'upload_withheld'));
 
     // Magpie's window guards cover only the five Magpie sources, all of which
     // are local parsers. In a two-pass sync they run in the first pass; the
@@ -463,10 +515,11 @@ export async function runSync({
       announceIdentityChange();
       const before = Object.keys(state.buckets).length + Object.keys(state.sessions).length;
       const magpiePlan = planMagpie([], magpie);
-      reportMagpieWithheld(magpiePlan);
+      noteHeld(reportMagpieWithheld(magpiePlan));
       pruneState(state, magpiePlan.preserveBuckets, new Set(), okSources);
       const pruned = before - (Object.keys(state.buckets).length + Object.keys(state.sessions).length);
-      const metaChanged = applyParserInfos(state, parserInfos);
+      for (const { source, code } of reportParserInfoChanges(state, parserInfos)) record.noteWarning(source, code);
+      const metaChanged = recordParserInfos(state, parserInfos);
       if (pruned > 0 || metaChanged) saveState(state, identity);
       if (!quiet && parserProgress.length > 0) {
         for (const p of parserProgress) {
@@ -526,13 +579,13 @@ export async function runSync({
     // Missing/corrupt state.json => empty maps => one-time full upload, then
     // incremental forever after.
     announceIdentityChange();
-    reportParserInfoChanges(state, parserInfos);
+    for (const { source, code } of reportParserInfoChanges(state, parserInfos)) record.noteWarning(source, code);
     const magpiePlan = planMagpie(allBuckets, {
       ...magpie,
       pending: magpie.pending.map(b => ({ ...b, hostname: host, project: uploadProject ? b.project : 'unknown' })),
     });
     allBuckets = magpiePlan.buckets;
-    reportMagpieWithheld(magpiePlan);
+    noteHeld(reportMagpieWithheld(magpiePlan));
     let migration;
     try {
       migration = planKikiMigration(allBuckets, allSessions, state, config.kikiStartAt);
@@ -557,6 +610,7 @@ export async function runSync({
     }
     if (migration.blocked) {
       okSources.delete('kiki');
+      record.noteWarning('kiki', 'upload_withheld');
       process.stderr.write(`${dim('  kiki: 历史与 kimi-code 同步记录重叠，暂停 Kiki 上传以避免双计。请保留 state.json，停用旧兼容采集器并按 README 迁移，显式设置 config set kikiStartAt <UTC半小时切点>。')}\n`);
     }
     // A cut (or the guard) withholds real Kiki history and freezes legacy
@@ -574,6 +628,7 @@ export async function runSync({
       if (migration.frozenBuckets > 0 || migration.frozenSessions > 0) {
         parts.push(`已冻结 ${migration.frozenBuckets} 个旧 kimi-code 桶 / ${migration.frozenSessions} 个会话，其增长不再上传（服务端记录会停留在旧值）`);
       }
+      record.noteWarning('kiki', 'upload_withheld');
       process.stderr.write(`${dim(`  kiki: ${parts.join('；')}。若这段历史应归入 Kiki，请设置切点 config set kikiStartAt <UTC半小时切点>；若确认从未运行过兼容采集器，可用 config set kikiStartAt none 解除保护。`)}\n`);
     }
     allBuckets = migration.buckets;
@@ -734,7 +789,10 @@ export async function runSync({
           // A source unknown to an older backend may become valid after deploy.
           // Leave those hashes uncommitted so the next sync retries them instead
           // of turning a temporary release-order mismatch into permanent loss.
-          if (batchUnknownSources.has(b.source)) continue;
+          if (batchUnknownSources.has(b.source)) {
+            record.noteServerDropped(b.source, 1);
+            continue;
+          }
           const key = bucketKey(b);
           const entry = pendingBucketState.get(key);
           if (entry) {
@@ -757,6 +815,11 @@ export async function runSync({
           }
         }
         if (batchStateChanged) saveState(state, identity);
+        // Same moment the batch is committed to state.json: if a desktop app
+        // kills the process later (its 120s timeout while Cursor is still
+        // exporting), the history still shows what reached the server, and
+        // the entry stays unfinished.
+        record.flush();
       }
 
       if (totalBatches > 1 || allBucketsToSend.length > 0) {
@@ -803,6 +866,7 @@ export async function runSync({
       if (err.message === 'UNAUTHORIZED') {
         const keyHint = 'API Key 无效，请运行 `npx @vibe-cafe/vibe-usage init` 重新配置。';
         console.error(failure(uploadedAnything() ? `${partialLabel()}: ${keyHint}` : keyHint));
+        record.finish({ failure: { code: 'unauthorized' } });
         if (throws) throw err;
         process.exit(1);
       }
@@ -811,6 +875,9 @@ export async function runSync({
       } else {
         console.error(failure(`同步失败: ${err.message}`));
       }
+      // Only the category (and an HTTP status number) is recorded, never the
+      // message: it carries the server's response body.
+      record.finish({ failure: syncFailureFromError(err) });
       if (throws) throw err;
       process.exit(1);
     }
