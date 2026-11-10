@@ -337,6 +337,7 @@ const SHORT_HELP = `
     ${BARE} daemon status      查看后台同步
     ${BARE} daemon uninstall   关闭后台同步
     ${BARE} summary [--days N] 最近 N 天用量(默认 7)
+    ${BARE} doctor             生成诊断报告(不含 Key、项目名和目录，可直接贴到群里)
     ${BARE} help --all         全部命令与选项
 
   旧命令(sync、init、daemon install …)仍可用，见 help --all。
@@ -365,6 +366,8 @@ const FULL_HELP = `
     ${BARE} skill         Install skill for AI coding tools
     ${BARE} skill --remove  Remove installed skills
     ${BARE} status       Show config and detected tools
+    ${BARE} doctor       Diagnostic report to paste when asking for help (fixed fields and codes only)
+    ${BARE} doctor --json  Same report as versioned JSON (schemaVersion 1) for the desktop apps
     ${BARE} quota discover --json  Detect subscription-quota products locally
     ${BARE} quota fetch --product <id> --json  Fetch only selected subscription quotas
     ${BARE} config show  Show full config as JSON
@@ -486,6 +489,11 @@ export async function run(rawArgs) {
     }
     case 'status': {
       await showStatus();
+      break;
+    }
+    case 'doctor': {
+      const { runDoctor } = await import('./doctor.js');
+      await runDoctor(args.slice(1));
       break;
     }
     case 'help':

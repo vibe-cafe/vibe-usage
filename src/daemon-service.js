@@ -445,6 +445,19 @@ export function isDaemonInstalled() {
   return plat === 'taskscheduler' ? taskExists() : existsSync(paths.file);
 }
 
+/**
+ * Read-only summary for `doctor`: the service platform, whether the service is
+ * installed and how it launches (`npx` / `pinned`). Never starts, queries the
+ * run state of, or changes the service.
+ */
+export function daemonSummary() {
+  const plat = detectPlatform();
+  if (!plat) return { platform: null, installed: false, mode: null };
+  const paths = getServicePaths(plat);
+  const installed = plat === 'taskscheduler' ? taskExists() : existsSync(paths.file);
+  return { platform: plat, installed, mode: installed ? describeInstalledMode(plat, paths) : null };
+}
+
 // How an installed service starts the daemon, read back from the unit itself
 // so `status` tells the truth about machines set up by older versions. The
 // plist splits argv into separate <string> elements, so look for the package

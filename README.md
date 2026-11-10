@@ -159,6 +159,16 @@ To relabel old history, the maintainer needs the old bucket keys, raw per-tool t
 - SQLite-backed tools are read via Node's built-in `node:sqlite` on Node ≥ 22.5 — no `sqlite3` binary needed (works on Windows out of the box); on older Node the CLI falls back to the system `sqlite3` executable
 - Continuous syncing is on by default: the first run installs a background service (see [Background sync](#background-sync)); the [Vibe Usage Mac app](https://github.com/vibe-cafe/vibe-usage-app) is the menu-bar alternative
 
+## Diagnostics
+
+When something looks wrong (a tool shows no data, syncs time out, the key seems rejected), run:
+
+```bash
+npx @vibe-cafe/vibe-usage@latest doctor
+```
+
+It prints a short plain-text report you can paste into a chat: system and CLI version, the runtime running it and which SQLite implementation is in use, whether a key is configured and still matches the upload state, a 4-character device tag, whether the server and the npm registry are reachable, the background service, the last 10 syncs (who started each, result, duration, upload counts, failure category), and for every detected or failing tool the last sync's counts plus fixed warning codes such as `read_failed` or `cursor_token_encrypted`. It contains no API key, tokens, conversation content, project names, directory names or hostname. `doctor` only reads local files and makes two unauthenticated connectivity requests; it never reads quotas or tool credentials, writes files or uploads anything. `doctor --json` prints the same data as versioned JSON for the desktop apps ([field reference](docs/doctor-json.md)).
+
 ## Cursor 网络排查
 
 Cursor 用量优先读取 `cursor.com` 的 CSV 导出（模型名最准确）。如果 CSV 为空、表头变化或没有 token 计数，会自动改用仪表盘自己的分页用量事件接口（`/api/dashboard/get-filtered-usage-events`）；该接口较早事件的模型名可能显示为 `default`，但 token 总量正确。CSV 仍可用但最新事件已超过 24 小时（且不超过 7 天）时，会只向事件接口补“CSV 最新事件之后”的增量，不覆盖或重传历史。`Cursor usage export skipped (network: …)` / `Cursor usage request skipped (network: …)` 表示这次请求失败；CLI 会保留 Cursor 的历史同步状态，下次同步重新尝试。

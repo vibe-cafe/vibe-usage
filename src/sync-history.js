@@ -153,6 +153,13 @@ export function beginSyncRecord({ surface: defaultSurface = 'cli', now = () => D
     durationMs: null,
     uploaded: { buckets: 0, sessions: 0 },
     failure: null,
+    // `parsed`: at least one parser pass finished, so a tool absent from
+    // `tools` ran and had nothing to report (no data, no warning) -- unless it
+    // is in `pending`, a deferred source (Cursor) still running when the entry
+    // was last saved. Lets `doctor` show a recovered tool as healthy instead
+    // of repeating an older entry's error.
+    parsed: false,
+    pending: [],
     tools: {},
   };
   let finished = false;
@@ -194,6 +201,20 @@ export function beginSyncRecord({ surface: defaultSurface = 'cli', now = () => D
           item.warnings[key] = count(item.warnings[key]) + count(n);
         }
       }
+    },
+
+    /** Deferred sources (Cursor) still running when the first pass uploads. */
+    notePending(sources) {
+      if (finished) return;
+      entry.pending = [...new Set([...entry.pending, ...sources])];
+    },
+
+    /** A parser pass finished for these sources (call before flush()). */
+    notePassDone(sources) {
+      if (finished) return;
+      const done = new Set(sources);
+      entry.parsed = true;
+      entry.pending = entry.pending.filter(source => !done.has(source));
     },
 
     /** One warning raised by sync.js itself (Magpie/Kiki holds, Cursor account changes). */
@@ -300,6 +321,9 @@ export function sanitizeSyncEntry(raw) {
     }
   }
   const runtimeName = raw.runtime?.name === 'bun' || raw.runtime?.name === 'node' ? raw.runtime.name : null;
+  const pending = Array.isArray(raw.pending)
+    ? [...new Set(raw.pending.filter(source => typeof source === 'string' && SOURCE_RE.test(source)))]
+    : [];
   return {
     startedAt,
     endedAt: result ? endedAt : null,
@@ -310,6 +334,8 @@ export function sanitizeSyncEntry(raw) {
     durationMs: result && Number.isSafeInteger(raw.durationMs) && raw.durationMs >= 0 ? raw.durationMs : null,
     uploaded: { buckets: count(raw.uploaded?.buckets), sessions: count(raw.uploaded?.sessions) },
     failure,
+    parsed: raw.parsed === true,
+    pending,
     tools,
   };
 }
