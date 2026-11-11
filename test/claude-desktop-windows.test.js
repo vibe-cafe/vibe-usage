@@ -1,7 +1,7 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import { execFileSync } from 'node:child_process';
-import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from 'node:fs';
+import { chmodSync, mkdirSync, mkdtempSync, rmSync, symlinkSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 
@@ -220,4 +220,89 @@ test('VIBE_USAGE_CLAUDE_DESKTOP_DIRS still replaces Windows Desktop discovery, M
   const result = run({ env: { VIBE_USAGE_CLAUDE_DESKTOP_DIRS: override } });
   assert.deepEqual(result.desktopRoots, [overrideRoot]);
   assert.deepEqual(totals(result), { input: 5, output: 1 });
+});
+
+test('Windows package directories that are links (mklink /J or symlink) are followed; a dangling one is ignored quietly', (t) => {
+  const { root, localAppData, coworkRoot, writeSession, run } = fixture(t);
+  // The real stores live on "another drive"; the package directory names in
+  // AppData are links to them, as `mklink /J` leaves behind.
+  const movedPackage = join(root, 'D-drive', 'Claude_pkg');
+  const movedData = join(root, 'D-drive', 'claude_data');
+  writeSession(
+    coworkRoot(join(movedPackage, 'LocalCache', 'Roaming', 'Claude')),
+    'packaged-session',
+    [{ id: 'pkg', input: 11, output: 1 }],
+  );
+  writeSession(coworkRoot(movedData), 'data-session', [{ id: 'data', input: 22, output: 2 }]);
+  const packages = join(localAppData, 'Packages');
+  const claudeData = join(localAppData, 'Claude-Data');
+  mkdirSync(packages, { recursive: true });
+  mkdirSync(claudeData, { recursive: true });
+  symlinkSync(movedPackage, join(packages, 'Claude_linked1'), 'junction');
+  symlinkSync(movedData, join(claudeData, 'claude_linked2'), 'junction');
+  symlinkSync(join(root, 'missing-target'), join(packages, 'Claude_dangling'), 'junction');
+
+  const result = run();
+  assert.deepEqual(result.desktopRoots.sort(), [
+    coworkRoot(join(claudeData, 'claude_linked2')),
+    coworkRoot(join(packages, 'Claude_linked1', 'LocalCache', 'Roaming', 'Claude')),
+  ].sort());
+  assert.equal(result.skipped, false);
+  assert.deepEqual(result.warnings, []);
+  assert.deepEqual(totals(result), { input: 33, output: 3 });
+  assert.equal(result.sessions.length, 2);
+});
+
+test('A Packages or Claude-Data path that cannot be listed (not a directory) is skipped without a warning', (t) => {
+  const { localAppData, dataDirs, coworkRoot, writeSession, run } = fixture(t);
+  writeSession(coworkRoot(dataDirs.classic), 'classic-session', [{ id: 'a', input: 40, output: 4 }]);
+  writeFileSync(join(localAppData, 'Packages'), 'not a directory');
+  writeFileSync(join(localAppData, 'Claude-Data'), 'not a directory');
+
+  const result = run();
+  assert.deepEqual(result.desktopRoots, [coworkRoot(dataDirs.classic)]);
+  assert.equal(result.skipped, false);
+  assert.deepEqual(result.warnings, []);
+  assert.deepEqual(totals(result), { input: 40, output: 4 });
+});
+
+test('An unreadable Packages or Claude-Data directory is skipped without a warning', {
+  skip: process.platform === 'win32' ? 'POSIX chmod fixture: Windows requires a separate ACL denial test'
+    : process.getuid?.() === 0 && 'POSIX root bypasses chmod denial; run as an unprivileged user',
+}, (t) => {
+  const { localAppData, dataDirs, coworkRoot, writeSession, run } = fixture(t);
+  writeSession(coworkRoot(dataDirs.classic), 'classic-session', [{ id: 'a', input: 40, output: 4 }]);
+  writeSession(coworkRoot(dataDirs.msix), 'msix-session', [{ id: 'b', input: 1000, output: 1000 }]);
+  writeSession(coworkRoot(dataDirs.claudeData), 'data-session', [{ id: 'c', input: 1000, output: 1000 }]);
+  const blocked = [join(localAppData, 'Packages'), join(localAppData, 'Claude-Data')];
+  for (const dir of blocked) chmodSync(dir, 0);
+  try {
+    const result = run();
+    assert.deepEqual(result.desktopRoots, [coworkRoot(dataDirs.classic)]);
+    assert.equal(result.skipped, false);
+    assert.deepEqual(result.warnings, []);
+    assert.deepEqual(totals(result), { input: 40, output: 4 });
+  } finally {
+    for (const dir of blocked) chmodSync(dir, 0o700);
+  }
+});
+
+test('One session copied into Packages, Claude-Data and ~/.claude counts once, from the most complete copy', (t) => {
+  const { user, dataDirs, coworkRoot, writeSession, run } = fixture(t);
+  const calls = [
+    { id: 'one', input: 100, output: 10 },
+    { id: 'two', input: 50, output: 5, at: '2026-11-10T10:02:00.000Z' },
+    { id: 'three', input: 25, output: 2, at: '2026-11-10T10:03:00.000Z' },
+  ];
+  writeSession(coworkRoot(dataDirs.claudeData), 'shared-session', calls.slice(0, 1));
+  writeSession(coworkRoot(dataDirs.msix), 'shared-session', calls.slice(0, 2));
+  writeSession(join(user, '.claude'), 'shared-session', calls);
+
+  const result = run();
+  assert.equal(result.desktopRoots.length, 2);
+  assert.equal(result.skipped, false);
+  assert.deepEqual(result.warnings, []);
+  assert.deepEqual(totals(result), { input: 175, output: 17 });
+  assert.equal(result.sessions.length, 1);
+  assert.equal(result.sessions[0].messageCount, 4);
 });
