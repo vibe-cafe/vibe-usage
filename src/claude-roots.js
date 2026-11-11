@@ -20,25 +20,74 @@ function hasClaudeData(root) {
   return existsSync(join(root, 'projects')) || existsSync(join(root, 'transcripts'));
 }
 
-function defaultClaudeDesktopDataDir() {
+// A `Claude_<suffix>` / `claude_<suffix>` package directory: prefix
+// case-insensitive, suffix ASCII letters and digits only. Same rule as the
+// Windows app's quota reader (vibe-usage-windows `claude_desktop.rs`).
+const MSIX_PACKAGE_DIR = /^claude_[a-z0-9]+$/i;
+
+/**
+ * Claude Desktop data directories of the MSIX (Store / packaged) build. A
+ * packaged app's writes to %APPDATA% are redirected into its package, so this
+ * CLI, running outside the package, never sees them under %APPDATA%\Claude:
+ *
+ * - `%LOCALAPPDATA%\Packages\Claude_<suffix>\LocalCache\Roaming\Claude`, the
+ *   package's virtualized %APPDATA%;
+ * - `%LOCALAPPDATA%\Claude-Data\claude_<suffix>`, where the package keeps its
+ *   data since a Claude Desktop update in 2026-11 (vibe-usage-windows#27).
+ *
+ * Only these two parents are listed, one level deep; nothing else in AppData
+ * is scanned. A parent that cannot be read simply contributes nothing.
+ */
+function windowsPackagedClaudeDesktopDataDirs() {
+  const localAppData = process.env.LOCALAPPDATA?.trim();
+  const local = localAppData
+    ? expandHome(localAppData)
+    : join(homedir(), 'AppData', 'Local');
+  const dirs = [];
+  for (const [parent, below] of [
+    [join(local, 'Packages'), ['LocalCache', 'Roaming', 'Claude']],
+    [join(local, 'Claude-Data'), []],
+  ]) {
+    let entries;
+    try {
+      entries = readdirSync(parent, { withFileTypes: true });
+    } catch {
+      continue;
+    }
+    entries.sort((a, b) => (a.name < b.name ? -1 : a.name > b.name ? 1 : 0));
+    for (const entry of entries) {
+      if (!MSIX_PACKAGE_DIR.test(entry.name)) continue;
+      // Junctions (`mklink /J`, used to move these large directories to
+      // another drive) are reported as symbolic links; keep them.
+      if (!entry.isDirectory() && !entry.isSymbolicLink()) continue;
+      dirs.push(join(parent, entry.name, ...below));
+    }
+  }
+  return dirs;
+}
+
+function defaultClaudeDesktopDataDirs() {
   if (process.platform === 'darwin') {
-    return join(homedir(), 'Library', 'Application Support', 'Claude');
+    return [join(homedir(), 'Library', 'Application Support', 'Claude')];
   }
   if (process.platform === 'win32') {
     const appData = process.env.APPDATA?.trim();
-    return appData
-      ? join(expandHome(appData), 'Claude')
-      : join(homedir(), 'AppData', 'Roaming', 'Claude');
+    return [
+      appData
+        ? join(expandHome(appData), 'Claude')
+        : join(homedir(), 'AppData', 'Roaming', 'Claude'),
+      ...windowsPackagedClaudeDesktopDataDirs(),
+    ];
   }
   const configHome = process.env.XDG_CONFIG_HOME?.trim();
-  return join(configHome ? expandHome(configHome) : join(homedir(), '.config'), 'Claude');
+  return [join(configHome ? expandHome(configHome) : join(homedir(), '.config'), 'Claude')];
 }
 
 function getClaudeDesktopDataDirs() {
   const override = process.env.VIBE_USAGE_CLAUDE_DESKTOP_DIRS?.trim();
   return override
     ? override.split(delimiter).map(expandHome).filter(Boolean)
-    : [defaultClaudeDesktopDataDir()];
+    : defaultClaudeDesktopDataDirs();
 }
 
 function discoverDesktopRoots(dir, depth, roots, onWarning) {
@@ -103,7 +152,8 @@ export function findClaudeDesktopRoots(
  *
  * Claude Desktop Code uses the default Claude Code root. Cowork creates a
  * private .claude root per local-agent session, so those roots are discovered
- * recursively under the app's user-data directory.
+ * recursively under the app's user-data directory (on Windows, also the MSIX
+ * package's data directories; see windowsPackagedClaudeDesktopDataDirs()).
  *
  * VIBE_USAGE_CLAUDE_DIRS is a test/diagnostic override. It replaces all normal
  * and Desktop discovery with a path.delimiter-separated root list.
