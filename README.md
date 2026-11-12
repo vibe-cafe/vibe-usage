@@ -399,10 +399,12 @@ npx @vibe-cafe/vibe-usage daemon status
 npx @vibe-cafe/vibe-usage daemon stop
 npx @vibe-cafe/vibe-usage daemon restart
 npx @vibe-cafe/vibe-usage daemon uninstall
-npx @vibe-cafe/vibe-usage daemon install    # only needed after --no-daemon or uninstall
+npx @vibe-cafe/vibe-usage daemon install    # only needed after --no-daemon, uninstall, or a Node upgrade broke it
 ```
 
 **How the service starts the CLI.** When you ran the CLI through `npx`, the service is registered as `npx --yes @vibe-cafe/vibe-usage@latest daemon`, so it survives `npm cache clean` and picks up the newest release at every login. When the CLI was installed globally (`npm install -g @vibe-cafe/vibe-usage`) or run from a checkout, the service pins that exact `node <bin> daemon` path instead — upgrade the package and `daemon restart` to pick up a new version. `daemon status` prints which of the two forms a machine has. A service installed by a CLI older than 0.10.25 keeps its pinned npx-cache path; to switch it to the self-updating form run `daemon uninstall` and then the bare command once.
+
+**After upgrading Node.** The service is registered with the stable `node` / `npx` on your `PATH` (e.g. Homebrew's `/opt/homebrew/bin/node`) rather than the versioned path an upgrade deletes; a service installed by an older CLI may still point at the versioned one. `daemon status` and `doctor` say so when the registered path is gone. 升级 Node 后如果后台同步停了，运行 `npx @vibe-cafe/vibe-usage daemon install` 重新注册。
 
 **Foreground mode** (no service, Ctrl+C to stop):
 

@@ -1,7 +1,7 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import { execFile, spawnSync } from 'node:child_process';
-import { mkdirSync, mkdtempSync, readdirSync, readFileSync, rmSync, statSync, writeFileSync } from 'node:fs';
+import { existsSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, rmSync, statSync, writeFileSync } from 'node:fs';
 import { createServer } from 'node:http';
 import { tmpdir } from 'node:os';
 import { dirname, join } from 'node:path';
@@ -85,6 +85,7 @@ const CONTRACT = {
     platform: oneOf(enumOf('launchd', 'systemd', 'taskscheduler'), null),
     installed: B,
     mode: oneOf(enumOf('npx', 'pinned'), null),
+    launchPathExists: oneOf(B, null),
   },
   settings: {
     uploadProject: oneOf(B, null),
@@ -448,6 +449,53 @@ test('doctor on an unconfigured machine without history still reports', async ()
   }
 });
 
+test('doctor reports an installed service whose launch path is gone', {
+  skip: !(process.platform === 'darwin' || (process.platform === 'linux' && existsSync('/run/systemd/system'))),
+}, async () => {
+  const { generateLaunchdPlist, generateSystemdUnit } = await import('../src/daemon-service.js');
+  const root = mkdtempSync(join(tmpdir(), 'vibe-usage-doctor-daemon-'));
+  try {
+    await withServer((req, res) => { req.resume(); res.writeHead(404).end(); }, async (apiUrl) => {
+      mkdirSync(join(root, 'config'));
+      writeFileSync(join(root, 'config', 'config.json'), JSON.stringify({ apiUrl }));
+      const launchd = process.platform === 'darwin';
+      const unitFile = launchd
+        ? join(root, 'Library', 'LaunchAgents', 'ai.vibecafe.vibe-usage.plist')
+        : join(root, '.config', 'systemd', 'user', 'vibe-usage.service');
+      mkdirSync(dirname(unitFile), { recursive: true });
+      const generate = launchd ? generateLaunchdPlist : generateSystemdUnit;
+      const goneNpx = join(root, 'Cellar', 'node', '26.8.2', 'bin', 'npx');
+      writeFileSync(unitFile, generate(join(dirname(goneNpx), 'node'), '/x/_npx/h/bin.js', undefined, {},
+        { mode: 'npx', npxPath: goneNpx, nodeDir: dirname(goneNpx) }));
+      const env = {
+        ...process.env,
+        HOME: root,
+        USERPROFILE: root,
+        VIBE_USAGE_DEV: '0',
+        VIBE_USAGE_CONFIG_DIR: join(root, 'config'),
+        VIBE_USAGE_STATE_DIR: join(root, 'state'),
+        npm_config_registry: apiUrl,
+      };
+      const broken = JSON.parse((await execFileAsync(process.execPath, [bin, 'doctor', '--json'], { env })).stdout);
+      assertContract(broken);
+      assert.deepEqual(broken.daemon, { platform: launchd ? 'launchd' : 'systemd', installed: true, mode: 'npx', launchPathExists: false });
+      const text = renderDoctorText(broken);
+      assert.match(text, /后台：CLI 后台服务：已安装（[^\n]*） · 启动路径已不存在，后台同步已停止[^\n]*daemon install` 重新注册/);
+      const plain = (await execFileAsync(process.execPath, [bin, 'doctor'], { env })).stdout;
+      assert.match(plain, /启动路径已不存在，后台同步已停止/);
+      assert.ok(!plain.includes(root), 'no temporary path in the report');
+
+      writeFileSync(unitFile, generate(process.execPath, bin, undefined, {}));
+      const healthy = JSON.parse((await execFileAsync(process.execPath, [bin, 'doctor', '--json'], { env })).stdout);
+      assert.equal(healthy.daemon.launchPathExists, true);
+      assert.equal(healthy.daemon.mode, 'pinned');
+      assert.doesNotMatch(renderDoctorText(healthy), /启动路径已不存在/);
+    });
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
 test('doctor rejects unknown options', () => {
   const result = spawnSync(process.execPath, [bin, 'doctor', '--upload'], { encoding: 'utf8' });
   assert.equal(result.status, 1);
@@ -611,7 +659,7 @@ test('docs/doctor-json.md documents every code the report can contain', async ()
     'schemaVersion', 'generatedAt', 'cli.version', 'cli.surface', 'system.platform', 'system.arch', 'system.release',
     'runtime.name', 'runtime.version', 'sqlite', 'account.configured', 'account.server', 'account.uploadState',
     'account.lastSyncRejected', 'account.deviceTag', 'network.server', 'network.npmRegistry', 'daemon.platform',
-    'daemon.installed', 'daemon.mode', 'settings.uploadProject', 'settings.extraRoots', 'settings.kikiStartAt',
+    'daemon.installed', 'daemon.mode', 'daemon.launchPathExists', 'settings.uploadProject', 'settings.extraRoots', 'settings.kikiStartAt',
     'settings.magpieStartAt', 'syncHistory.available', 'syncHistory.entries[]', 'tools[]',
   ]) {
     assert.ok(doc.includes(`| \`${field}\` |`), `undocumented field ${field}`);

@@ -69,6 +69,7 @@ maintainer (Hogan), 一键诊断 plan, step 2.
 | `daemon.platform` | `launchd` \| `systemd` \| `taskscheduler` \| null | Background-service platform; `null` = unsupported (e.g. Linux without systemd). |
 | `daemon.installed` | boolean | The CLI background service is installed. |
 | `daemon.mode` | `npx` \| `pinned` \| null | How it launches: `npx …@latest` (self-updating) or a pinned bin path. `null` when not installed or unreadable. |
+| `daemon.launchPathExists` | boolean \| null | Added 2026-11-12. `false` = a file the installed service starts (its node / npx, or the pinned bin script) no longer exists — typically the versioned Node that an upgrade such as `brew upgrade node` deleted — so the service cannot start and background sync has stopped, although `installed` stays `true`. Show 「后台服务启动路径已失效，后台同步已停止；运行 `npx @vibe-cafe/vibe-usage daemon install` 重新注册」. `true` = every registered path exists (it does not mean the service is running). `null` = not installed, or the service definition could not be read. Older CLIs omit the field: treat absent as `null`. |
 | `settings.uploadProject` | boolean \| null | The last project-name setting the server returned for this `apiUrl` (cached in `config.json`); `null` = never read successfully. |
 | `settings.extraRoots` | number | Number of additional data roots configured (`config add-root`, plus a persisted `codexExtraHome`). |
 | `settings.kikiStartAt` | `set` \| `unset` | Whether a Kiki cut is configured. |
@@ -183,7 +184,7 @@ maintainer (Hogan), 一键诊断 plan, step 2.
     "server": { "reachable": true, "latencyMs": 320, "error": null },
     "npmRegistry": { "registry": "official", "reachable": false, "latencyMs": null, "error": "timeout" }
   },
-  "daemon": { "platform": "launchd", "installed": false, "mode": null },
+  "daemon": { "platform": "launchd", "installed": false, "mode": null, "launchPathExists": null },
   "settings": { "uploadProject": true, "extraRoots": 0, "kikiStartAt": "unset", "magpieStartAt": "unset" },
   "syncHistory": {
     "available": true,

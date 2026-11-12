@@ -1,7 +1,7 @@
 import { execFileSync } from 'node:child_process';
-import { writeFileSync, readFileSync, unlinkSync, mkdirSync, existsSync } from 'node:fs';
+import { writeFileSync, readFileSync, unlinkSync, mkdirSync, existsSync, realpathSync } from 'node:fs';
 import { join, win32 as winPath, posix as posixPath } from 'node:path';
-import { homedir, platform } from 'node:os';
+import { homedir, platform, tmpdir } from 'node:os';
 import { fileURLToPath } from 'node:url';
 import { success, failure, warn, dim } from './output.js';
 
@@ -47,13 +47,80 @@ export function npxLauncher(nodePath, exists = existsSync, os = platform()) {
   return exists(npxPath) ? { mode: 'npx', npxPath, nodeDir } : null;
 }
 
+function defaultTempDirs() {
+  const dirs = new Set([tmpdir(), '/tmp', '/private/tmp']);
+  try {
+    dirs.add(realpathSync(tmpdir()));
+  } catch {
+    // keep the unresolved form
+  }
+  return [...dirs];
+}
+
+// A PATH entry that only lives as long as one shell: fnm's per-shell links
+// (`fnm_multishells/<pid>_<time>/bin`) and anything under a temp directory.
+function isShortLivedDir(dir, tempDirs) {
+  if (dir.split('/').includes('fnm_multishells')) return true;
+  return tempDirs.some(temp => dir === temp || dir.startsWith(`${temp}/`));
+}
+
+/**
+ * The runtime path a service should pin. Homebrew / Linuxbrew put node on PATH
+ * as a symlink into a versioned keg (`/opt/homebrew/bin/node` ->
+ * `../Cellar/node/26.8.2/bin/node`), and `process.execPath` is that resolved,
+ * versioned path; `brew upgrade node` deletes it and the service never starts
+ * again. So prefer the first PATH entry that resolves to the very same binary,
+ * which the package manager re-points on upgrade. Short-lived PATH entries are
+ * skipped. No match (nvm, Volta, a plain binary) -> `execPath`, as before.
+ * Windows keeps `execPath`.
+ */
+export function stableRuntimePath(execPath, {
+  pathEnv = process.env.PATH,
+  os = platform(),
+  resolve = realpathSync,
+  tempDirs = defaultTempDirs(),
+} = {}) {
+  if (os === 'win32' || !pathEnv) return execPath;
+  let target;
+  try {
+    target = resolve(execPath);
+  } catch {
+    return execPath;
+  }
+  const name = posixPath.basename(execPath);
+  for (const dir of pathEnv.split(':')) {
+    if (!posixPath.isAbsolute(dir) || isShortLivedDir(dir, tempDirs)) continue;
+    const candidate = posixPath.join(dir, name);
+    try {
+      if (resolve(candidate) === target) return candidate;
+    } catch {
+      // not on this PATH entry
+    }
+  }
+  return execPath;
+}
+
+/**
+ * What `install()` registers: the runtime path, and in npx mode the npx next
+ * to it. The npx next to the stable path wins; the one next to `execPath` is
+ * the fallback (as before) when the stable directory has none.
+ */
+export function resolveServiceLaunch(execPath, binPath, options = {}) {
+  const { exists = existsSync, os = platform() } = options;
+  const nodePath = stableRuntimePath(execPath, { ...options, os });
+  const isNpxCache = isNpxCachePath(binPath);
+  let launcher = null;
+  if (isNpxCache) {
+    launcher = npxLauncher(nodePath, exists, os);
+    if (!launcher && nodePath !== execPath) launcher = npxLauncher(execPath, exists, os);
+  }
+  return { nodePath, isNpxCache, launcher };
+}
+
 function resolvePaths() {
-  const nodePath = process.execPath;
   const thisFile = fileURLToPath(import.meta.url);
   const binPath = join(thisFile, '..', '..', 'bin', 'vibe-usage.js');
-  const isNpxCache = isNpxCachePath(binPath);
-  const launcher = isNpxCache ? npxLauncher(nodePath) : null;
-  return { nodePath, binPath, isNpxCache, launcher };
+  return { binPath, ...resolveServiceLaunch(process.execPath, binPath) };
 }
 
 // argv the service runs; the last token is always `daemon` so process
@@ -400,6 +467,7 @@ export function parseWindowsTaskInvocation(cmd) {
       runtimePath: winPath.join(winPath.dirname(npxPath), 'node.exe'),
       binPath: 'vibe-usage.js',
       mode: 'npx',
+      npxPath,
     };
   }
   return null;
@@ -445,18 +513,83 @@ export function isDaemonInstalled() {
   return plat === 'taskscheduler' ? taskExists() : existsSync(paths.file);
 }
 
+// An installed service whose registered node/npx/bin no longer exists.
+export function isDaemonLaunchBroken() {
+  const plat = detectPlatform();
+  if (!plat) return false;
+  return missingLaunchPaths(plat, getServicePaths(plat))?.length > 0;
+}
+
 /**
  * Read-only summary for `doctor`: the service platform, whether the service is
- * installed and how it launches (`npx` / `pinned`). Never starts, queries the
+ * installed, how it launches (`npx` / `pinned`) and whether the files it
+ * launches still exist (`launchPathExists`). Never starts, queries the
  * run state of, or changes the service.
  */
 export function daemonSummary() {
   const plat = detectPlatform();
-  if (!plat) return { platform: null, installed: false, mode: null };
+  if (!plat) return { platform: null, installed: false, mode: null, launchPathExists: null };
   const paths = getServicePaths(plat);
   const installed = plat === 'taskscheduler' ? taskExists() : existsSync(paths.file);
-  return { platform: plat, installed, mode: installed ? describeInstalledMode(plat, paths) : null };
+  if (!installed) return { platform: plat, installed, mode: null, launchPathExists: null };
+  const missing = missingLaunchPaths(plat, paths);
+  return {
+    platform: plat,
+    installed,
+    mode: describeInstalledMode(plat, paths),
+    launchPathExists: missing ? missing.length === 0 : null,
+  };
 }
+
+function unescapeXml(value) {
+  return value
+    .replace(/&lt;/g, '<')
+    .replace(/&gt;/g, '>')
+    .replace(/&quot;/g, '"')
+    .replace(/&apos;/g, "'")
+    .replace(/&amp;/g, '&');
+}
+
+/**
+ * The files an installed unit starts, read back from the unit text: the npx
+ * binary in npx mode, the runtime and the bin script when pinned. `null` when
+ * the text has no recognizable invocation.
+ */
+export function launchPathsFromText(plat, text) {
+  if (plat === 'taskscheduler') {
+    const invocation = parseWindowsTaskInvocation(text);
+    if (!invocation) return null;
+    return invocation.mode === 'npx' ? [invocation.npxPath] : [invocation.runtimePath, invocation.binPath];
+  }
+  let argv = null;
+  if (plat === 'launchd') {
+    const block = text.match(/<key>ProgramArguments<\/key>\s*<array>([\s\S]*?)<\/array>/);
+    if (block) argv = [...block[1].matchAll(/<string>([^<]*)<\/string>/g)].map(match => unescapeXml(match[1]));
+  } else if (plat === 'systemd') {
+    const line = text.match(/^ExecStart=(.+)$/m);
+    if (line) argv = line[1].trim().split(/\s+/);
+  }
+  if (!argv?.length) return null;
+  return installedModeFromText(text) === 'npx' ? [argv[0]] : argv.slice(0, 2);
+}
+
+/**
+ * Registered launch paths that no longer exist (e.g. the versioned node an
+ * upgrade deleted): `[]` when all are there, `null` when the unit cannot be
+ * read or parsed. A service with a missing path cannot start at all.
+ */
+export function missingLaunchPaths(plat, paths, exists = existsSync) {
+  let text;
+  try {
+    text = readFileSync(plat === 'taskscheduler' ? paths.cmd : paths.file, 'utf-8');
+  } catch {
+    return null;
+  }
+  const launch = launchPathsFromText(plat, text);
+  return launch ? launch.filter(path => !exists(path)) : null;
+}
+
+const REINSTALL_COMMAND = 'npx @vibe-cafe/vibe-usage daemon install';
 
 // How an installed service starts the daemon, read back from the unit itself
 // so `status` tells the truth about machines set up by older versions. The
@@ -494,8 +627,14 @@ function install() {
   const paths = getServicePaths(plat);
 
   if (isDaemonInstalled()) {
-    console.log(warn('Daemon 已安装，运行 `vibe-usage daemon restart` 或 `uninstall` 先处理。'));
-    return;
+    // A registration whose node/npx is gone can never start again, so
+    // `daemon install` replaces it; a working one is left alone, as before.
+    if (!missingLaunchPaths(plat, paths)?.length) {
+      console.log(warn('Daemon 已安装，运行 `vibe-usage daemon restart` 或 `uninstall` 先处理。'));
+      return;
+    }
+    console.log(warn('已注册的后台服务启动路径已不存在（常见于升级 Node 之后），先移除旧注册再重新安装。'));
+    uninstall();
   }
 
   mkdirSync(paths.dir, { recursive: true });
@@ -623,10 +762,16 @@ function status() {
 
   const paths = getServicePaths(plat);
 
-  const printMode = () => {
+  const printRegistration = () => {
     const mode = describeInstalledMode(plat, paths);
     if (mode === 'npx') console.log(dim(`  运行方式: npx ${PACKAGE_SPEC}（每次登录自动更新）`));
     else if (mode === 'pinned') console.log(dim('  运行方式: 固定路径（升级后需 daemon uninstall 再重跑一条命令）'));
+    const missing = missingLaunchPaths(plat, paths);
+    if (missing?.length) {
+      console.log(warn('启动路径已不存在，后台服务无法启动，后台同步已停止。'));
+      for (const path of missing) console.log(dim(`  找不到: ${path}`));
+      console.log(dim(`  常见于升级或卸载 Node 之后。运行 \`${REINSTALL_COMMAND}\` 重新注册。`));
+    }
   };
 
   if (plat === 'taskscheduler') {
@@ -635,7 +780,7 @@ function status() {
       console.log(dim('  运行 `vibe-usage daemon install` 安装。'));
       return;
     }
-    printMode();
+    printRegistration();
     const invocation = readTaskInvocation(paths);
     const processExpression = windowsDaemonProcessExpression(invocation);
     const scriptLines = [
@@ -692,7 +837,7 @@ function status() {
     console.log(dim('  运行 `vibe-usage daemon install` 安装。'));
     return;
   }
-  printMode();
+  printRegistration();
 
   if (plat === 'systemd') {
     const result = run('systemctl', ['--user', 'status', `${SERVICE_NAME}.service`]);
