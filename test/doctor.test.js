@@ -480,16 +480,16 @@ test('doctor reports an installed service whose launch path is gone', {
       assertContract(broken);
       assert.deepEqual(broken.daemon, { platform: launchd ? 'launchd' : 'systemd', installed: true, mode: 'npx', launchPathExists: false });
       const text = renderDoctorText(broken);
-      assert.match(text, /后台：CLI 后台服务：已安装（[^\n]*） · 启动路径已不存在，后台同步已停止[^\n]*daemon install` 重新注册/);
+      assert.match(text, /后台：CLI 后台服务：已安装（[^\n]*） · 后台服务的启动路径已失效，下次启动时会失败[^\n]*daemon install` 重新注册/);
       const plain = (await execFileAsync(process.execPath, [bin, 'doctor'], { env })).stdout;
-      assert.match(plain, /启动路径已不存在，后台同步已停止/);
+      assert.match(plain, /后台服务的启动路径已失效，下次启动时会失败/);
       assert.ok(!plain.includes(root), 'no temporary path in the report');
 
       writeFileSync(unitFile, generate(process.execPath, bin, undefined, {}));
       const healthy = JSON.parse((await execFileAsync(process.execPath, [bin, 'doctor', '--json'], { env })).stdout);
       assert.equal(healthy.daemon.launchPathExists, true);
       assert.equal(healthy.daemon.mode, 'pinned');
-      assert.doesNotMatch(renderDoctorText(healthy), /启动路径已不存在/);
+      assert.doesNotMatch(renderDoctorText(healthy), /启动路径已失效/);
     });
   } finally {
     rmSync(root, { recursive: true, force: true });

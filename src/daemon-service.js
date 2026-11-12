@@ -768,7 +768,7 @@ function status() {
     else if (mode === 'pinned') console.log(dim('  运行方式: 固定路径（升级后需 daemon uninstall 再重跑一条命令）'));
     const missing = missingLaunchPaths(plat, paths);
     if (missing?.length) {
-      console.log(warn('启动路径已不存在，后台服务无法启动，后台同步已停止。'));
+      console.log(warn('后台服务的启动路径已失效，下次启动时（如重启电脑后）会失败；正在运行的后台进程可能还在跑。'));
       for (const path of missing) console.log(dim(`  找不到: ${path}`));
       console.log(dim(`  常见于升级或卸载 Node 之后。运行 \`${REINSTALL_COMMAND}\` 重新注册。`));
     }

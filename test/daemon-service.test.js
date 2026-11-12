@@ -565,14 +565,14 @@ test('daemon status reports a registered launch path that no longer exists', { s
       { mode: 'npx', npxPath: goneNpx, nodeDir: dirname(goneNpx) });
     const broken = run('daemon', 'status');
     assert.equal(broken.status, 0, broken.stderr);
-    assert.match(broken.stdout, /启动路径已不存在，后台服务无法启动/);
+    assert.match(broken.stdout, /后台服务的启动路径已失效，下次启动时（如重启电脑后）会失败/);
     assert.ok(broken.stdout.includes(goneNpx), broken.stdout);
     assert.match(broken.stdout, /daemon install` 重新注册/);
 
     writeUnit(unitFile, process.execPath, bin);
     const healthy = run('daemon', 'status');
     assert.equal(healthy.status, 0, healthy.stderr);
-    assert.doesNotMatch(healthy.stdout, /启动路径已不存在/);
+    assert.doesNotMatch(healthy.stdout, /启动路径已失效/);
   });
 });
 
