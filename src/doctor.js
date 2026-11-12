@@ -476,6 +476,9 @@ export function renderDoctorText(report) {
   if (!daemon.platform) daemonText = 'CLI 后台服务：本系统不支持';
   else if (!daemon.installed) daemonText = 'CLI 后台服务：未安装';
   else daemonText = `CLI 后台服务：已安装（${daemon.platform}，${daemon.mode === 'npx' ? 'npx 每次取最新版' : daemon.mode === 'pinned' ? '固定路径' : '运行方式未知'}）`;
+  if (daemon.installed && daemon.launchPathExists === false) {
+    daemonText += ' · 后台服务的启动路径已失效，下次启动时会失败（常见于升级 Node 之后；运行 `npx @vibe-cafe/vibe-usage daemon install` 重新注册）';
+  }
   const lastDaemon = report.syncHistory.entries.find(entry => entry.surface === 'daemon');
   if (lastDaemon) {
     const result = lastDaemon.result

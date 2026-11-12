@@ -6,7 +6,7 @@ import { fetchAccount, ingest, requestDeviceCode, pollDeviceCode } from './api.j
 import { runSync } from './sync.js';
 import { detectInstalledTools } from './tools.js';
 import { bigHeader, success, failure, warn, arrow, link, dim, divider } from './output.js';
-import { manageDaemon, isDaemonInstalled, isDaemonPlatform } from './daemon-service.js';
+import { manageDaemon, isDaemonInstalled, isDaemonLaunchBroken, isDaemonPlatform } from './daemon-service.js';
 
 const CLIENT_NAME = 'vibe-usage CLI';
 
@@ -125,7 +125,7 @@ export async function runInit(options = {}) {
     console.log(dim('已按 --no-daemon 跳过后台同步。随时运行 `npx @vibe-cafe/vibe-usage daemon install` 开启。'));
   } else if (!isDaemonPlatform()) {
     console.log(dim('当前平台不支持后台同步，之后手动运行 `npx @vibe-cafe/vibe-usage` 即可同步。'));
-  } else if (isDaemonInstalled()) {
+  } else if (isDaemonInstalled() && !isDaemonLaunchBroken()) {
     console.log(success('后台自动同步已在运行。'));
   } else if (process.stdin.isTTY) {
     await manageDaemon('install');
