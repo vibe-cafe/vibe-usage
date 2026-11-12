@@ -428,7 +428,8 @@ test('Homebrew npx mode registers the npx and PATH next to the stable node, neve
   assert.deepEqual(global, { nodePath: '/opt/homebrew/bin/node', isNpxCache: false, launcher: null });
 });
 
-test('on a real filesystem the stable path survives a simulated brew upgrade', () => {
+// Homebrew layouts and stableRuntimePath() are POSIX-only (Windows keeps execPath).
+test('on a real filesystem the stable path survives a simulated brew upgrade', { skip: process.platform === 'win32' }, () => {
   const root = realpathSync(mkdtempSync(join(tmpdir(), 'vibe-usage-brew-')));
   try {
     const keg = version => join(root, 'Cellar', 'node', version, 'bin');
