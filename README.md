@@ -416,4 +416,4 @@ npx @vibe-cafe/vibe-usage daemon
 
 ## License
 
-MIT
+[MIT](LICENSE)
