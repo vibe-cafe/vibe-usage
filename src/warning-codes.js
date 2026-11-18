@@ -61,8 +61,9 @@ const RULES = [
   // "暂不支持读取", so it must precede the format rule.
   ['cursor_token_encrypted', /已加密保存登录凭证|issues\/144/],
   ['sqlite_unavailable', /sqlite3 CLI not found/i],
-  // DSH on Node < 22.15 without the zstd CLI.
-  ['decoder_unavailable', /install the zstd CLI/],
+  // DSH on Node < 22.15 without the zstd CLI; Codex compressed rollouts on
+  // Node < 22.15.
+  ['decoder_unavailable', /install the zstd CLI|没有 zstd 解压/],
   ['backfill_paused', /历史补齐本次暂停/],
   ['auth_rejected', /session rejected|auth rejected/i],
   ['network_timeout', /\(timeout after \d+ms\)|Request timed out/],
@@ -91,6 +92,9 @@ const RULES = [
     'missing session header record',
     'Zstandard',
     'zstd frames',
+    // A damaged Codex .jsonl.zst. Before the read rules: it names a file and
+    // the decoder's own message, and it is not an I/O failure.
+    '压缩记录解压失败',
   ].join('|'))],
   // Directory reads. Node's fs messages name the syscall, so a generic
   // "cannot read <path>" whose error came from readdir is a directory too.

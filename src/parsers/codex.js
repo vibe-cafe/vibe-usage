@@ -10,7 +10,9 @@ import {
 } from 'node:fs';
 import { join } from 'node:path';
 import { createInterface } from 'node:readline';
+import { Readable } from 'node:stream';
 import { createHash } from 'node:crypto';
+import { isZstdDecodeError, zstdDecoderAvailable, zstdFileChunks } from './zstd-file.js';
 import { mergeCodexSegments, codexSegmentSignature } from './codex-segments.js';
 import { aggregateToBuckets } from './aggregate.js';
 import { mergeCindyHarnessUsage, readCindyHarnessUsage } from './cindy-ledger.js';
@@ -70,19 +72,41 @@ function decorateCodexModel(model, serviceTier, timestampMs) {
 // both, index them together so fork replay-skip works across directories, and
 // select the most complete physical file when the same session briefly exists
 // in both locations during an archive move.
+//
+// Codex Desktop also compresses every rollout that has not been modified for
+// 7 days to `<name>.jsonl.zst` and deletes the plain file
+// (codex-rs/rollout/src/compression.rs, run at startup). Reopening such a
+// conversation restores the plain `.jsonl` and deletes the `.zst`. Both moves
+// publish the new file before removing the old one, so for a moment both exist
+// with the same records (the plain one possibly with more appended). Codex
+// itself then reads the plain file and skips the compressed sibling
+// (`should_skip_compressed_sibling`); so does this parser.
+const COMPRESSED_SUFFIX = '.zst';
+
+function isCompressedRollout(filePath) {
+  return filePath.endsWith(`.jsonl${COMPRESSED_SUFFIX}`);
+}
+
 /**
- * Recursively find all .jsonl files under a directory.
+ * Recursively find all rollout files under a directory: plain `.jsonl` and,
+ * where no plain sibling exists, compressed `.jsonl.zst`.
  * Codex CLI stores sessions as: ~/.codex/sessions/YYYY/MM/DD/rollout-*.jsonl
  */
-function findJsonlFiles(dir, strict = false) {
+function findRolloutFiles(dir, strict = false) {
   const results = [];
   if (!existsSync(dir)) return results;
   try {
-    for (const entry of readdirSync(dir, { withFileTypes: true })) {
+    const names = new Set();
+    const entries = readdirSync(dir, { withFileTypes: true });
+    for (const entry of entries) if (!entry.isDirectory()) names.add(entry.name);
+    for (const entry of entries) {
       const fullPath = join(dir, entry.name);
       if (entry.isDirectory()) {
-        for (const nested of findJsonlFiles(fullPath, strict)) results.push(nested);
+        for (const nested of findRolloutFiles(fullPath, strict)) results.push(nested);
       } else if (entry.name.endsWith('.jsonl')) {
+        results.push(fullPath);
+      } else if (isCompressedRollout(entry.name)
+          && !names.has(entry.name.slice(0, -COMPRESSED_SUFFIX.length))) {
         results.push(fullPath);
       }
     }
@@ -94,18 +118,59 @@ function findJsonlFiles(dir, strict = false) {
   return results;
 }
 
+/**
+ * stat() a discovered rollout. When Codex compressed or restored it between
+ * the directory listing and now, the other form is the same conversation.
+ */
+function statRollout(filePath) {
+  try {
+    return { filePath, stat: statSync(filePath) };
+  } catch (err) {
+    if (err?.code !== 'ENOENT') throw err;
+    const other = isCompressedRollout(filePath)
+      ? filePath.slice(0, -COMPRESSED_SUFFIX.length)
+      : `${filePath}${COMPRESSED_SUFFIX}`;
+    return { filePath: other, stat: statSync(other) };
+  }
+}
+
+/**
+ * Lines of a rollout, bounded to the size captured before parsing. A
+ * compressed rollout is decompressed as a stream (never to disk, never whole
+ * into memory) and always read from its first byte: compressed offsets do not
+ * correspond to text offsets. `decodedBytes()` reports how much text it held.
+ *
+ * Leaving a `for await` over the lines early does not close the interface:
+ * the input keeps flowing to its end in the background (a whole file read,
+ * or decompressed, for one header line). A caller that stops early calls
+ * `close()`, which also stops the input.
+ */
 function readLines(filePath, snapshotSize, start = 0) {
-  return createInterface({
-    input: createReadStream(filePath, {
+  let input;
+  let decoded = null;
+  if (isCompressedRollout(filePath)) {
+    if (start !== 0) throw new Error('a compressed Codex rollout is only read from its start');
+    decoded = { bytes: 0 };
+    input = Readable.from(zstdFileChunks(filePath, snapshotSize, decoded), { objectMode: false });
+  } else {
+    input = createReadStream(filePath, {
       encoding: 'utf-8',
       // Rollouts are append-only while Codex is working. Bound both parser
       // passes to the size captured before pass 1 so they see the same prefix
       // even when the live file grows between reads.
       ...(start > 0 ? { start } : {}),
       ...(snapshotSize == null ? {} : { end: snapshotSize - 1 }),
-    }),
-    crlfDelay: Infinity,
+    });
+  }
+  const lines = createInterface({ input, crlfDelay: Infinity });
+  lines.once('close', () => {
+    // Nobody reads these lines any more: an error the decoder still raises
+    // (damage past the header) must not become an uncaught exception.
+    input.on('error', () => {});
+    input.destroy();
   });
+  if (decoded) lines.decodedBytes = () => decoded.bytes;
+  return lines;
 }
 
 function extractProject(meta) {
@@ -146,24 +211,29 @@ function extractParentThreadId(meta) {
  * only forks, sub-agents, and parents referenced by them need replay indexes.
  */
 async function readSessionHeader(filePath, snapshotSize) {
-  for await (const line of readLines(filePath, snapshotSize)) {
-    if (!line.trim()) continue;
-    try {
-      const obj = normalizeUsageRecord(JSON.parse(line));
-      if (obj.type !== 'session_meta' || !obj.payload) continue;
-      const meta = obj.payload;
-      return {
-        sessionId: meta.id || null,
-        forkedFromId: meta.forked_from_id || null,
-        parentThreadId: extractParentThreadId(meta),
-        sessionProject: extractProject(meta),
-        modelProvider: meta.model_provider,
-        sessionStartedAtMs: timestampMs(meta.timestamp) ?? timestampMs(obj.timestamp),
-        isSubagent: isSubagentMeta(meta),
-      };
-    } catch {
-      continue;
+  const lines = readLines(filePath, snapshotSize);
+  try {
+    for await (const line of lines) {
+      if (!line.trim()) continue;
+      try {
+        const obj = normalizeUsageRecord(JSON.parse(line));
+        if (obj.type !== 'session_meta' || !obj.payload) continue;
+        const meta = obj.payload;
+        return {
+          sessionId: meta.id || null,
+          forkedFromId: meta.forked_from_id || null,
+          parentThreadId: extractParentThreadId(meta),
+          sessionProject: extractProject(meta),
+          modelProvider: meta.model_provider,
+          sessionStartedAtMs: timestampMs(meta.timestamp) ?? timestampMs(obj.timestamp),
+          isSubagent: isSubagentMeta(meta),
+        };
+      } catch {
+        continue;
+      }
     }
+  } finally {
+    lines.close();
   }
   return {
     sessionId: null,
@@ -204,6 +274,8 @@ function snapshotGuard(filePath, size) {
 }
 
 function tailStateFor(file) {
+  // Compressed rollouts are summarized only as whole files (see readLines()).
+  if (file.compressed) return null;
   const prior = file.priorTail;
   const tail = prior?.tail;
   if (!tail || !prior.signature) return null;
@@ -537,6 +609,13 @@ function auditMaxBytes() {
   return 64 * 1024 * 1024;
 }
 
+// What re-reading a file costs: its text. For a compressed rollout that is the
+// decompressed size its last full read recorded; without one it is not audited.
+function auditSize(file) {
+  if (!file.compressed) return file.snapshotSize;
+  return file.cache?.result?.decodedBytes ?? Number.POSITIVE_INFINITY;
+}
+
 function applySessionEvent(acc, event) {
   const timestampMsValue = event.timestamp.getTime();
   if (acc.lastTimestampMs != null && timestampMsValue < acc.lastTimestampMs) return false;
@@ -649,8 +728,10 @@ async function parseSessionFile(filePath, snapshotSize, fm, boundary, {
   // same session can briefly exist in both sessions/ and archived_sessions/
   // (mid-archive, or a re-synced archive). Path-keyed grouping would emit it
   // as two different sessionHashes and double-count its session stats. Fall
-  // back to the path only when the id is unknown (corrupt/missing meta).
-  const sessionKey = fm.sessionId || filePath;
+  // back to the path only when the id is unknown (corrupt/missing meta) -- the
+  // plain path, so compressing the file does not make it a new session.
+  const sessionKey = fm.sessionId
+    || (isCompressedRollout(filePath) ? filePath.slice(0, -COMPRESSED_SUFFIX.length) : filePath);
 
   let turnContextModel = previousTail?.turnContextModel || 'unknown';
   let serviceTier = previousTail?.serviceTier || null;
@@ -661,7 +742,8 @@ async function parseSessionFile(filePath, snapshotSize, fm, boundary, {
   let prevRecordTotal = previousTail?.prevRecordTotal ?? null;
   let pendingUsageMirror = previousTail?.pendingUsageMirror ?? null;
   const start = previousTail?.parsedBytes || 0;
-  for await (const line of (lines ?? readLines(filePath, snapshotSize, start))) {
+  const reader = lines ?? readLines(filePath, snapshotSize, start);
+  for await (const line of reader) {
     if (!line.trim()) continue;
     try {
       const obj = normalizeUsageRecord(JSON.parse(line));
@@ -859,6 +941,9 @@ async function parseSessionFile(filePath, snapshotSize, fm, boundary, {
   }
   const session = sessionFromAccumulator(sessionAccumulator);
   const result = { buckets, ultrafastBuckets, magpieEntries, sessions: session ? [session] : [] };
+  // A compressed rollout's text size bounds the rolling audit (its file size
+  // does not); see auditSize().
+  if (typeof reader.decodedBytes === 'function') result.decodedBytes = reader.decodedBytes();
   if (captureTail) {
     const guard = snapshotGuard(filePath, snapshotSize);
     result.tail = {
@@ -988,7 +1073,35 @@ function mergeFileResults(results, magpie, ultrafastStartMs = null) {
   return { buckets: aggregateToBuckets(entries), sessions };
 }
 
-async function parseNativeCodex({ codexExtraHome, extraRoots = [], magpie, codexUltrafastStartAt } = {}) {
+// A compressed rollout that cannot be decompressed is never counted in part:
+// the source is skipped, which keeps its upload state, and the file is named.
+// Codex verifies a compressed file before publishing it, so this means damage
+// on disk; it repeats every sync until the file is repaired or removed.
+function undecodableRollout(err, cacheStats) {
+  return {
+    buckets: [], sessions: [], skipped: true,
+    warnings: [`codex: 压缩记录解压失败，已保留上次同步数据: ${err.filePath}（${err.message}）`],
+    ...(cacheStats ? { cache: cacheStats } : {}),
+  };
+}
+
+async function parseNativeCodex(options = {}) {
+  const discovery = { undecodable: 0 };
+  const result = await parseCodexHomes(options, discovery);
+  if (discovery.undecodable === 0) return result;
+  // Node without node:zlib zstd (before 22.15): these rollouts stay unread as
+  // in every earlier release, and the rest of Codex still syncs. Said on every
+  // run, since the usage they hold is missing from the upload.
+  return {
+    ...result,
+    warnings: [
+      ...(result.warnings || []),
+      `codex: ${discovery.undecodable} 个压缩的旧对话（.jsonl.zst）没有统计：当前 Node ${process.version} 没有 zstd 解压，需要 Node 22.15 或更高版本`,
+    ],
+  };
+}
+
+async function parseCodexHomes({ codexExtraHome, extraRoots = [], magpie, codexUltrafastStartAt } = {}, discovery) {
   // null: this machine has no Ultrafast cut, every window keeps the merged format.
   const ultrafastStartMs = codexUltrafastStartMs(codexUltrafastStartAt);
   let extraCodexHomePath = null;
@@ -1049,25 +1162,37 @@ async function parseNativeCodex({ codexExtraHome, extraRoots = [], magpie, codex
     audited: 0,
   };
   const files = [];
+  const canDecompress = zstdDecoderAvailable();
   for (const { codexHome, dir, strict } of dirs) {
     let filePaths;
     try {
-      filePaths = findJsonlFiles(dir, strict);
+      filePaths = findRolloutFiles(dir, strict);
     } catch {
       return {
         buckets: [], sessions: [], skipped: true,
         warnings: [`codex: 额外根目录读取失败，已保留上次同步数据: ${codexHome}`],
       };
     }
-    for (const filePath of filePaths) {
+    const seen = new Set();
+    for (const listedPath of filePaths) {
       try {
-        const stat = statSync(filePath);
+        const { filePath, stat } = statRollout(listedPath);
+        if (seen.has(filePath)) continue;
+        seen.add(filePath);
         if (stat.size <= 0) continue;
+        const compressed = isCompressedRollout(filePath);
+        if (compressed && !canDecompress) {
+          // Exactly what every release before this one did with these files.
+          // Reported on every run (see parseNativeCodex()).
+          discovery.undecodable++;
+          continue;
+        }
         const signature = fileSignature(stat);
         const file = {
           codexHome,
           filePath,
           strict,
+          compressed,
           snapshotSize: stat.size,
           signature,
           cache: null,
@@ -1098,7 +1223,7 @@ async function parseNativeCodex({ codexExtraHome, extraRoots = [], magpie, codex
   if (files.every(file => file.cache?.header && file.cache?.result)) {
     const cutoff = Date.now() - auditIntervalMs();
     const candidate = files
-      .filter(file => file.snapshotSize <= auditMaxBytes())
+      .filter(file => auditSize(file) <= auditMaxBytes())
       .filter(file => (file.cache.lastAuditedAt || 0) <= cutoff)
       .sort((a, b) => (a.cache.lastAuditedAt || 0) - (b.cache.lastAuditedAt || 0))[0];
     if (candidate) auditPaths.add(candidate.filePath);
@@ -1120,7 +1245,8 @@ async function parseNativeCodex({ codexExtraHome, extraRoots = [], magpie, codex
         file.header = await readSessionHeader(file.filePath, file.snapshotSize);
         cacheStats.filesRead++;
         updateFileCache(file, { header: file.header });
-      } catch {
+      } catch (err) {
+        if (isZstdDecodeError(err)) return undecodableRollout(err);
         // An unreadable header may hide another segment of a known session.
         // Never upload the remaining readable segment as its complete total.
         return {
@@ -1178,7 +1304,9 @@ async function parseNativeCodex({ codexExtraHome, extraRoots = [], magpie, codex
         meta = await indexSessionFile(file.filePath, file.snapshotSize);
         cacheStats.filesRead++;
         updateFileCache(file, { index: meta });
-      } catch {
+      } catch (err) {
+        // Dropping it would also lose a fork's replay boundary, if it is a parent.
+        if (isZstdDecodeError(err)) return undecodableRollout(err, cacheStats);
         if (file.strict) {
           return {
             buckets: [], sessions: [], skipped: true,
@@ -1223,7 +1351,10 @@ async function parseNativeCodex({ codexExtraHome, extraRoots = [], magpie, codex
       cache = own?.result ? own
         : olderEntryFor(selected.codexHome, filePath, signature, cacheOptions, ultrafastStartMs)?.summary || own;
     }
+    // A compressed member's file size says nothing about the text it holds, so
+    // a group with one is not audited (see auditSize()).
     if (cache?.result && !groupAudited && auditPaths.size === 0
+      && !members.some(file => file.compressed)
       && signature.size <= auditMaxBytes()
       && (cache.lastAuditedAt || 0) <= Date.now() - auditIntervalMs()) {
       cache = null;
@@ -1231,7 +1362,7 @@ async function parseNativeCodex({ codexExtraHome, extraRoots = [], magpie, codex
       cacheStats.audited++;
     }
     const group = { ...selected, filePath, signature, snapshotSize: signature.size,
-      cache, members, lines: null, appendTail: null, priorTail: null };
+      compressed: false, cache, members, lines: null, appendTail: null, priorTail: null };
     try {
       let meta = cache?.index;
       if (!meta) {
@@ -1245,6 +1376,7 @@ async function parseNativeCodex({ codexExtraHome, extraRoots = [], magpie, codex
       for (const member of members) fileMeta.delete(member.filePath);
       groupedFiles.push(group);
     } catch (err) {
+      if (isZstdDecodeError(err)) return undecodableRollout(err, cacheStats);
       return { buckets: [], sessions: [], skipped: true,
         warnings: [`codex: 无法合并会话分段，已保留上次同步数据: ${err.message}`] };
     }
@@ -1286,15 +1418,21 @@ async function parseNativeCodex({ codexExtraHome, extraRoots = [], magpie, codex
       const previousTail = !needsIndex.has(file.filePath) && !auditPaths.has(file.filePath)
         ? file.appendTail
         : null;
-      if (file.members && !file.lines) {
-        file.lines = await mergeCodexSegments(file.members, readLines);
-        cacheStats.filesRead += file.members.length;
+      let parsed;
+      try {
+        if (file.members && !file.lines) {
+          file.lines = await mergeCodexSegments(file.members, readLines);
+          cacheStats.filesRead += file.members.length;
+        }
+        parsed = await parseSessionFile(file.filePath, file.snapshotSize, fm, boundary, {
+          previousTail,
+          captureTail: !needsIndex.has(file.filePath) && !file.compressed,
+          lines: file.lines,
+        });
+      } catch (err) {
+        if (isZstdDecodeError(err)) return undecodableRollout(err, cacheStats);
+        throw err;
       }
-      const parsed = await parseSessionFile(file.filePath, file.snapshotSize, fm, boundary, {
-        previousTail,
-        captureTail: !needsIndex.has(file.filePath),
-        lines: file.lines,
-      });
       if (!file.members) cacheStats.filesRead++;
       if (previousTail) cacheStats.tailHits++;
       const { tail, ...summary } = parsed;
