@@ -87,7 +87,7 @@ test('a sync announces how much it is about to upload', async () => {
 
   try {
     await withServer((req, res) => {
-      if (req.method === 'GET' && req.url === '/api/usage/settings') {
+      if (req.method === 'GET' && req.url.split('?')[0] === '/api/usage/settings') {
         res.writeHead(200, { 'content-type': 'application/json' });
         res.end(JSON.stringify({ uploadProject: true }));
         return;
@@ -159,7 +159,7 @@ test('a quiet sync still writes a parser skip warning to stderr', async () => {
 
   try {
     await withServer((req, res) => {
-      if (req.method === 'GET' && req.url === '/api/usage/settings') {
+      if (req.method === 'GET' && req.url.split('?')[0] === '/api/usage/settings') {
         res.writeHead(200, { 'content-type': 'application/json' });
         res.end(JSON.stringify({ uploadProject: true }));
         return;
@@ -219,7 +219,7 @@ test('silent sync phases report live status only on a TTY', async () => {
 
   try {
     await withServer((req, res) => {
-      if (req.method === 'GET' && req.url === '/api/usage/settings') {
+      if (req.method === 'GET' && req.url.split('?')[0] === '/api/usage/settings') {
         res.writeHead(200, { 'content-type': 'application/json' });
         res.end(JSON.stringify({ uploadProject: true }));
         return;
@@ -363,7 +363,7 @@ test('a successful batch is persisted before a later batch fails', async () => {
   let phase = 'first';
   try {
     await withServer((req, res) => {
-      if (req.method === 'GET' && req.url === '/api/usage/settings') {
+      if (req.method === 'GET' && req.url.split('?')[0] === '/api/usage/settings') {
         res.writeHead(200, { 'content-type': 'application/json' });
         res.end(JSON.stringify({ uploadProject: true }));
         return;
@@ -473,7 +473,7 @@ test('a changed API key re-uploads the whole local history exactly once', async 
   const received = [];
   try {
     await withServer((req, res) => {
-      if (req.method === 'GET' && req.url === '/api/usage/settings') {
+      if (req.method === 'GET' && req.url.split('?')[0] === '/api/usage/settings') {
         res.writeHead(200, { 'content-type': 'application/json' });
         res.end(JSON.stringify({ uploadProject: true }));
         return;
@@ -579,7 +579,7 @@ test('dropped unknown sources leave bucket and session state uncommitted', async
   let dropUnknownSource = true;
   try {
     await withServer((req, res) => {
-      if (req.method === 'GET' && req.url === '/api/usage/settings') {
+      if (req.method === 'GET' && req.url.split('?')[0] === '/api/usage/settings') {
         res.writeHead(200, { 'content-type': 'application/json' });
         res.end(JSON.stringify({ uploadProject: true }));
         return;

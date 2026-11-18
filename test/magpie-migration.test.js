@@ -140,7 +140,7 @@ function fixture(t) {
 async function server(t, f) {
   const received = [];
   const http = createServer((req, res) => {
-    if (req.url === '/api/usage/settings') { res.end(JSON.stringify({ uploadProject: false })); return; }
+    if (req.url.split('?')[0] === '/api/usage/settings') { res.end(JSON.stringify({ uploadProject: false })); return; }
     if (req.url === '/api/usage/account') { res.end('{}'); return; }
     const chunks = [];
     req.on('data', chunk => chunks.push(chunk));

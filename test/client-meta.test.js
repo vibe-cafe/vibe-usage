@@ -56,3 +56,11 @@ test('batch metadata keeps one sync id across all requests', () => {
   assert.deepEqual([first.batchIndex, first.batchCount], [0, 2]);
   assert.deepEqual([second.batchIndex, second.batchCount], [1, 2]);
 });
+
+test('the Codex Ultrafast cut is declared only when the sync knows it', () => {
+  assert.equal('codexUltrafastStartAt' in createSyncClient({ hostname: 'host' }), false);
+  assert.equal(createSyncClient({ hostname: 'host', codexUltrafastStartAt: null }).codexUltrafastStartAt, null);
+  const declared = createSyncClient({ hostname: 'host', codexUltrafastStartAt: '2026-11-10T10:30:00.000Z' });
+  assert.equal(declared.codexUltrafastStartAt, '2026-11-10T10:30:00.000Z');
+  assert.equal(forBatch(declared, 1, 3).codexUltrafastStartAt, '2026-11-10T10:30:00.000Z');
+});

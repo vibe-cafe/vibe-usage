@@ -1558,15 +1558,28 @@ test('algorithm-5 caches stay valid where Magpie has never been active', async (
         assert.equal(warm.cache.filesRead, 0);
         assert.equal(warm.cache.resultHits, 2);
 
-        // An append still resumes from the algorithm-5 tail.
+        // An append does not resume from a tail written before algorithm 7:
+        // those tails stored the Ultrafast tier as "no tier". The one rollout
+        // that grew is read from the start once (header + usage pass) ...
         appendFileSync(
           join(fixture.dir, 'rollout-a.jsonl'),
           JSON.stringify(tokenCount('2026-07-10T08:05:00.000Z', usage(5, 0, 3, 0), 118)) + '\n'
         );
         const appended = await parse({ magpie });
-        assert.equal(appended.cache.tailHits, 1);
-        assert.equal(appended.cache.filesRead, 1);
+        assert.equal(appended.cache.tailHits, 0);
+        assert.equal(appended.cache.filesRead, 2);
+        assert.equal(appended.cache.resultHits, 1, 'the untouched rollout still comes from its algorithm-5 entry');
         assert.deepEqual(sumBuckets(appended.buckets), { input: 105, output: 13, cached: 20, reasoning: 2 });
+
+        // ... and the next append resumes from the tail that read left behind.
+        appendFileSync(
+          join(fixture.dir, 'rollout-a.jsonl'),
+          JSON.stringify(tokenCount('2026-07-10T08:06:00.000Z', usage(5, 0, 3, 0), 126)) + '\n'
+        );
+        const resumed = await parse({ magpie });
+        assert.equal(resumed.cache.tailHits, 1);
+        assert.equal(resumed.cache.filesRead, 1);
+        assert.deepEqual(sumBuckets(resumed.buckets), { input: 110, output: 16, cached: 20, reasoning: 2 });
       });
     });
   } finally {

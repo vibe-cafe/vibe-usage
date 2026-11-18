@@ -54,6 +54,9 @@ export function isWarningCode(code) {
 // the generic read/dir rules, because e.g. "无法读取 <db>: 不认识的表结构" is a
 // format problem, not an I/O one.
 const RULES = [
+  // Codex held for one sync because the server did not report this machine's
+  // Ultrafast cut (codex-ultrafast.js).
+  ['upload_withheld', /Ultrafast 档位起点/],
   // Cursor 3.27+ token encryption (issue #144). Its notice also says
   // "暂不支持读取", so it must precede the format rule.
   ['cursor_token_encrypted', /已加密保存登录凭证|issues\/144/],

@@ -193,7 +193,21 @@ export function pollDeviceCode(apiUrl, deviceCode) {
   return _jsonRequest(apiUrl, '/api/usage/device/poll', 'POST', { deviceCode }, 15_000);
 }
 
-function _jsonRequest(apiUrl, path, method, body, timeoutMs) {
+/**
+ * Register this machine's Codex Ultrafast cut (see codex-ultrafast.js). The
+ * server keeps the first registration and answers with the cut in force, so a
+ * repeated or concurrent call is harmless. One attempt, no retry: a failure
+ * only means this sync uploads the merged format once more.
+ * @returns {Promise<{startAt: string, created: boolean}>}
+ */
+export function registerCodexUltrafastStart(apiUrl, apiKey, { hostname, proposedStartAt, client }) {
+  return _jsonRequest(
+    apiUrl, '/api/usage/codex-ultrafast-start', 'POST', { hostname, proposedStartAt, client }, 15_000,
+    { Authorization: `Bearer ${apiKey}` },
+  );
+}
+
+function _jsonRequest(apiUrl, path, method, body, timeoutMs, headers = {}) {
   return new Promise((resolve, reject) => {
     const url = new URL(path, apiUrl);
     const mod = url.protocol === 'https:' ? https : http;
@@ -205,6 +219,7 @@ function _jsonRequest(apiUrl, path, method, body, timeoutMs) {
       headers: {
         'Content-Type': 'application/json',
         'Content-Length': raw.length,
+        ...headers,
       },
     }, (res) => {
       let data = '';
@@ -327,7 +342,7 @@ export async function fetchSettings(apiUrl, apiKey, retry = {}) {
 
   for (let attempt = 0; attempt < MAX_RETRIES; attempt++) {
     try {
-      return await fetchSettingsOnce(apiUrl, apiKey);
+      return await fetchSettingsOnce(apiUrl, apiKey, retry.hostname);
     } catch (err) {
       if (err.message === 'UNAUTHORIZED') throw err;
       // Retrying a permanent client response cannot make it valid. 429 is the
@@ -343,8 +358,15 @@ export async function fetchSettings(apiUrl, apiKey, retry = {}) {
   return null;
 }
 
-async function fetchSettingsOnce(apiUrl, apiKey) {
-  const settings = await getJson(apiUrl, apiKey, '/api/usage/settings', { timeoutMs: 10_000 });
+// Naming the upload hostname makes the server add that machine's Codex
+// Ultrafast cut (`codexUltrafast: { startAt }`) to the same response, so the
+// cut costs no extra request per sync. Servers that predate it ignore the
+// parameter.
+async function fetchSettingsOnce(apiUrl, apiKey, hostname) {
+  const path = hostname
+    ? `/api/usage/settings?hostname=${encodeURIComponent(hostname)}`
+    : '/api/usage/settings';
+  const settings = await getJson(apiUrl, apiKey, path, { timeoutMs: 10_000 });
   if (typeof settings?.uploadProject !== 'boolean') {
     throw new Error('Invalid settings response');
   }

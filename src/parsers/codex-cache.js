@@ -14,7 +14,26 @@ import { join } from 'node:path';
 // separate from ~/.vibe-usage/state.json, whose hashes are the authoritative
 // record of successful uploads and must remain backward-compatible.
 export const CODEX_CACHE_SCHEMA_VERSION = 1;
-export const CODEX_PARSER_ALGORITHM_VERSION = 6;
+export const CODEX_PARSER_ALGORITHM_VERSION = 7;
+// Version 7 keeps Codex Ultrafast usage apart from the plain model's buckets
+// (`result.ultrafastBuckets`, raw model name) so the per-machine cut can name it
+// when results are assembled; a tail also carries the raw `ultrafast` tier.
+//
+// A version-6 *summary* is still read. It folds Ultrafast usage into the plain
+// model -- exactly the merged format every window before the cut keeps -- so
+// codex.js uses it wherever it has no window at or after the cut, and re-reads
+// the rollout otherwise (`summaryMatchesCut()`). Discarding every version-6
+// entry instead is what 0.14.8 did to version 5: on a large history neither a
+// desktop app (killed at 120s) nor an older daemon sharing this directory ever
+// finished rebuilding, and Codex stopped uploading. For the same reason an
+// accepted older entry is never rewritten just to restamp it: a daemon still
+// running version-6 code rejects version-7 entries, re-reads those rollouts and
+// writes version 6 back, which stays cheap only while version-7 entries are
+// limited to the rollouts this version actually had to parse.
+//
+// A version-6 *tail* is not read: it stored the Ultrafast tier as "no tier", so
+// continuing from it would file the rest of the session under the plain model.
+const MERGED_ULTRAFAST_SUMMARY_ALGORITHM_VERSIONS = new Set([6]);
 // Version 6 (#143) only started keeping raw Magpie attribution data (the
 // session's model provider and per-response ids). Where Magpie has never been
 // active (no ledger, no cut), attribution is a no-op and a version-5 entry
@@ -24,8 +43,9 @@ export const CODEX_PARSER_ALGORITHM_VERSION = 6;
 // rebuild finished. Magpie machines still rebuild so attribution stays exact.
 const MAGPIE_FREE_COMPATIBLE_ALGORITHM_VERSIONS = new Set([5]);
 
-function acceptedAlgorithm(version, magpieFree) {
+function acceptedSummaryAlgorithm(version, magpieFree) {
   return version === CODEX_PARSER_ALGORITHM_VERSION
+    || MERGED_ULTRAFAST_SUMMARY_ALGORITHM_VERSIONS.has(version)
     || (magpieFree === true && MAGPIE_FREE_COMPATIBLE_ALGORITHM_VERSIONS.has(version));
 }
 
@@ -74,7 +94,7 @@ export function loadCodexFileCache(codexHome, filePath, signature, { magpieFree 
   try {
     const parsed = JSON.parse(readFileSync(path, 'utf8'));
     if (parsed.schemaVersion !== CODEX_CACHE_SCHEMA_VERSION) return null;
-    if (!acceptedAlgorithm(parsed.algorithmVersion, magpieFree)) return null;
+    if (!acceptedSummaryAlgorithm(parsed.algorithmVersion, magpieFree)) return null;
     if (parsed.filePath !== filePath) return null;
     if (signature && !sameSignature(parsed.signature, signature)) return null;
     return parsed;
@@ -108,14 +128,14 @@ export function saveCodexFileCache(codexHome, filePath, signature, data) {
   }
 }
 
-export function loadCodexFileTail(codexHome, filePath, { magpieFree = false } = {}) {
+export function loadCodexFileTail(codexHome, filePath) {
   if (!codexCacheEnabled()) return null;
   const path = tailPath(codexHome, filePath);
   if (!existsSync(path)) return null;
   try {
     const parsed = JSON.parse(readFileSync(path, 'utf8'));
     if (parsed.schemaVersion !== CODEX_CACHE_SCHEMA_VERSION) return null;
-    if (!acceptedAlgorithm(parsed.algorithmVersion, magpieFree)) return null;
+    if (parsed.algorithmVersion !== CODEX_PARSER_ALGORITHM_VERSION) return null;
     if (parsed.filePath !== filePath || !parsed.signature || !parsed.tail) return null;
     return parsed;
   } catch {
