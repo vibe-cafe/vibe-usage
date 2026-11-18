@@ -413,9 +413,11 @@ test('algorithm-6 summaries wholly before the cut are kept; one with a window at
 
     const afterCut = await parseAt(W1030);
     assert.equal(afterCut.cache.resultHits, 1, 'the early rollout comes from its algorithm-6 summary');
-    // An older summary that is not exact under the cut is not used at all, so
-    // that one rollout is read like a new file: its header, then its usage.
-    assert.equal(afterCut.cache.filesRead, 2, 'only the rollout with a post-cut window is read again');
+    // An older summary that is not exact under the cut is not used, so that one
+    // rollout's usage is read again. Its header is not: algorithm 6 computed
+    // it exactly as this version does, and it does not depend on the cut.
+    assert.equal(afterCut.cache.headerHits, 2);
+    assert.equal(afterCut.cache.filesRead, 1, 'only the usage of the rollout with a post-cut window is read again');
     assert.deepEqual(uploaded(afterCut), uploaded(expected));
     assert.deepEqual(byKey(afterCut), {
       [`${MODEL}@10:00`]: 110, [`${MODEL}@10:30`]: 60, [`${UF}@10:30`]: 40,
@@ -427,9 +429,51 @@ test('algorithm-6 summaries wholly before the cut are kept; one with a window at
     assert.deepEqual(uploaded(again), uploaded(expected));
     // With the cut at the epoch even the early summary has to go.
     const all = await parseAt(CODEX_ULTRAFAST_ALL_HISTORY);
-    assert.equal(all.cache.filesRead, 2);
+    assert.equal(all.cache.filesRead, 1);
     assert.equal(all.cache.resultHits, 1, 'the rollout already rebuilt by this version is not read again');
     assert.deepEqual(uploaded(all), uploaded(await parseUncached(CODEX_ULTRAFAST_ALL_HISTORY)));
+  });
+});
+
+test('an algorithm-6 entry whose summary is not exact under the cut still gives its header and replay index', async () => {
+  // A fork starts with a copy of its parent's records. The replay index is what
+  // tells that copy from the fork's own usage, so it has to arrive intact.
+  const copied = (records, instant) => records.slice(1).map(record => ({ ...record, timestamp: instant }));
+  const parent = [
+    sessionMeta(at('10:05'), 'parent'),
+    turnContext(at('10:05'), { model: MODEL, serviceTier: null }),
+    tokenCount(at('10:05', '10'), usage(50), 50),
+    turnContext(at('10:31'), { model: MODEL, serviceTier: ULTRAFAST_TIER_VALUE }),
+    tokenCount(at('10:31', '10'), usage(40), 90),
+  ];
+  const fork = [
+    sessionMeta(at('10:40'), 'fork', { forked_from_id: 'parent' }),
+    ...copied(parent, at('10:40', '01')),
+    turnContext(at('10:41'), { model: MODEL, serviceTier: ULTRAFAST_TIER_VALUE }),
+    tokenCount(at('10:41', '10'), usage(7), 97),
+  ];
+  await withFixture({ 'rollout-parent.jsonl': parent, 'rollout-fork.jsonl': fork }, async (fixture) => {
+    const expected = await parseUncached(W1030);
+    assert.deepEqual(byKey(expected), { [`${MODEL}@10:00`]: 50, [`${UF}@10:30`]: 47 }, 'the copied 90 tokens are not counted again');
+    await parseAt(null);
+    downgradeCacheToAlgorithm6(fixture.cacheDir);
+    const older = olderCacheFiles(fixture.cacheDir);
+
+    // Both summaries have a window at or after the cut: the usage is read again,
+    // one pass per rollout. Neither header nor index is.
+    const afterCut = await parseAt(W1030);
+    assert.equal(afterCut.cache.headerHits, 2);
+    assert.equal(afterCut.cache.indexHits, 2);
+    assert.equal(afterCut.cache.resultHits, 0);
+    assert.equal(afterCut.cache.filesRead, 2);
+    assert.deepEqual(uploaded(afterCut), uploaded(expected));
+    assert.deepEqual(olderCacheFiles(fixture.cacheDir), older);
+
+    // What was taken over is now part of this version's own entries.
+    const again = await parseAt(W1030);
+    assert.equal(again.cache.filesRead, 0);
+    assert.equal(again.cache.resultHits, 2);
+    assert.deepEqual(uploaded(again), uploaded(expected));
   });
 });
 

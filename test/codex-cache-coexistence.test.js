@@ -376,3 +376,225 @@ for (const variant of VARIANTS) {
     }
   }
 }
+
+// ------------------------------- duplicate sessions across two Codex homes ---
+// The same session id in two homes (two accounts of a multi-account launcher
+// that share one history, a copied home added as an extra root) is read as one
+// group. Its usage is stored once, on the group's entry; the entry of each
+// physical file holds only that file's header and replay index and never gets
+// a summary of its own.
+//
+// 0.15.0 took an older entry over only when it carried a summary. On such a
+// machine the first runs after the upgrade therefore read every one of those
+// files from the first byte for its header and again for its index, 45 seconds
+// at a time -- about a dozen syncs with Codex `skipped` on a machine with 9,891
+// such sessions -- although the group summaries those passes lead to were all
+// still usable. Headers and indexes are computed by algorithm 7 exactly as by
+// algorithm 6, so they are taken over as well.
+const TWO_HOME_CUT = '2026-11-10T10:00:00.000Z';
+const isGroupEntry = entry => entry.filePath.includes('/.vibe-usage-session-');
+
+async function timedRun(env, run) {
+  const startedAt = clock.now;
+  clock.charging = true;
+  try {
+    const result = await withEnv(env, run);
+    return {
+      result,
+      done: !result.skipped,
+      elapsedMs: Math.round(clock.now - startedAt),
+      filesRead: result.cache?.filesRead,
+      indexing: result.indexing ? `${result.indexing.phase} ${result.indexing.completed}/${result.indexing.total}` : null,
+    };
+  } finally {
+    clock.charging = false;
+  }
+}
+
+/**
+ * One machine, two homes. Four sessions exist in both (identical copies), one
+ * only in the first. All usage is before the cut except the last 701 calls of
+ * `late`, which are Ultrafast.
+ */
+function createTwoHomeMachine() {
+  const root = mkdtempSync(join(tmpdir(), 'vibe-usage-codex-two-homes-'));
+  roots.push(root);
+  const homes = [join(root, 'home-a'), join(root, 'home-b')];
+  const sharedCache = join(root, 'cache');
+  const day = home => join(home, 'sessions', '2026', '11', '10');
+  for (const home of homes) mkdirSync(day(home), { recursive: true });
+  const base = { CODEX_HOME: homes[0], VIBE_USAGE_CINDY_DIRS: join(root, 'absent'), VIBE_USAGE_CODEX_CACHE: undefined };
+  const shared = { ...base, VIBE_USAGE_CACHE_DIR: sharedCache, VIBE_USAGE_CODEX_WORK_BUDGET_MS: String(BUDGET_MS) };
+  const unlimited = { VIBE_USAGE_CODEX_WORK_BUDGET_MS: String(3_600_000) };
+  const options = cut => ({ extraRoots: [homes[1]], codexUltrafastStartAt: cut });
+  let tokens = 0;
+  let ultrafastTokensAfterCut = 0;
+
+  /** 1,000 calls of 10 tokens, one per second, padded so the file spans many read chunks. */
+  function rollout(id, serviceTier, startsAt) {
+    const lines = [sessionMeta(startsAt, id), turnContext(startsAt, { model: MODEL, serviceTier })].map(JSON.stringify);
+    for (let n = 1; n <= 1000; n++) {
+      const at = Date.parse(startsAt) + n * 1000;
+      tokens += 10;
+      if (serviceTier === ULTRAFAST_TIER_VALUE && at >= Date.parse(TWO_HOME_CUT)) ultrafastTokensAfterCut += 10;
+      lines.push(JSON.stringify({
+        timestamp: new Date(at).toISOString(),
+        type: 'event_msg',
+        payload: {
+          type: 'token_count',
+          pad: 'x'.repeat(900),
+          info: {
+            total_token_usage: { total_tokens: n * 10 },
+            last_token_usage: { input_tokens: 10, cached_input_tokens: 0, output_tokens: 0, reasoning_output_tokens: 0, total_tokens: 10 },
+          },
+        },
+      }));
+    }
+    return `${lines.join('\n')}\n`;
+  }
+  const inBothHomes = [
+    ['std', null, '2026-11-10T08:00:00.000Z'],
+    ['uf', ULTRAFAST_TIER_VALUE, '2026-11-10T08:20:00.000Z'],
+    ['fast', 'fast', '2026-11-10T08:40:00.000Z'],
+    ['late', ULTRAFAST_TIER_VALUE, '2026-11-10T09:55:00.000Z'],
+  ];
+  for (const [id, serviceTier, startsAt] of inBothHomes) {
+    const content = rollout(id, serviceTier, startsAt);
+    for (const home of homes) writeFileSync(join(day(home), `rollout-${id}.jsonl`), content);
+  }
+  writeFileSync(join(day(homes[0]), 'rollout-solo.jsonl'), rollout('solo', null, '2026-11-10T09:00:00.000Z'));
+
+  const olderDirs = () => readdirSync(join(sharedCache, 'codex')).map(home => join(sharedCache, 'codex', home));
+  /** Every file directly in the older collector's directories: `{ path: content }`. */
+  const olderFiles = () => Object.fromEntries(olderDirs().flatMap(dir => readdirSync(dir, { withFileTypes: true })
+    .filter(entry => entry.isFile())
+    .map(entry => [join(dir, entry.name), readFileSync(join(dir, entry.name), 'utf8')])));
+  const olderSummaries = () => Object.entries(olderFiles())
+    .filter(([path]) => !path.endsWith('.tail.json'))
+    .map(([path, content]) => ({ path, entry: JSON.parse(content) }));
+
+  return {
+    physicalFiles: inBothHomes.length * 2 + 1,
+    duplicateCopies: inBothHomes.length * 2,
+    groups: inBothHomes.length,
+    tokens: () => tokens,
+    ultrafastTokensAfterCut: () => ultrafastTokensAfterCut,
+    olderFiles,
+    olderSummaries,
+    /** The machine as the older version left it: a complete algorithm-6 cache. */
+    async olderRun() {
+      if (olderParse) {
+        await withEnv({ ...shared, ...unlimited }, () => olderParse({ extraRoots: [homes[1]] }));
+        return;
+      }
+      const scratch = join(root, 'older-scratch');
+      await withEnv({ ...base, ...unlimited, VIBE_USAGE_CACHE_DIR: scratch }, () => parse({ extraRoots: [homes[1]] }));
+      for (const home of readdirSync(join(scratch, 'codex'))) {
+        const target = join(sharedCache, 'codex', home);
+        mkdirSync(target, { recursive: true });
+        for (const path of jsonFiles(join(scratch, 'codex', home))) {
+          writeFileSync(join(target, basename(path)), asAlgorithm6(JSON.parse(readFileSync(path, 'utf8'))));
+        }
+      }
+      rmSync(scratch, { recursive: true, force: true });
+    },
+    /** Restamp what the older version left as another algorithm version. */
+    restampOlder(algorithmVersion) {
+      for (const { path, entry } of olderSummaries()) writeFileSync(path, `${JSON.stringify({ ...entry, algorithmVersion })}\n`);
+    },
+    /**
+     * What 0.15.0 left when its 45 seconds ran out during the header and index
+     * passes: its own entry for every file it had to read -- the header for
+     * each, the index for only some.
+     */
+    leaveHalfRebuilt() {
+      let written = 0;
+      for (const { path, entry } of olderSummaries()) {
+        if (isGroupEntry(entry) || entry.result) continue;
+        const ownDir = join(path, '..', 'v7');
+        mkdirSync(ownDir, { recursive: true });
+        writeFileSync(join(ownDir, basename(path)), `${JSON.stringify({
+          ...entry, algorithmVersion: 7, index: written % 2 === 0 ? null : entry.index, result: null,
+        })}\n`);
+        written++;
+      }
+      return written;
+    },
+    newRun: cut => timedRun(shared, () => parse(options(cut))),
+    uncached: cut => withEnv({ ...base, VIBE_USAGE_CODEX_CACHE: '0', VIBE_USAGE_CACHE_DIR: join(root, 'unused') },
+      () => parse(options(cut))),
+  };
+}
+
+/** The older cache has the shape this section is about. */
+function assertOlderLayout(machine) {
+  const summaries = machine.olderSummaries().map(({ entry }) => entry);
+  const copies = summaries.filter(entry => !isGroupEntry(entry) && entry.header && entry.index && !entry.result);
+  const groups = summaries.filter(entry => isGroupEntry(entry) && entry.index && entry.result);
+  assert.equal(copies.length, machine.duplicateCopies, 'every physical copy has a header and an index, and no summary');
+  assert.equal(groups.length, machine.groups, 'every duplicated session has its summary on the group entry');
+  assert.ok(summaries.every(entry => entry.algorithmVersion === 6));
+}
+
+async function assertFinishesOnFirstRun(machine) {
+  const before = machine.olderFiles();
+  const first = await machine.newRun(TWO_HOME_CUT);
+  const trace = JSON.stringify({ done: first.done, s: Math.round(first.elapsedMs / 1000), at: first.indexing, cache: first.result.cache });
+  assert.equal(first.done, true, `the first run after the upgrade did not finish: ${trace}`);
+  const cache = first.result.cache;
+  // No header is read and no replay index is rebuilt from a rollout.
+  assert.equal(cache.headerHits, machine.physicalFiles, trace);
+  // Every physical copy, and the three groups whose summary is still exact.
+  assert.equal(cache.indexHits, machine.duplicateCopies + (machine.groups - 1), trace);
+  assert.equal(cache.resultHits, (machine.groups - 1) + 1, trace);
+  // The one session with usage after the cut is the only thing read: its two
+  // copies, merged once.
+  assert.equal(cache.filesRead, 2, trace);
+  assert.equal(first.elapsedMs, 2 * FULL_READ_MS, trace);
+  assert.deepEqual(machine.olderFiles(), before, 'the older collector\'s files were rewritten');
+
+  const expected = await machine.uncached(TWO_HOME_CUT);
+  assert.deepEqual(sorted(first.result), sorted(expected));
+  assert.deepEqual(first.result.sessions, expected.sessions);
+  const sum = buckets => buckets.reduce((total, b) => total + b.inputTokens + b.outputTokens, 0);
+  assert.equal(sum(first.result.buckets), machine.tokens());
+  assert.equal(machine.ultrafastTokensAfterCut(), 7010);
+  assert.equal(sum(first.result.buckets.filter(b => b.model.endsWith('-ultrafast'))), machine.ultrafastTokensAfterCut());
+
+  const second = await machine.newRun(TWO_HOME_CUT);
+  assert.equal(second.done, true);
+  assert.equal(second.filesRead, 0);
+  assert.equal(second.elapsedMs, 0);
+  assert.deepEqual(sorted(second.result), sorted(expected));
+}
+
+test('duplicate sessions in two homes: the first run after the upgrade takes headers and indexes from the older entries', async () => {
+  const machine = createTwoHomeMachine();
+  await machine.olderRun();
+  assertOlderLayout(machine);
+  await assertFinishesOnFirstRun(machine);
+});
+
+test('duplicate sessions in two homes: a rebuild that 0.15.0 left half-done is completed from the older entries', async () => {
+  const machine = createTwoHomeMachine();
+  await machine.olderRun();
+  assertOlderLayout(machine);
+  assert.equal(machine.leaveHalfRebuilt(), machine.duplicateCopies);
+  await assertFinishesOnFirstRun(machine);
+});
+
+test('duplicate sessions in two homes: headers and indexes written by algorithm 5 are not taken over', async () => {
+  // Algorithm 5 hashed durable usage records without their response id and
+  // kept no model provider, so its headers and indexes are not what this
+  // version computes. (Its summaries still stand in where Magpie was never
+  // active.) Such a machine reads the copies again, across several runs.
+  const machine = createTwoHomeMachine();
+  await machine.olderRun();
+  machine.restampOlder(5);
+  const first = await machine.newRun(TWO_HOME_CUT);
+  assert.equal(first.done, false);
+  assert.match(first.indexing, /^discovery /);
+  // Only the session that exists once: its algorithm-5 summary is usable whole.
+  assert.equal(first.result.cache.headerHits, 1);
+  assert.equal(first.result.cache.indexHits, 0);
+});

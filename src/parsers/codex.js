@@ -894,10 +894,17 @@ function summaryMatchesCut(result, ultrafastStartMs) {
   return (result.buckets || []).every(bucket => Date.parse(bucket.bucketStart) < ultrafastStartMs);
 }
 
-// An older version's summary may stand in only when it is exact under the cut.
-function usableOlderSummary(codexHome, filePath, signature, cacheOptions, ultrafastStartMs) {
+// What an older version left for exactly this file state (codex-cache.js
+// decides, by algorithm version, which of it may be taken at all).
+function olderEntryFor(codexHome, filePath, signature, cacheOptions, ultrafastStartMs) {
   const older = loadOlderCodexFileCache(codexHome, filePath, signature, cacheOptions);
-  return older?.result && summaryMatchesCut(older.result, ultrafastStartMs) ? older : null;
+  if (!older) return null;
+  return {
+    // Its summary may stand in only when it is exact under the cut.
+    summary: older.entry?.result && summaryMatchesCut(older.entry.result, ultrafastStartMs) ? older.entry : null,
+    header: older.header,
+    index: older.index,
+  };
 }
 
 /**
@@ -905,8 +912,9 @@ function usableOlderSummary(codexHome, filePath, signature, cacheOptions, ultraf
  *
  *   1. this version's finished summary for exactly this file state;
  *   2. this version's append tail -- the file grew since we last read it;
- *   3. an older version's summary for exactly this file state, if it is exact
- *      under the current cut;
+ *   3. an older version's entry for exactly this file state: all of it if its
+ *      summary is exact under the current cut, otherwise its header and replay
+ *      index, to fill in what this version's own entry does not have yet;
  *   4. nothing: the rollout is read from the start.
  *
  * Our own state always comes first. An older collector that is still running
@@ -916,6 +924,17 @@ function usableOlderSummary(codexHome, filePath, signature, cacheOptions, ultraf
  * machine has a cut the summary is then rejected (it folds Ultrafast into the
  * plain model in post-cut windows), and with the tail never loaded the rollout
  * was parsed from the first byte on every run.
+ *
+ * The header and index of step 3 are what an upgrade needs for a session that
+ * exists in several homes. Its usage is summarized once, on the group's entry
+ * (see the duplicate-id loop in parseNativeCodex()); the entry of each physical
+ * file never has a summary, only a header and an index. Requiring a summary, as
+ * 0.15.0 did, read every such file from the first byte for its header and again
+ * for its index. The same applies to a rebuild that was interrupted half-way:
+ * our own entry then has the header but not yet the index.
+ *
+ * The rolling audit is unaffected: it only runs when every file has a summary,
+ * and a file that took just a header and index here has none.
  */
 function startingCache(file, cacheOptions, ultrafastStartMs) {
   const own = loadCodexFileCache(file.codexHome, file.filePath, file.signature);
@@ -926,8 +945,15 @@ function startingCache(file, cacheOptions, ultrafastStartMs) {
   file.priorTail = loadCodexFileTail(file.codexHome, file.filePath);
   if (file.priorCache) file.appendTail = tailStateFor(file);
   if (file.appendTail) return;
-  const older = usableOlderSummary(file.codexHome, file.filePath, file.signature, cacheOptions, ultrafastStartMs);
-  if (older) file.cache = older;
+  const older = olderEntryFor(file.codexHome, file.filePath, file.signature, cacheOptions, ultrafastStartMs);
+  if (!older) return;
+  if (older.summary) {
+    file.cache = older.summary;
+    return;
+  }
+  const header = own?.header ?? older.header;
+  const index = own?.index ?? older.index;
+  if (header || index) file.cache = { ...own, header, index };
 }
 
 function mergeFileResults(results, magpie, ultrafastStartMs = null) {
@@ -1185,11 +1211,14 @@ async function parseNativeCodex({ codexExtraHome, extraRoots = [], magpie, codex
     const filePath = `${selected.codexHome}/.vibe-usage-session-${createHash('sha256').update(id).digest('hex')}`;
     const signature = codexSegmentSignature(members);
     // Same order as startingCache(), without step 2: a group has no append tail.
+    // An older group entry is taken whole or not at all: when its summary is not
+    // exact under the cut the members are merged again anyway, and indexing the
+    // merged records costs no further read.
     let cache = null;
     if (!members.some(file => auditPaths.has(file.filePath))) {
       const own = loadCodexFileCache(selected.codexHome, filePath, signature);
       cache = own?.result ? own
-        : usableOlderSummary(selected.codexHome, filePath, signature, cacheOptions, ultrafastStartMs) || own;
+        : olderEntryFor(selected.codexHome, filePath, signature, cacheOptions, ultrafastStartMs)?.summary || own;
     }
     if (cache?.result && !groupAudited && auditPaths.size === 0
       && signature.size <= auditMaxBytes()
