@@ -31,23 +31,40 @@ export const CODEX_PARSER_ALGORITHM_VERSION = 7;
 // rollout from the start once and resumes from its own tail afterwards.
 //
 // Entries of the older versions are still *read*, from where those versions
-// keep them, so upgrading does not re-read a large history:
+// keep them, so upgrading does not re-read a large history. Only for the
+// rollout's current stat signature, and only when this version has nothing of
+// its own to start from (codex.js `startingCache()`). Two things can be taken
+// from such an entry, each with its own rule:
+//
+// The summary (`result`), and with it the whole entry:
 //   - A version-6 summary folds Ultrafast usage into the plain model -- exactly
 //     the merged format every window before the cut keeps -- so codex.js uses it
 //     wherever it has no window at or after the cut and reads the rollout
 //     otherwise (`summaryMatchesCut()`).
 //   - A version-5 summary additionally requires that Magpie was never active.
-//   - Only for the rollout's current stat signature, and only when this
-//     version has nothing of its own to start from (codex.js `startingCache()`).
-//     An older tail is never resumed: it stored the Ultrafast tier as "no
-//     tier", so continuing from it would file the rest of the session under
-//     the plain model.
+// An older tail is never resumed: it stored the Ultrafast tier as "no tier", so
+// continuing from it would file the rest of the session under the plain model.
 const MERGED_ULTRAFAST_SUMMARY_ALGORITHM_VERSIONS = new Set([6]);
 // Version 6 (#143) only started keeping raw Magpie attribution data (the
 // session's model provider and per-response ids). Where Magpie has never been
 // active (no ledger, no cut), attribution is a no-op and a version-5 entry
 // yields exactly the same buckets and sessions.
 const MAGPIE_FREE_COMPATIBLE_ALGORITHM_VERSIONS = new Set([5]);
+// The `header` and `index` alone, when the entry has no summary or its summary
+// is not exact under the cut. Neither depends on the tier or the cut, so they
+// are valid wherever the listed version computes them exactly as this one does.
+// This is what keeps an upgrade cheap for a session that exists in several
+// homes: its usage is summarized on the group's entry, and the entry of each
+// physical file holds only a header and an index. 0.15.0 required a summary
+// and read every such file twice from the first byte after the upgrade.
+//
+// EMPTY THIS SET when the output of `readSessionHeader()` or
+// `indexSessionFile()` in codex.js changes -- including through
+// `normalizeUsageRecord()`, which decides what a token record's fingerprint is
+// made of. Version 5 is not listed for exactly that reason: its headers and
+// indexes carry no model provider, and it fingerprinted durable usage records
+// without their response id.
+const SAME_HEADER_AND_INDEX_ALGORITHM_VERSIONS = new Set([6]);
 
 function acceptedOlderSummaryAlgorithm(version, magpieFree) {
   return MERGED_ULTRAFAST_SUMMARY_ALGORITHM_VERSIONS.has(version)
@@ -130,17 +147,31 @@ export function loadCodexFileCache(codexHome, filePath, signature) {
 }
 
 /**
- * An older version's summary for exactly this file state, from where that
- * version keeps it. A fallback only: the caller decides whether it is exact
- * under the current Ultrafast cut, and must look at its own entries first --
- * an older collector that is still running refreshes this file after every
- * append, so preferring it would shadow this version's own append tail.
+ * What an older version left for exactly this file state, from where that
+ * version keeps it, reduced to what its algorithm version allows to be taken:
+ *
+ *   - `entry`: the whole entry, where that version's summaries are accepted.
+ *     The caller still has to check that the summary is exact under the
+ *     current Ultrafast cut.
+ *   - `header` / `index`: where that version computes them as this one does.
+ *
+ * A fallback only. The caller must look at its own entries first -- an older
+ * collector that is still running refreshes this file after every append, so
+ * preferring it would shadow this version's own append tail.
  */
 export function loadOlderCodexFileCache(codexHome, filePath, signature, { magpieFree = false } = {}) {
   if (!codexCacheEnabled() || !signature) return null;
+  const summaryAccepted = version => acceptedOlderSummaryAlgorithm(version, magpieFree);
+  const partsAccepted = version => SAME_HEADER_AND_INDEX_ALGORITHM_VERSIONS.has(version);
   const older = readSummary(olderEntryPath(codexHome, filePath), filePath,
-    version => acceptedOlderSummaryAlgorithm(version, magpieFree));
-  return older && sameSignature(older.signature, signature) ? older : null;
+    version => summaryAccepted(version) || partsAccepted(version));
+  if (!older || !sameSignature(older.signature, signature)) return null;
+  const parts = partsAccepted(older.algorithmVersion);
+  return {
+    entry: summaryAccepted(older.algorithmVersion) ? older : null,
+    header: (parts && older.header) || null,
+    index: (parts && older.index) || null,
+  };
 }
 
 export function saveCodexFileCache(codexHome, filePath, signature, data) {
