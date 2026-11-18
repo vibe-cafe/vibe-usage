@@ -8,6 +8,7 @@ import {
   isWarningCode,
 } from '../src/warning-codes.js';
 import { ENCRYPTED_TOKEN_NOTICE } from '../src/parsers/cursor.js';
+import { CODEX_ULTRAFAST_HOLD_WARNING } from '../src/codex-ultrafast.js';
 import { sqliteUnavailableError } from '../src/parsers/sqlite.js';
 
 // Synthetic paths only: a Chinese user name with a space, an encoded Claude
@@ -68,6 +69,7 @@ const CASES = [
   [`codex: 额外根目录不可用，已跳过本次 Codex 同步: ${HOME}/old/.codex`, 'extra_root_unavailable'],
   [`codex: 额外根目录读取失败，已保留上次同步数据: ${HOME}/.codex`, 'extra_root_read_failed'],
   ['codex: 会话文件读取失败，已保留上次同步数据', 'read_failed'],
+  [CODEX_ULTRAFAST_HOLD_WARNING, 'upload_withheld'],
   ['codex: 同一会话的部分文件读取失败，已保留上次同步数据', 'read_failed'],
   ['codex: 无法合并会话分段，已保留上次同步数据: conflicting copy order', 'merge_failed'],
   ['grok: 额外根目录不可用，已跳过本次 Grok 同步: /Volumes/备份/.grok', 'extra_root_unavailable'],

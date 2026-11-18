@@ -1,7 +1,8 @@
 import { bucketKey } from './state.js';
+import { HALF_HOUR_MS, chooseCutStartAt, splitBucketKey as splitKey } from './cut-start.js';
 
 export const MAGPIE_SOURCES = new Set(['claude-code', 'codex', 'pi-coding-agent', 'omp', 'opencode']);
-export const HALF_HOUR_MS = 1_800_000;
+export { HALF_HOUR_MS };
 
 export function magpieStartTime(value) {
   if (value === undefined) return null;
@@ -15,21 +16,9 @@ export function magpieStartTime(value) {
   return time;
 }
 
-function splitKey(key) {
-  const parts = key.split('|');
-  return { source: parts[0], model: parts[1], project: parts.slice(2, -2).join('|'),
-    hostname: parts.at(-2), bucketStart: parts.at(-1) };
-}
-
-export function chooseMagpieStartAt(state, { daemonInstalled, surface, now = Date.now() }) {
-  if (daemonInstalled && surface !== 'daemon') return undefined;
-  if (state.identityChanged) return new Date((Math.floor(now / HALF_HOUR_MS) + 1) * HALF_HOUR_MS).toISOString();
-  let latest = -Infinity;
-  for (const key of Object.keys(state.buckets)) {
-    const row = splitKey(key);
-    if (MAGPIE_SOURCES.has(row.source)) latest = Math.max(latest, Date.parse(row.bucketStart) || -Infinity);
-  }
-  return Number.isFinite(latest) ? new Date(latest + HALF_HOUR_MS).toISOString() : 'none';
+// The selection rule is shared with the Codex Ultrafast cut: cut-start.js.
+export function chooseMagpieStartAt(state, options) {
+  return chooseCutStartAt(state, MAGPIE_SOURCES, options);
 }
 
 const coordinate = b => `${b.source}|${b.project}|${b.hostname}|${b.bucketStart}`;

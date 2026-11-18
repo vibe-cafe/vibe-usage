@@ -322,7 +322,7 @@ async function runSyncChild({ handler, parsers, env = {} }) {
 }
 
 function settingsOk(req, res) {
-  if (req.method === 'GET' && req.url === '/api/usage/settings') {
+  if (req.method === 'GET' && req.url.split('?')[0] === '/api/usage/settings') {
     res.writeHead(200, { 'content-type': 'application/json' });
     res.end(JSON.stringify({ uploadProject: true }));
     return true;

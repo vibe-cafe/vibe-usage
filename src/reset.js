@@ -85,6 +85,9 @@ export async function runReset(args = [], deps = {}) {
   // item against state.json and uploads zero bytes — the deleted data would
   // never come back.
   clearState();
+  // The Codex Ultrafast cut is not cleared here: it lives on the server, and
+  // the delete above already rewound it (to "all history") in the same
+  // transaction that removed the rows -- only when that delete succeeded.
   if (config.magpieStartAt !== undefined) {
     delete config.magpieStartAt;
     saveConfig(config);

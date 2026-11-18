@@ -67,7 +67,7 @@ test('WorkBuddy sync uploads routed-model buckets and session metadata once', as
   const received = [];
   try {
     await withServer((req, res) => {
-      if (req.method === 'GET' && req.url === '/api/usage/settings') {
+      if (req.method === 'GET' && req.url.split('?')[0] === '/api/usage/settings') {
         res.writeHead(200, { 'content-type': 'application/json' });
         res.end(JSON.stringify({ uploadProject: true }));
         return;

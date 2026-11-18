@@ -140,7 +140,7 @@ test('real gzip sync preserves mixed history, retries post-cut Kiki, and leaves 
   const received = [];
   let failKiki = false;
   const server = createServer((req, res) => {
-    if (req.url === '/api/usage/settings') { res.end(JSON.stringify({ uploadProject: true })); return; }
+    if (req.url.split('?')[0] === '/api/usage/settings') { res.end(JSON.stringify({ uploadProject: true })); return; }
     const chunks = [];
     req.on('data', chunk => chunks.push(chunk));
     req.on('end', () => {
@@ -221,7 +221,7 @@ test('an unreadable Kiki root skips with a warning and preserves prior kiki stat
   const priorKey = bucketKey(bucket('kiki', oldTime, 13));
   writeFileSync(join(stateDir, 'state.json'), JSON.stringify({ buckets: { [priorKey]: 'prior-hash' }, sessions: {} }));
   const server = createServer((req, res) => {
-    if (req.url === '/api/usage/settings') { res.end(JSON.stringify({ uploadProject: true })); return; }
+    if (req.url.split('?')[0] === '/api/usage/settings') { res.end(JSON.stringify({ uploadProject: true })); return; }
     const chunks = [];
     req.on('data', chunk => chunks.push(chunk));
     req.on('end', () => { res.end(JSON.stringify({ ingested: 0, sessions: 0 })); });
@@ -274,7 +274,7 @@ test('clearing kikiStartAt re-admits withheld pre-cut history and a different cu
   mkdirSync(join(kimiHome, 'sessions'), { recursive: true });
   const received = [];
   const server = createServer((req, res) => {
-    if (req.url === '/api/usage/settings') { res.end(JSON.stringify({ uploadProject: true })); return; }
+    if (req.url.split('?')[0] === '/api/usage/settings') { res.end(JSON.stringify({ uploadProject: true })); return; }
     const chunks = [];
     req.on('data', chunk => chunks.push(chunk));
     req.on('end', () => {
@@ -349,7 +349,7 @@ test('re-running init keeps kikiStartAt, so Kiki is neither paused nor re-upload
   writeFileSync(join(stateDir, 'state.json'), JSON.stringify({ buckets: { [collectorKey]: 'collector-hash' }, sessions: {} }));
   const received = [];
   const server = createServer((req, res) => {
-    if (req.url === '/api/usage/settings') { res.end(JSON.stringify({ uploadProject: true })); return; }
+    if (req.url.split('?')[0] === '/api/usage/settings') { res.end(JSON.stringify({ uploadProject: true })); return; }
     if (req.method === 'GET') { res.end('{}'); return; }
     const chunks = [];
     req.on('data', chunk => chunks.push(chunk));

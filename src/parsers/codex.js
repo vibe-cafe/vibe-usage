@@ -25,20 +25,29 @@ import {
   fileSignature,
   loadCodexFileCache,
   loadCodexFileTail,
+  loadOlderCodexFileCache,
   saveCodexFileCache,
   saveCodexFileTail,
 } from './codex-cache.js';
+import { codexUltrafastModel, codexUltrafastStartMs } from '../codex-ultrafast.js';
 
 // Changing a model id changes its server-side bucket key. Keep pre-release
 // history byte-for-byte stable so upgrading cannot re-upload the same tokens
 // under tier-decorated keys and double-count them.
 const CODEX_SERVICE_TIER_ATTRIBUTION_START_MS = Date.parse('2026-08-31T00:00:00.000Z');
 
+const CODEX_ULTRAFAST_TIER = 'ultrafast';
+
 function normalizeCodexServiceTier(value) {
   if (typeof value !== 'string') return null;
   const tier = value.trim().toLowerCase();
   if (tier === 'fast' || tier === 'priority') return tier;
   if (tier === 'flex' || tier === 'batch') return tier;
+  // Recognized, but never appended here: Ultrafast has no fixed start date. It
+  // is named from the machine's own cut when results are assembled (see
+  // ../codex-ultrafast.js), so the caches below keep it as raw, undecorated
+  // usage next to the plain model's buckets.
+  if (tier === CODEX_ULTRAFAST_TIER) return tier;
   return null;
 }
 
@@ -628,6 +637,7 @@ async function parseSessionFile(filePath, snapshotSize, fm, boundary, {
   lines = null,
 } = {}) {
   const entries = [];
+  const ultrafastEntries = [];
   const magpieEntries = [...(previousTail?.magpieEntries || [])];
   const sessionEvents = [];
   let rawTokenSeen = previousTail?.rawTokenSeen || 0;
@@ -787,7 +797,8 @@ async function parseSessionFile(filePath, snapshotSize, fm, boundary, {
       const rawModel = info.model || payload.model || segmentContext?.model || turnContextModel || 'unknown';
       const effectiveTier = Object.hasOwn(segmentContext || {}, 'serviceTier')
         ? normalizeCodexServiceTier(segmentContext.serviceTier) : serviceTier;
-      const model = decorateCodexModel(rawModel, effectiveTier, timestamp.getTime());
+      const isUltrafast = effectiveTier === CODEX_ULTRAFAST_TIER;
+      const model = decorateCodexModel(rawModel, isUltrafast ? null : effectiveTier, timestamp.getTime());
 
         // OpenAI API: input_tokens INCLUDES cached, output_tokens INCLUDES reasoning.
         // Normalize to Anthropic-style semantics where each field is non-overlapping.
@@ -808,7 +819,8 @@ async function parseSessionFile(filePath, snapshotSize, fm, boundary, {
         // ledger are evaluated only after all cached/raw results are assembled.
         magpieEntries.push({ ...entry, magpie: { responseId: payload.response_id,
           counts: [usage.input_tokens || 0, usage.output_tokens || 0, cachedInput] } });
-      } else entries.push(entry);
+      } else if (isUltrafast && model !== 'unknown') ultrafastEntries.push(entry);
+      else entries.push(entry);
     } catch {
       continue;
     }
@@ -828,6 +840,13 @@ async function parseSessionFile(filePath, snapshotSize, fm, boundary, {
     previousTail?.buckets || [],
     aggregateToBuckets(entries),
   ]);
+  // Ultrafast usage under the raw model name, one bucket per window. Always an
+  // array, even when empty: its presence is what marks a summary as written by
+  // algorithm 7 (see summaryMatchesCut()).
+  const ultrafastBuckets = mergeBucketLists([
+    previousTail?.ultrafastBuckets || [],
+    aggregateToBuckets(ultrafastEntries),
+  ]);
   const sessionAccumulator = buildSessionAccumulator(
     sessionEvents,
     previousTail?.sessionAccumulator || null
@@ -839,7 +858,7 @@ async function parseSessionFile(filePath, snapshotSize, fm, boundary, {
     return parseSessionFile(filePath, snapshotSize, fm, boundary, { captureTail });
   }
   const session = sessionFromAccumulator(sessionAccumulator);
-  const result = { buckets, magpieEntries, sessions: session ? [session] : [] };
+  const result = { buckets, ultrafastBuckets, magpieEntries, sessions: session ? [session] : [] };
   if (captureTail) {
     const guard = snapshotGuard(filePath, snapshotSize);
     result.tail = {
@@ -854,6 +873,7 @@ async function parseSessionFile(filePath, snapshotSize, fm, boundary, {
       prevRecordTotal,
       pendingUsageMirror,
       buckets,
+      ultrafastBuckets,
       magpieEntries,
       sessionAccumulator,
       guardHash: guard.hash,
@@ -863,24 +883,75 @@ async function parseSessionFile(filePath, snapshotSize, fm, boundary, {
   return result;
 }
 
-function mergeFileResults(results, magpie) {
+// A summary written before algorithm 7 has no `ultrafastBuckets`: its Ultrafast
+// usage is folded into the plain model's buckets. That is the merged format,
+// which is still the right output for every window before the cut -- all of
+// them while the machine has no cut. Only a summary with a window at or after
+// the cut has to be rebuilt from the rollout.
+function summaryMatchesCut(result, ultrafastStartMs) {
+  if (Array.isArray(result.ultrafastBuckets)) return true;
+  if (ultrafastStartMs === null) return true;
+  return (result.buckets || []).every(bucket => Date.parse(bucket.bucketStart) < ultrafastStartMs);
+}
+
+// An older version's summary may stand in only when it is exact under the cut.
+function usableOlderSummary(codexHome, filePath, signature, cacheOptions, ultrafastStartMs) {
+  const older = loadOlderCodexFileCache(codexHome, filePath, signature, cacheOptions);
+  return older?.result && summaryMatchesCut(older.result, ultrafastStartMs) ? older : null;
+}
+
+/**
+ * What a rollout's parse starts from. In this order, and the order matters:
+ *
+ *   1. this version's finished summary for exactly this file state;
+ *   2. this version's append tail -- the file grew since we last read it;
+ *   3. an older version's summary for exactly this file state, if it is exact
+ *      under the current cut;
+ *   4. nothing: the rollout is read from the start.
+ *
+ * Our own state always comes first. An older collector that is still running
+ * (a daemon not yet restarted, a desktop app on its cached CLI) rewrites its
+ * summary after every append, so it nearly always has one for the current file
+ * state. Looking there before step 2 let that summary shadow our tail; once the
+ * machine has a cut the summary is then rejected (it folds Ultrafast into the
+ * plain model in post-cut windows), and with the tail never loaded the rollout
+ * was parsed from the first byte on every run.
+ */
+function startingCache(file, cacheOptions, ultrafastStartMs) {
+  const own = loadCodexFileCache(file.codexHome, file.filePath, file.signature);
+  file.cache = own;
+  file.priorCache = own;
+  if (own?.result) return;
+  file.priorCache = own || loadCodexFileCache(file.codexHome, file.filePath);
+  file.priorTail = loadCodexFileTail(file.codexHome, file.filePath);
+  if (file.priorCache) file.appendTail = tailStateFor(file);
+  if (file.appendTail) return;
+  const older = usableOlderSummary(file.codexHome, file.filePath, file.signature, cacheOptions, ultrafastStartMs);
+  if (older) file.cache = older;
+}
+
+function mergeFileResults(results, magpie, ultrafastStartMs = null) {
   const entries = [];
   const magpieEntries = [];
   const sessions = [];
+  const toEntry = (bucket, model) => ({
+    source: bucket.source,
+    model,
+    project: bucket.project,
+    ...(bucket.hostname ? { hostname: bucket.hostname } : {}),
+    timestamp: new Date(bucket.bucketStart),
+    inputTokens: bucket.inputTokens,
+    outputTokens: bucket.outputTokens,
+    cachedInputTokens: bucket.cachedInputTokens,
+    reasoningOutputTokens: bucket.reasoningOutputTokens,
+  });
   for (const result of results) {
     for (const entry of result.magpieEntries || []) magpieEntries.push(entry);
-    for (const bucket of result.buckets || []) {
-      entries.push({
-        source: bucket.source,
-        model: bucket.model,
-        project: bucket.project,
-        ...(bucket.hostname ? { hostname: bucket.hostname } : {}),
-        timestamp: new Date(bucket.bucketStart),
-        inputTokens: bucket.inputTokens,
-        outputTokens: bucket.outputTokens,
-        cachedInputTokens: bucket.cachedInputTokens,
-        reasoningOutputTokens: bucket.reasoningOutputTokens,
-      });
+    for (const bucket of result.buckets || []) entries.push(toEntry(bucket, bucket.model));
+    // Before the cut the name is unchanged, so these tokens sum into the plain
+    // model's bucket exactly as they did when the parser never told them apart.
+    for (const bucket of result.ultrafastBuckets || []) {
+      entries.push(toEntry(bucket, codexUltrafastModel(bucket.model, bucket.bucketStart, ultrafastStartMs)));
     }
     for (const session of result.sessions || []) sessions.push(session);
   }
@@ -888,7 +959,9 @@ function mergeFileResults(results, magpie) {
   return { buckets: aggregateToBuckets(entries), sessions };
 }
 
-async function parseNativeCodex({ codexExtraHome, extraRoots = [], magpie } = {}) {
+async function parseNativeCodex({ codexExtraHome, extraRoots = [], magpie, codexUltrafastStartAt } = {}) {
+  // null: this machine has no Ultrafast cut, every window keeps the merged format.
+  const ultrafastStartMs = codexUltrafastStartMs(codexUltrafastStartAt);
   let extraCodexHomePath = null;
   if (codexExtraHome?.trim()) {
     const validation = validateExtraCodexHome(codexExtraHome);
@@ -962,22 +1035,19 @@ async function parseNativeCodex({ codexExtraHome, extraRoots = [], magpie } = {}
         const stat = statSync(filePath);
         if (stat.size <= 0) continue;
         const signature = fileSignature(stat);
-        const cache = loadCodexFileCache(codexHome, filePath, signature, cacheOptions);
-        const priorCache = cache || loadCodexFileCache(codexHome, filePath, undefined, cacheOptions);
-        const priorTail = cache ? null : loadCodexFileTail(codexHome, filePath, cacheOptions);
         const file = {
           codexHome,
           filePath,
           strict,
           snapshotSize: stat.size,
           signature,
-          cache,
-          priorCache,
-          priorTail,
+          cache: null,
+          priorCache: null,
+          priorTail: null,
           header: null,
           appendTail: null,
         };
-        if (!cache && priorCache) file.appendTail = tailStateFor(file);
+        startingCache(file, cacheOptions, ultrafastStartMs);
         files.push(file);
       } catch (err) {
         // The file may move to archived_sessions between discovery and stat.
@@ -1114,8 +1184,13 @@ async function parseNativeCodex({ codexExtraHome, extraRoots = [], magpie } = {}
     const selected = members[0];
     const filePath = `${selected.codexHome}/.vibe-usage-session-${createHash('sha256').update(id).digest('hex')}`;
     const signature = codexSegmentSignature(members);
-    let cache = members.some(file => auditPaths.has(file.filePath)) ? null
-      : loadCodexFileCache(selected.codexHome, filePath, signature, cacheOptions);
+    // Same order as startingCache(), without step 2: a group has no append tail.
+    let cache = null;
+    if (!members.some(file => auditPaths.has(file.filePath))) {
+      const own = loadCodexFileCache(selected.codexHome, filePath, signature);
+      cache = own?.result ? own
+        : usableOlderSummary(selected.codexHome, filePath, signature, cacheOptions, ultrafastStartMs) || own;
+    }
     if (cache?.result && !groupAudited && auditPaths.size === 0
       && signature.size <= auditMaxBytes()
       && (cache.lastAuditedAt || 0) <= Date.now() - auditIntervalMs()) {
@@ -1170,6 +1245,7 @@ async function parseNativeCodex({ codexExtraHome, extraRoots = [], magpie } = {}
       : { rawTokenCount: 0, recordIndex: null };
     const key = boundaryKey(boundary);
     let result = !auditPaths.has(file.filePath) && file.cache?.result?.boundaryKey === key
+      && summaryMatchesCut(file.cache.result, ultrafastStartMs)
       ? file.cache.result
       : null;
     if (result) {
@@ -1216,7 +1292,7 @@ async function parseNativeCodex({ codexExtraHome, extraRoots = [], magpie } = {}
     }
   }
 
-  return { ...mergeFileResults(results, magpie), cache: cacheStats };
+  return { ...mergeFileResults(results, magpie, ultrafastStartMs), cache: cacheStats };
 }
 
 function sameRequestUsage(left, right) {

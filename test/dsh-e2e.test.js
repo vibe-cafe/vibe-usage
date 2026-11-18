@@ -21,7 +21,7 @@ test('DSH sync backfills V3 usage without reset, preserves privacy, and protects
   const received = [];
   const server = createServer((req, res) => {
     res.setHeader('content-type', 'application/json');
-    if (req.method === 'GET' && req.url === '/api/usage/settings') {
+    if (req.method === 'GET' && req.url.split('?')[0] === '/api/usage/settings') {
       res.end(JSON.stringify({ uploadProject: false }));
     } else if (req.method === 'POST' && req.url === '/api/usage/ingest') {
       const chunks = [];

@@ -5,7 +5,7 @@ import {
   loadState, saveState, pruneState, stateIdentity,
   bucketKey, bucketHash, sessionKey, sessionHash,
 } from './state.js';
-import { ingest, fetchSettings } from './api.js';
+import { ingest, fetchSettings, registerCodexUltrafastStart } from './api.js';
 import { createSyncClient, forBatch } from './client-meta.js';
 import { parsers } from './parsers/index.js';
 import { aggregateToBuckets } from './parsers/aggregate.js';
@@ -15,6 +15,11 @@ import { planKikiMigration } from './kiki-migration.js';
 import { MAGPIE_SOURCES, chooseMagpieStartAt, planMagpieMigration } from './magpie-migration.js';
 import { createMagpieContext } from './parsers/magpie.js';
 import { isDaemonInstalled } from './daemon-service.js';
+import {
+  CODEX_ULTRAFAST_ALL_HISTORY, CODEX_ULTRAFAST_HOLD_FAILURE, CODEX_ULTRAFAST_HOLD_WARNING,
+  proposeCodexUltrafastStart, resolveCodexUltrafastCut,
+} from './codex-ultrafast.js';
+import { findCodexDataDirs } from './tools.js';
 import { success, failure, warn, arrow, link, dim, liveStatus } from './output.js';
 import { beginSyncRecord, syncFailureFromError } from './sync-history.js';
 import { classifyParserError, countWarningCodes } from './warning-codes.js';
@@ -275,6 +280,15 @@ async function runSyncPasses({
   // Resolve it before parsing or loading upload state so failure is a true
   // no-op: no data upload and no state mutation.
   const apiUrl = config.apiUrl || 'https://vibecafe.ai';
+  // The stable upload hostname, captured once (see AGENTS.md "Stable
+  // hostname"). Resolved before the settings request because the server keys
+  // this machine's Codex Ultrafast cut by it.
+  let host = config.hostname;
+  if (!host) {
+    host = osHostname().replace(/\.local$/, '');
+    config.hostname = host;
+    saveConfig(config);
+  }
   // state.json records what was already uploaded to *this* account on *this*
   // server. Passing the identity into loadState() makes state left by a
   // previous account fall away, so a re-bind re-uploads the local history
@@ -290,9 +304,13 @@ async function runSyncPasses({
   const status = liveStatus({ enabled: !quiet });
   status.start(elapsedMs => `正在读取上传设置${phaseElapsed(elapsedMs)}`);
   let uploadProject;
+  // The settings response of this very sync, or null when the cached privacy
+  // choice below stands in for it.
+  let confirmedSettings = null;
   try {
-    const settings = await fetchSettings(apiUrl, config.apiKey);
+    const settings = await fetchSettings(apiUrl, config.apiKey, { hostname: host });
     uploadProject = resolveUploadProjectSetting(settings);
+    confirmedSettings = settings;
     // Scope the cached privacy choice to the server that returned it. Reusing
     // the value after `apiUrl` changes could expose project names to a
     // different server during its first settings outage.
@@ -330,10 +348,14 @@ async function runSyncPasses({
   // diagnostics (Cursor uses the last event time to gate its events fallback
   // and avoid re-uploading already-known history under a different model id).
   const state = loadState(identity);
+  // Asked by both cut rules below, at most once per sync and only if one of
+  // them needs it: on Windows the answer is a PowerShell call.
+  let daemonInstalledAnswer;
+  const daemonInstalled = () => (daemonInstalledAnswer ??= isDaemonInstalled());
   const magpie = createMagpieContext({
     startAt: config.magpieStartAt,
     onPossible() {
-      const startAt = chooseMagpieStartAt(state, { daemonInstalled: isDaemonInstalled(), surface });
+      const startAt = chooseMagpieStartAt(state, { daemonInstalled: daemonInstalled(), surface });
       if (startAt !== undefined) {
         config.magpieStartAt = startAt;
         saveConfig(config);
@@ -343,6 +365,59 @@ async function runSyncPasses({
     },
   });
   magpie.discover();
+
+  // Which format this sync's Codex buckets take (codex-ultrafast.js): the
+  // machine's registered cut, no cut yet, or -- when the server gave no answer
+  // -- no Codex upload at all this run.
+  const codexHome = resolveCodexExtraHome(config.codexExtraHome, codexExtraHome);
+  const codexUltrafast = await resolveCodexUltrafastCut({
+    settings: confirmedSettings,
+    propose: () => proposeCodexUltrafastStart(state, {
+      daemonInstalled: surface === 'daemon' || daemonInstalled(), surface,
+    }),
+    register: proposedStartAt => registerCodexUltrafastStart(apiUrl, config.apiKey, {
+      hostname: host,
+      proposedStartAt,
+      client: createSyncClient({ defaultSurface: surface, hostname: host }),
+    }),
+  });
+  if (codexUltrafast.registered) {
+    const scope = codexUltrafast.startAt === CODEX_ULTRAFAST_ALL_HISTORY
+      ? '全部本地历史的 Ultrafast 用量单独计价'
+      : `${codexUltrafast.startAt} 之前保持原名，之后的 Ultrafast 用量单独计价`;
+    process.stderr.write(`${dim(`  codex: 已登记这台设备的 Ultrafast 档位起点，${scope}。`)}\n`);
+  }
+  // Set when the Codex parser's turn comes and it is skipped for want of an
+  // answer. A machine without Codex has nothing held: no warning, no failed sync.
+  let codexHeld = false;
+  // Skipped, not empty: the source's upload state must survive the pause.
+  const heldCodexResult = () => {
+    codexHeld = Object.keys(state.buckets).some(key => key.startsWith('codex|'))
+      || findCodexDataDirs(codexHome, extraRootList(config.extraRoots?.codex)).length > 0;
+    return {
+      buckets: [],
+      sessions: [],
+      skipped: true,
+      warnings: codexHeld ? [CODEX_ULTRAFAST_HOLD_WARNING] : [],
+    };
+  };
+  // A held Codex must not end as a successful sync. Both desktop apps show only
+  // stdout when the exit code is 0, so "已同步 1 buckets" from another tool would
+  // hide that Codex stopped uploading -- for as long as the server stays silent.
+  // Once every other tool has been synced, report it the way a failed second
+  // pass is reported (#131): one stderr line, the last one, naming what did
+  // upload; exit code 1; a fixed code in the sync history.
+  const finishPasses = (ingested) => {
+    if (!codexHeld) return ingested;
+    console.error(failure(uploadedAnything()
+      ? `${partialLabel()}: ${CODEX_ULTRAFAST_HOLD_FAILURE}`
+      : `同步未完成: ${CODEX_ULTRAFAST_HOLD_FAILURE}`));
+    record.finish({ failure: { code: 'codex_held' } });
+    const err = new Error('CODEX_HELD');
+    err.code = 'CODEX_HELD';
+    if (throws) throw err;
+    process.exit(1);
+  };
 
   // A sync may run as two passes (see below); these lines print once, and
   // the upload client (one syncId per runSync) is created once.
@@ -376,12 +451,14 @@ async function runSyncPasses({
   let parsedSources = 0;
   const runParser = async ([source, parse]) => {
     try {
+      if (source === 'codex' && codexUltrafast.hold) return { source, result: heldCodexResult() };
       const result = await parse({
         extraRoots: extraRootList(config.extraRoots?.[source]),
         previousInfo: state.parserMeta?.[source],
         magpie,
         ...(source === 'codex' ? {
-          codexExtraHome: resolveCodexExtraHome(config.codexExtraHome, codexExtraHome),
+          codexExtraHome: codexHome,
+          codexUltrafastStartAt: codexUltrafast.startAt,
         } : {}),
       });
       return { source, result };
@@ -415,7 +492,7 @@ async function runSyncPasses({
   if (deferredSettled) {
     const bySource = new Map([...localOutcomes, ...await deferredOutcomes].map(o => [o.source, o]));
     status.stop();
-    return syncOutcomes(parserRegistry.map(([source]) => bySource.get(source)));
+    return finishPasses(await syncOutcomes(parserRegistry.map(([source]) => bySource.get(source))));
   }
 
   // Still downloading (a first whole-account Cursor export can take minutes,
@@ -432,7 +509,7 @@ async function runSyncPasses({
   status.start(elapsedMs => `正在等待 ${pendingSources}${phaseElapsed(elapsedMs)}`);
   const lateOutcomes = await deferredOutcomes;
   status.stop();
-  return firstPassIngested + await syncOutcomes(lateOutcomes);
+  return finishPasses(firstPassIngested + await syncOutcomes(lateOutcomes));
 
   // One diff-and-upload pass over a set of parser outcomes. `final` is false
   // only for the first of two passes (see above): that pass stays quiet about
@@ -548,12 +625,6 @@ async function runSyncPasses({
       }
     }
 
-    let host = config.hostname;
-    if (!host) {
-      host = osHostname().replace(/\.local$/, '');
-      config.hostname = host;
-      saveConfig(config);
-    }
     // Cloud-sourced parsers (e.g. cursor) pre-set their own hostname sentinel so
     // the same account data isn't stored as separate rows per machine.
     for (const b of allBuckets) if (!b.hostname) b.hostname = host;
@@ -723,12 +794,19 @@ async function runSyncPasses({
     let totalDroppedUnknownModels = 0;
     let totalDroppedImplausible = 0;
     let totalProtectedBuckets = 0;
+    let totalRejectedBuckets = 0;
+    const rejectedSources = new Set();
     const droppedSources = new Set();
     const bucketBatches = Math.ceil(allBucketsToSend.length / BATCH_SIZE);
     const sessionBatches = Math.ceil(allSessionsToSend.length / SESSION_BATCH_SIZE);
     const totalBatches = Math.max(bucketBatches, sessionBatches, 1);
     // One syncId per runSync, shared by both passes.
-    syncClient ??= createSyncClient({ defaultSurface: surface, hostname: host });
+    syncClient ??= createSyncClient({
+      defaultSurface: surface,
+      hostname: host,
+      // Declared on every batch; undefined (no Codex in this sync) sends nothing.
+      codexUltrafastStartAt: codexUltrafast.hold ? undefined : codexUltrafast.startAt,
+    });
 
     // Say up front how much is about to go up. A first sync (or one that
     // backfills after a parser was broken) can be thousands of batches, and with
@@ -775,6 +853,16 @@ async function runSyncPasses({
         uploadedSoFar.buckets += result.ingested ?? batch.length;
         uploadedSoFar.sessions += result.sessions ?? 0;
         const batchUnknownSources = new Set(result.dropped?.unknownSources || []);
+        // The server refused rows of these sources because this sync's Codex
+        // Ultrafast cut is not the one it has registered (another collector
+        // registered it meanwhile, or a reset rewound it). Nothing of theirs
+        // from this batch is recorded as uploaded; the next sync reads the cut
+        // again and re-sends them in the matching format.
+        const batchRejectedSources = new Set(result.rejected?.sources || []);
+        if (batchRejectedSources.size > 0) {
+          totalRejectedBuckets += Number(result.rejected.buckets) || 0;
+          for (const s of batchRejectedSources) rejectedSources.add(s);
+        }
         if (result.dropped) {
           totalDroppedBuckets += Number(result.dropped.buckets) || 0;
           totalDroppedUnknownModels += Number(result.dropped.unknownModels) || 0;
@@ -795,6 +883,7 @@ async function runSyncPasses({
             record.noteServerDropped(b.source, 1);
             continue;
           }
+          if (batchRejectedSources.has(b.source)) continue;
           const key = bucketKey(b);
           const entry = pendingBucketState.get(key);
           if (entry) {
@@ -848,6 +937,12 @@ async function runSyncPasses({
 
       if (totalProtectedBuckets > 0) {
         console.log(dim(`  服务端保留了 ${totalProtectedBuckets} 个更大的已有 bucket（本次较小快照未覆盖）`));
+      }
+
+      // stderr, quiet runs included: the daemon log is the only trail.
+      if (totalRejectedBuckets > 0) {
+        for (const source of rejectedSources) record.noteWarning(source, 'upload_withheld');
+        process.stderr.write(`${dim(`  ${[...rejectedSources].sort().join(', ')}: 服务端登记的 Ultrafast 档位起点与本次同步不一致，${totalRejectedBuckets} 个 bucket 未上传，下次同步按新起点自动重传。`)}\n`);
       }
 
       if (!quiet && totalSessionsSynced > 0) {

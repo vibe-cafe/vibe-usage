@@ -392,7 +392,7 @@ test('Kilo real parser sync is idempotent and a later failed parse preserves upl
   for (const p of [config, state, home]) mkdirSync(p);
   const requests = [];
   const server = createServer((req, res) => {
-    if (req.url === '/api/usage/settings') {
+    if (req.url.split('?')[0] === '/api/usage/settings') {
       res.writeHead(200, { 'content-type': 'application/json' });
       res.end(JSON.stringify({ uploadProject: false }));
       return;

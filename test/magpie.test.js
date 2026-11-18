@@ -215,8 +215,13 @@ test('Codex cache hits and append tails keep raw ids/models and reapply attribut
   const appended = await codex({ magpie: context() });
   assert.equal(appended.cache.tailHits, 1);
   assert.equal(appended.buckets[0].inputTokens, 220);
-  for (const dir of readdirSync(f.paths.cache + '/codex')) for (const file of readdirSync(join(f.paths.cache, 'codex', dir))) {
-    const text = readFileSync(join(f.paths.cache, 'codex', dir, file), 'utf8');
+  // Every cache file, wherever the current algorithm keeps them below cache/codex.
+  const cacheFiles = dir => readdirSync(dir, { withFileTypes: true }).flatMap(entry => (
+    entry.isDirectory() ? cacheFiles(join(dir, entry.name)) : [join(dir, entry.name)]));
+  const files = cacheFiles(join(f.paths.cache, 'codex'));
+  assert.ok(files.length > 0);
+  for (const file of files) {
+    const text = readFileSync(file, 'utf8');
     assert.doesNotMatch(text, /magpie\/deepseek/);
     if (text.includes('magpieEntries')) assert.match(text, /response-1/);
   }

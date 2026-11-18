@@ -14,18 +14,43 @@ import { join } from 'node:path';
 // separate from ~/.vibe-usage/state.json, whose hashes are the authoritative
 // record of successful uploads and must remain backward-compatible.
 export const CODEX_CACHE_SCHEMA_VERSION = 1;
-export const CODEX_PARSER_ALGORITHM_VERSION = 6;
+export const CODEX_PARSER_ALGORITHM_VERSION = 7;
+// Version 7 keeps Codex Ultrafast usage apart from the plain model's buckets
+// (`result.ultrafastBuckets`, raw model name) so the per-machine cut can name it
+// when results are assembled; a tail also carries the raw `ultrafast` tier.
+//
+// Version 7 writes into its own directory (`codexCacheDir()`, a `v7` folder
+// inside the per-home directory older versions use) and never touches the files
+// of an older version. One directory shared by two versions is how 0.14.8
+// stopped Codex uploads: a daemon started before an upgrade keeps running the
+// old parser for days, and when both wrote `<file>.json` each overwrote the
+// other's entry and append tail, so a rollout that was still growing was read
+// from the first byte by both, every run. With a few long sessions open neither
+// side finished inside its work budget and Codex never uploaded. Now the old
+// collector keeps resuming from its own tails, and this version reads a growing
+// rollout from the start once and resumes from its own tail afterwards.
+//
+// Entries of the older versions are still *read*, from where those versions
+// keep them, so upgrading does not re-read a large history:
+//   - A version-6 summary folds Ultrafast usage into the plain model -- exactly
+//     the merged format every window before the cut keeps -- so codex.js uses it
+//     wherever it has no window at or after the cut and reads the rollout
+//     otherwise (`summaryMatchesCut()`).
+//   - A version-5 summary additionally requires that Magpie was never active.
+//   - Only for the rollout's current stat signature, and only when this
+//     version has nothing of its own to start from (codex.js `startingCache()`).
+//     An older tail is never resumed: it stored the Ultrafast tier as "no
+//     tier", so continuing from it would file the rest of the session under
+//     the plain model.
+const MERGED_ULTRAFAST_SUMMARY_ALGORITHM_VERSIONS = new Set([6]);
 // Version 6 (#143) only started keeping raw Magpie attribution data (the
 // session's model provider and per-response ids). Where Magpie has never been
 // active (no ledger, no cut), attribution is a no-op and a version-5 entry
-// yields exactly the same buckets and sessions. Accepting it there avoids
-// re-reading every rollout: 0.14.8 discarded all version-5 entries, and on a
-// large history the desktop apps killed sync at 120s on every run until the
-// rebuild finished. Magpie machines still rebuild so attribution stays exact.
+// yields exactly the same buckets and sessions.
 const MAGPIE_FREE_COMPATIBLE_ALGORITHM_VERSIONS = new Set([5]);
 
-function acceptedAlgorithm(version, magpieFree) {
-  return version === CODEX_PARSER_ALGORITHM_VERSION
+function acceptedOlderSummaryAlgorithm(version, magpieFree) {
+  return MERGED_ULTRAFAST_SUMMARY_ALGORITHM_VERSIONS.has(version)
     || (magpieFree === true && MAGPIE_FREE_COMPATIBLE_ALGORITHM_VERSIONS.has(version));
 }
 
@@ -53,35 +78,69 @@ function sameSignature(a, b) {
     && a?.ino === b.ino;
 }
 
-export function codexCacheDir(codexHome) {
+/** Where versions up to 6 keep their entries. Read-only for this version. */
+export function olderCodexCacheDir(codexHome) {
   const base = process.env.VIBE_USAGE_CACHE_DIR?.trim()
     || join(homedir(), '.vibe-usage', 'cache');
   return join(base, 'codex', `root-${hash(codexHome)}`);
+}
+
+/** Where this version reads and writes its own entries. */
+export function codexCacheDir(codexHome) {
+  return join(olderCodexCacheDir(codexHome), `v${CODEX_PARSER_ALGORITHM_VERSION}`);
 }
 
 function entryPath(codexHome, filePath) {
   return join(codexCacheDir(codexHome), `${hash(filePath, 32)}.json`);
 }
 
+function olderEntryPath(codexHome, filePath) {
+  return join(olderCodexCacheDir(codexHome), `${hash(filePath, 32)}.json`);
+}
+
 function tailPath(codexHome, filePath) {
   return join(codexCacheDir(codexHome), `${hash(filePath, 32)}.tail.json`);
 }
 
-export function loadCodexFileCache(codexHome, filePath, signature, { magpieFree = false } = {}) {
-  if (!codexCacheEnabled()) return null;
-  const path = entryPath(codexHome, filePath);
+function readSummary(path, filePath, acceptsAlgorithm) {
   if (!existsSync(path)) return null;
   try {
     const parsed = JSON.parse(readFileSync(path, 'utf8'));
     if (parsed.schemaVersion !== CODEX_CACHE_SCHEMA_VERSION) return null;
-    if (!acceptedAlgorithm(parsed.algorithmVersion, magpieFree)) return null;
+    if (!acceptsAlgorithm(parsed.algorithmVersion)) return null;
     if (parsed.filePath !== filePath) return null;
-    if (signature && !sameSignature(parsed.signature, signature)) return null;
     return parsed;
   } catch {
     // Cache corruption is a performance miss, never a correctness failure.
     return null;
   }
+}
+
+/**
+ * This version's own summary for a rollout. With a signature, only the entry
+ * for exactly that file state; without one, whatever state was summarized last
+ * (the "what did we know before this file grew" lookup that pairs with
+ * `loadCodexFileTail()`).
+ */
+export function loadCodexFileCache(codexHome, filePath, signature) {
+  if (!codexCacheEnabled()) return null;
+  const own = readSummary(entryPath(codexHome, filePath), filePath,
+    version => version === CODEX_PARSER_ALGORITHM_VERSION);
+  return own && (!signature || sameSignature(own.signature, signature)) ? own : null;
+}
+
+/**
+ * An older version's summary for exactly this file state, from where that
+ * version keeps it. A fallback only: the caller decides whether it is exact
+ * under the current Ultrafast cut, and must look at its own entries first --
+ * an older collector that is still running refreshes this file after every
+ * append, so preferring it would shadow this version's own append tail.
+ */
+export function loadOlderCodexFileCache(codexHome, filePath, signature, { magpieFree = false } = {}) {
+  if (!codexCacheEnabled() || !signature) return null;
+  const older = readSummary(olderEntryPath(codexHome, filePath), filePath,
+    version => acceptedOlderSummaryAlgorithm(version, magpieFree));
+  return older && sameSignature(older.signature, signature) ? older : null;
 }
 
 export function saveCodexFileCache(codexHome, filePath, signature, data) {
@@ -108,14 +167,14 @@ export function saveCodexFileCache(codexHome, filePath, signature, data) {
   }
 }
 
-export function loadCodexFileTail(codexHome, filePath, { magpieFree = false } = {}) {
+export function loadCodexFileTail(codexHome, filePath) {
   if (!codexCacheEnabled()) return null;
   const path = tailPath(codexHome, filePath);
   if (!existsSync(path)) return null;
   try {
     const parsed = JSON.parse(readFileSync(path, 'utf8'));
     if (parsed.schemaVersion !== CODEX_CACHE_SCHEMA_VERSION) return null;
-    if (!acceptedAlgorithm(parsed.algorithmVersion, magpieFree)) return null;
+    if (parsed.algorithmVersion !== CODEX_PARSER_ALGORITHM_VERSION) return null;
     if (parsed.filePath !== filePath || !parsed.signature || !parsed.tail) return null;
     return parsed;
   } catch {
@@ -144,6 +203,7 @@ export function saveCodexFileTail(codexHome, filePath, signature, tail) {
   }
 }
 
+/** Removes this version's entry only; an older collector's files are not ours to delete. */
 export function removeCodexFileCache(codexHome, filePath) {
   if (!codexCacheEnabled()) return;
   rmSync(entryPath(codexHome, filePath), { force: true });
