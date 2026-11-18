@@ -593,7 +593,10 @@ test('duplicate sessions in two homes: headers and indexes written by algorithm 
   machine.restampOlder(5);
   const first = await machine.newRun(TWO_HOME_CUT);
   assert.equal(first.done, false);
-  assert.match(first.indexing, /^discovery /);
+  // Header discovery reads each copy only up to its first record (it used to
+  // keep reading every file to its end in the background, which this clock
+  // charged as a full read), so the budget runs out in the replay index.
+  assert.match(first.indexing, /^replay-index /);
   // Only the session that exists once: its algorithm-5 summary is usable whole.
   assert.equal(first.result.cache.headerHits, 1);
   assert.equal(first.result.cache.indexHits, 0);
