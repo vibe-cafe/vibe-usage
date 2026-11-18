@@ -25,6 +25,7 @@ import {
   fileSignature,
   loadCodexFileCache,
   loadCodexFileTail,
+  loadOlderCodexFileCache,
   saveCodexFileCache,
   saveCodexFileTail,
 } from './codex-cache.js';
@@ -893,6 +894,42 @@ function summaryMatchesCut(result, ultrafastStartMs) {
   return (result.buckets || []).every(bucket => Date.parse(bucket.bucketStart) < ultrafastStartMs);
 }
 
+// An older version's summary may stand in only when it is exact under the cut.
+function usableOlderSummary(codexHome, filePath, signature, cacheOptions, ultrafastStartMs) {
+  const older = loadOlderCodexFileCache(codexHome, filePath, signature, cacheOptions);
+  return older?.result && summaryMatchesCut(older.result, ultrafastStartMs) ? older : null;
+}
+
+/**
+ * What a rollout's parse starts from. In this order, and the order matters:
+ *
+ *   1. this version's finished summary for exactly this file state;
+ *   2. this version's append tail -- the file grew since we last read it;
+ *   3. an older version's summary for exactly this file state, if it is exact
+ *      under the current cut;
+ *   4. nothing: the rollout is read from the start.
+ *
+ * Our own state always comes first. An older collector that is still running
+ * (a daemon not yet restarted, a desktop app on its cached CLI) rewrites its
+ * summary after every append, so it nearly always has one for the current file
+ * state. Looking there before step 2 let that summary shadow our tail; once the
+ * machine has a cut the summary is then rejected (it folds Ultrafast into the
+ * plain model in post-cut windows), and with the tail never loaded the rollout
+ * was parsed from the first byte on every run.
+ */
+function startingCache(file, cacheOptions, ultrafastStartMs) {
+  const own = loadCodexFileCache(file.codexHome, file.filePath, file.signature);
+  file.cache = own;
+  file.priorCache = own;
+  if (own?.result) return;
+  file.priorCache = own || loadCodexFileCache(file.codexHome, file.filePath);
+  file.priorTail = loadCodexFileTail(file.codexHome, file.filePath);
+  if (file.priorCache) file.appendTail = tailStateFor(file);
+  if (file.appendTail) return;
+  const older = usableOlderSummary(file.codexHome, file.filePath, file.signature, cacheOptions, ultrafastStartMs);
+  if (older) file.cache = older;
+}
+
 function mergeFileResults(results, magpie, ultrafastStartMs = null) {
   const entries = [];
   const magpieEntries = [];
@@ -998,22 +1035,19 @@ async function parseNativeCodex({ codexExtraHome, extraRoots = [], magpie, codex
         const stat = statSync(filePath);
         if (stat.size <= 0) continue;
         const signature = fileSignature(stat);
-        const cache = loadCodexFileCache(codexHome, filePath, signature, cacheOptions);
-        const priorCache = cache || loadCodexFileCache(codexHome, filePath, undefined, cacheOptions);
-        const priorTail = cache ? null : loadCodexFileTail(codexHome, filePath);
         const file = {
           codexHome,
           filePath,
           strict,
           snapshotSize: stat.size,
           signature,
-          cache,
-          priorCache,
-          priorTail,
+          cache: null,
+          priorCache: null,
+          priorTail: null,
           header: null,
           appendTail: null,
         };
-        if (!cache && priorCache) file.appendTail = tailStateFor(file);
+        startingCache(file, cacheOptions, ultrafastStartMs);
         files.push(file);
       } catch (err) {
         // The file may move to archived_sessions between discovery and stat.
@@ -1150,8 +1184,13 @@ async function parseNativeCodex({ codexExtraHome, extraRoots = [], magpie, codex
     const selected = members[0];
     const filePath = `${selected.codexHome}/.vibe-usage-session-${createHash('sha256').update(id).digest('hex')}`;
     const signature = codexSegmentSignature(members);
-    let cache = members.some(file => auditPaths.has(file.filePath)) ? null
-      : loadCodexFileCache(selected.codexHome, filePath, signature, cacheOptions);
+    // Same order as startingCache(), without step 2: a group has no append tail.
+    let cache = null;
+    if (!members.some(file => auditPaths.has(file.filePath))) {
+      const own = loadCodexFileCache(selected.codexHome, filePath, signature);
+      cache = own?.result ? own
+        : usableOlderSummary(selected.codexHome, filePath, signature, cacheOptions, ultrafastStartMs) || own;
+    }
     if (cache?.result && !groupAudited && auditPaths.size === 0
       && signature.size <= auditMaxBytes()
       && (cache.lastAuditedAt || 0) <= Date.now() - auditIntervalMs()) {

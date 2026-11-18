@@ -413,7 +413,9 @@ test('algorithm-6 summaries wholly before the cut are kept; one with a window at
 
     const afterCut = await parseAt(W1030);
     assert.equal(afterCut.cache.resultHits, 1, 'the early rollout comes from its algorithm-6 summary');
-    assert.equal(afterCut.cache.filesRead, 1, 'only the rollout with a post-cut window is read again');
+    // An older summary that is not exact under the cut is not used at all, so
+    // that one rollout is read like a new file: its header, then its usage.
+    assert.equal(afterCut.cache.filesRead, 2, 'only the rollout with a post-cut window is read again');
     assert.deepEqual(uploaded(afterCut), uploaded(expected));
     assert.deepEqual(byKey(afterCut), {
       [`${MODEL}@10:00`]: 110, [`${MODEL}@10:30`]: 60, [`${UF}@10:30`]: 40,
@@ -425,7 +427,8 @@ test('algorithm-6 summaries wholly before the cut are kept; one with a window at
     assert.deepEqual(uploaded(again), uploaded(expected));
     // With the cut at the epoch even the early summary has to go.
     const all = await parseAt(CODEX_ULTRAFAST_ALL_HISTORY);
-    assert.equal(all.cache.filesRead, 1);
+    assert.equal(all.cache.filesRead, 2);
+    assert.equal(all.cache.resultHits, 1, 'the rollout already rebuilt by this version is not read again');
     assert.deepEqual(uploaded(all), uploaded(await parseUncached(CODEX_ULTRAFAST_ALL_HISTORY)));
   });
 });

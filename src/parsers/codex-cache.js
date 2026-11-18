@@ -37,9 +37,11 @@ export const CODEX_PARSER_ALGORITHM_VERSION = 7;
 //     wherever it has no window at or after the cut and reads the rollout
 //     otherwise (`summaryMatchesCut()`).
 //   - A version-5 summary additionally requires that Magpie was never active.
-//   - Only for the rollout's current stat signature. An older tail is never
-//     resumed: it stored the Ultrafast tier as "no tier", so continuing from it
-//     would file the rest of the session under the plain model.
+//   - Only for the rollout's current stat signature, and only when this
+//     version has nothing of its own to start from (codex.js `startingCache()`).
+//     An older tail is never resumed: it stored the Ultrafast tier as "no
+//     tier", so continuing from it would file the rest of the session under
+//     the plain model.
 const MERGED_ULTRAFAST_SUMMARY_ALGORITHM_VERSIONS = new Set([6]);
 // Version 6 (#143) only started keeping raw Magpie attribution data (the
 // session's model provider and per-response ids). Where Magpie has never been
@@ -115,18 +117,27 @@ function readSummary(path, filePath, acceptsAlgorithm) {
 }
 
 /**
- * The summary for a rollout: this version's own entry, else -- only when the
- * caller asks for an exact stat signature -- an older version's entry for that
- * same signature. Without a signature (the "what did we know before this file
- * grew" lookup that pairs with `loadCodexFileTail()`), only this version's own
- * entry is returned: an older summary must never be continued from.
+ * This version's own summary for a rollout. With a signature, only the entry
+ * for exactly that file state; without one, whatever state was summarized last
+ * (the "what did we know before this file grew" lookup that pairs with
+ * `loadCodexFileTail()`).
  */
-export function loadCodexFileCache(codexHome, filePath, signature, { magpieFree = false } = {}) {
+export function loadCodexFileCache(codexHome, filePath, signature) {
   if (!codexCacheEnabled()) return null;
   const own = readSummary(entryPath(codexHome, filePath), filePath,
     version => version === CODEX_PARSER_ALGORITHM_VERSION);
-  if (!signature) return own;
-  if (own && sameSignature(own.signature, signature)) return own;
+  return own && (!signature || sameSignature(own.signature, signature)) ? own : null;
+}
+
+/**
+ * An older version's summary for exactly this file state, from where that
+ * version keeps it. A fallback only: the caller decides whether it is exact
+ * under the current Ultrafast cut, and must look at its own entries first --
+ * an older collector that is still running refreshes this file after every
+ * append, so preferring it would shadow this version's own append tail.
+ */
+export function loadOlderCodexFileCache(codexHome, filePath, signature, { magpieFree = false } = {}) {
+  if (!codexCacheEnabled() || !signature) return null;
   const older = readSummary(olderEntryPath(codexHome, filePath), filePath,
     version => acceptedOlderSummaryAlgorithm(version, magpieFree));
   return older && sameSignature(older.signature, signature) ? older : null;
