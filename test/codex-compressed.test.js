@@ -1,6 +1,7 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { mkdirSync, mkdtempSync, readdirSync, rmSync, writeFileSync } from 'node:fs';
+import fs, { mkdirSync, mkdtempSync, readdirSync, rmSync, writeFileSync } from 'node:fs';
+import { syncBuiltinESMExports } from 'node:module';
 import { join } from 'node:path';
 import { tmpdir } from 'node:os';
 import zlib from 'node:zlib';
@@ -445,4 +446,32 @@ test('the rolling audit is bounded by a compressed rollout\'s text, not its file
       }
     }
   });
+});
+
+test('a parent that Codex moves away between discovery and its replay index skips Codex for that run', async () => {
+  // Codex compresses, restores or archives a rollout by publishing the other
+  // form and deleting this one. If that happens to a fork's parent after its
+  // header was read, dropping the parent (as before) counted the fork's copied
+  // history again, and the server keeps the larger value for good.
+  const forms = [['rollout-parent.jsonl', jsonl(parentRecords)]];
+  if (HAS_ZSTD) forms.push(['rollout-parent.jsonl.zst', zst(jsonl(parentRecords))]);
+  for (const [parentName, content] of forms) {
+    const realCreateReadStream = fs.createReadStream;
+    let parentOpens = 0;
+    fs.createReadStream = (path, options) => {
+      if (String(path).endsWith(parentName) && ++parentOpens === 2) rmSync(path);
+      return realCreateReadStream(path, options);
+    };
+    syncBuiltinESMExports();
+    try {
+      const result = await parseRollouts({ [parentName]: content, 'rollout-fork.jsonl': jsonl(forkRecords) });
+      assert.equal(parentOpens, 2, `${parentName}: header, then the replay index`);
+      assert.equal(result.skipped, true, parentName);
+      assert.deepEqual(result.buckets, [], parentName);
+      assert.deepEqual(countWarningCodes(result.warnings), { read_failed: 1 }, parentName);
+    } finally {
+      fs.createReadStream = realCreateReadStream;
+      syncBuiltinESMExports();
+    }
+  }
 });

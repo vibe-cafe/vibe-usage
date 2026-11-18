@@ -72,6 +72,7 @@ const CASES = [
   [CODEX_ULTRAFAST_HOLD_WARNING, 'upload_withheld'],
   ['codex: 同一会话的部分文件读取失败，已保留上次同步数据', 'read_failed'],
   ['codex: 无法合并会话分段，已保留上次同步数据: conflicting copy order', 'merge_failed'],
+  ['codex: 会话文件读取失败（同步期间被 Codex 压缩、还原或归档），已保留上次同步数据', 'read_failed'],
   ['codex: 3857 个压缩的旧对话（.jsonl.zst）没有统计：当前 Node v20.19.0 没有 zstd 解压，需要 Node 22.15 或更高版本', 'decoder_unavailable'],
   [`codex: 压缩记录解压失败，已保留上次同步数据: ${HOME}/.codex/sessions/2026/11/01/rollout-x.jsonl.zst（incomplete Zstandard frame at byte 0）`, 'unsupported_format'],
   [`codex: 压缩记录解压失败，已保留上次同步数据: ${HOME}/读取失败/rollout-x.jsonl.zst（Data corruption detected in frame at byte 0）`, 'unsupported_format'],

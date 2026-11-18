@@ -1307,6 +1307,17 @@ async function parseCodexHomes({ codexExtraHome, extraRoots = [], magpie, codexU
       } catch (err) {
         // Dropping it would also lose a fork's replay boundary, if it is a parent.
         if (isZstdDecodeError(err)) return undecodableRollout(err, cacheStats);
+        // Gone since its header was read: Codex compressed, restored or
+        // archived it, i.e. published it under another name. Dropping it here
+        // made a fork of it count the copied history again; the next run finds
+        // the new name.
+        if (err?.code === 'ENOENT') {
+          return {
+            buckets: [], sessions: [], skipped: true,
+            warnings: ['codex: 会话文件读取失败（同步期间被 Codex 压缩、还原或归档），已保留上次同步数据'],
+            cache: cacheStats,
+          };
+        }
         if (file.strict) {
           return {
             buckets: [], sessions: [], skipped: true,
