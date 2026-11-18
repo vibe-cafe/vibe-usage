@@ -933,8 +933,11 @@ function olderEntryFor(codexHome, filePath, signature, cacheOptions, ultrafastSt
  * for its index. The same applies to a rebuild that was interrupted half-way:
  * our own entry then has the header but not yet the index.
  *
- * The rolling audit is unaffected: it only runs when every file has a summary,
- * and a file that took just a header and index here has none.
+ * The rolling audit is unaffected. Its per-file half only runs when every file
+ * has a summary, and a file that took just a header and index here has none;
+ * the group audit in parseNativeCodex() does not depend on that and runs as
+ * before. (The members of a duplicate group never have a summary of their own,
+ * so a machine with such groups only ever gets the group audit -- unchanged.)
  */
 function startingCache(file, cacheOptions, ultrafastStartMs) {
   const own = loadCodexFileCache(file.codexHome, file.filePath, file.signature);
