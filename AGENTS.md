@@ -188,7 +188,7 @@ Release ordering: the separate website pricing fix and CLI are independent (pric
 | Release ordering | After the sync-history PR. CLI publish first; the apps' merge of `--json` follows. |
 | Rollback | Publish a CLI without `doctor`; the apps fall back to their own half of the report. |
 
-**Approved 2026-11-18 by the maintainer (Hogan) — Codex Ultrafast usage uploads as `<model>-ultrafast` from a per-machine cut that the server registers and enforces.** Hogan chose this direction ("per-machine cut plus server-side enforcement") on 2026-11-18 after two independent evaluations; the concrete rules below were written up for his sign-off together with this change (`交接笔记/Ultrafast-CLI与服务端方案.md` in the maintenance workspace). Do not merge or publish before that sign-off, and correct this entry if he changes any rule.
+**Approved 2026-11-18 by the maintainer (Hogan) — Codex Ultrafast usage uploads as `<model>-ultrafast` from a per-machine cut that the server registers and enforces.** Hogan chose this direction ("per-machine cut plus server-side enforcement") on 2026-11-18 after two independent evaluations; the concrete rules below were written up in `交接笔记/Ultrafast-CLI与服务端方案.md` (maintenance workspace) and he approved them the same day, after three rounds of cross-review and a run of the lock tests on a real Postgres. Merging, the database change and npm publication each still need his go-ahead at the time.
 
 | | |
 |---|---|
