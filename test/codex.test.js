@@ -1,7 +1,7 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import { appendFileSync, chmodSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, rmSync, statSync, writeFileSync } from 'node:fs';
-import { join } from 'node:path';
+import { basename, dirname, join } from 'node:path';
 import { tmpdir } from 'node:os';
 import { parse } from '../src/parsers/codex.js';
 import { codexCacheDir } from '../src/parsers/codex-cache.js';
@@ -1504,20 +1504,22 @@ test('the durable usage cache keeps numeric accounting fields only', async () =>
   }
 });
 
-// Rewrite every cache entry the way 0.14.7 (algorithm 5) stored it: no raw
-// Magpie fields in headers, results or append tails.
+// Turn the cache into what 0.14.7 (algorithm 5) left behind: no raw Magpie
+// fields in headers, results or append tails, no separate Ultrafast buckets,
+// and the files one level up, in the per-home directory versions before 7 used.
 function downgradeCacheToAlgorithm5(cacheDir) {
   const visit = (dir) => {
     for (const entry of readdirSync(dir, { withFileTypes: true })) {
       const path = join(dir, entry.name);
       if (entry.isDirectory()) { visit(path); continue; }
-      if (!entry.name.endsWith('.json')) continue;
+      if (!entry.name.endsWith('.json') || basename(dir) !== 'v7') continue;
       const data = JSON.parse(readFileSync(path, 'utf8'));
       data.algorithmVersion = 5;
       if (data.header) delete data.header.modelProvider;
-      if (data.result) delete data.result.magpieEntries;
-      if (data.tail) delete data.tail.magpieEntries;
-      writeFileSync(path, `${JSON.stringify(data)}\n`);
+      if (data.result) { delete data.result.magpieEntries; delete data.result.ultrafastBuckets; }
+      if (data.tail) { delete data.tail.magpieEntries; delete data.tail.ultrafastBuckets; }
+      writeFileSync(join(dirname(dir), entry.name), `${JSON.stringify(data)}\n`);
+      rmSync(path);
     }
   };
   visit(cacheDir);
@@ -1559,8 +1561,9 @@ test('algorithm-5 caches stay valid where Magpie has never been active', async (
         assert.equal(warm.cache.resultHits, 2);
 
         // An append does not resume from a tail written before algorithm 7:
-        // those tails stored the Ultrafast tier as "no tier". The one rollout
-        // that grew is read from the start once (header + usage pass) ...
+        // those tails stored the Ultrafast tier as "no tier", and they belong
+        // to a collector that may still be running. The one rollout that grew
+        // is read from the start once (header + usage pass) ...
         appendFileSync(
           join(fixture.dir, 'rollout-a.jsonl'),
           JSON.stringify(tokenCount('2026-07-10T08:05:00.000Z', usage(5, 0, 3, 0), 118)) + '\n'

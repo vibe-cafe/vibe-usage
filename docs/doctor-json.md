@@ -156,6 +156,7 @@ maintainer (Hogan), 一键诊断 plan, step 2.
 | `network_failed` | 网络失败 |
 | `server_error` | 服务器错误（带 `status`） |
 | `invalid_response` | 服务器返回无法解析 |
+| `codex_held` | Codex 本次未上传（服务端没有答复 Ultrafast 档位起点）。其他工具已同步；`result` 是 `partial`（有别的数据上传了）或 `failed`（没有）。下次同步拿到答复后自动补传，不需要用户操作 |
 | `unexpected_error` | 意外错误 |
 
 ### Probe errors

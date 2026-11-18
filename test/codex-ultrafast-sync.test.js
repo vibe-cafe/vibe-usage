@@ -152,6 +152,7 @@ function machine(t, server) {
     CODEX_HOME: join(root, 'codex'), VIBE_USAGE_CINDY_DIRS: join(root, 'absent'),
     VIBE_USAGE_MAGPIE_TEST_FILE: join(root, 'absent-ledger.jsonl'), VIBE_USAGE_DEV: '0',
     VIBE_USAGE_API_URL: server.apiUrl,
+    VIBE_USAGE_OMP_SESSION_DIRS: join(root, 'omp'),
   };
   const rollout = join(env.CODEX_HOME, 'sessions', '2026', '11', '10', 'rollout-mixed.jsonl');
   const run = code => exec(process.execPath, ['--input-type=module', '-e', code], { env, cwd: process.cwd() });
@@ -170,6 +171,29 @@ function machine(t, server) {
     },
     append(records) { appendFileSync(rollout, records.map(JSON.stringify).join('\n') + '\n'); },
     state() { return JSON.parse(readFileSync(join(root, 'state.json'), 'utf8')); },
+    history() { return JSON.parse(readFileSync(join(root, 'sync-history.json'), 'utf8')).entries; },
+    /** Another tool's log on this machine: one Oh My Pi call of 150 tokens. */
+    writeOtherTool(timestamp = at('10:31')) {
+      const file = join(env.VIBE_USAGE_OMP_SESSION_DIRS, 'session.jsonl');
+      mkdirSync(dirname(file), { recursive: true });
+      writeFileSync(file, [
+        { type: 'session', id: `fixture-${timestamp}`, timestamp, cwd: '/Users/x/proj' },
+        { type: 'message', id: `reply-${timestamp}`, timestamp, message: { role: 'assistant', provider: 'fixture', model: 'fixture-model',
+          responseId: `reply-${timestamp}`, usage: { input: 100, output: 20, cacheRead: 30, cacheWrite: 0 } } },
+      ].map(JSON.stringify).join('\n') + '\n');
+    },
+    /**
+     * `vibe-usage sync` exactly as a desktop app runs it: the real entry point,
+     * every parser, piped output. Resolves with what the app gets to see.
+     */
+    async appSync() {
+      try {
+        const { stdout, stderr } = await exec(process.execPath, ['bin/vibe-usage.js', 'sync'], { env, cwd: process.cwd() });
+        return { exitCode: 0, stdout, stderr };
+      } catch (err) {
+        return { exitCode: err.code, stdout: err.stdout, stderr: err.stderr };
+      }
+    },
     codexStateKeys() {
       return existsSync(join(root, 'state.json'))
         ? Object.keys(m.state().buckets).filter(key => key.startsWith('codex|')).map(key => key.split('|')).map(p => `${p[1]}@${p.at(-1).slice(11, 16)}`).sort()
@@ -392,37 +416,73 @@ test('reset on a machine that never had a cut and may register: all history is s
   assert.equal(Object.keys(server.codex()).length, 4);
 });
 
-test('no answer about the cut: Codex is held for the run, its state survives, other tools upload', async (t) => {
+const lastLine = text => text.trim().split('\n').filter(Boolean).at(-1) || '';
+
+test('no answer about the cut: Codex is held, other tools upload, and the app is told the sync was only partly done', async (t) => {
   const server = await startServer(t);
   const m = machine(t, server);
   m.write(earlyOnly());
   await m.syncMerged();
   const keysBefore = m.codexStateKeys();
   m.append(rest());
+  m.writeOtherTool();
 
-  const otherTool = `
-    parsers.grok = async () => ({ buckets: [{ source: 'grok', model: 'grok-5', project: 'proj',
-      bucketStart: '${W1030}', inputTokens: 7, outputTokens: 0, cachedInputTokens: 0, reasoningOutputTokens: 0, totalTokens: 7 }], sessions: [] });`;
   // A server that does not report the cut (not deployed yet, or rolled back).
   server.reportCut = false;
-  const held = await m.sync({ extra: otherTool });
-  assert.match(held.stderr, /codex: 服务端暂时没有答复这台设备的 Ultrafast 档位起点，本次不上传 Codex/);
+  const held = await m.appSync();
+  // The other tool went up and stdout says so, as on any sync ...
+  assert.match(held.stdout, /已同步 1 buckets/);
+  assert.equal([...server.rows.values()].filter(row => row.source === 'omp').length, 1);
+  // ... but the run does not end as a success: exit code 1 and, as the last
+  // stderr line (the one the Windows app shows), what was uploaded and what was not.
+  assert.equal(held.exitCode, 1);
+  assert.match(lastLine(held.stderr), /部分完成（已上传 1 buckets · 1 sessions）: Codex 本次未上传：服务端暂时没有答复这台设备的 Ultrafast 档位起点，其他工具已正常同步，下次同步自动补传。/);
+  assert.doesNotMatch(held.stdout, /Codex 本次未上传|Ultrafast/);
+  // Nothing of Codex was sent, and nothing of its upload state was dropped.
   assert.deepEqual(server.codex(), { [`${MODEL}@10:00`]: 50 });
   assert.deepEqual(m.codexStateKeys(), keysBefore);
-  assert.equal([...server.rows.values()].filter(row => row.source === 'grok').length, 1);
   assert.equal(server.sent('POST', '/api/usage/ingest').at(-1).payload.client.codexUltrafastStartAt, undefined);
+  // The local sync history carries the fixed code.
+  const entry = m.history().at(-1);
+  assert.equal(entry.result, 'partial');
+  assert.deepEqual(entry.failure, { code: 'codex_held' });
+  assert.equal(entry.uploaded.buckets, 1);
+  assert.equal(entry.tools.codex.skipped, true);
+  assert.equal(entry.tools.codex.warnings.upload_withheld, 1);
 
-  // The settings endpoint is down and the cached privacy choice stands in: same hold.
+  // The settings endpoint is down and the cached privacy choice stands in.
+  // Nothing new from the other tool this time: still not a success.
   server.reportCut = true;
   server.settingsDown = true;
-  const offline = await m.sync();
-  assert.match(offline.stderr, /本次不上传 Codex/);
+  const offline = await m.appSync();
+  assert.equal(offline.exitCode, 1);
+  assert.match(lastLine(offline.stderr), /同步未完成: Codex 本次未上传：/);
+  assert.doesNotMatch(offline.stdout, /已同步/);
+  assert.deepEqual(m.history().at(-1).failure, { code: 'codex_held' });
+  assert.equal(m.history().at(-1).result, 'failed');
   assert.deepEqual(server.codex(), { [`${MODEL}@10:00`]: 50 });
 
-  // Back to normal: the pause is made up on the next sync.
+  // The daemon (`throws`) gets an error it can log instead of an exit.
+  await assert.rejects(m.sync({ surface: 'daemon' }), /CODEX_HELD/);
+
+  // Back to normal: the pause is made up on the next sync, which succeeds.
   server.settingsDown = false;
-  await m.sync();
+  const recovered = await m.appSync();
+  assert.equal(recovered.exitCode, 0);
+  assert.equal(m.history().at(-1).result, 'success');
   assert.deepEqual(server.codex(), { [`${MODEL}@10:00`]: 55, [`${MODEL}@10:30`]: 60, [`${UF}@10:30`]: 40 });
+});
+
+test('a machine without Codex is not failed when the server gives no answer about the cut', async (t) => {
+  const server = await startServer(t);
+  const m = machine(t, server);
+  m.writeOtherTool();
+  server.reportCut = false;
+  const result = await m.appSync();
+  assert.equal(result.exitCode, 0);
+  assert.match(result.stdout, /已同步 1 buckets/);
+  assert.doesNotMatch(result.stderr, /Codex|Ultrafast/);
+  assert.equal(m.history().at(-1).result, 'success');
 });
 
 test('a cut registered by another collector mid-sync: refused rows stay uncommitted and are re-sent split', async (t) => {

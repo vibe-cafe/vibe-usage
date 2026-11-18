@@ -26,6 +26,9 @@ const CODEX_SOURCES = new Set(['codex']);
 
 export const CODEX_ULTRAFAST_HOLD_WARNING =
   'codex: 服务端暂时没有答复这台设备的 Ultrafast 档位起点，本次不上传 Codex（其他工具照常），下次同步自动补传';
+/** The sync's closing failure line when Codex was held (see runSync). */
+export const CODEX_ULTRAFAST_HOLD_FAILURE =
+  'Codex 本次未上传：服务端暂时没有答复这台设备的 Ultrafast 档位起点，其他工具已正常同步，下次同步自动补传。';
 
 /**
  * A cut as epoch milliseconds; `null` when the machine has none. Anything that

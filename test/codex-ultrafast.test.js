@@ -1,7 +1,7 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import { appendFileSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, renameSync, rmSync, writeFileSync } from 'node:fs';
-import { join } from 'node:path';
+import { basename, dirname, join } from 'node:path';
 import { tmpdir } from 'node:os';
 import { parse } from '../src/parsers/codex.js';
 import {
@@ -331,62 +331,72 @@ test('continuation segments of one session and an archive move keep the same key
 });
 
 // -------------------------------------------------- entries from algorithm 6 ---
-// Rewrite the cache the way 0.14.12 (algorithm 6) stored it: Ultrafast usage
-// folded into the plain model's buckets and the tier remembered as "no tier".
-function downgradeCacheToAlgorithm6(cacheDir) {
-  const fold = (owner) => {
-    const merged = new Map();
-    for (const bucket of [...(owner.buckets || []), ...(owner.ultrafastBuckets || [])]) {
-      const key = `${bucket.model}|${bucket.project}|${bucket.bucketStart}`;
-      const sum = merged.get(key);
-      if (!sum) { merged.set(key, { ...bucket }); continue; }
-      for (const field of ['inputTokens', 'outputTokens', 'cachedInputTokens', 'reasoningOutputTokens', 'totalTokens']) {
-        sum[field] = (sum[field] || 0) + (bucket[field] || 0);
-      }
+// Turn the cache into what 0.14.12 (algorithm 6) left behind: Ultrafast usage
+// folded into the plain model's buckets, the tier remembered as "no tier", and
+// the files one level up, in the per-home directory versions before 7 used.
+function foldUltrafast(owner) {
+  const merged = new Map();
+  for (const bucket of [...(owner.buckets || []), ...(owner.ultrafastBuckets || [])]) {
+    const key = `${bucket.model}|${bucket.project}|${bucket.bucketStart}`;
+    const sum = merged.get(key);
+    if (!sum) { merged.set(key, { ...bucket }); continue; }
+    for (const field of ['inputTokens', 'outputTokens', 'cachedInputTokens', 'reasoningOutputTokens', 'totalTokens']) {
+      sum[field] = (sum[field] || 0) + (bucket[field] || 0);
     }
-    owner.buckets = [...merged.values()];
-    delete owner.ultrafastBuckets;
-  };
+  }
+  owner.buckets = [...merged.values()];
+  delete owner.ultrafastBuckets;
+}
+function asAlgorithm6(data) {
+  data.algorithmVersion = 6;
+  if (data.result) foldUltrafast(data.result);
+  if (data.tail) {
+    foldUltrafast(data.tail);
+    if (data.tail.serviceTier === 'ultrafast') data.tail.serviceTier = null;
+  }
+  return `${JSON.stringify(data)}\n`;
+}
+function downgradeCacheToAlgorithm6(cacheDir) {
   const visit = (dir) => {
     for (const entry of readdirSync(dir, { withFileTypes: true })) {
       const path = join(dir, entry.name);
       if (entry.isDirectory()) { visit(path); continue; }
-      if (!entry.name.endsWith('.json')) continue;
-      const data = JSON.parse(readFileSync(path, 'utf8'));
-      data.algorithmVersion = 6;
-      if (data.result) fold(data.result);
-      if (data.tail) {
-        fold(data.tail);
-        if (data.tail.serviceTier === 'ultrafast') data.tail.serviceTier = null;
-      }
-      writeFileSync(path, `${JSON.stringify(data)}\n`);
+      if (!entry.name.endsWith('.json') || basename(dir) !== 'v7') continue;
+      writeFileSync(join(dirname(dir), entry.name), asAlgorithm6(JSON.parse(readFileSync(path, 'utf8'))));
+      rmSync(path);
     }
   };
   visit(cacheDir);
 }
-function cacheVersions(cacheDir) {
-  const versions = [];
+/** `{ relative path: content }` of every cache file an older version owns. */
+function olderCacheFiles(cacheDir) {
+  const files = {};
   const visit = (dir) => {
     for (const entry of readdirSync(dir, { withFileTypes: true })) {
       const path = join(dir, entry.name);
-      if (entry.isDirectory()) visit(path);
-      else if (entry.name.endsWith('.json')) versions.push(JSON.parse(readFileSync(path, 'utf8')).algorithmVersion);
+      if (entry.isDirectory()) { if (entry.name !== 'v7') visit(path); continue; }
+      files[path.slice(cacheDir.length)] = readFileSync(path, 'utf8');
     }
   };
   visit(cacheDir);
-  return versions.sort();
+  return files;
 }
 
 test('algorithm-6 summaries are used as they are while the machine has no cut, and are not rewritten', async () => {
   await withFixture({ 'rollout-mixed.jsonl': mixedSession(), 'rollout-other.jsonl': mixedSession('other') }, async (fixture) => {
     const cold = await parseAt(null);
     downgradeCacheToAlgorithm6(fixture.cacheDir);
+    const older = olderCacheFiles(fixture.cacheDir);
+    assert.equal(Object.keys(older).length, 4, 'two summaries and two tails');
     const warm = await parseAt(null);
     assert.equal(warm.cache.filesRead, 0);
     assert.equal(warm.cache.resultHits, 2);
     assert.deepEqual(uploaded(warm), uploaded(cold));
-    // Still algorithm 6 on disk: an older daemon sharing this directory keeps its entries.
-    assert.ok(cacheVersions(fixture.cacheDir).every(version => version === 6));
+    // Nothing an older collector owns was written, restamped or removed --
+    // neither by using its summaries nor by re-reading under a cut.
+    await parseAt(W1030);
+    await parseAt(CODEX_ULTRAFAST_ALL_HISTORY);
+    assert.deepEqual(olderCacheFiles(fixture.cacheDir), older);
   });
 });
 

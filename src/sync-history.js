@@ -45,6 +45,9 @@ export const SYNC_FAILURE_CODES = Object.freeze({
   network_failed: '网络失败',
   server_error: '服务器错误',
   invalid_response: '服务器返回无法解析',
+  // Everything else was synced; Codex alone was not uploaded this run because
+  // the server gave no answer about the machine's Ultrafast cut.
+  codex_held: 'Codex 本次未上传（服务端没有答复 Ultrafast 档位起点）',
   unexpected_error: '意外错误',
 });
 
