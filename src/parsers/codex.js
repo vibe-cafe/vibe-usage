@@ -255,7 +255,7 @@ async function readSessionHeader(filePath, snapshotSize) {
 }
 
 function cacheData(cache, changes = {}) {
-  // A compressed rollout's proven plain twin (see indexFromCopy()).
+  // A compressed rollout's proven plain twin (see indexFromCompressedCopy()).
   const copyOf = changes.copyOf ?? cache?.copyOf ?? null;
   return {
     header: changes.header ?? cache?.header ?? null,
@@ -589,6 +589,14 @@ function updateFileCache(file, changes) {
   }
   file.cache = { ...(file.cache || {}), ...data };
 }
+
+// The share of the work budget a run may spend reading compressed history no
+// run has read yet: the replay index or merge of a `.jsonl.zst`, and the usage
+// of one. The rest of the budget stays for what changed since the last run --
+// new and grown plain rollouts, i.e. the conversations in use -- so they are
+// uploaded on the first sync after an upgrade that finds years of compressed
+// history (see the partial-result rules in parseCodexHomes()).
+const BACKLOG_SHARE = 2 / 3;
 
 function workBudgetMs() {
   const configured = Number(process.env.VIBE_USAGE_CODEX_WORK_BUDGET_MS);
@@ -1115,29 +1123,33 @@ async function parseNativeCodex(options = {}) {
 
 /**
  * The replay index of a rollout that holds exactly the bytes of another file
- * of its session whose index is already known, without parsing it: a hard link
- * of that file (the same stat signature), or a compressed rollout that
- * decompresses to exactly a plain copy's bytes. An index is a function of the
+ * of its session whose index is already known. An index is a function of the
  * bytes alone (its `filePath` aside), so the other file's index is this one's.
- * Proving a compressed copy still decompresses it, but skips parsing every
- * record -- on a machine whose Codex homes share conversations (Orca links each
- * one into every account's home, and Codex then compresses its own copy), that
- * is what the first sync after reading `.jsonl.zst` spends its time on.
  *
- * A compressed rollout is compared with the plain file of its session that the
- * duplicate-id loop sorts first among those of the same decompressed size, so
- * the proven copy joins that file's class (planCodexSegments()). Returns
- * `{ meta, copyOf }` (`copyOf` naming the plain file and its signature when a
- * compressed copy was proven) or null when this file must be parsed.
+ * linkedIndex(): a hard link of that file (the same stat signature; Orca links
+ * each rollout into every account's home). Costs no read.
  */
-async function indexFromCopy(file, sameSession, fileMeta, needsIndex) {
-  const indexed = sameSession.filter(other => other !== file
-    && needsIndex.has(other.filePath) && fileMeta.has(other.filePath));
-  const derived = other => ({ ...fileMeta.get(other.filePath), filePath: file.filePath });
-  const link = indexed.find(other => sameSignature(other.signature, file.signature));
-  if (link) return { meta: derived(link), copyOf: null };
+function linkedIndex(file, sameSession, fileMeta, needsIndex) {
+  const link = sameSession.find(other => other !== file && needsIndex.has(other.filePath)
+    && fileMeta.has(other.filePath) && sameSignature(other.signature, file.signature));
+  return link ? { ...fileMeta.get(link.filePath), filePath: file.filePath } : null;
+}
+
+/**
+ * indexFromCompressedCopy(): a compressed rollout that decompresses to exactly
+ * a plain copy's bytes. Proving it still decompresses the file, but skips
+ * parsing every record -- on a machine whose Codex homes share conversations
+ * (and Codex then compresses its own copy), that is what reading `.jsonl.zst`
+ * for the first time spends its time on. It is compared with the plain file of
+ * its session that the duplicate-id loop sorts first among those of its
+ * decompressed size, so the proven copy joins that file's class
+ * (planCodexSegments()). Returns `{ meta, copyOf }` (the plain file's path and
+ * signature) or null when the file must be parsed.
+ */
+async function indexFromCompressedCopy(file, sameSession, fileMeta, needsIndex) {
   if (!file.compressed) return null;
-  const plain = indexed.filter(other => !other.compressed)
+  const plain = sameSession.filter(other => other !== file && !other.compressed
+    && needsIndex.has(other.filePath) && fileMeta.has(other.filePath))
     .sort((a, b) => (fileMeta.get(b.filePath).parsedRecordCount || 0)
       - (fileMeta.get(a.filePath).parsedRecordCount || 0) || a.filePath.localeCompare(b.filePath));
   if (plain.length === 0) return null;
@@ -1145,7 +1157,7 @@ async function indexFromCopy(file, sameSession, fileMeta, needsIndex) {
     plain.map(other => ({ filePath: other.filePath, size: other.snapshotSize, file: other })));
   if (!twin) return null;
   return {
-    meta: derived(twin.file),
+    meta: { ...fileMeta.get(twin.file.filePath), filePath: file.filePath },
     copyOf: { filePath: twin.file.filePath, signature: twin.file.signature },
   };
 }
@@ -1327,6 +1339,29 @@ async function parseCodexHomes({ codexExtraHome, extraRoots = [], magpie, codexU
     if (parentId) referencedParentIds.add(parentId);
   }
 
+  // From here on running out of budget no longer skips the source. What is
+  // not read yet is left for the next run, and every session that depends on
+  // it is left out of this one: its own usage, a group with a member not read
+  // yet, and a fork or sub-agent whose parent is not read yet (without the
+  // parent its copied history would count). Everything else is exact and is
+  // uploaded. Leaving a session out only delays it: the server keeps the larger
+  // of two values for a key, so a window that is low for now changes nothing
+  // there, while counting copied history would be permanent.
+  //
+  // Reading compressed history no run has read yet (the first sync after
+  // Codex compressed a long history: tens of gigabytes on a heavy user's
+  // machine) only gets BACKLOG_SHARE of the budget, so the conversations in
+  // use still get their new records read and uploaded in the same run.
+  const backlogBudget = budget * BACKLOG_SHARE;
+  const canRead = backlog => Date.now() - startedAt < (backlog ? backlogBudget : budget);
+  const pendingPaths = new Set();
+  const pendingIds = new Set();
+  const leaveForNextRun = file => {
+    pendingPaths.add(file.filePath);
+    if (file.header?.sessionId) pendingIds.add(file.header.sessionId);
+  };
+  let pendingPhase = null;
+
   // Only replay participants, their parents, corrupt-header files, and
   // duplicate physical copies need the full compact token index.
   const fileMeta = new Map();
@@ -1347,23 +1382,29 @@ async function parseCodexHomes({ codexExtraHome, extraRoots = [], magpie, codexU
       continue;
     }
     needsIndex.add(file.filePath);
+    const sameSession = header?.sessionId ? candidatesById.get(header.sessionId) : [];
     let meta = auditPaths.has(file.filePath) ? null : file.cache?.index;
     if (meta) {
       cacheStats.indexHits++;
+    } else if (!auditPaths.has(file.filePath) && (meta = linkedIndex(file, sameSession, fileMeta, needsIndex))) {
+      // A hard link of a file already indexed: no read.
+      updateFileCache(file, { index: meta });
+    } else if (!canRead(file.compressed)) {
+      leaveForNextRun(file);
+      pendingPhase ??= 'replay-index';
+      continue;
     } else {
       try {
-        const copy = auditPaths.has(file.filePath) || !header.sessionId ? null
-          : await indexFromCopy(file, candidatesById.get(header.sessionId), fileMeta, needsIndex);
+        const copy = auditPaths.has(file.filePath) ? null
+          : await indexFromCompressedCopy(file, sameSession, fileMeta, needsIndex);
         if (copy) {
           meta = copy.meta;
-          // A hard link costs no read; proving a compressed copy decompressed it.
-          if (copy.copyOf) cacheStats.filesRead++;
-          updateFileCache(file, { index: meta, ...(copy.copyOf ? { copyOf: copy.copyOf } : {}) });
+          updateFileCache(file, { index: meta, copyOf: copy.copyOf });
         } else {
           meta = await indexSessionFile(file.filePath, file.snapshotSize);
-          cacheStats.filesRead++;
           updateFileCache(file, { index: meta });
         }
+        cacheStats.filesRead++;
       } catch (err) {
         // Dropping it would also lose a fork's replay boundary, if it is a parent.
         if (isZstdDecodeError(err)) return undecodableRollout(err, cacheStats);
@@ -1388,21 +1429,18 @@ async function parseCodexHomes({ codexExtraHome, extraRoots = [], magpie, codexU
       }
     }
     fileMeta.set(file.filePath, meta);
-    if (overBudget()) {
-      return {
-        buckets: [], sessions: [], skipped: true,
-        indexing: { phase: 'replay-index', completed: fileMeta.size, total: files.length },
-        cache: cacheStats,
-      };
-    }
   }
 
   // Duplicate ids can be disjoint continuation segments, not just archives.
   // Keep physical caches intact and give each combined session its own cache.
-  const groupedFiles = [];
-  let groupAudited = false;
+  const groups = new Map();
+  const plans = [];
   for (const id of duplicateIds) {
     const members = candidatesById.get(id);
+    if (members.some(file => pendingPaths.has(file.filePath))) {
+      for (const member of members) fileMeta.delete(member.filePath);
+      continue;
+    }
     if (members.some(file => !fileMeta.has(file.filePath))) {
       return { buckets: [], sessions: [], skipped: true,
         warnings: ['codex: 同一会话的部分文件读取失败，已保留上次同步数据'] };
@@ -1410,7 +1448,13 @@ async function parseCodexHomes({ codexExtraHome, extraRoots = [], magpie, codexU
     members.sort((a, b) => (fileMeta.get(b.filePath).parsedRecordCount || 0)
       - (fileMeta.get(a.filePath).parsedRecordCount || 0) || a.filePath.localeCompare(b.filePath));
     // `identity` names the group's cache entry, `read` is what the merge reads.
-    const { identity, read } = planCodexSegments(members);
+    plans.push({ id, members, ...planCodexSegments(members) });
+  }
+  // Groups merged from plain files only come first (see BACKLOG_SHARE); the
+  // output keeps the order of duplicateIds.
+  plans.sort((a, b) => a.read.some(file => file.compressed) - b.read.some(file => file.compressed));
+  let groupAudited = false;
+  for (const { id, members, identity, read } of plans) {
     const selected = identity[0];
     const filePath = `${selected.codexHome}/.vibe-usage-session-${createHash('sha256').update(id).digest('hex')}`;
     const signature = codexSegmentSignature(identity);
@@ -1436,19 +1480,25 @@ async function parseCodexHomes({ codexExtraHome, extraRoots = [], magpie, codexU
     }
     const group = { ...selected, filePath, signature, snapshotSize: signature.size,
       compressed: false, cache, members: read, lines: null, appendTail: null, priorTail: null };
+    for (const member of members) fileMeta.delete(member.filePath);
     let meta = cache?.index;
-    try {
-      if (!meta) {
+    if (meta) {
+      cacheStats.indexHits++;
+    } else if (!canRead(read.some(file => file.compressed))) {
+      pendingIds.add(id);
+      for (const member of members) pendingPaths.add(member.filePath);
+      pendingPhase ??= 'segments';
+      continue;
+    } else {
+      try {
         group.lines = await mergeCodexSegments(read, readLines);
         cacheStats.filesRead += read.length;
         meta = await indexSessionFile(filePath, null, group.lines);
-      } else cacheStats.indexHits++;
-    } catch (err) {
-      if (isZstdDecodeError(err)) return undecodableRollout(err, cacheStats);
-      return { buckets: [], sessions: [], skipped: true,
-        warnings: [`codex: 无法合并会话分段，已保留上次同步数据: ${err.message}`] };
-    }
-    if (group.lines) {
+      } catch (err) {
+        if (isZstdDecodeError(err)) return undecodableRollout(err, cacheStats);
+        return { buckets: [], sessions: [], skipped: true,
+          warnings: [`codex: 无法合并会话分段，已保留上次同步数据: ${err.message}`] };
+      }
       const changes = { header: group.header, index: meta };
       // Neither a fork nor a sub-agent: its replay boundary is empty whatever
       // the other sessions hold (replayBoundary()), so it is summarized from
@@ -1469,12 +1519,9 @@ async function parseCodexHomes({ codexExtraHome, extraRoots = [], magpie, codexU
     }
     fileMeta.set(filePath, meta);
     needsIndex.add(filePath);
-    for (const member of members) fileMeta.delete(member.filePath);
-    groupedFiles.push(group);
-    if (overBudget()) return { buckets: [], sessions: [], skipped: true,
-      indexing: { phase: 'segments', completed: groupedFiles.length, total: duplicateIds.size }, cache: cacheStats };
+    groups.set(id, group);
   }
-  files.push(...groupedFiles);
+  for (const id of duplicateIds) if (groups.has(id)) files.push(groups.get(id));
 
   // One index per logical session, including all continuation segments, feeds
   // the unchanged fork/subagent replay boundary logic.
@@ -1489,12 +1536,25 @@ async function parseCodexHomes({ codexExtraHome, extraRoots = [], magpie, codexU
   }
 
   const results = [];
-  for (let i = 0; i < files.length; i++) {
-    const file = files[i];
+  const leftOut = file => {
+    // A group stands for its members; a physical file for itself.
+    for (const path of (file.members ? candidatesById.get(file.header.sessionId) : [file]).map(f => f.filePath)) {
+      pendingPaths.add(path);
+    }
+    pendingPhase ??= 'usage';
+  };
+  for (const file of files) {
     const fm = fileMeta.get(file.filePath);
     if (!fm) continue;
     if (fm.sessionId && sessionById.get(fm.sessionId)?.filePath !== file.filePath) continue;
 
+    if (needsIndex.has(file.filePath)) {
+      const parentId = fm.forkedFromId || (fm.isSubagent ? fm.parentThreadId : null);
+      if (parentId && pendingIds.has(parentId)) {
+        leftOut(file);
+        continue;
+      }
+    }
     const boundary = needsIndex.has(file.filePath)
       ? replayBoundary(fm, sessionById)
       : { rawTokenCount: 0, recordIndex: null };
@@ -1506,6 +1566,9 @@ async function parseCodexHomes({ codexExtraHome, extraRoots = [], magpie, codexU
     if (result) {
       // Summarized in this run's duplicate-id loop: not taken from the cache.
       if (!file.summarizedThisRun) cacheStats.resultHits++;
+    } else if (!canRead(file.compressed || !!file.members?.some(member => member.compressed))) {
+      leftOut(file);
+      continue;
     } else {
       const previousTail = !needsIndex.has(file.filePath) && !auditPaths.has(file.filePath)
         ? file.appendTail
@@ -1544,17 +1607,18 @@ async function parseCodexHomes({ codexExtraHome, extraRoots = [], magpie, codexU
     }
     file.lines = null; // Never retain the transient combined transcript after parsing.
     results.push(result);
-
-    if (overBudget() && i < files.length - 1) {
-      return {
-        buckets: [], sessions: [], skipped: true,
-        indexing: { phase: 'usage', completed: i + 1, total: files.length },
-        cache: cacheStats,
-      };
-    }
   }
 
-  return { ...mergeFileResults(results, magpie, ultrafastStartMs), cache: cacheStats };
+  const merged = { ...mergeFileResults(results, magpie, ultrafastStartMs), cache: cacheStats };
+  if (pendingPaths.size === 0) return merged;
+  // Rollouts whose session waits for the next run, of all physical rollouts.
+  const physical = files.filter(file => !file.members);
+  const waiting = physical.filter(file => pendingPaths.has(file.filePath)
+    || (file.header?.sessionId && pendingIds.has(file.header.sessionId))).length;
+  return {
+    ...merged,
+    indexing: { phase: pendingPhase, completed: physical.length - waiting, total: physical.length },
+  };
 }
 
 function sameRequestUsage(left, right) {

@@ -225,8 +225,8 @@ test('a group merged in one run and summarized in a later one is merged only onc
       for (let i = 0; i < 20; i++) {
         result = await run();
         reads += result.cache?.filesRead || 0;
-        if (!result.skipped) break;
-        phases.push(result.indexing?.phase);
+        if (!result.skipped && !result.indexing) break;
+        phases.push(`${result.skipped ? 'skipped' : 'partial'} ${result.indexing?.phase}`);
       }
     } finally {
       Date.now = realNow;
@@ -235,7 +235,9 @@ test('a group merged in one run and summarized in a later one is merged only onc
       process.env.VIBE_USAGE_CODEX_WORK_BUDGET_MS = '600000';
     }
     assert.equal(result.skipped, undefined, JSON.stringify(result));
-    assert.deepEqual(phases, ['discovery', 'replay-index', 'replay-index', 'segments']);
+    // Only a run that could not read every header is skipped; after that a run
+    // that runs out of budget uploads what is exact and leaves the rest.
+    assert.deepEqual(phases, ['skipped discovery', 'partial replay-index', 'partial replay-index', 'partial segments']);
     // Two headers, two indexes, one merge of both copies -- not a second
     // merge in the usage pass of the next run.
     assert.equal(reads, 6);
