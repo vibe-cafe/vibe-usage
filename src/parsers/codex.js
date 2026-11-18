@@ -12,8 +12,10 @@ import { join } from 'node:path';
 import { createInterface } from 'node:readline';
 import { Readable } from 'node:stream';
 import { createHash } from 'node:crypto';
-import { isZstdDecodeError, zstdDecoderAvailable, zstdFileChunks } from './zstd-file.js';
-import { mergeCodexSegments, codexSegmentSignature } from './codex-segments.js';
+import {
+  isZstdDecodeError, zstdDecoderAvailable, zstdFileChunks, zstdFileCopyOf, zstdFileHeadChunks,
+} from './zstd-file.js';
+import { mergeCodexSegments, codexSegmentSignature, planCodexSegments } from './codex-segments.js';
 import { aggregateToBuckets } from './aggregate.js';
 import { mergeCindyHarnessUsage, readCindyHarnessUsage } from './cindy-ledger.js';
 import {
@@ -28,6 +30,7 @@ import {
   loadCodexFileCache,
   loadCodexFileTail,
   loadOlderCodexFileCache,
+  sameSignature,
   saveCodexFileCache,
   saveCodexFileTail,
 } from './codex-cache.js';
@@ -144,14 +147,20 @@ function statRollout(filePath) {
  * the input keeps flowing to its end in the background (a whole file read,
  * or decompressed, for one header line). A caller that stops early calls
  * `close()`, which also stops the input.
+ *
+ * `head`: the caller only reads the first records (see zstdFileHeadChunks()).
  */
-function readLines(filePath, snapshotSize, start = 0) {
+function readLines(filePath, snapshotSize, start = 0, { head = false } = {}) {
   let input;
   let decoded = null;
   if (isCompressedRollout(filePath)) {
     if (start !== 0) throw new Error('a compressed Codex rollout is only read from its start');
-    decoded = { bytes: 0 };
-    input = Readable.from(zstdFileChunks(filePath, snapshotSize, decoded), { objectMode: false });
+    if (head) {
+      input = Readable.from(zstdFileHeadChunks(filePath, snapshotSize), { objectMode: false });
+    } else {
+      decoded = { bytes: 0 };
+      input = Readable.from(zstdFileChunks(filePath, snapshotSize, decoded), { objectMode: false });
+    }
   } else {
     input = createReadStream(filePath, {
       encoding: 'utf-8',
@@ -211,7 +220,7 @@ function extractParentThreadId(meta) {
  * only forks, sub-agents, and parents referenced by them need replay indexes.
  */
 async function readSessionHeader(filePath, snapshotSize) {
-  const lines = readLines(filePath, snapshotSize);
+  const lines = readLines(filePath, snapshotSize, 0, { head: true });
   try {
     for await (const line of lines) {
       if (!line.trim()) continue;
@@ -246,11 +255,14 @@ async function readSessionHeader(filePath, snapshotSize) {
 }
 
 function cacheData(cache, changes = {}) {
+  // A compressed rollout's proven plain twin (see indexFromCopy()).
+  const copyOf = changes.copyOf ?? cache?.copyOf ?? null;
   return {
     header: changes.header ?? cache?.header ?? null,
     index: changes.index ?? cache?.index ?? null,
     result: changes.result ?? cache?.result ?? null,
     lastAuditedAt: changes.lastAuditedAt ?? cache?.lastAuditedAt ?? null,
+    ...(copyOf ? { copyOf } : {}),
   };
 }
 
@@ -1101,6 +1113,43 @@ async function parseNativeCodex(options = {}) {
   };
 }
 
+/**
+ * The replay index of a rollout that holds exactly the bytes of another file
+ * of its session whose index is already known, without parsing it: a hard link
+ * of that file (the same stat signature), or a compressed rollout that
+ * decompresses to exactly a plain copy's bytes. An index is a function of the
+ * bytes alone (its `filePath` aside), so the other file's index is this one's.
+ * Proving a compressed copy still decompresses it, but skips parsing every
+ * record -- on a machine whose Codex homes share conversations (Orca links each
+ * one into every account's home, and Codex then compresses its own copy), that
+ * is what the first sync after reading `.jsonl.zst` spends its time on.
+ *
+ * A compressed rollout is compared with the plain file of its session that the
+ * duplicate-id loop sorts first among those of the same decompressed size, so
+ * the proven copy joins that file's class (planCodexSegments()). Returns
+ * `{ meta, copyOf }` (`copyOf` naming the plain file and its signature when a
+ * compressed copy was proven) or null when this file must be parsed.
+ */
+async function indexFromCopy(file, sameSession, fileMeta, needsIndex) {
+  const indexed = sameSession.filter(other => other !== file
+    && needsIndex.has(other.filePath) && fileMeta.has(other.filePath));
+  const derived = other => ({ ...fileMeta.get(other.filePath), filePath: file.filePath });
+  const link = indexed.find(other => sameSignature(other.signature, file.signature));
+  if (link) return { meta: derived(link), copyOf: null };
+  if (!file.compressed) return null;
+  const plain = indexed.filter(other => !other.compressed)
+    .sort((a, b) => (fileMeta.get(b.filePath).parsedRecordCount || 0)
+      - (fileMeta.get(a.filePath).parsedRecordCount || 0) || a.filePath.localeCompare(b.filePath));
+  if (plain.length === 0) return null;
+  const twin = await zstdFileCopyOf(file.filePath, file.snapshotSize,
+    plain.map(other => ({ filePath: other.filePath, size: other.snapshotSize, file: other })));
+  if (!twin) return null;
+  return {
+    meta: derived(twin.file),
+    copyOf: { filePath: twin.file.filePath, signature: twin.file.signature },
+  };
+}
+
 async function parseCodexHomes({ codexExtraHome, extraRoots = [], magpie, codexUltrafastStartAt } = {}, discovery) {
   // null: this machine has no Ultrafast cut, every window keeps the merged format.
   const ultrafastStartMs = codexUltrafastStartMs(codexUltrafastStartAt);
@@ -1282,7 +1331,9 @@ async function parseCodexHomes({ codexExtraHome, extraRoots = [], magpie, codexU
   // duplicate physical copies need the full compact token index.
   const fileMeta = new Map();
   const needsIndex = new Set();
-  for (const file of files) {
+  // Plain rollouts first, so a compressed copy of one can take its index.
+  const indexOrder = [...files.filter(file => !file.compressed), ...files.filter(file => file.compressed)];
+  for (const file of indexOrder) {
     const header = file.header;
     const required = !header
       || !header.sessionId
@@ -1301,9 +1352,18 @@ async function parseCodexHomes({ codexExtraHome, extraRoots = [], magpie, codexU
       cacheStats.indexHits++;
     } else {
       try {
-        meta = await indexSessionFile(file.filePath, file.snapshotSize);
-        cacheStats.filesRead++;
-        updateFileCache(file, { index: meta });
+        const copy = auditPaths.has(file.filePath) || !header.sessionId ? null
+          : await indexFromCopy(file, candidatesById.get(header.sessionId), fileMeta, needsIndex);
+        if (copy) {
+          meta = copy.meta;
+          // A hard link costs no read; proving a compressed copy decompressed it.
+          if (copy.copyOf) cacheStats.filesRead++;
+          updateFileCache(file, { index: meta, ...(copy.copyOf ? { copyOf: copy.copyOf } : {}) });
+        } else {
+          meta = await indexSessionFile(file.filePath, file.snapshotSize);
+          cacheStats.filesRead++;
+          updateFileCache(file, { index: meta });
+        }
       } catch (err) {
         // Dropping it would also lose a fork's replay boundary, if it is a parent.
         if (isZstdDecodeError(err)) return undecodableRollout(err, cacheStats);
@@ -1349,9 +1409,11 @@ async function parseCodexHomes({ codexExtraHome, extraRoots = [], magpie, codexU
     }
     members.sort((a, b) => (fileMeta.get(b.filePath).parsedRecordCount || 0)
       - (fileMeta.get(a.filePath).parsedRecordCount || 0) || a.filePath.localeCompare(b.filePath));
-    const selected = members[0];
+    // `identity` names the group's cache entry, `read` is what the merge reads.
+    const { identity, read } = planCodexSegments(members);
+    const selected = identity[0];
     const filePath = `${selected.codexHome}/.vibe-usage-session-${createHash('sha256').update(id).digest('hex')}`;
-    const signature = codexSegmentSignature(members);
+    const signature = codexSegmentSignature(identity);
     // Same order as startingCache(), without step 2: a group has no append tail.
     // An older group entry is taken whole or not at all: when its summary is not
     // exact under the cut the members are merged again anyway, and indexing the
@@ -1365,7 +1427,7 @@ async function parseCodexHomes({ codexExtraHome, extraRoots = [], magpie, codexU
     // A compressed member's file size says nothing about the text it holds, so
     // a group with one is not audited (see auditSize()).
     if (cache?.result && !groupAudited && auditPaths.size === 0
-      && !members.some(file => file.compressed)
+      && !read.some(file => file.compressed)
       && signature.size <= auditMaxBytes()
       && (cache.lastAuditedAt || 0) <= Date.now() - auditIntervalMs()) {
       cache = null;
@@ -1373,24 +1435,42 @@ async function parseCodexHomes({ codexExtraHome, extraRoots = [], magpie, codexU
       cacheStats.audited++;
     }
     const group = { ...selected, filePath, signature, snapshotSize: signature.size,
-      compressed: false, cache, members, lines: null, appendTail: null, priorTail: null };
+      compressed: false, cache, members: read, lines: null, appendTail: null, priorTail: null };
+    let meta = cache?.index;
     try {
-      let meta = cache?.index;
       if (!meta) {
-        group.lines = await mergeCodexSegments(members, readLines);
-        cacheStats.filesRead += members.length;
+        group.lines = await mergeCodexSegments(read, readLines);
+        cacheStats.filesRead += read.length;
         meta = await indexSessionFile(filePath, null, group.lines);
-        updateFileCache(group, { header: group.header, index: meta });
       } else cacheStats.indexHits++;
-      fileMeta.set(filePath, meta);
-      needsIndex.add(filePath);
-      for (const member of members) fileMeta.delete(member.filePath);
-      groupedFiles.push(group);
     } catch (err) {
       if (isZstdDecodeError(err)) return undecodableRollout(err, cacheStats);
       return { buckets: [], sessions: [], skipped: true,
         warnings: [`codex: 无法合并会话分段，已保留上次同步数据: ${err.message}`] };
     }
+    if (group.lines) {
+      const changes = { header: group.header, index: meta };
+      // Neither a fork nor a sub-agent: its replay boundary is empty whatever
+      // the other sessions hold (replayBoundary()), so it is summarized from
+      // these merged records now, exactly as the usage pass would. Otherwise a
+      // build that runs out of budget before the usage pass merges every such
+      // group a second time.
+      if (!meta.isSubagent && !meta.forkedFromId) {
+        const boundary = { rawTokenCount: 0, recordIndex: null };
+        const { tail, ...summary } = await parseSessionFile(filePath, group.snapshotSize, meta, boundary, {
+          previousTail: null, captureTail: false, lines: group.lines,
+        });
+        changes.result = { boundaryKey: boundaryKey(boundary), ...summary };
+        changes.lastAuditedAt = Date.now();
+        group.lines = null;
+        group.summarizedThisRun = true;
+      }
+      updateFileCache(group, changes);
+    }
+    fileMeta.set(filePath, meta);
+    needsIndex.add(filePath);
+    for (const member of members) fileMeta.delete(member.filePath);
+    groupedFiles.push(group);
     if (overBudget()) return { buckets: [], sessions: [], skipped: true,
       indexing: { phase: 'segments', completed: groupedFiles.length, total: duplicateIds.size }, cache: cacheStats };
   }
@@ -1424,7 +1504,8 @@ async function parseCodexHomes({ codexExtraHome, extraRoots = [], magpie, codexU
       ? file.cache.result
       : null;
     if (result) {
-      cacheStats.resultHits++;
+      // Summarized in this run's duplicate-id loop: not taken from the cache.
+      if (!file.summarizedThisRun) cacheStats.resultHits++;
     } else {
       const previousTail = !needsIndex.has(file.filePath) && !auditPaths.has(file.filePath)
         ? file.appendTail
