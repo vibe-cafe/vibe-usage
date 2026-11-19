@@ -1,14 +1,14 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import fs, {
-  existsSync, linkSync, mkdirSync, mkdtempSync, readdirSync, rmSync, unlinkSync, writeFileSync,
+  existsSync, linkSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, rmSync, unlinkSync, writeFileSync,
 } from 'node:fs';
 import { syncBuiltinESMExports } from 'node:module';
-import { join } from 'node:path';
+import { join, sep } from 'node:path';
 import { tmpdir } from 'node:os';
 import zlib from 'node:zlib';
 import { parse } from '../src/parsers/codex.js';
-import { codexCacheDir } from '../src/parsers/codex-cache.js';
+import { codexCacheDir, olderCodexCacheDir } from '../src/parsers/codex-cache.js';
 import { planCodexSegments } from '../src/parsers/codex-segments.js';
 import { ZstdDecodeError, zstdFileCopyOf, zstdFileHeadChunks } from '../src/parsers/zstd-file.js';
 
@@ -349,5 +349,55 @@ test('the copy relation is dropped when the plain twin changes', needsZstd, asyn
     unlinkSync(file('codex', `${sharedFile}.zst`));
     const alone = await run();
     assert.deepEqual(view(alone), view(await uncached()));
+  });
+});
+
+test('a warm sync looks up no older entry and no tail for the copies of a shared session', async () => {
+  await withHomes(async ({ homes, file, run, uncached }) => {
+    // One conversation linked into both Orca homes, an unlinked copy of it in
+    // ~/.codex, and a fork of it, so its copies are also a fork's parent.
+    writeFileSync(file('orca1', sharedFile), shared);
+    linkSync(file('orca1', sharedFile), file('orca2', sharedFile));
+    writeFileSync(file('codex', sharedFile), shared);
+    writeFileSync(file('orca1', forkFile), fork);
+    const first = await run();
+    // What 0.14 left for exactly these file states, next to each entry of ours:
+    // the same entry under algorithm 6.
+    let planted = 0;
+    for (const home of Object.values(homes)) {
+      const dir = codexCacheDir(home);
+      for (const name of groupEntries(dir)) {
+        const entry = JSON.parse(readFileSync(join(dir, name), 'utf8'));
+        writeFileSync(join(olderCodexCacheDir(home), name), JSON.stringify({ ...entry, algorithmVersion: 6 }));
+        planted++;
+      }
+    }
+    assert.ok(planted >= 5, `planted ${planted}`);
+    const realReadFileSync = fs.readFileSync;
+    const reads = [];
+    fs.readFileSync = (path, ...rest) => {
+      reads.push(String(path));
+      return realReadFileSync(path, ...rest);
+    };
+    syncBuiltinESMExports();
+    let second;
+    try {
+      second = await run();
+    } finally {
+      fs.readFileSync = realReadFileSync;
+      syncBuiltinESMExports();
+    }
+    // Every copy of the shared session has its own header and index and never a
+    // summary (the group's entry holds it); the fork has its own summary.
+    const older = Object.values(homes).map(olderCodexCacheDir);
+    const olderReads = reads.filter(path => older.some(dir => path.startsWith(dir + sep)
+      && !path.startsWith(join(dir, 'v7') + sep)));
+    assert.deepEqual(olderReads, []);
+    assert.deepEqual(reads.filter(path => path.endsWith('.tail.json')), []);
+    assert.equal(second.cache.filesRead, 0);
+    assert.equal(second.cache.headerHits, 4);
+    assert.deepEqual(view(second), view(first));
+    assert.deepEqual(view(second), view(await uncached()));
+    assert.equal(totalInput(second), 3005);
   });
 });

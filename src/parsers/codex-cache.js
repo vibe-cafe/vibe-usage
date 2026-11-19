@@ -1,5 +1,4 @@
 import {
-  existsSync,
   mkdirSync,
   readFileSync,
   renameSync,
@@ -120,8 +119,11 @@ function tailPath(codexHome, filePath) {
   return join(codexCacheDir(codexHome), `${hash(filePath, 32)}.tail.json`);
 }
 
+// One read, no existsSync() first: a missing or unreadable entry is a miss
+// either way, and a sync looks up tens of thousands of entries (on the
+// maintainer's Mac, ~37,000 that exist), each of which paid a stat() for
+// nothing.
 function readSummary(path, filePath, acceptsAlgorithm) {
-  if (!existsSync(path)) return null;
   try {
     const parsed = JSON.parse(readFileSync(path, 'utf8'));
     if (parsed.schemaVersion !== CODEX_CACHE_SCHEMA_VERSION) return null;
@@ -202,7 +204,6 @@ export function saveCodexFileCache(codexHome, filePath, signature, data) {
 export function loadCodexFileTail(codexHome, filePath) {
   if (!codexCacheEnabled()) return null;
   const path = tailPath(codexHome, filePath);
-  if (!existsSync(path)) return null;
   try {
     const parsed = JSON.parse(readFileSync(path, 'utf8'));
     if (parsed.schemaVersion !== CODEX_CACHE_SCHEMA_VERSION) return null;

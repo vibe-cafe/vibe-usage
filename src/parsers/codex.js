@@ -1043,12 +1043,29 @@ function olderEntryFor(codexHome, filePath, signature, cacheOptions, ultrafastSt
  * the group audit in parseNativeCodex() does not depend on that and runs as
  * before. (The members of a duplicate group never have a summary of their own,
  * so a machine with such groups only ever gets the group audit -- unchanged.)
+ *
+ * The lookup also ends after step 1 when our own entry for exactly this file
+ * state has no summary but already holds a header and a replay index. That is
+ * every member of a session kept in several homes: the member never gets a
+ * summary of its own (the group's entry holds it), so steps 2 and 3 ran on
+ * every sync and found nothing to use -- step 3 takes our own header and index
+ * before an older one, and a member needs no file summary. On the maintainer's
+ * Mac (2026-11-19, 25,628 rollouts, 11,500 shared sessions) that was 23,957
+ * tail lookups and 20,222 older entries (102 MB) read and thrown away per sync,
+ * about 0.95 s of a 3.45 s warm sync. Outside that case two things are given
+ * up, each costing one read of the rollout and never a different result (the
+ * cache is never authoritative): an older summary for this exact state --
+ * there is normally none to be had, since our entry got its index from the
+ * rollout, a hard-linked twin or an older entry whose summary was not usable --
+ * and the append tail of a file that has an index but no longer needs one (its
+ * duplicate or its fork disappeared).
  */
 function startingCache(file, cacheOptions, ultrafastStartMs) {
   const own = loadCodexFileCache(file.codexHome, file.filePath, file.signature);
   file.cache = own;
   file.priorCache = own;
   if (own?.result) return;
+  if (own?.header && own?.index) return;
   file.priorCache = own || loadCodexFileCache(file.codexHome, file.filePath);
   file.priorTail = loadCodexFileTail(file.codexHome, file.filePath);
   if (file.priorCache) file.appendTail = tailStateFor(file);
