@@ -4,7 +4,21 @@ import { delimiter, join } from 'node:path';
 import { homedir } from 'node:os';
 import { antigravityConversationDirs, normalizeExtraRoot } from '../extra-roots.js';
 import { aggregateToBuckets, extractSessions } from './aggregate.js';
-import { hasTokenUsage, listDbCascades, readDbUsageRecords, readDbWorkspaceUri, readDbStepRows, resolveUsageTimestamp } from './antigravity-db.js';
+import {
+  hasTokenUsage,
+  listDbCascades,
+  readDbCascadeBundle,
+  resolveUsageTimestamp,
+} from './antigravity-db.js';
+import {
+  commitFileEntries,
+  loadFileEntries,
+  parserCacheEnabled,
+  pruneFileEntries,
+  sqliteStatToken,
+} from './parser-cache.js';
+
+const ANTIGRAVITY_CACHE_ALGO = 1;
 
 
 
@@ -206,8 +220,9 @@ async function rpcPost(baseUrl, path, body, csrfToken, timeoutMs = 10000) {
 }
 
 async function probeHttpPort(ports, csrfToken) {
-  for (const port of ports) {
-    const baseUrl = `http://127.0.0.1:${port}`;
+  if (ports.length === 0) return null;
+  if (ports.length === 1) {
+    const baseUrl = `http://127.0.0.1:${ports[0]}`;
     try {
       await rpcPost(
         baseUrl,
@@ -218,10 +233,26 @@ async function probeHttpPort(ports, csrfToken) {
       );
       return baseUrl;
     } catch {
-      // Not the right port, try next
+      return null;
     }
   }
-  return null;
+  try {
+    return await Promise.any(
+      ports.map(async (port) => {
+        const baseUrl = `http://127.0.0.1:${port}`;
+        await rpcPost(
+          baseUrl,
+          '/exa.language_server_pb.LanguageServerService/GetWorkspaceInfos',
+          {},
+          csrfToken,
+          3000,
+        );
+        return baseUrl;
+      }),
+    );
+  } catch {
+    return null;
+  }
 }
 
 // ── Helpers ──────────────────────────────────────────────────────────
@@ -500,13 +531,16 @@ export async function parse({ extraRoots = [] } = {}) {
   const strictDirs = new Set(extraDirs);
   const conversationDirs = [...new Set([...defaultDirs, ...extraDirs])];
   const candidates = [];
+  const scannedDirs = [];
   for (const dir of conversationDirs) {
     const strict = strictDirs.has(dir);
     try {
-      for (const cascadeId of listDbCascades(dir, { strict })) {
+      for (const cascadeId of listDbCascades(dir, { strict: true })) {
         candidates.push({ dir, cascadeId, strict });
       }
-    } catch {
+      scannedDirs.push(dir);
+    } catch (err) {
+      if (!strict && err.code === 'ENOENT') continue;
       return {
         buckets: [], sessions: [], skipped: true,
         warnings: [`antigravity: 额外根目录读取失败，已保留上次同步数据: ${dir}`],
@@ -530,65 +564,118 @@ export async function parse({ extraRoots = [] } = {}) {
     if (!previous || size > previous.size) selectedConfiguredCopies.set(candidate.cascadeId, { ...candidate, size });
   }
 
+  const cachedEntries = loadFileEntries(
+    SOURCE,
+    ANTIGRAVITY_CACHE_ALGO,
+    candidates.map(({ dir, cascadeId }) => join(dir, `${cascadeId}.db`)),
+  );
+  const cacheUpdates = [];
+  const cacheOn = parserCacheEnabled();
+
   for (const { dir, cascadeId, strict } of candidates) {
     const selected = selectedConfiguredCopies.get(cascadeId);
     if (selected && selected.dir !== dir) continue;
-    try {
-      const options = { strict };
-      // One steps scan feeds all of it: the usage newer builds keep on the step
-      // (which `gen_metadata` no longer carries), the idx → clock fallback for
-      // generator rows that lost their own timestamp, and session events.
-      const stepRows = readDbStepRows(dir, cascadeId, options);
-      const genRecords = readDbUsageRecords(dir, cascadeId, options);
-      const project = projectFromUri(readDbWorkspaceUri(dir, cascadeId)) || 'unknown';
-      const records = mergeCascadeUsage(genRecords, stepRows);
+    const dbPath = join(dir, `${cascadeId}.db`);
+    const sig = cacheOn ? sqliteStatToken(dbPath) : null;
+    const cached = sig ? cachedEntries.get(dbPath) : null;
+    let parsedCascade = null;
 
-      if (records.length > 0) {
-        dbHandled.add(cascadeId);
+    if (cached && cached.sig === sig) {
+      try {
+        parsedCascade = JSON.parse(cached.payload);
+      } catch {
+        parsedCascade = null;
+      }
+    }
+
+    if (!parsedCascade) {
+      try {
+        const options = { strict };
+        // Single SQLite open reading steps, gen_metadata, and workspace URI
+        // directly as raw BLOBs (avoiding 3x open/close + hex encoding).
+        const { stepRows, genRecords, workspaceUri } = readDbCascadeBundle(dir, cascadeId, options);
+        const project = projectFromUri(workspaceUri) || 'unknown';
+        const records = mergeCascadeUsage(genRecords, stepRows);
+
+        const compactRecords = [];
         for (const rec of records) {
-          if (rec.responseId && seenResponseIds.has(rec.responseId)) continue;
-          if (rec.responseId) seenResponseIds.add(rec.responseId);
-          // Gemini 3.7 CLI blobs dropped chatStartMetadata.createdAt (9.4.1)
-          // and modelDisplayName (21); newer stores drop generator usage
-          // altogether and keep it on the step. Either way the clock comes from
-          // the record itself or from steps.metadata at the same idx.
           const timestamp = resolveUsageTimestamp(rec, stepRows.timestamps);
           if (!timestamp || isNaN(timestamp.getTime())) continue;
-          entries.push({
-            source: SOURCE,
+          compactRecords.push({
+            responseId: rec.responseId || '',
             model: rec.model,
-            project,
-            timestamp,
+            tsMs: timestamp.getTime(),
             inputTokens: toSafeNumber(rec.inputTokens),
             outputTokens: toSafeNumber(rec.outputTokens),
             cachedInputTokens: toSafeNumber(rec.cacheReadTokens),
-            // The store carries one untyped cache-write count; an unexplained
-            // total belongs in the cheaper 5m tier (see the cache-write rule in
-            // AGENTS.md).
             cacheCreation5mTokens: toSafeNumber(rec.cacheCreationTokens),
             reasoningOutputTokens: toSafeNumber(rec.thinkingOutputTokens),
           });
         }
-      }
-
-      // Session timing from the same steps scan (independent of token usage).
-      for (const ev of stepRows.events) {
-        sessionEvents.push({
-          sessionId: cascadeId,
-          source: SOURCE,
+        const compactEvents = stepRows.events.map((ev) => [
+          ev.timestamp.getTime(),
+          ev.role === 'user' ? 1 : 0,
+        ]);
+        parsedCascade = {
           project,
-          timestamp: ev.timestamp,
-          role: ev.role,
+          hasRecords: records.length > 0,
+          records: compactRecords,
+          events: compactEvents,
+        };
+        if (sig) {
+          cacheUpdates.push({ key: dbPath, sig, payload: parsedCascade });
+        }
+      } catch (err) {
+        if (!strict) {
+          warnings.push(`antigravity: cannot read ${dbPath}: ${err.message}`);
+          continue;
+        }
+        return {
+          buckets: [], sessions: [], skipped: true,
+          warnings: [`antigravity: 额外根目录读取失败，已保留上次同步数据: ${dir}`],
+        };
+      }
+    }
+
+    const { project, hasRecords, records: compactRecords, events: compactEvents } = parsedCascade;
+    if (hasRecords) {
+      dbHandled.add(cascadeId);
+      for (const rec of compactRecords) {
+        if (rec.responseId && seenResponseIds.has(rec.responseId)) continue;
+        if (rec.responseId) seenResponseIds.add(rec.responseId);
+        entries.push({
+          source: SOURCE,
+          model: rec.model,
+          project,
+          timestamp: new Date(rec.tsMs),
+          inputTokens: rec.inputTokens,
+          outputTokens: rec.outputTokens,
+          cachedInputTokens: rec.cachedInputTokens,
+          // The store carries one untyped cache-write count; an unexplained
+          // total belongs in the cheaper 5m tier (see the cache-write rule in
+          // AGENTS.md).
+          cacheCreation5mTokens: rec.cacheCreation5mTokens,
+          reasoningOutputTokens: rec.reasoningOutputTokens,
         });
       }
-    } catch (err) {
-      if (!strict) throw err;
-      return {
-        buckets: [], sessions: [], skipped: true,
-        warnings: [`antigravity: 额外根目录读取失败，已保留上次同步数据: ${dir}`],
-      };
+    }
+
+    // Session timing from the same steps scan (independent of token usage).
+    for (const [tsMs, isUser] of compactEvents) {
+      sessionEvents.push({
+        sessionId: cascadeId,
+        source: SOURCE,
+        project,
+        timestamp: new Date(tsMs),
+        role: isUser ? 'user' : 'assistant',
+      });
     }
   }
+
+  if (cacheUpdates.length > 0) {
+    commitFileEntries(SOURCE, ANTIGRAVITY_CACHE_ALGO, cacheUpdates);
+  }
+  pruneFileEntries(SOURCE, ANTIGRAVITY_CACHE_ALGO, scannedDirs, candidates.map(({ dir, cascadeId }) => join(dir, `${cascadeId}.db`)));
 
   // ── Path 2: RPC fallback, only for legacy .pb cascades not already parsed ──
   const pbCascades = [...new Set(defaultDirs.flatMap(listPbCascades))]

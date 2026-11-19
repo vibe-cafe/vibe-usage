@@ -4,6 +4,9 @@
 // 200k rows is past the limit on every runtime CI uses (Node 22 overflows from
 // ~110k, the Mac app's Node 24 from ~150k). The stores are generated inside
 // SQLite with a recursive CTE so the fixture stays fast.
+// Where node:sqlite exists (Node 22.13+, both desktop apps) the parser reads
+// through its single-connection path first, so these tests cover that path;
+// on Node 20 they cover the sqlite3 CLI fallback.
 import test, { after } from 'node:test';
 import assert from 'node:assert/strict';
 import { execFileSync } from 'node:child_process';

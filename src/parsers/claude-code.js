@@ -13,12 +13,24 @@ import {
 import { projectFromCwd, toCount } from './fs-utils.js';
 import { getClaudeRoots } from '../claude-roots.js';
 import {
+  claudeCacheDir,
   claudeCacheEnabled,
   fileSignature,
   loadClaudeFileCache,
   pruneClaudeFileCache,
   saveClaudeFileCache,
 } from './claude-cache.js';
+import {
+  dirJsonStatToken,
+  hashManifest,
+  loadSourceSnapshot,
+  localTimeZoneToken,
+  magpieManifestToken,
+  parserCacheEnabled,
+  saveSourceSnapshot,
+} from './parser-cache.js';
+
+const CLAUDE_SNAPSHOT_ALGO = 1;
 
 const MAX_WARNINGS = 20;
 const READ_CHUNK_BYTES = 1024 * 1024;
@@ -525,6 +537,10 @@ async function scanProjectCandidate(candidate, ctx) {
     ctx.audited = true;
     cache = null;
   }
+  if (candidate.size <= AUDIT_MAX_BYTES) {
+    const fullReadAt = cache ? cache.fullReadAt || 0 : Date.now();
+    ctx.nextAuditAt = Math.min(ctx.nextAuditAt, fullReadAt + ctx.auditIntervalMs);
+  }
   let cachedState = null;
   if (cache) {
     try {
@@ -675,6 +691,7 @@ export async function parse({ extraRoots = [], magpie } = {}) {
     progressed: false,
     saveFailed: false,
     audited: false,
+    nextAuditAt: Number.MAX_SAFE_INTEGER,
     auditIntervalMs: auditIntervalMs(),
     entriesByKey: new Map(),
     anonymousEntries: [],
@@ -700,6 +717,49 @@ export async function parse({ extraRoots = [], magpie } = {}) {
     return false;
   });
   const projectGroups = collectCandidates(roots, 'projects', ctx);
+  const transcriptGroups = collectCandidates(roots, 'transcripts', ctx);
+
+  // L1 whole-source manifest fast path: when Claude cache is enabled, no
+  // directory warnings occurred, and no audit-interval test override is
+  // active, check whether every discovered transcript's stat signature plus
+  // Magpie ledger state matches the previous complete run.
+  // One snapshot per source: the roots go into the manifest, not the key,
+  // because Claude Desktop Cowork adds a root per session and a key per root
+  // combination would keep a full copy of the result for each of them.
+  const snapshotKey = 'claude-code';
+  const magpieToken = magpieManifestToken(magpie);
+  const magpiePendingBefore = magpie?.pending?.length ?? 0;
+  let manifestParts = null;
+  if (
+    parserCacheEnabled()
+    && ctx.cacheEnabled
+    && magpieToken
+    && !ctx.incomplete
+    && ctx.warnings.length === 0
+    && !process.env.VIBE_USAGE_CLAUDE_AUDIT_INTERVAL_MS
+    && !process.env.VIBE_USAGE_CLAUDE_WORK_BUDGET_MS
+  ) {
+    // The signature captured at discovery, never a fresh stat: each file is
+    // read only up to the size captured then, so a fresh stat taken after an
+    // append would store the shorter result under the longer file's manifest.
+    const sig = (c) => `${c.signature.size}:${c.signature.mtimeMs}:${c.signature.dev}:${c.signature.ino}`;
+    const parts = [`tz|${localTimeZoneToken()}`, magpieToken, ...roots.map(root => `root|${root}`)];
+    for (const [sessionId, candidates] of projectGroups) {
+      for (const c of candidates) parts.push(`p|${sessionId}|${c.filePath}|${sig(c)}`);
+    }
+    for (const [sessionId, candidates] of transcriptGroups) {
+      for (const c of candidates) parts.push(`t|${sessionId}|${c.filePath}|${sig(c)}`);
+    }
+    manifestParts = parts;
+    const manifest = hashManifest([...parts, `l2|${dirJsonStatToken(claudeCacheDir())}`]);
+    const snap = loadSourceSnapshot(snapshotKey, CLAUDE_SNAPSHOT_ALGO, manifest);
+    if (snap && Date.now() < snap.nextAuditAt
+      && magpieManifestToken(magpie) === magpieToken
+      && Array.isArray(snap.buckets) && Array.isArray(snap.sessions)) {
+      return { buckets: snap.buckets, sessions: snap.sessions };
+    }
+  }
+
   const projectSessionIds = new Set();
   const parsedSessions = [];
 
@@ -726,7 +786,6 @@ export async function parse({ extraRoots = [], magpie } = {}) {
     pruneClaudeFileCache([...projectGroups.values()].flat().map((c) => c.filePath));
   }
 
-  const transcriptGroups = collectCandidates(roots, 'transcripts', ctx);
   for (const [sessionId, candidates] of transcriptGroups) {
     if (projectSessionIds.has(sessionId)) continue;
     const parsed = await scanBestCandidate(candidates, scanTranscriptCandidate, ctx);
@@ -743,10 +802,20 @@ export async function parse({ extraRoots = [], magpie } = {}) {
   }
   const entries = [...iterateUsageEntries(ctx)];
 
-  return {
+  const result = {
     buckets: aggregateToBuckets(ctx.collectMagpie ? magpie.attribute(entries, 'claude') : entries),
     sessions: ctx.sessions,
     ...(ctx.incomplete ? { skipped: true } : {}),
     ...(ctx.warnings.length > 0 ? { warnings: ctx.warnings } : {}),
   };
+  const magpieStable = !magpie || (!magpie.failed && (magpie.pending?.length ?? 0) === magpiePendingBefore);
+  if (manifestParts && magpieStable && !ctx.incomplete && ctx.warnings.length === 0) {
+    const finalManifest = hashManifest([...manifestParts, `l2|${dirJsonStatToken(claudeCacheDir())}`]);
+    saveSourceSnapshot(snapshotKey, CLAUDE_SNAPSHOT_ALGO, finalManifest, {
+      nextAuditAt: ctx.nextAuditAt,
+      buckets: result.buckets,
+      sessions: result.sessions,
+    });
+  }
+  return result;
 }

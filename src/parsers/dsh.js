@@ -4,8 +4,21 @@ import { basename, join, relative } from 'node:path';
 import zlib from 'node:zlib';
 import { getDshSessionsDir } from '../tools.js';
 import { aggregateToBuckets, extractSessions } from './aggregate.js';
+import {
+  commitFileEntries,
+  hashManifest,
+  loadFileEntries,
+  loadSourceSnapshot,
+  localTimeZoneToken,
+  parserCacheEnabled,
+  pruneFileEntries,
+  saveSourceSnapshot,
+  statToken,
+} from './parser-cache.js';
 
 const SOURCE = 'dsh';
+// 2: cached models carry `project` instead of the session's full `cwd`.
+const DSH_CACHE_ALGO = 2;
 
 // Verified against deepseek-ai/deepseek-harness, released formats V0-V4:
 // packages/session/session-format/src/filename.ts, session-format-v0-to-v1,
@@ -219,58 +232,42 @@ function isUserMessageRecord(rec) {
  * output before aggregation, like the Pi-family parsers.
  */
 function buildSessionModel(text, fileVersion) {
-  const lines = text.split('\n');
-
   let header = null;
-  for (let i = 0; i < lines.length; i++) {
-    if (lines[i].length === 0) continue;
+  const messages = [];
+  let inheritedSeq = null;
+  let invalidInheritedSeed = false;
+
+  let start = 0;
+  const len = text.length;
+  while (start < len) {
+    let end = text.indexOf('\n', start);
+    if (end === -1) end = len;
+    const line = text.slice(start, end);
+    start = end + 1;
+    if (line.length === 0) continue;
+
     let rec;
     try {
-      rec = JSON.parse(lines[i]);
+      rec = JSON.parse(line);
     } catch {
       continue; // torn final line: keep the complete records
     }
-    if (rec && typeof rec === 'object' && header === null && rec.type === 'session') {
+    if (!rec || typeof rec !== 'object') continue;
+
+    if (header === null && rec.type === 'session') {
       header = rec;
     }
-  }
 
-  if (!header || typeof header.id !== 'string' || header.id.length === 0) {
-    throw new Error('missing session header record');
-  }
-  if (!Number.isInteger(header.version) || header.version < 0 || header.version > MAX_SESSION_FORMAT_VERSION) {
-    const error = new Error(
-      'session ' + header.id + ' uses format version ' + header.version +
-      ' (parser supports 0–' + MAX_SESSION_FORMAT_VERSION + ')',
-    );
-    error.code = 'UNSUPPORTED_FORMAT_VERSION';
-    throw error;
-  }
-  if (header.version !== fileVersion) {
-    throw new Error('session header format version ' + header.version + ' disagrees with filename version ' + fileVersion);
-  }
-  if (header.version >= 2 && typeof header.isSeeded !== 'boolean') {
-    throw new Error('format v' + header.version + ' session header lacks isSeeded');
-  }
-
-  const messages = [];
-  let inheritedSeq = null;
-  for (let i = 0; i < lines.length; i++) {
-    if (lines[i].length === 0) continue;
-    let rec;
-    try {
-      rec = JSON.parse(lines[i]);
-    } catch {
-      continue;
-    }
-    if (!rec || typeof rec !== 'object') continue;
     const timeMs = recordTimeMs(rec);
     if (timeMs == null) continue;
     const seq = Number.isSafeInteger(rec.seq) && rec.seq >= 0 ? rec.seq : null;
 
-    if (header.version >= 2 && rec.type === 'session/end-seed' && rec.data?.inherited === true) {
-      if (seq == null) throw new Error('inherited end-seed marker lacks a valid seq');
-      inheritedSeq = seq;
+    if (rec.type === 'session/end-seed' && rec.data?.inherited === true) {
+      if (seq == null) {
+        invalidInheritedSeed = true;
+      } else {
+        inheritedSeq = seq;
+      }
     }
 
     if (isUserMessageRecord(rec)) {
@@ -294,6 +291,26 @@ function buildSessionModel(text, fileVersion) {
     });
   }
 
+  if (!header || typeof header.id !== 'string' || header.id.length === 0) {
+    throw new Error('missing session header record');
+  }
+  if (!Number.isInteger(header.version) || header.version < 0 || header.version > MAX_SESSION_FORMAT_VERSION) {
+    const error = new Error(
+      'session ' + header.id + ' uses format version ' + header.version +
+      ' (parser supports 0–' + MAX_SESSION_FORMAT_VERSION + ')',
+    );
+    error.code = 'UNSUPPORTED_FORMAT_VERSION';
+    throw error;
+  }
+  if (header.version !== fileVersion) {
+    throw new Error('session header format version ' + header.version + ' disagrees with filename version ' + fileVersion);
+  }
+  if (header.version >= 2 && typeof header.isSeeded !== 'boolean') {
+    throw new Error('format v' + header.version + ' session header lacks isSeeded');
+  }
+  if (header.version >= 2 && invalidInheritedSeed) {
+    throw new Error('inherited end-seed marker lacks a valid seq');
+  }
   if (header.version >= 2 && header.isSeeded !== (inheritedSeq !== null)) {
     throw new Error('isSeeded disagrees with the inherited end-seed marker');
   }
@@ -309,7 +326,9 @@ function buildSessionModel(text, fileVersion) {
       Number.isSafeInteger(header.seedLength) && header.seedLength > 0
         ? header.seedLength
         : 0,
-    cwd: header.cwd,
+    // Only the project name is kept (it is all the output uses), so the
+    // parser cache never stores a session's full working directory.
+    project: projectFromCwd(header.cwd),
     messages,
   };
 }
@@ -407,7 +426,7 @@ function replaySkipCount(child, parent) {
 /** Fold a (possibly replay-trimmed) model into flat usage entries + timing events. */
 function modelToResult(model, skipCount) {
   const sessionId = model.sessionId;
-  const project = projectFromCwd(model.cwd);
+  const project = model.project;
   const entries = [];
   const events = [];
   for (let i = skipCount; i < model.messages.length; i++) {
@@ -520,51 +539,114 @@ export async function parse() {
     return { buckets: [], sessions: [], skipped: true, warnings };
   }
   if (files.length === 0) {
+    if (!anyFailure) pruneFileEntries(SOURCE, DSH_CACHE_ALGO, [sessionsDir], []);
     const result = { buckets: [], sessions: [] };
     if (anyFailure) Object.assign(result, { skipped: true, warnings });
     return result;
   }
 
+  // L1 whole-source manifest fast path: when no directory read failed and
+  // every session file's stat signature is unchanged, reuse the pre-aggregated
+  // buckets/sessions directly without opening or decompressing any file.
+  const fileStats = [];
+  const cacheOn = parserCacheEnabled();
+  let canUseManifest = !anyFailure && cacheOn;
+  for (const item of files) {
+    let stat = null;
+    try {
+      stat = statSync(item.file);
+    } catch {
+      canUseManifest = false;
+    }
+    if (stat && (!stat.isFile() || stat.size > MAX_SESSION_FILE_BYTES)) {
+      canUseManifest = false;
+    }
+    // With the parser cache off, no per-file signature is built either.
+    fileStats.push({ ...item, stat, sig: stat && cacheOn ? `${item.version}:${item.compressed ? 1 : 0}:${statToken(stat)}` : null });
+  }
+
+  // One snapshot per source; the sessions directory is in the manifest.
+  const snapshotKey = SOURCE;
+  const manifest = canUseManifest
+    ? hashManifest([`tz|${localTimeZoneToken()}`, `dir|${sessionsDir}`, ...fileStats.map((f) => `${f.file}|${f.sig}`)])
+    : null;
+  if (manifest) {
+    const snap = loadSourceSnapshot(snapshotKey, DSH_CACHE_ALGO, manifest);
+    if (snap
+      && Array.isArray(snap.buckets) && Array.isArray(snap.sessions)) {
+      return snap;
+    }
+  }
+
+  // L2 per-file incremental cache: reuse parsed models for unchanged logs and
+  // only decompress/parse files that grew or appeared since the last run.
+  const cachedEntries = loadFileEntries(SOURCE, DSH_CACHE_ALGO, fileStats.map(f => f.file));
+  const cacheUpdates = [];
+
   // sessionId -> newest generation, then largest copy within that generation.
   // Migrations can shrink a log by embedding chunks, so size alone is unsafe.
   const perSession = new Map();
-  for (const { file, compressed, version } of files) {
-    let text;
-    try {
-      const stat = statSync(file);
-      if (!stat.isFile()) throw new Error('session log is no longer a file');
-      if (stat.size > MAX_SESSION_FILE_BYTES) {
-        throw new Error('session log too large (' + stat.size + ' bytes)');
+  for (const { file, compressed, version, stat, sig } of fileStats) {
+    let model = null;
+    let weight = 0;
+    const cached = sig ? cachedEntries.get(file) : null;
+    if (cached && cached.sig === sig) {
+      try {
+        const parsed = JSON.parse(cached.payload);
+        if (parsed && parsed.model && typeof parsed.weight === 'number') {
+          model = parsed.model;
+          weight = parsed.weight;
+        }
+      } catch {
+        model = null;
       }
-      const buffer = readFileSync(file);
-      if (buffer.length < stat.size) throw new Error('session log changed while reading');
-      const snapshot = buffer.length === stat.size ? buffer : buffer.subarray(0, stat.size);
-      text = compressed ? decompressSessionLog(snapshot, file) : snapshot.toString('utf8');
-    } catch (error) {
-      const reason = error?.code === 'ENOENT' && !hasBuiltinZstd && compressed
-        ? ZSTD_HINT
-        : error?.message || String(error);
-      recordFailure('dsh: skipping ' + relative(process.cwd(), file) + ' (' + reason + ')');
-      continue;
     }
 
-    let model;
-    try {
-      model = buildSessionModel(text, version);
-    } catch (error) {
-      recordFailure(
-        'dsh: skipping ' + relative(process.cwd(), file) + ' (' + error.message + ')',
-      );
-      continue;
+    if (!model) {
+      let text;
+      try {
+        const s = stat || statSync(file);
+        if (!s.isFile()) throw new Error('session log is no longer a file');
+        if (s.size > MAX_SESSION_FILE_BYTES) {
+          throw new Error('session log too large (' + s.size + ' bytes)');
+        }
+        const buffer = readFileSync(file);
+        if (buffer.length < s.size) throw new Error('session log changed while reading');
+        const snapshot = buffer.length === s.size ? buffer : buffer.subarray(0, s.size);
+        text = compressed ? decompressSessionLog(snapshot, file) : snapshot.toString('utf8');
+      } catch (error) {
+        const reason = error?.code === 'ENOENT' && !hasBuiltinZstd && compressed
+          ? ZSTD_HINT
+          : error?.message || String(error);
+        recordFailure('dsh: skipping ' + relative(process.cwd(), file) + ' (' + reason + ')');
+        continue;
+      }
+
+      try {
+        model = buildSessionModel(text, version);
+      } catch (error) {
+        recordFailure(
+          'dsh: skipping ' + relative(process.cwd(), file) + ' (' + error.message + ')',
+        );
+        continue;
+      }
+      weight = text.length;
+      if (sig) {
+        cacheUpdates.push({ key: file, sig, payload: { model, weight } });
+      }
     }
 
-    const weight = text.length;
     const previous = perSession.get(model.sessionId);
     if (!previous || model.formatVersion > previous.model.formatVersion ||
       (model.formatVersion === previous.model.formatVersion && weight > previous.weight)) {
       perSession.set(model.sessionId, { model, weight });
     }
   }
+
+  if (cacheUpdates.length > 0) {
+    commitFileEntries(SOURCE, DSH_CACHE_ALGO, cacheUpdates);
+  }
+  if (!anyFailure) pruneFileEntries(SOURCE, DSH_CACHE_ALGO, [sessionsDir], fileStats.map(f => f.file));
 
   const entries = [];
   const eventsBySession = new Map();
@@ -599,6 +681,8 @@ export async function parse() {
   if (warnings.length > 0 || anyFailure) {
     result.skipped = anyFailure;
     result.warnings = warnings;
+  } else if (manifest) {
+    saveSourceSnapshot(snapshotKey, DSH_CACHE_ALGO, manifest, result);
   }
   return result;
 }

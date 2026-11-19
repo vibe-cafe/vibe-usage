@@ -9,6 +9,15 @@ import { execFileSync } from 'node:child_process';
 import { parse } from '../src/parsers/opencode.js';
 import { validateExtraRoot } from '../src/extra-roots.js';
 import { getOpenCodeStores } from '../src/opencode-roots.js';
+
+const parserCacheDir = mkdtempSync(join(tmpdir(), 'vibe-parser-cache-test-'));
+const previousParserCacheDir = process.env.VIBE_USAGE_CACHE_DIR;
+process.env.VIBE_USAGE_CACHE_DIR = parserCacheDir;
+test.after(() => {
+  if (previousParserCacheDir === undefined) delete process.env.VIBE_USAGE_CACHE_DIR;
+  else process.env.VIBE_USAGE_CACHE_DIR = previousParserCacheDir;
+  rmSync(parserCacheDir, { recursive: true, force: true });
+});
 const require = createRequire(import.meta.url);
 const start = Date.parse('2026-09-12T00:00:00Z');
 function rows(session = 'ses_one', model = 'test-model') {

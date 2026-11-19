@@ -68,8 +68,11 @@ test('DSH sync backfills V3 usage without reset, preserves privacy, and protects
     `;
     const sync = () => execFileAsync(process.execPath, ['--input-type=module', '-e', command], {
       cwd: process.cwd(),
+      // HOME and the parser cache too: the child runs a real sync, which would
+      // otherwise write the developer's ~/.vibe-usage/cache.
       env: { ...process.env, VIBE_USAGE_DEV: '0', VIBE_USAGE_CONFIG_DIR: configDir,
-        VIBE_USAGE_STATE_DIR: stateDir, VIBE_USAGE_DSH_SESSIONS: sessions },
+        VIBE_USAGE_STATE_DIR: stateDir, VIBE_USAGE_DSH_SESSIONS: sessions,
+        HOME: join(root, 'home'), USERPROFILE: join(root, 'home'), VIBE_USAGE_CACHE_DIR: join(root, 'cache') },
     });
 
     writeLog(0, oldTurn);

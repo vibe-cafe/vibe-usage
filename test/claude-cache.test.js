@@ -14,6 +14,8 @@ import {
   writeFileSync,
   writeSync,
 } from 'node:fs';
+import fs from 'node:fs';
+import { syncBuiltinESMExports } from 'node:module';
 import { dirname, join } from 'node:path';
 import { tmpdir } from 'node:os';
 import { parse } from '../src/parsers/claude-code.js';
@@ -379,4 +381,55 @@ test('the rolling audit re-reads a transcript whose cache is older than the inte
   const audited = await f.run({ VIBE_USAGE_CLAUDE_AUDIT_INTERVAL_MS: '0' });
   assert.equal(audited.buckets[0].inputTokens, 10);
   assert.equal((await f.run()).buckets[0].inputTokens, 10, 'the audit rewrote the entry');
+});
+
+test('a source snapshot lets each overdue transcript take its rolling audit', async t => {
+  const f = fixture(t);
+  const initial = Date.now();
+  let now = initial;
+  t.mock.method(Date, 'now', () => now);
+  const writePair = input => {
+    for (const id of ['one', 'two']) {
+      writeTranscript(f.path(id), [user(0), assistant(1, { id, input })], { mtimeSeconds: 1700000000 });
+    }
+  };
+  writePair(10);
+  assert.equal((await f.run()).buckets[0].inputTokens, 20);
+  writePair(20);
+  now += 31 * 86400000;
+  assert.equal((await f.run()).buckets[0].inputTokens, 30);
+  assert.equal((await f.run()).buckets[0].inputTokens, 40);
+});
+
+test('a transcript appended between discovery and the snapshot is not frozen at its shorter read', async t => {
+  const f = fixture(t);
+  const path = f.path('race');
+  writeTranscript(path, [user(0), assistant(1, { id: 'a', input: 10 })]);
+  // Claude Code writes its last response right after discovery stat'ed the
+  // file. That run reads only the captured size; the snapshot it saves must be
+  // keyed by that same captured state, so the next run sees the append. With a
+  // second stat for the manifest, the shorter result was stored under the
+  // longer file's signature and every later run returned it.
+  const realStatSync = fs.statSync;
+  let appended = false;
+  fs.statSync = function statSyncThenAppend(p, ...rest) {
+    const stat = realStatSync.call(this, p, ...rest);
+    if (!appended && String(p) === path) {
+      appended = true;
+      appendFileSync(path, lines([assistant(2, { id: 'b', input: 20 })]));
+    }
+    return stat;
+  };
+  syncBuiltinESMExports();
+  let first;
+  try {
+    first = await f.run();
+  } finally {
+    fs.statSync = realStatSync;
+    syncBuiltinESMExports();
+  }
+  assert.ok(appended, 'the append happened during the first run');
+  assert.equal(first.buckets.reduce((n, b) => n + b.inputTokens, 0), 10, 'first run reads the captured size');
+  assert.equal((await f.run()).buckets.reduce((n, b) => n + b.inputTokens, 0), 30);
+  assert.deepEqual(normalize(await f.run()), normalize(await f.uncached()));
 });
