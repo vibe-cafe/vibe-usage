@@ -7,7 +7,7 @@ import { syncBuiltinESMExports } from 'node:module';
 import { join, sep } from 'node:path';
 import { tmpdir } from 'node:os';
 import { parse } from '../src/parsers/codex.js';
-import { codexCacheDir } from '../src/parsers/codex-cache.js';
+import { codexCacheDir, olderCodexCacheDir } from '../src/parsers/codex-cache.js';
 
 // The per-home manifest (codex-cache.js): a warm sync starts from it without
 // opening the entries, and reads a full replay index only for the boundary of
@@ -127,6 +127,35 @@ async function readsDuring(root, fn) {
   }
 }
 
+/**
+ * Date.now() under the test's control for the rest of the test, so nothing
+ * depends on how fine the machine's clock is: from a fixed instant, one
+ * millisecond per call (every audit time differs), or -- onlyOnReads() -- only
+ * when a file is opened, which is how a test runs a sync out of budget at a
+ * chosen point.
+ */
+function controlledClock() {
+  const realNow = Date.now;
+  const realCreateReadStream = fs.createReadStream;
+  let now = Date.parse('2026-07-20T00:00:00.000Z');
+  let perRead = false;
+  Date.now = () => (perRead ? now : ++now);
+  fs.createReadStream = (...args) => {
+    if (perRead) now++;
+    return realCreateReadStream(...args);
+  };
+  syncBuiltinESMExports();
+  return {
+    onlyOnReads() { perRead = true; },
+    everyCall() { perRead = false; },
+    restore() {
+      Date.now = realNow;
+      fs.createReadStream = realCreateReadStream;
+      syncBuiltinESMExports();
+    },
+  };
+}
+
 /** Every entry this version wrote, parsed. */
 function entries(homes) {
   const found = [];
@@ -212,17 +241,22 @@ test('writing back a cache state taken from the manifest writes the full index',
     writeFileSync(file('codex', forkFile), fork);
     writeFileSync(file('codex', plainFile), plain);
     const single = { extraRoots: [] };
-    await run(single);
-    await run(single);
-    process.env.VIBE_USAGE_CODEX_AUDIT_INTERVAL_MS = '0';
-    let audited = 0;
-    for (let i = 0; i < 4; i++) {
-      const result = await run(single);
-      audited += result.cache.audited;
-      assert.deepEqual(view(result), view(await uncached(single)));
-      assertNoSlimIndexWritten(homes);
+    const clock = controlledClock();
+    try {
+      await run(single);
+      await run(single);
+      process.env.VIBE_USAGE_CODEX_AUDIT_INTERVAL_MS = '0';
+      let audited = 0;
+      for (let i = 0; i < 4; i++) {
+        const result = await run(single);
+        audited += result.cache.audited;
+        assert.deepEqual(view(result), view(await uncached(single)));
+        assertNoSlimIndexWritten(homes);
+      }
+      assert.equal(audited, 4);
+    } finally {
+      clock.restore();
     }
-    assert.ok(audited >= 3, `audited ${audited}`);
   });
 });
 
@@ -340,33 +374,26 @@ test('an entry written back when the run stops right after it still has its full
     writeFileSync(file('codex', parentFile), parent);
     writeFileSync(file('codex', forkFile), fork);
     const single = { extraRoots: [] };
-    await run(single);
-    await run(single);
-    process.env.VIBE_USAGE_CODEX_AUDIT_INTERVAL_MS = '0';
-    assert.equal((await run(single)).cache.audited, 1); // the plain conversation
-    // The parent is next. A clock that moves only when a file is opened and a
-    // 1 ms budget stop the run at the first check after its header read.
-    process.env.VIBE_USAGE_CODEX_WORK_BUDGET_MS = '1';
-    const realNow = Date.now;
-    const realCreateReadStream = fs.createReadStream;
-    let now = realNow();
-    Date.now = () => now;
-    fs.createReadStream = (...args) => {
-      now++;
-      return realCreateReadStream(...args);
-    };
-    syncBuiltinESMExports();
+    const clock = controlledClock();
     let stopped;
     try {
+      await run(single);
+      await run(single);
+      process.env.VIBE_USAGE_CODEX_AUDIT_INTERVAL_MS = '0';
+      // Audit times follow the order the files were first summarized in.
+      assert.equal((await run(single)).cache.audited, 1); // the plain conversation
+      // The parent is next. With the clock moving only when a file is opened
+      // and a 1 ms budget, the run stops at the first check after its header.
+      process.env.VIBE_USAGE_CODEX_WORK_BUDGET_MS = '1';
+      clock.onlyOnReads();
       stopped = await run(single);
     } finally {
-      Date.now = realNow;
-      fs.createReadStream = realCreateReadStream;
-      syncBuiltinESMExports();
+      clock.restore();
       process.env.VIBE_USAGE_CODEX_WORK_BUDGET_MS = '600000';
     }
     assert.equal(stopped.skipped, true);
     assert.equal(stopped.indexing?.phase, 'discovery');
+    assert.equal(stopped.indexing?.completed, 2, 'stopped right after the parent');
     const parentEntry = entries(homes).find(({ entry }) => entry.filePath === file('codex', parentFile));
     assert.ok(parentEntry?.entry.index, 'the parent entry keeps an index');
     assertNoSlimIndexWritten(homes);
@@ -379,13 +406,14 @@ test('the rolling audit moves on to the next file instead of repeating one', asy
     writeFileSync(file('codex', parentFile), parent);
     writeFileSync(file('codex', forkFile), fork);
     const single = { extraRoots: [] };
-    await run(single);
-    await run(single);
-    process.env.VIBE_USAGE_CODEX_AUDIT_INTERVAL_MS = '0';
-    // Each run audits the file audited longest ago and reads only that one.
-    const realCreateReadStream = fs.createReadStream;
+    const clock = controlledClock();
+    const realCreateReadStream = fs.createReadStream; // the clock's own wrapper
     const audited = [];
     try {
+      await run(single);
+      await run(single);
+      process.env.VIBE_USAGE_CODEX_AUDIT_INTERVAL_MS = '0';
+      // Each run audits the file audited longest ago and reads only that one.
       for (let i = 0; i < 3; i++) {
         const opened = new Set();
         fs.createReadStream = (path, ...rest) => {
@@ -399,9 +427,9 @@ test('the rolling audit moves on to the next file instead of repeating one', asy
       }
     } finally {
       fs.createReadStream = realCreateReadStream;
-      syncBuiltinESMExports();
+      clock.restore();
     }
-    assert.deepEqual(audited.sort(), [file('codex', forkFile), file('codex', parentFile), file('codex', plainFile)].sort());
+    assert.deepEqual(audited, [file('codex', plainFile), file('codex', parentFile), file('codex', forkFile)]);
   });
 });
 
@@ -410,30 +438,22 @@ test('a fork left for the next run keeps the parent state its summary was checke
     const single = { extraRoots: [] };
     writeFileSync(file('codex', plainFile), plain);
     writeFileSync(file('codex', forkFile), fork);
-    await run(single);
-    await run(single);
-    assert.equal(totalInput(await run(single)), 3305, 'no parent yet: the fork counts all of its calls');
-    // Its parent appears, and this run runs out of budget right after reading
-    // the parent: the fork's boundary changes, but the fork is left for the
-    // next run instead of being summarized again.
-    writeFileSync(file('codex', parentFile), parent);
-    process.env.VIBE_USAGE_CODEX_WORK_BUDGET_MS = '2';
-    const realNow = Date.now;
-    const realCreateReadStream = fs.createReadStream;
-    let now = realNow();
-    Date.now = () => now;
-    fs.createReadStream = (...args) => {
-      now++;
-      return realCreateReadStream(...args);
-    };
-    syncBuiltinESMExports();
+    const clock = controlledClock();
     let partial;
     try {
+      await run(single);
+      await run(single);
+      assert.equal(totalInput(await run(single)), 3305, 'no parent yet: the fork counts all of its calls');
+      // Its parent appears, and this run runs out of budget right after reading
+      // the parent (its header, then its replay index: two files opened): the
+      // fork's boundary changes, but the fork is left for the next run instead
+      // of being summarized again.
+      writeFileSync(file('codex', parentFile), parent);
+      process.env.VIBE_USAGE_CODEX_WORK_BUDGET_MS = '2';
+      clock.onlyOnReads();
       partial = await run(single);
     } finally {
-      Date.now = realNow;
-      fs.createReadStream = realCreateReadStream;
-      syncBuiltinESMExports();
+      clock.restore();
       process.env.VIBE_USAGE_CODEX_WORK_BUDGET_MS = '600000';
     }
     assert.equal(partial.skipped, undefined, JSON.stringify(partial.indexing));
@@ -441,5 +461,87 @@ test('a fork left for the next run keeps the parent state its summary was checke
     const next = await run(single);
     assert.deepEqual(view(next), view(await uncached(single)));
     assert.equal(totalInput(next), 3305, 'parent 3000 + the fork\'s own 5 + plain 300');
+  });
+});
+
+test('a fork summary checked against an algorithm-5 parent index is checked again once that index is rebuilt', async () => {
+  await withHomes(async ({ homes, file, run, uncached }) => {
+    const single = { extraRoots: [] };
+    writeFileSync(file('codex', parentFile), parent);
+    writeFileSync(file('codex', forkFile), fork);
+    await run(single);
+    // The parent as an algorithm-5 collector left it: its entry in the older
+    // location and none of this version's, no manifest. Algorithm 5
+    // fingerprinted durable usage records without their response id, so its
+    // index does not match a fork indexed by this version; here the
+    // fingerprints are simply made different.
+    const dir = codexCacheDir(homes.codex);
+    for (const { name, entry } of entries(homes)) {
+      if (entry.filePath !== file('codex', parentFile)) continue;
+      const older = { ...entry, algorithmVersion: 5, header: { ...entry.header }, result: { ...entry.result },
+        index: { ...entry.index, tokenFingerprints: entry.index.tokenFingerprints.map(fingerprint => `v5-${fingerprint}`) } };
+      delete older.header.modelProvider;
+      delete older.result.magpieEntries;
+      delete older.result.ultrafastBuckets;
+      writeFileSync(join(olderCodexCacheDir(homes.codex), name), JSON.stringify(older));
+      unlinkSync(join(dir, name));
+    }
+    rmSync(join(dir, 'manifest.v1'), { force: true });
+    // Magpie-free and no cut: the algorithm-5 entry is taken whole, and with
+    // its index the fork's copy of the parent counts (as it does without the
+    // manifest). Two runs put that state, parent file unchanged, in the manifest.
+    await run(single);
+    assert.equal(totalInput(await run(single)), 6005);
+    // The cut moves before all history: an algorithm-5 summary may no longer
+    // stand in, so the parent is indexed again by this version. Its file has
+    // not changed; the index used for it has.
+    const all = { ...single, codexUltrafastStartAt: '1970-01-01T00:00:00.000Z' };
+    const rebuilt = await run(all);
+    assert.deepEqual(view(rebuilt), view(await uncached(all)));
+    assert.equal(totalInput(rebuilt), 3005, 'parent 3000 + the fork\'s own 5');
+    assert.equal(totalInput(await run(all)), 3005);
+  });
+});
+
+test('a full index that has to be built from the rollout again counts against the budget', async () => {
+  await withHomes(async ({ homes, file, run, uncached }) => {
+    const single = { extraRoots: [] };
+    writeFileSync(file('codex', plainFile), plain);
+    writeFileSync(file('codex', parentFile), parent);
+    writeFileSync(file('codex', forkFile), fork);
+    const clock = controlledClock();
+    const realCreateReadStream = fs.createReadStream; // the clock's own wrapper
+    const opened = [];
+    let partial;
+    try {
+      await run(single);
+      await run(single);
+      await run(single);
+      // The fork's entry is gone (its record stays), and its parent grows: the
+      // fork's boundary has to be computed from a full index the entry can no
+      // longer give. The parent alone (header, index, usage: three files
+      // opened) uses up a 3 ms budget.
+      for (const { name, entry } of entries(homes)) {
+        if (entry.filePath === file('codex', forkFile)) unlinkSync(join(codexCacheDir(homes.codex), name));
+      }
+      appendFileSync(file('codex', parentFile), jsonl([tokenCount('2026-07-10T10:00:00.000Z', 40, 3043)]));
+      process.env.VIBE_USAGE_CODEX_WORK_BUDGET_MS = '3';
+      clock.onlyOnReads();
+      fs.createReadStream = (path, ...rest) => {
+        opened.push(String(path));
+        return realCreateReadStream(path, ...rest);
+      };
+      syncBuiltinESMExports();
+      partial = await run(single);
+    } finally {
+      fs.createReadStream = realCreateReadStream;
+      clock.restore();
+      process.env.VIBE_USAGE_CODEX_WORK_BUDGET_MS = '600000';
+    }
+    assert.equal(partial.indexing?.phase, 'usage', JSON.stringify(partial.indexing));
+    assert.ok(!opened.includes(file('codex', forkFile)), 'the fork is left for the next run, not read past the budget');
+    const next = await run(single);
+    assert.deepEqual(view(next), view(await uncached(single)));
+    assert.equal(totalInput(next), 3345);
   });
 });

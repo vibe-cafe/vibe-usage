@@ -604,6 +604,28 @@ function isSlimIndex(index) {
   return !!index?.[SLIM_INDEX_SOURCE];
 }
 
+// What a parent's replay index contributes to a boundary: its per-record
+// arrays, as a digest. A parent's file can stay the same while the index used
+// for it changes -- an algorithm-5 entry, whose durable usage records were
+// fingerprinted without their response id, is taken whole on a Magpie-free
+// machine and gives way to an index built by this version once Magpie becomes
+// active or the cut moves (and such an index can also have been copied into a
+// version-7 entry). So the parent state a summary was checked against
+// (replayParentState()) includes this digest. A slim index carries the one its
+// record was written with.
+const INDEX_DIGEST = Symbol('Codex replay index digest');
+
+function replayIndexDigest(index) {
+  if (!index) return null;
+  if (HEAVY_INDEX_FIELDS.every(key => Array.isArray(index[key]))) {
+    index[INDEX_DIGEST] ??= createHash('sha256')
+      .update(JSON.stringify(HEAVY_INDEX_FIELDS.map(key => index[key])))
+      .digest('base64url').slice(0, 22);
+    return index[INDEX_DIGEST];
+  }
+  return typeof index.indexDigest === 'string' ? index.indexDigest : null;
+}
+
 /**
  * Fill a slim index, in place (every holder of the object sees it), from the
  * entry it was recorded from: this version's, or the older version's whose
@@ -630,6 +652,8 @@ function fillFullIndex(index) {
     || full.parsedRecordCount !== index.parsedRecordCount
     || full.rawTokenCount !== index.rawTokenCount) return false;
   delete index[SLIM_INDEX_SOURCE];
+  delete index.indexDigest;
+  delete index[INDEX_DIGEST];
   Object.assign(index, full);
   return true;
 }
@@ -650,6 +674,8 @@ async function ensureFullIndex(index, file, cacheStats) {
     cacheStats.filesRead++;
   }
   delete index[SLIM_INDEX_SOURCE];
+  delete index.indexDigest;
+  delete index[INDEX_DIGEST];
   Object.assign(index, full);
   updateFileCache(file, { index });
 }
@@ -662,9 +688,12 @@ async function ensureFullIndex(index, file, cacheStats) {
 const INDEX_FIELDS_IN_HEADER = ['sessionId', 'forkedFromId', 'parentThreadId', 'sessionProject',
   'modelProvider', 'sessionStartedAtMs', 'isSubagent'];
 
-function compactManifestIndex(index, header, filePath) {
+function compactManifestIndex(index, header, filePath, withDigest = false) {
   const slim = slimIndexFields(index);
   if (!slim) return null;
+  delete slim.indexDigest;
+  const digest = withDigest ? replayIndexDigest(index) : null;
+  if (digest) slim.indexDigest = digest;
   const compact = {};
   for (const [key, value] of Object.entries(slim)) {
     if (key === 'filePath' && value === filePath) continue;
@@ -684,12 +713,12 @@ function expandManifestIndex(compact, header, filePath) {
 }
 
 /** What a manifest record keeps of a cache state (never the per-record arrays). */
-function manifestRecord(cache, signature, src, boundaryParent, filePath) {
+function manifestRecord(cache, signature, src, boundaryParent, filePath, withDigest = false) {
   return {
     signature,
     src,
     header: cache.header ?? null,
-    index: compactManifestIndex(cache.index, cache.header ?? null, filePath),
+    index: compactManifestIndex(cache.index, cache.header ?? null, filePath, withDigest),
     ...(cache.copyOf ? { copyOf: cache.copyOf } : {}),
     result: cache.result ?? null,
     lastAuditedAt: cache.lastAuditedAt ?? null,
@@ -730,6 +759,7 @@ function sameManifestRecord(a, b) {
     && sameSignature(a.signature, b.signature)
     && !!a.header === !!b.header
     && !!a.index === !!b.index
+    && a.index?.indexDigest === b.index?.indexDigest
     && !!a.result === !!b.result
     && a.result?.boundaryKey === b.result?.boundaryKey
     && a.lastAuditedAt === b.lastAuditedAt
@@ -1373,7 +1403,7 @@ async function indexFromCompressedCopy(file, sameSession, fileMeta, needsIndex) 
  * time, or the audit would pick the same file again on every run.) A run that
  * leaves work for the next one keeps the records it did not get to.
  */
-function writeCodexManifests(manifests, files, complete) {
+function writeCodexManifests(manifests, files, complete, parentIds = new Set()) {
   if (!codexCacheEnabled()) return;
   const next = new Map([...manifests.keys()].map(codexHome => [codexHome, new Map()]));
   for (const file of files) {
@@ -1385,7 +1415,8 @@ function writeCodexManifests(manifests, files, complete) {
     const changedSinceRecorded = file.cacheWritten && previous && !sameSignature(previous.signature, file.signature);
     if (usable && !changedSinceRecorded) {
       const boundaryParent = 'boundaryParent' in file ? file.boundaryParent : file.manifestRecord?.boundaryParent;
-      records.set(file.filePath, manifestRecord(file.cache, file.signature, file.cacheSource, boundaryParent ?? undefined, file.filePath));
+      records.set(file.filePath, manifestRecord(file.cache, file.signature, file.cacheSource, boundaryParent ?? undefined,
+        file.filePath, parentIds.has(file.cache.header?.sessionId)));
     } else if (previous) {
       records.set(file.filePath, previous);
     }
@@ -1800,9 +1831,12 @@ async function parseCodexHomes({ codexExtraHome, extraRoots = [], magpie, codexU
 
   // Where each rollout and group is, for a parent's full index and its state.
   const filesByPath = new Map(files.map(file => [file.filePath, file]));
-  const replayParentState = path => {
-    const signature = filesByPath.get(path)?.signature;
-    return signature ? `${path}\u0000${signature.size}:${signature.mtimeMs}:${signature.dev}:${signature.ino}` : null;
+  const replayParentState = parent => {
+    const signature = filesByPath.get(parent.filePath)?.signature;
+    const digest = replayIndexDigest(parent);
+    return signature && digest
+      ? `${parent.filePath}\u0000${signature.size}:${signature.mtimeMs}:${signature.dev}:${signature.ino}\u0000${digest}`
+      : null;
   };
   const results = [];
   const leftOut = file => {
@@ -1827,13 +1861,14 @@ async function parseCodexHomes({ codexExtraHome, extraRoots = [], magpie, codexU
     // The replay boundary of a fork or sub-agent whose parent session is known
     // needs both full indexes. Not when the manifest record (for exactly this
     // file state) says its summary was checked against exactly this parent
-    // file state: the boundary is a function of the two indexes, and each index
-    // a function of its file's bytes. Without a parent no array is needed.
+    // state -- the parent's file and the index used for it (replayIndexDigest()):
+    // the boundary is a function of the two indexes. Without a parent no array
+    // is needed.
     const parentId = needsIndex.has(file.filePath)
       ? (fm.forkedFromId || (fm.isSubagent ? fm.parentThreadId : null))
       : null;
     const parent = parentId ? sessionById.get(parentId) : null;
-    const parentState = parent ? replayParentState(parent.filePath) : null;
+    let parentState = parent ? replayParentState(parent) : null;
     let boundary = null;
     let key;
     if (parent && parentState && !auditPaths.has(file.filePath)
@@ -1842,8 +1877,19 @@ async function parseCodexHomes({ codexExtraHome, extraRoots = [], magpie, codexU
       key = file.cache.result.boundaryKey;
     } else {
       if (parent) {
+        // Filled from their entries if possible; a full index that has to be
+        // built from the rollout again counts against the budget like any read.
+        const parentFile = filesByPath.get(parent.filePath);
+        if ((!fillFullIndex(fm) || !fillFullIndex(parent))
+          && !canRead([file, parentFile].some(f => f?.compressed || !!f?.members?.some(member => member.compressed)))) {
+          leftOut(file);
+          continue;
+        }
         await ensureFullIndex(fm, file, cacheStats);
-        await ensureFullIndex(parent, filesByPath.get(parent.filePath), cacheStats);
+        await ensureFullIndex(parent, parentFile, cacheStats);
+        // The state of the index actually used, which its entry may have
+        // changed since the manifest recorded it.
+        parentState = replayParentState(parent);
       }
       boundary = needsIndex.has(file.filePath)
         ? replayBoundary(fm, sessionById)
@@ -1905,7 +1951,7 @@ async function parseCodexHomes({ codexExtraHome, extraRoots = [], magpie, codexU
 
   const merged = { ...mergeFileResults(results, magpie, ultrafastStartMs), cache: cacheStats };
   try {
-    writeCodexManifests(manifests, files, pendingPaths.size === 0);
+    writeCodexManifests(manifests, files, pendingPaths.size === 0, referencedParentIds);
   } catch {
     // An accelerator only: a write failure costs the next run its entry reads.
   }
