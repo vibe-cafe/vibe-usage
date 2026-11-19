@@ -9,13 +9,32 @@ import { quotaResult } from '../schema.js';
 
 const QUOTA_PATH = '/exa.language_server_pb.LanguageServerService/RetrieveUserQuotaSummary';
 
+/** Fixed places to look for agy besides PATH. On Windows the official
+ * installers (antigravity.google/cli/install.ps1 and install.cmd) put
+ * `agy.exe` in `%LOCALAPPDATA%\agy\bin`, which reaches PATH only after
+ * `agy install` edits the user environment, so a desktop app started before
+ * that (autostart) never sees it on PATH. The Windows app's "detected" check
+ * mirrors this list (`quota_product::antigravity_cli_paths`). */
+export function antigravityInstallPaths(environment = process.env, home = homedir(), platform = process.platform) {
+  const name = platform === 'win32' ? 'agy.exe' : 'agy';
+  const localAppData = environment.LOCALAPPDATA?.trim();
+  return [
+    join(home, '.local', 'bin', name),
+    ...(platform === 'win32' && localAppData ? [join(localAppData, 'agy', 'bin', name)] : []),
+  ];
+}
+
 export function antigravityBinary(environment = process.env, home = homedir(), platform = process.platform) {
   const name = platform === 'win32' ? 'agy.exe' : 'agy';
   const override = environment.ANTIGRAVITY_CLI_PATH?.trim();
+  const [userBin, ...installed] = antigravityInstallPaths(environment, home, platform);
+  // PATH stays ahead of the installer default so an agy that works today keeps
+  // being the one that runs.
   const candidates = override ? [override] : [
-    join(home, '.local', 'bin', name),
+    userBin,
     ...(environment.PATH || '').split(platform === 'win32' ? ';' : delimiter)
       .filter(Boolean).map(root => join(root, name)),
+    ...installed,
   ];
   return candidates.find(path => {
     if (!isAbsolute(path)) return false;

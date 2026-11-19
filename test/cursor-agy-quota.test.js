@@ -1,11 +1,11 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { mkdtempSync, rmSync, readFileSync, writeFileSync, existsSync } from 'node:fs';
+import { mkdtempSync, mkdirSync, rmSync, readFileSync, writeFileSync, existsSync } from 'node:fs';
 import { tmpdir } from 'node:os';
-import { join } from 'node:path';
+import { dirname, join } from 'node:path';
 import { execFileSync, spawn } from 'node:child_process';
 import { fetchCursorQuota, parseCursorQuota, readCursorQuotaToken, cursorQuotaDbPath } from '../src/quotas/providers/cursor.js';
-import { fetchAntigravityQuota, parseAntigravityQuota, withAntigravitySession } from '../src/quotas/providers/antigravity.js';
+import { antigravityBinary, fetchAntigravityQuota, parseAntigravityQuota, withAntigravitySession } from '../src/quotas/providers/antigravity.js';
 import { fetchQuotaProducts, discoverQuotaProducts } from '../src/quotas/registry.js';
 
 const token = `header.${Buffer.from(JSON.stringify({ sub: 'fixture-account' })).toString('base64url')}.fixture-signature`;
@@ -158,6 +158,34 @@ test('AGY never reads credentials during discovery or falls back to another acco
   assert.equal(rejected.status,'unauthorized');
   const missing = await fetchAntigravityQuota({ environment: {PATH:''}, home: '/missing' });
   assert.equal(missing.status,'missing_credentials');
+});
+
+test('AGY finds the official Windows install outside PATH, after an agy on PATH', t => {
+  const root = mkdtempSync(join(tmpdir(), 'vbu-agy-windows-'));
+  t.after(() => rmSync(root, { recursive: true, force: true }));
+  const home = join(root, 'home');
+  const localAppData = join(root, 'localappdata');
+  const environment = { PATH: join(root, 'bin'), LOCALAPPDATA: localAppData };
+  const detected = () => discoverQuotaProducts({ environment, home, platform: 'win32' })
+    .products.find(p => p.id === 'antigravity').detected;
+  const touch = path => { mkdirSync(dirname(path), { recursive: true }); writeFileSync(path, ''); };
+  assert.equal(antigravityBinary(environment, home, 'win32'), undefined);
+  assert.equal(detected(), false);
+
+  // Where install.ps1 / install.cmd put it; PATH may not have it (yet).
+  const installed = join(localAppData, 'agy', 'bin', 'agy.exe');
+  touch(installed);
+  assert.equal(antigravityBinary(environment, home, 'win32'), installed);
+  assert.equal(detected(), true);
+
+  // An agy that already runs from PATH keeps being the one used.
+  const onPath = join(root, 'bin', 'agy.exe');
+  touch(onPath);
+  assert.equal(antigravityBinary(environment, home, 'win32'), onPath);
+
+  // Only Windows looks under LOCALAPPDATA.
+  touch(join(localAppData, 'agy', 'bin', 'agy'));
+  assert.equal(antigravityBinary({ PATH: '', LOCALAPPDATA: localAppData }, home, 'linux'), undefined);
 });
 
 test('AGY owns and cleans its prompt-free child on success and timeout', async t => {
