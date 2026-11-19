@@ -3,15 +3,10 @@ import {
   closeSync,
   createReadStream,
   existsSync,
-  mkdirSync,
   openSync,
-  readFileSync,
   readSync,
   readdirSync,
-  renameSync,
-  rmSync,
   statSync,
-  writeFileSync,
 } from 'node:fs';
 import { join } from 'node:path';
 import { createInterface } from 'node:readline';
@@ -30,75 +25,16 @@ import {
 } from '../codex-roots.js';
 import { discoverCodexHomes } from '../extra-roots.js';
 import {
-  codexCacheDir,
   codexCacheEnabled,
   fileSignature,
   loadCodexFileCache,
   loadCodexFileTail,
   loadOlderCodexFileCache,
-  olderCodexCacheDir,
   sameSignature,
   saveCodexFileCache,
   saveCodexFileTail,
 } from './codex-cache.js';
 import { codexUltrafastModel, codexUltrafastStartMs } from '../codex-ultrafast.js';
-import {
-  dirJsonStatToken,
-  hashManifest,
-  localTimeZoneToken,
-  magpieManifestToken,
-  parserCacheEnabled,
-} from './parser-cache.js';
-
-const CODEX_SNAPSHOT_ALGO = 1;
-
-
-function codexSnapshotPath(codexHomes) {
-  const roots = hashManifest(codexHomes);
-  return join(codexCacheDir(codexHomes[0]), `_snapshot-${roots}.cache`);
-}
-
-function codexL2Digest(codexHomes) {
-  return codexHomes
-    .map((h) => `${h}|v7:${dirJsonStatToken(codexCacheDir(h))}|old:${dirJsonStatToken(olderCodexCacheDir(h))}`)
-    .join('\n');
-}
-
-function loadCodexSnapshot(codexHomes, manifest) {
-  if (!parserCacheEnabled()) return null;
-  const path = codexSnapshotPath(codexHomes);
-  if (!existsSync(path)) return null;
-  try {
-    const parsed = JSON.parse(readFileSync(path, 'utf8'));
-    if (parsed.algo !== CODEX_SNAPSHOT_ALGO || parsed.manifest !== manifest
-      || !(Date.now() < parsed.nextAuditAt)) return null;
-    if (!Array.isArray(parsed.buckets) || !Array.isArray(parsed.sessions)) return null;
-    return { buckets: parsed.buckets, sessions: parsed.sessions };
-  } catch {
-    return null;
-  }
-}
-
-function saveCodexSnapshot(codexHomes, manifest, data) {
-  if (!parserCacheEnabled()) return;
-  const dir = codexCacheDir(codexHomes[0]);
-  const path = codexSnapshotPath(codexHomes);
-  const tmp = `${path}.${process.pid}.tmp`;
-  try {
-    mkdirSync(dir, { recursive: true, mode: 0o700 });
-    writeFileSync(tmp, JSON.stringify({ algo: CODEX_SNAPSHOT_ALGO, manifest, ...data }), {
-      encoding: 'utf8',
-      mode: 0o600,
-    });
-    renameSync(tmp, path);
-  } catch {
-    try {
-      rmSync(tmp, { force: true });
-    } catch {
-      // Best effort cleanup.
-    }
-  }
-}
 
 // Changing a model id changes its server-side bucket key. Keep pre-release
 // history byte-for-byte stable so upgrading cannot re-upload the same tokens
@@ -1326,6 +1262,7 @@ async function parseCodexHomes({ codexExtraHome, extraRoots = [], magpie, codexU
           header: null,
           appendTail: null,
         };
+        startingCache(file, cacheOptions, ultrafastStartMs);
         files.push(file);
       } catch (err) {
         // The file may move to archived_sessions between discovery and stat.
@@ -1339,50 +1276,6 @@ async function parseCodexHomes({ codexExtraHome, extraRoots = [], magpie, codexU
     }
   }
   if (files.length === 0) return { buckets: [], sessions: [] };
-
-  // L1 whole-source manifest fast path: skip opening hundreds of per-file
-  // cache entries and re-merging when every rollout stat signature, L2 cache
-  // directory state, Magpie ledger state, and the Ultrafast cut match the
-  // previous complete run.
-  const magpieToken = magpieManifestToken(magpie);
-  const magpiePendingBefore = magpie?.pending?.length ?? 0;
-  let manifestParts = null;
-  if (
-    codexCacheEnabled()
-    && magpieToken
-    && discovery.undecodable === 0
-    && !process.env.VIBE_USAGE_CODEX_AUDIT_INTERVAL_MS
-    && !process.env.VIBE_USAGE_CODEX_WORK_BUDGET_MS
-  ) {
-    const cutKey = ultrafastStartMs === null ? 'null' : String(ultrafastStartMs);
-    manifestParts = [
-      `tz|${localTimeZoneToken()}`,
-      `cut|${cutKey}`,
-      magpieToken,
-      ...files.map(f => `${f.codexHome}|${f.filePath}|${f.signature.size}:${f.signature.mtimeMs}:${f.signature.dev}:${f.signature.ino}`),
-    ];
-    const manifest = hashManifest([...manifestParts, codexL2Digest(codexHomes)]);
-    const snap = loadCodexSnapshot(codexHomes, manifest);
-    if (snap && magpieManifestToken(magpie) === magpieToken) {
-      return {
-        buckets: snap.buckets,
-        sessions: snap.sessions,
-        cache: {
-          headerHits: files.length,
-          indexHits: 0,
-          resultHits: files.length,
-          tailHits: 0,
-          filesRead: 0,
-          audited: 0,
-          snapshotHit: true,
-        },
-      };
-    }
-  }
-
-  for (const file of files) {
-    startingCache(file, cacheOptions, ultrafastStartMs);
-  }
 
   // A warm cache gets a tiny rolling correctness audit. Never mix this into a
   // cold/resumed build: all files must already have complete results, and at
@@ -1717,25 +1610,7 @@ async function parseCodexHomes({ codexExtraHome, extraRoots = [], magpie, codexU
   }
 
   const merged = { ...mergeFileResults(results, magpie, ultrafastStartMs), cache: cacheStats };
-  if (pendingPaths.size === 0) {
-    const magpieStable = !magpie || (!magpie.failed && (magpie.pending?.length ?? 0) === magpiePendingBefore);
-    if (manifestParts && magpieStable) {
-      const finalManifest = hashManifest([...manifestParts, codexL2Digest(codexHomes)]);
-      let nextAuditAt = Number.MAX_SAFE_INTEGER;
-      for (const file of files) {
-        if (file.cache?.result && auditSize(file) <= auditMaxBytes()
-          && !file.members?.some(member => member.compressed)) {
-          nextAuditAt = Math.min(nextAuditAt, (file.cache.lastAuditedAt || 0) + auditIntervalMs());
-        }
-      }
-      saveCodexSnapshot(codexHomes, finalManifest, {
-        nextAuditAt,
-        buckets: merged.buckets,
-        sessions: merged.sessions,
-      });
-    }
-    return merged;
-  }
+  if (pendingPaths.size === 0) return merged;
   // Rollouts whose session waits for the next run, of all physical rollouts.
   const physical = files.filter(file => !file.members);
   const waiting = physical.filter(file => pendingPaths.has(file.filePath)

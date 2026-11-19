@@ -55,7 +55,7 @@ export function createMagpieContext({ startAt, onPossible, now = Date.now() } = 
   let offset = null;
   let possibleChecked = false;
   const ctx = {
-    startAt, failed: false, pending: [], bytesRead: 0, ledgerExists: undefined, ledgerFile: file,
+    startAt, failed: false, pending: [], bytesRead: 0, ledgerExists: undefined,
     discover(hasResponseModel = false) {
       let snapshot;
       try { snapshot = statSync(file); }

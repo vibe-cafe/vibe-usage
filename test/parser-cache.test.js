@@ -108,22 +108,16 @@ test('dirJsonStatToken detects in-place edits to cached json files', (t) => {
   assert.notEqual(t2, t1);
 });
 
-test('magpieManifestToken tracks ledger stat and cut changes', (t) => {
-  const dir = withTempCache(t);
-  const ledger = join(dir, 'usage.jsonl');
-  writeFileSync(ledger, '{"id":1}\n');
-
+test('magpieManifestToken: no whole-source snapshot where a Magpie ledger exists or was never checked', () => {
   assert.equal(magpieManifestToken(null), 'magpie:none');
-  assert.equal(magpieManifestToken({ failed: true }), null);
-
-  const tok1 = magpieManifestToken({ startAt: 'none', ledgerExists: true, ledgerFile: ledger, failed: false });
-  assert.ok(tok1);
-  const tok2 = magpieManifestToken({ startAt: '2026-11-01T00:00:00.000Z', ledgerExists: true, ledgerFile: ledger, failed: false });
-  assert.notEqual(tok1, tok2);
-
-  writeFileSync(ledger, '{"id":1}\n{"id":2}\n');
-  const tok3 = magpieManifestToken({ startAt: 'none', ledgerExists: true, ledgerFile: ledger, failed: false });
-  assert.notEqual(tok1, tok3);
+  assert.equal(magpieManifestToken({ failed: true, ledgerExists: false }), null);
+  // Attributed results depend on the ledger's contents, and a ledger read
+  // failure must reach sync.js, which a snapshot hit would skip.
+  assert.equal(magpieManifestToken({ startAt: 'none', ledgerExists: true, failed: false }), null);
+  assert.equal(magpieManifestToken({ startAt: undefined, ledgerExists: undefined, failed: false }), null);
+  const none = magpieManifestToken({ startAt: undefined, ledgerExists: false, failed: false });
+  assert.ok(none);
+  assert.notEqual(magpieManifestToken({ startAt: 'none', ledgerExists: false, failed: false }), none);
 });
 
 test('VIBE_USAGE_PARSER_CACHE=0 disables reads and writes cleanly', (t) => {

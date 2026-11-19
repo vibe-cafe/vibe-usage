@@ -157,18 +157,16 @@ export function localTimeZoneToken() {
 }
 
 /**
- * Build a deterministic manifest token for a Magpie context so L1 snapshots
- * remain valid even on machines with an active Magpie ledger, invalidating
- * whenever the ledger file or cut changes. Returns null when Magpie failed.
+ * Manifest token for a Magpie context. A machine with a Magpie ledger (or a
+ * context whose ledger was never checked, or failed) gets null, i.e. no whole-
+ * source snapshot: attribution depends on the ledger's contents and a ledger
+ * read failure must reach sync.js, which a snapshot hit would skip.
  */
 export function magpieManifestToken(magpie) {
   if (!magpie) return 'magpie:none';
-  if (magpie.failed) return null;
+  if (magpie.failed || magpie.ledgerExists !== false) return null;
   const start = magpie.startAt === undefined ? 'undef' : String(magpie.startAt);
-  if (!magpie.ledgerExists) return `magpie:${start}|exists:0`;
-  const sig = magpie.ledgerFile ? fileStatToken(magpie.ledgerFile) : null;
-  if (!sig) return null;
-  return `magpie:${start}|exists:1|${sig}`;
+  return `magpie:${start}|exists:0`;
 }
 
 /** Hash an ordered array of manifest lines into a compact hex digest. */

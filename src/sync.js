@@ -202,7 +202,7 @@ export function recordParserInfos(state, parserInfos) {
 // Parser execution is I/O bound (log reads, occasional network calls). Run a
 // bounded number at once to cut wall-clock sync time without the memory spike
 // of loading every tool's logs simultaneously.
-export const PARSER_CONCURRENCY = 6;
+export const PARSER_CONCURRENCY = 4;
 
 // Parsers whose run time follows the size of a remote account rather than this
 // machine. Cursor downloads cursor.com's usage export; a whole-account export
@@ -320,10 +320,7 @@ async function runSyncPasses({
     ) {
       config.lastUploadProject = uploadProject;
       config.lastUploadProjectApiUrl = apiUrl;
-      const latest = loadConfig();
-      if (latest?.apiKey === config.apiKey && latest.apiUrl === config.apiUrl) {
-        saveConfig({ ...latest, lastUploadProject: uploadProject, lastUploadProjectApiUrl: apiUrl });
-      }
+      saveConfig(config);
     }
   } catch (err) {
     status.stop();
@@ -358,12 +355,10 @@ async function runSyncPasses({
   const magpie = createMagpieContext({
     startAt: config.magpieStartAt,
     onPossible() {
-      const latest = loadConfig();
-      if (!latest || latest.apiKey !== config.apiKey || latest.apiUrl !== config.apiUrl) return undefined;
-      if (latest.magpieStartAt !== undefined) return latest.magpieStartAt;
       const startAt = chooseMagpieStartAt(state, { daemonInstalled: daemonInstalled(), surface });
       if (startAt !== undefined) {
-        saveConfig({ ...latest, magpieStartAt: startAt });
+        config.magpieStartAt = startAt;
+        saveConfig(config);
         process.stderr.write(`${dim(`  Magpie: 已确定切点 ${startAt}，${startAt === 'none' ? '全部本地历史可还原模型' : '切点之前保持原名，之后的新用量可还原模型'}。`)}\n`);
       }
       return startAt;
