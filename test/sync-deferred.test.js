@@ -214,6 +214,28 @@ test('each pass prunes only its own sources; Cursor keys survive the first pass'
   });
 });
 
+test('a source still indexing uploads what it read and keeps the state of what it has not', async () => {
+  // Codex after an upgrade that finds a long compressed history: not skipped,
+  // the sessions it could compute exactly, and `indexing` for the rest.
+  const dead = `local-fast|gone|p|${HOST}|2026-10-01T00:00:00.000Z`;
+  const partial = `parsers['local-fast'] = async () => ({ buckets: [${bucket('local-fast')}], sessions: [],
+    indexing: { phase: 'replay-index', completed: 1, total: 2 } });`;
+  await withBackend(async (backend) => {
+    await inSandbox(backend, async ({ run, state }) => {
+      const { stdout } = await run(script(partial));
+      assert.deepEqual(backend.ingests.map(i => i.sources), [['local-fast']]);
+      assert.match(stdout, /local-fast: 正在建立本地索引 1\/2（下次同步继续）/);
+      // The key of a session it has not read yet is kept, so that session is
+      // not sent again once it is read.
+      assert.equal(state().buckets[dead], 'x');
+    }, { state: { buckets: { [dead]: 'x' }, sessions: {} } });
+    await inSandbox(backend, async ({ run, state }) => {
+      await run(script(LOCAL_FAST));
+      assert.equal(state().buckets[dead], undefined, 'a complete result still prunes');
+    }, { state: { buckets: { [dead]: 'x' }, sessions: {} } });
+  });
+});
+
 test('a failing first pass stops the sync before the slow source uploads', async () => {
   await withBackend(async (backend) => {
     await inSandbox(backend, async ({ fails, statePath }) => {

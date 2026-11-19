@@ -88,11 +88,12 @@ export function fileSignature(stat) {
   };
 }
 
-function sameSignature(a, b) {
-  return a?.size === b.size
-    && a?.mtimeMs === b.mtimeMs
-    && a?.dev === b.dev
-    && a?.ino === b.ino;
+/** Whether two stat signatures name one file state (and, with dev + ino, one file). */
+export function sameSignature(a, b) {
+  return a?.size === b?.size
+    && a?.mtimeMs === b?.mtimeMs
+    && a?.dev === b?.dev
+    && a?.ino === b?.ino;
 }
 
 /** Where versions up to 6 keep their entries. Read-only for this version. */

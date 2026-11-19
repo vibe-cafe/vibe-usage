@@ -216,7 +216,9 @@ function createMachine({ switching = false } = {}) {
       const result = await withEnv({ ...base, ...env }, run);
       return {
         result,
-        done: !result.skipped,
+        // Complete: neither skipped nor leaving part of the history for the
+        // next run (a partial result still uploads everything that is exact).
+        done: !result.skipped && !result.indexing,
         elapsedMs: Math.round(clock.now - startedAt),
         tailHits: result.cache?.tailHits,
         filesRead: result.cache?.filesRead,
@@ -324,10 +326,12 @@ for (const variant of VARIANTS) {
 
         // Only without a cut, right after the older collector, with nothing
         // appended since, can its summaries stand in. Everywhere else three
-        // changed rollouts at 20s each cannot fit a 45s budget on the first run
-        // -- which is what makes this a test of the loop at all.
+        // changed rollouts at 20s each run past a 45s budget on the first run
+        // -- which is what makes this a test of the loop at all. (A read is
+        // started while the budget lasts and finished; whether anything is
+        // then left for the next run depends on the variant.)
         const startsCold = variant.cutAt(1) !== null || order === 'new-first' || growsBetween;
-        if (startsCold) assert.equal(newRuns[0].done, false, trace);
+        if (startsCold) assert.ok(newRuns[0].elapsedMs >= BUDGET_MS, trace);
 
         // The last run in which something other than an append changed under
         // the new collector: a newly registered cut, or a rollout that moved
@@ -401,7 +405,7 @@ async function timedRun(env, run) {
     const result = await withEnv(env, run);
     return {
       result,
-      done: !result.skipped,
+      done: !result.skipped && !result.indexing,
       elapsedMs: Math.round(clock.now - startedAt),
       filesRead: result.cache?.filesRead,
       indexing: result.indexing ? `${result.indexing.phase} ${result.indexing.completed}/${result.indexing.total}` : null,

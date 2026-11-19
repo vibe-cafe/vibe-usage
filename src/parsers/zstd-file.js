@@ -1,4 +1,5 @@
 import { closeSync, createReadStream, openSync, readSync } from 'node:fs';
+import { open } from 'node:fs/promises';
 import { pipeline } from 'node:stream';
 import zlib from 'node:zlib';
 
@@ -28,6 +29,8 @@ const PROBE_WINDOW = 512;
 // with these, about what the zstd CLI does on the same machine.
 const READ_HIGH_WATER_MARK = 1024 * 1024;
 const DECODER_CHUNK_SIZE = 256 * 1024;
+// A header read decodes only the first record (a few KB to tens of KB).
+const HEAD_READ_HIGH_WATER_MARK = 64 * 1024;
 
 /** A file that is not complete, valid Zstandard data (as opposed to an I/O error). */
 export class ZstdDecodeError extends Error {
@@ -151,11 +154,11 @@ function isDecoderError(err) {
  * length. Decoder failures and size mismatches throw ZstdDecodeError; file
  * system errors (the file vanished, permissions) are rethrown as they are.
  */
-export async function* zstdFileChunks(filePath, size, counter = null) {
+export async function* zstdFileChunks(filePath, size, counter = null, frames = null) {
   if (!zstdDecoderAvailable()) {
     throw new Error(`zstd decoder unavailable in Node ${process.version}`);
   }
-  const frames = zstdFrames(filePath, size);
+  frames ??= zstdFrames(filePath, size);
   for (const frame of frames) {
     const source = createReadStream(filePath, {
       start: frame.start,
@@ -186,5 +189,77 @@ export async function* zstdFileChunks(filePath, size, counter = null) {
         filePath
       );
     }
+  }
+}
+
+/**
+ * The start of a Zstandard file's decompressed contents, for a caller that
+ * stops after its first records (and must stop the iteration to stop reading).
+ * The frames are not located first: that walk touches every block header,
+ * which on a cold disk costs a read of the whole file -- a whole run of the
+ * work budget for a few thousand rollouts, only to find their first lines.
+ * The decoder starts at the first frame and is trusted only for what a caller
+ * reads before it stops: at worst (damage, or Node 22 stopping early) the first
+ * record is missing or unparseable, which costs a full read later, and every
+ * full read goes through `zstdFileChunks()` and its checks.
+ */
+export async function* zstdFileHeadChunks(filePath, size) {
+  if (!zstdDecoderAvailable()) {
+    throw new Error(`zstd decoder unavailable in Node ${process.version}`);
+  }
+  const source = createReadStream(filePath, {
+    start: 0,
+    end: size - 1,
+    highWaterMark: HEAD_READ_HIGH_WATER_MARK,
+  });
+  const decoder = zlib.createZstdDecompress({ chunkSize: DECODER_CHUNK_SIZE });
+  pipeline(source, decoder, () => {});
+  try {
+    for await (const chunk of decoder) yield chunk;
+  } catch (err) {
+    if (isDecoderError(err)) throw new ZstdDecodeError(err.message, filePath, err);
+    throw err;
+  } finally {
+    source.destroy();
+    decoder.destroy();
+  }
+}
+
+/**
+ * Which of `candidates` (`[{ filePath, size }]`, in order of preference) holds
+ * exactly the bytes the first `size` bytes of a Zstandard file decompress to,
+ * or null. Only the first candidate of the declared decompressed size is
+ * compared (the first candidate when a frame does not declare its size), and
+ * the comparison stops at the first difference. A file that does not decode
+ * throws ZstdDecodeError, as `zstdFileChunks()` does; so does any other error
+ * of the compressed file. An error reading the candidate is thrown as it is.
+ */
+export async function zstdFileCopyOf(filePath, size, candidates) {
+  const frames = zstdFrames(filePath, size);
+  const declared = frames.every(frame => frame.contentSize != null)
+    ? frames.reduce((sum, frame) => sum + frame.contentSize, 0)
+    : null;
+  const candidate = declared == null ? candidates[0]
+    : candidates.find(other => other.size === declared);
+  if (!candidate) return null;
+  const other = await open(candidate.filePath, 'r');
+  try {
+    let buffer = Buffer.allocUnsafe(DECODER_CHUNK_SIZE);
+    let position = 0;
+    for await (const chunk of zstdFileChunks(filePath, size, null, frames)) {
+      if (position + chunk.length > candidate.size) return null;
+      if (buffer.length < chunk.length) buffer = Buffer.allocUnsafe(chunk.length);
+      let filled = 0;
+      while (filled < chunk.length) {
+        const { bytesRead } = await other.read(buffer, filled, chunk.length - filled, position + filled);
+        if (bytesRead === 0) return null;
+        filled += bytesRead;
+      }
+      if (!chunk.equals(buffer.subarray(0, chunk.length))) return null;
+      position += chunk.length;
+    }
+    return position === candidate.size ? candidate : null;
+  } finally {
+    await other.close();
   }
 }

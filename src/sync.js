@@ -564,8 +564,11 @@ async function runSyncPasses({
       }
       // A parser may downgrade a transient error (Cursor network timeout) to a
       // warning instead of throwing. Its empty result is not proof that its prior
-      // data disappeared, so it must not be pruned this run.
-      if (!skipped) okSources.add(source);
+      // data disappeared, so it must not be pruned this run. Nor is the result
+      // of one still indexing (Codex uploads what it has read exactly and
+      // reports `indexing` until it has read the rest): what it left out is
+      // still there and still uploaded.
+      if (!skipped && !indexing) okSources.add(source);
       for (const bucket of buckets) allBuckets.push(bucket);
       for (const session of sessions) allSessions.push(session);
       if (buckets.length > 0 || sessions.length > 0) {
