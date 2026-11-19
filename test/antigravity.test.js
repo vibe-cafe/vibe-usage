@@ -19,6 +19,15 @@ import { parse, parseWinProcessList } from '../src/parsers/antigravity.js';
 import { antigravityConversationDirs, validateExtraRoot } from '../src/extra-roots.js';
 import { findAntigravityDataDirs } from '../src/tools.js';
 
+const parserCacheDir = mkdtempSync(join(tmpdir(), 'vibe-parser-cache-test-'));
+const previousParserCacheDir = process.env.VIBE_USAGE_CACHE_DIR;
+process.env.VIBE_USAGE_CACHE_DIR = parserCacheDir;
+test.after(() => {
+  if (previousParserCacheDir === undefined) delete process.env.VIBE_USAGE_CACHE_DIR;
+  else process.env.VIBE_USAGE_CACHE_DIR = previousParserCacheDir;
+  rmSync(parserCacheDir, { recursive: true, force: true });
+});
+
 // ── Minimal protobuf encoder (mirrors the wire format the decoder reads) ──
 function varint(n) {
   const bytes = [];
@@ -702,6 +711,34 @@ test('database failure inside a configured Antigravity home skips the source', a
   } finally {
     if (previous === undefined) delete process.env.VIBE_USAGE_ANTIGRAVITY_DIRS;
     else process.env.VIBE_USAGE_ANTIGRAVITY_DIRS = previous;
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test('a locked cascade keeps its usage after unlocking and reusing the cache', async t => {
+  let DatabaseSync;
+  try { ({ DatabaseSync } = await import('node:sqlite')); }
+  catch { return t.skip('node:sqlite unavailable'); }
+  const root = mkdtempSync(join(tmpdir(), 'vibe-agy-lock-'));
+  const previous = { ...process.env };
+  process.env.VIBE_USAGE_ANTIGRAVITY_DIRS = root;
+  process.env.VIBE_USAGE_CACHE_DIR = join(root, 'cache');
+  const db = new DatabaseSync(join(root, 'cascade.db'));
+  try {
+    db.exec('CREATE TABLE steps(idx INTEGER, metadata BLOB); CREATE TABLE gen_metadata(idx INTEGER, data BLOB)');
+    db.prepare('INSERT INTO gen_metadata VALUES (1, ?)').run(buildBlob({
+      input: 100, totalOutput: 10, seconds: 1783484000, displayName: 'fixture-model',
+    }));
+    db.exec('BEGIN EXCLUSIVE');
+    assert.equal((await parse()).buckets[0]?.inputTokens, 100);
+    db.exec('ROLLBACK');
+    assert.equal((await parse()).buckets[0]?.inputTokens, 100);
+  } finally {
+    db.close();
+    for (const key of ['VIBE_USAGE_ANTIGRAVITY_DIRS', 'VIBE_USAGE_CACHE_DIR']) {
+      if (previous[key] === undefined) delete process.env[key];
+      else process.env[key] = previous[key];
+    }
     rmSync(root, { recursive: true, force: true });
   }
 });

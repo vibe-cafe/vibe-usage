@@ -1,8 +1,18 @@
 import { readdirSync, readFileSync } from 'node:fs';
 import { join, basename } from 'node:path';
 import { aggregateToBuckets, extractSessions } from './aggregate.js';
-import { queryDbJson, sqliteUnavailableError, isSqliteUnavailableError } from './sqlite.js';
+import { queryDbJson, withNodeSqlite, sqliteUnavailableError, isSqliteUnavailableError } from './sqlite.js';
 import { getOpenCodeStores } from '../opencode-roots.js';
+import {
+  hashManifest,
+  loadSourceSnapshot,
+  localTimeZoneToken,
+  magpieManifestToken,
+  saveSourceSnapshot,
+  sqliteStatToken,
+} from './parser-cache.js';
+
+const OPENCODE_CACHE_ALGO = 1;
 
 // Select only accounting/timing metadata, never message text or tool inputs.
 // Keep the existing top-level model/project precedence for old uploads.
@@ -40,6 +50,27 @@ function v2Query(sessionTable) {
 
 function readSqlite(path) {
   try {
+    const native = withNodeSqlite(path, (db) => {
+      const tables = new Set(
+        db.prepare(
+          `SELECT name FROM sqlite_master WHERE type = 'table'
+           AND name IN ('message', 'session_message', 'session', 'session_v2')`,
+        ).all().map(row => row.name),
+      );
+      if (!tables.has('message') && !tables.has('session_message')) {
+        throw new Error(`不认识的表结构（没有 message / session_message 表）: ${path}`);
+      }
+      const rows = [];
+      if (tables.has('message')) rows.push(...db.prepare(V1_QUERY).all());
+      if (tables.has('session_message')) {
+        const sessionTable = tables.has('session_v2') ? 'session_v2'
+          : (tables.has('session') ? 'session' : null);
+        rows.push(...db.prepare(v2Query(sessionTable)).all());
+      }
+      return rows;
+    });
+    if (native.supported) return native.value;
+
     const tables = new Set(queryDbJson(path,
       `SELECT name FROM sqlite_master WHERE type = 'table'
        AND name IN ('message', 'session_message', 'session', 'session_v2')`)
@@ -91,6 +122,32 @@ function tokenSize(row) {
 export async function parse({ extraRoots = [], magpie } = {}) {
   const warnings = [];
   const stores = getOpenCodeStores({ extraRoots, onWarning: message => warnings.push(message) });
+
+  // L1 whole-source snapshot fast path for SQLite-backed OpenCode stores.
+  // Checks main .db + -wal stat signatures plus the Magpie ledger signature.
+  const magpieToken = magpieManifestToken(magpie);
+  const magpiePendingBefore = magpie?.pending?.length ?? 0;
+  const snapshotKey = JSON.stringify(['opencode', ...stores.map(store => store.path)]);
+  let manifest = null;
+  if (warnings.length === 0 && stores.length > 0 && magpieToken && stores.every(s => s.kind === 'sqlite')) {
+    const parts = [magpieToken];
+    let ok = true;
+    for (const store of stores) {
+      const tok = sqliteStatToken(store.path);
+      if (!tok) { ok = false; break; }
+      parts.push(`${store.path}|${tok}`);
+    }
+    if (ok) {
+      manifest = hashManifest([`tz|${localTimeZoneToken()}`, ...parts]);
+      const snap = loadSourceSnapshot(snapshotKey, OPENCODE_CACHE_ALGO, manifest);
+      if (snap
+        && magpieManifestToken(magpie) === magpieToken
+        && Array.isArray(snap.buckets) && Array.isArray(snap.sessions)) {
+        return snap;
+      }
+    }
+  }
+
   const records = new Map();
   for (const store of stores) {
     try {
@@ -138,5 +195,8 @@ export async function parse({ extraRoots = [], magpie } = {}) {
       // 2026-09-26) under-billed every Claude/Anthropic run through OpenCode.
       cacheCreation5mTokens: tokens.cache?.write || 0 });
   }
-  return { buckets: aggregateToBuckets(magpie ? magpie.attribute(entries, 'opencode') : entries), sessions: extractSessions(events) };
+  const result = { buckets: aggregateToBuckets(magpie ? magpie.attribute(entries, 'opencode') : entries), sessions: extractSessions(events) };
+  const magpieStable = !magpie || (!magpie.failed && (magpie.pending?.length ?? 0) === magpiePendingBefore);
+  if (manifest && magpieStable) saveSourceSnapshot(snapshotKey, OPENCODE_CACHE_ALGO, manifest, result);
+  return result;
 }

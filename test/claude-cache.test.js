@@ -380,3 +380,21 @@ test('the rolling audit re-reads a transcript whose cache is older than the inte
   assert.equal(audited.buckets[0].inputTokens, 10);
   assert.equal((await f.run()).buckets[0].inputTokens, 10, 'the audit rewrote the entry');
 });
+
+test('a source snapshot lets each overdue transcript take its rolling audit', async t => {
+  const f = fixture(t);
+  const initial = Date.now();
+  let now = initial;
+  t.mock.method(Date, 'now', () => now);
+  const writePair = input => {
+    for (const id of ['one', 'two']) {
+      writeTranscript(f.path(id), [user(0), assistant(1, { id, input })], { mtimeSeconds: 1700000000 });
+    }
+  };
+  writePair(10);
+  assert.equal((await f.run()).buckets[0].inputTokens, 20);
+  writePair(20);
+  now += 31 * 86400000;
+  assert.equal((await f.run()).buckets[0].inputTokens, 30);
+  assert.equal((await f.run()).buckets[0].inputTokens, 40);
+});

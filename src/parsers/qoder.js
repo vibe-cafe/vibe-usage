@@ -5,6 +5,19 @@ import { aggregateToBuckets, extractSessions } from './aggregate.js';
 import { projectFromCwd, toCount } from './fs-utils.js';
 import { isSqliteUnavailableError, queryDbJsonSnapshotOnLock, sqliteUnavailableError } from './sqlite.js';
 import { QODER_EDITIONS, getQoderProjectsDir, getQoderDbPath } from '../qoder-roots.js';
+import {
+  commitFileEntries,
+  fileStatToken,
+  hashManifest,
+  loadFileEntries,
+  loadSourceSnapshot,
+  localTimeZoneToken,
+  pruneFileEntries,
+  saveSourceSnapshot,
+  sqliteStatToken,
+} from './parser-cache.js';
+
+const QODER_CACHE_ALGO = 1;
 
 /**
  * Qoder (Alibaba's agentic coding platform). Two editions with fully separate
@@ -108,16 +121,17 @@ function isHumanPrompt(record) {
   return true;
 }
 
-async function parseTranscriptFile(filePath, ctx) {
-  const { source, entries, events } = ctx;
+async function parseTranscriptFile(filePath) {
+  const fileEntries = [];
+  const fileEvents = [];
   const fallbackSession = basename(filePath, '.jsonl');
   // One assistant message spans several lines; keep the last usage-bearing
   // record per message id so a call is counted exactly once.
   const usageByMessage = new Map();
 
-  const rl = createInterface({ input: createReadStream(filePath, { encoding: 'utf-8' }), crlfDelay: Infinity });
-  for await (const line of rl) {
-    if (!line.trim()) continue;
+  const input = createReadStream(filePath, { encoding: 'utf8' });
+  const lines = createInterface({ input, crlfDelay: Infinity });
+  for await (const line of lines) {
     let record;
     try {
       record = JSON.parse(line);
@@ -130,18 +144,19 @@ async function parseTranscriptFile(filePath, ctx) {
 
     const timestamp = toDate(record.timestamp);
     if (!timestamp) continue;
+    const tsMs = timestamp.getTime();
     const sessionId = record.sessionId || record.session_id || fallbackSession;
     const project = projectFromCwd(record.cwd);
     const message = record.message && typeof record.message === 'object' ? record.message : {};
 
     if (type === 'user') {
       if (isHumanPrompt(record)) {
-        events.push({ sessionId, source, project, timestamp, role: 'user' });
+        fileEvents.push([sessionId, project, tsMs, 1]);
       }
       continue;
     }
 
-    events.push({ sessionId, source, project, timestamp, role: 'assistant' });
+    fileEvents.push([sessionId, project, tsMs, 0]);
 
     const usage = message.usage;
     if (!usage || typeof usage !== 'object') continue;
@@ -150,40 +165,82 @@ async function parseTranscriptFile(filePath, ctx) {
       usage,
       model: normalizeQoderModel(message.model),
       project,
-      timestamp,
+      tsMs,
     });
   }
 
-  for (const { usage, model, project, timestamp } of usageByMessage.values()) {
+  for (const { usage, model, project, tsMs } of usageByMessage.values()) {
     // Cache writes join input (same convention as the Claude Code parser).
     const input = toCount(usage.input_tokens) + toCount(usage.cache_creation_input_tokens);
     const cached = toCount(usage.cache_read_input_tokens ?? usage.cached_tokens);
     const output = toCount(usage.output_tokens);
     if (input + cached + output === 0) continue; // credit-billed call: tokens not reported
-    entries.push({
-      source,
+    fileEntries.push({
       model,
       project,
-      timestamp,
+      tsMs,
       inputTokens: input,
       outputTokens: output,
       cachedInputTokens: cached,
-      reasoningOutputTokens: 0,
     });
   }
+  return { entries: fileEntries, events: fileEvents };
 }
 
-async function parseTranscripts(edition, ctx) {
-  const root = getQoderProjectsDir(edition);
-  if (!existsSync(root)) return;
-  for (const file of listJsonlFiles(root, ctx)) {
-    try {
-      await parseTranscriptFile(file, ctx);
-    } catch (err) {
-      // A half-written or unreadable transcript: keep prior upload state, retry next run.
-      ctx.skipped = true;
-      warn(ctx, `cannot read ${file}: ${err.message}`);
+async function parseTranscripts(root, files, ctx) {
+  const { source, entries, events } = ctx;
+  const cachedEntries = loadFileEntries(source, QODER_CACHE_ALGO, files.map(f => f.file));
+  const cacheUpdates = [];
+
+  for (const { file, sig } of files) {
+    let parsed = null;
+    const cached = sig ? cachedEntries.get(file) : null;
+    if (cached && cached.sig === sig) {
+      try {
+        parsed = JSON.parse(cached.payload);
+      } catch {
+        parsed = null;
+      }
     }
+    if (!parsed) {
+      try {
+        parsed = await parseTranscriptFile(file);
+        if (sig) cacheUpdates.push({ key: file, sig, payload: parsed });
+      } catch (err) {
+        // A half-written or unreadable transcript: keep prior upload state, retry next run.
+        ctx.skipped = true;
+        warn(ctx, `cannot read ${file}: ${err.message}`);
+        continue;
+      }
+    }
+    for (const e of parsed.entries) {
+      entries.push({
+        source,
+        model: e.model,
+        project: e.project,
+        timestamp: new Date(e.tsMs),
+        inputTokens: e.inputTokens,
+        outputTokens: e.outputTokens,
+        cachedInputTokens: e.cachedInputTokens,
+        reasoningOutputTokens: 0,
+      });
+    }
+    for (const [sessionId, project, tsMs, isUser] of parsed.events) {
+      events.push({
+        sessionId,
+        source,
+        project,
+        timestamp: new Date(tsMs),
+        role: isUser ? 'user' : 'assistant',
+      });
+    }
+  }
+
+  if (cacheUpdates.length > 0) {
+    commitFileEntries(source, QODER_CACHE_ALGO, cacheUpdates);
+  }
+  if (!ctx.skipped) {
+    pruneFileEntries(source, QODER_CACHE_ALGO, [root], files.map(f => f.file));
   }
 }
 
@@ -314,15 +371,47 @@ function parseIde(edition, ctx) {
 // ── Entry points ───────────────────────────────────────────────────────────
 
 async function parseEdition(edition) {
-  const ctx = { source: QODER_EDITIONS[edition].source, entries: [], events: [], warnings: [], skipped: false };
-  await parseTranscripts(edition, ctx);
+  const source = QODER_EDITIONS[edition].source;
+  const ctx = { source, entries: [], events: [], warnings: [], skipped: false };
+
+  const root = getQoderProjectsDir(edition);
+  const rawFiles = existsSync(root) ? listJsonlFiles(root, ctx).sort() : [];
+  const dbPath = getQoderDbPath(edition);
+  const hasDb = existsSync(dbPath);
+  const snapshotKey = JSON.stringify([source, root, dbPath]);
+
+  const filesWithSig = rawFiles.map((file) => ({ file, sig: fileStatToken(file) }));
+  const dbSig = hasDb ? sqliteStatToken(dbPath) : 'none';
+
+  let manifest = null;
+  if (!ctx.skipped && filesWithSig.every((f) => f.sig) && dbSig) {
+    manifest = hashManifest([
+      `tz|${localTimeZoneToken()}`,
+      `db|${dbPath}|${dbSig}`,
+      ...filesWithSig.map((f) => `jsonl|${f.file}|${f.sig}`),
+    ]);
+    const snap = loadSourceSnapshot(snapshotKey, QODER_CACHE_ALGO, manifest);
+    if (snap
+      && Array.isArray(snap.buckets) && Array.isArray(snap.sessions)) {
+      return { buckets: snap.buckets, sessions: snap.sessions, skipped: false, warnings: [] };
+    }
+  }
+
+  await parseTranscripts(root, filesWithSig, ctx);
   parseIde(edition, ctx);
-  return {
+  const result = {
     buckets: aggregateToBuckets(ctx.entries),
     sessions: extractSessions(ctx.events),
     skipped: ctx.skipped,
     warnings: ctx.warnings,
   };
+  if (manifest && !ctx.skipped && ctx.warnings.length === 0) {
+    saveSourceSnapshot(snapshotKey, QODER_CACHE_ALGO, manifest, {
+      buckets: result.buckets,
+      sessions: result.sessions,
+    });
+  }
+  return result;
 }
 
 export async function parseQoder() {

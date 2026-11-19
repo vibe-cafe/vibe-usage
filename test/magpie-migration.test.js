@@ -394,3 +394,19 @@ test('no Magpie installation leaves config and ordinary parser output unchanged'
   assert.doesNotMatch(result.stderr, /Magpie/);
   assert.equal(existsSync(f.env.VIBE_USAGE_MAGPIE_TEST_FILE), false);
 });
+
+test('a Pi-only cut discovered after settings is persisted before upload', async t => {
+  const f = fixture(t);
+  const { apiUrl } = await server(t, f);
+  f.write('config.json', { apiKey: 'fixture', apiUrl, hostname: 'fixture-host' });
+  await f.run(restrict(['pi-coding-agent']) + `
+    parsers['pi-coding-agent'] = async ({ magpie }) => {
+      await new Promise(resolve => setImmediate(resolve));
+      magpie.discover(true);
+      return { buckets: [], sessions: [] };
+    };
+    const { runSync } = await import('./src/sync.js');
+    await runSync({ surface: 'daemon', quiet: true, throws: true });
+  `);
+  assert.equal(f.read('config.json').magpieStartAt, 'none');
+});

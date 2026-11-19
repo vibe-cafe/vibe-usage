@@ -7,6 +7,15 @@ import { createRequire } from 'node:module';
 import { parseQoder, parseQoderCn } from '../src/parsers/qoder.js';
 import { findQoderDataDirs, getQoderDbPath, getQoderProjectsDir } from '../src/qoder-roots.js';
 
+const parserCacheDir = mkdtempSync(join(tmpdir(), 'vibe-parser-cache-test-'));
+const previousParserCacheDir = process.env.VIBE_USAGE_CACHE_DIR;
+process.env.VIBE_USAGE_CACHE_DIR = parserCacheDir;
+test.after(() => {
+  if (previousParserCacheDir === undefined) delete process.env.VIBE_USAGE_CACHE_DIR;
+  else process.env.VIBE_USAGE_CACHE_DIR = previousParserCacheDir;
+  rmSync(parserCacheDir, { recursive: true, force: true });
+});
+
 const require = createRequire(import.meta.url);
 
 const ENV_KEYS = [

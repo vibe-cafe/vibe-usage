@@ -1,6 +1,11 @@
 import { readdirSync } from 'node:fs';
 import { join } from 'node:path';
-import { queryDbJsonSnapshotOnLock, sqliteUnavailableError, isSqliteUnavailableError } from './sqlite.js';
+import {
+  queryDbJsonSnapshotOnLock,
+  withNodeSqliteSnapshotOnLock,
+  sqliteUnavailableError,
+  isSqliteUnavailableError,
+} from './sqlite.js';
 
 /**
  * Offline reader for Antigravity SQLite conversation stores.
@@ -290,6 +295,11 @@ function queryCascadeDb(conversationsDir, cascadeId, sql) {
   }
 }
 
+function isMissingTableError(err, table) {
+  return err && typeof err.message === 'string'
+    && new RegExp(`no such table:\\s*${table}`, 'i').test(err.message);
+}
+
 /** List cascade IDs backed by a `.db` file in a conversations directory. */
 export function listDbCascades(conversationsDir, { strict = false } = {}) {
   try {
@@ -314,7 +324,7 @@ export function readDbUsageRecords(conversationsDir, cascadeId, { strict = false
   try {
     rows = queryCascadeDb(conversationsDir, cascadeId, 'SELECT idx, hex(data) AS h FROM gen_metadata ORDER BY idx');
   } catch (err) {
-    if (isSqliteUnavailableError(err) || strict) throw err;
+    if (strict || !isMissingTableError(err, 'gen_metadata')) throw err;
     return [];
   }
   const records = [];
@@ -361,7 +371,7 @@ export function readDbStepRows(conversationsDir, cascadeId, { strict = false } =
       'SELECT idx, hex(metadata) AS h FROM steps WHERE metadata IS NOT NULL ORDER BY idx',
     );
   } catch (err) {
-    if (isSqliteUnavailableError(err) || strict) throw err;
+    if (strict || !isMissingTableError(err, 'steps')) throw err;
     return { usages: [], timestamps: new Map(), events: [] };
   }
   const usages = [];
@@ -409,7 +419,7 @@ export function readDbWorkspaceUri(conversationsDir, cascadeId) {
   try {
     rows = queryCascadeDb(conversationsDir, cascadeId, 'SELECT hex(data) AS h FROM trajectory_metadata_blob LIMIT 1');
   } catch (err) {
-    if (isSqliteUnavailableError(err)) throw err;
+    if (!isMissingTableError(err, 'trajectory_metadata_blob')) throw err;
     return null;
   }
   if (!rows.length || !rows[0].h) return null;
@@ -420,6 +430,139 @@ export function readDbWorkspaceUri(conversationsDir, cascadeId) {
   } catch {
     return null;
   }
+}
+
+function toBuffer(blob) {
+  if (!blob) return null;
+  if (Buffer.isBuffer(blob)) return blob;
+  if (blob instanceof Uint8Array) return Buffer.from(blob.buffer, blob.byteOffset, blob.byteLength);
+  if (typeof blob === 'string') return Buffer.from(blob, 'hex');
+  return null;
+}
+
+function decodeGenRows(rows, blobKey) {
+  const records = [];
+  for (const row of rows) {
+    const buf = toBuffer(row[blobKey]);
+    if (!buf || buf.length === 0) continue;
+    let rec;
+    try {
+      rec = parseGenMetadataBlob(buf);
+    } catch {
+      continue; // one malformed blob must not kill the rest
+    }
+    if (rec) {
+      rec.idx = Number.isFinite(Number(row.idx)) ? Number(row.idx) : null;
+      records.push(rec);
+    }
+  }
+  return records;
+}
+
+function decodeStepRowsList(rows, blobKey) {
+  const usages = [];
+  const timestamps = new Map();
+  const events = [];
+  for (const row of rows) {
+    const buf = toBuffer(row[blobKey]);
+    if (!buf || buf.length === 0) continue;
+    let meta;
+    try {
+      meta = decodeMessage(buf);
+    } catch {
+      continue; // one malformed blob must not kill the rest
+    }
+    const idx = Number(row.idx);
+    const timestamp = stepTimestamp(meta);
+    if (timestamp && Number.isFinite(idx)) timestamps.set(idx, timestamp);
+
+    const source = firstVarint(meta, 3);
+    const role = source === STEP_SOURCE_USER
+      ? 'user'
+      : source === STEP_SOURCE_MODEL ? 'assistant' : null;
+    if (role && timestamp) events.push({ role, timestamp });
+
+    const stepUsage = decodeStepUsage(meta);
+    if (!stepUsage.usage && stepUsage.retryUsages.length === 0) continue;
+    usages.push({
+      idx: Number.isFinite(idx) ? idx : null,
+      timestamp,
+      modelName: stepUsage.modelName,
+      modelId: stepUsage.modelId,
+      usage: stepUsage.usage,
+      retryUsages: stepUsage.retryUsages,
+    });
+  }
+  return { usages, timestamps, events };
+}
+
+function decodeWorkspaceBlob(blob) {
+  const buf = toBuffer(blob);
+  if (!buf || buf.length === 0) return null;
+  try {
+    const meta = decodeMessage(buf);
+    const ws0 = firstMessage(meta, 1);
+    return (ws0 && firstString(ws0, 1)) || null;
+  } catch {
+    return null;
+  }
+}
+
+/**
+ * Read steps, gen_metadata, and trajectory_metadata_blob for one cascade `.db`
+ * in a single SQLite open and using raw BLOBs (avoiding 3x open/close + hex
+ * round-trips). Falls back to the three individual queries when `node:sqlite`
+ * is unavailable.
+ */
+export function readDbCascadeBundle(conversationsDir, cascadeId, { strict = false } = {}) {
+  const dbPath = join(conversationsDir, `${cascadeId}.db`);
+  let res;
+  try {
+    res = withNodeSqliteSnapshotOnLock(
+      dbPath,
+      (db) => {
+        let stepRows;
+        try {
+          const rows = db.prepare('SELECT idx, metadata FROM steps WHERE metadata IS NOT NULL ORDER BY idx').all();
+          stepRows = decodeStepRowsList(rows, 'metadata');
+        } catch (err) {
+          if (strict || !isMissingTableError(err, 'steps')) throw err;
+          stepRows = { usages: [], timestamps: new Map(), events: [] };
+        }
+
+        let genRecords;
+        try {
+          const rows = db.prepare('SELECT idx, data FROM gen_metadata ORDER BY idx').all();
+          genRecords = decodeGenRows(rows, 'data');
+        } catch (err) {
+          if (strict || !isMissingTableError(err, 'gen_metadata')) throw err;
+          genRecords = [];
+        }
+
+        let workspaceUri = null;
+        try {
+          const row = db.prepare('SELECT data FROM trajectory_metadata_blob LIMIT 1').get();
+          if (row && row.data) workspaceUri = decodeWorkspaceBlob(row.data);
+        } catch (err) {
+          if (!isMissingTableError(err, 'trajectory_metadata_blob')) throw err;
+          workspaceUri = null;
+        }
+
+        return { stepRows, genRecords, workspaceUri };
+      },
+      { tempPrefix: 'vibe-usage-antigravity-' },
+    );
+  } catch (err) {
+    if (isSqliteUnavailableError(err)) throw sqliteUnavailableError('Antigravity');
+    throw err;
+  }
+
+  if (res.supported) return res.value;
+
+  const stepRows = readDbStepRows(conversationsDir, cascadeId, { strict });
+  const genRecords = readDbUsageRecords(conversationsDir, cascadeId, { strict });
+  const workspaceUri = readDbWorkspaceUri(conversationsDir, cascadeId);
+  return { stepRows, genRecords, workspaceUri };
 }
 
 // Step source enum in steps.metadata field 3 (behavior-verified against payload

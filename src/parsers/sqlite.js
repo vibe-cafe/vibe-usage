@@ -17,6 +17,46 @@ const require = createRequire(import.meta.url);
  * If neither is available, throws an Error whose message contains "ENOENT" so
  * callers can surface an "Install sqlite3" hint, matching the previous behavior.
  */
+/**
+ * Run a callback against a single open `node:sqlite` DatabaseSync connection,
+ * returning `{ supported: true, value }` when `node:sqlite` is available and
+ * `{ supported: false }` when the runtime must fall back to the `sqlite3` CLI.
+ * Allows callers to execute multiple queries (and read raw BLOBs) in one open.
+ */
+export function withNodeSqlite(dbPath, fn, { readOnly = true } = {}) {
+  const db = openNodeSqlite(dbPath, readOnly);
+  if (!db) return { supported: false, value: undefined };
+  try {
+    return { supported: true, value: fn(db) };
+  } finally {
+    db.close();
+  }
+}
+
+/**
+ * Same as `withNodeSqlite`, retrying once against a disposable temp snapshot
+ * (copying `-wal` and `-shm` companions) when the live app holds a write lock.
+ */
+export function withNodeSqliteSnapshotOnLock(dbPath, fn, { tempPrefix = 'vibe-usage-sqlite-' } = {}) {
+  try {
+    return withNodeSqlite(dbPath, fn, { readOnly: true });
+  } catch (err) {
+    if (!isLockError(err)) throw err;
+    const snapshotDir = mkdtempSync(join(tmpdir(), tempPrefix));
+    const queryPath = join(snapshotDir, basename(dbPath));
+    try {
+      copyFileSync(dbPath, queryPath);
+      for (const suffix of ['-shm', '-wal']) {
+        const companion = `${dbPath}${suffix}`;
+        if (existsSync(companion)) copyFileSync(companion, `${queryPath}${suffix}`);
+      }
+      return withNodeSqlite(queryPath, fn, { readOnly: false });
+    } finally {
+      rmSync(snapshotDir, { recursive: true, force: true });
+    }
+  }
+}
+
 export function queryDbJson(
   dbPath,
   sql,

@@ -66,11 +66,15 @@ function writeSession(root, projectKey, sessionId, records, plain = false, versi
 async function withDshSessions(run) {
   const root = mkdtempSync(join(tmpdir(), 'vibe-usage-dsh-test-'));
   const sessions = join(root, 'sessions');
+  const previousCache = process.env.VIBE_USAGE_CACHE_DIR;
+  process.env.VIBE_USAGE_CACHE_DIR = join(root, 'cache');
   const previous = process.env.VIBE_USAGE_DSH_SESSIONS;
   process.env.VIBE_USAGE_DSH_SESSIONS = sessions;
   try {
     return await run(sessions);
   } finally {
+    if (previousCache === undefined) delete process.env.VIBE_USAGE_CACHE_DIR;
+    else process.env.VIBE_USAGE_CACHE_DIR = previousCache;
     if (previous === undefined) delete process.env.VIBE_USAGE_DSH_SESSIONS;
     else process.env.VIBE_USAGE_DSH_SESSIONS = previous;
     rmSync(root, { recursive: true, force: true });
@@ -757,3 +761,24 @@ for (const problem of ['future-version', 'corrupt', 'header-mismatch', 'missing-
     });
   });
 }
+
+test('escaped JSON records survive cache hits and a change of time zone', async () => {
+  await withDshSessions(async root => {
+    const dir = writeSession(root, 'project', 's', [], true);
+    const usage = assistantRecord(1700000120000, 'routed', { inputTokens: 100, outputTokens: 30 });
+    const line = JSON.stringify(usage).replace('assistant/message', 'assistant\\/message');
+    writeFileSync(join(dir, 'session.jsonl'), JSON.stringify(sessionRecord('s', '/p')) + '\n' + line + '\n');
+    const tz = process.env.TZ;
+    try {
+      process.env.TZ = 'UTC';
+      const first = await parse();
+      assert.equal(first.buckets[0].totalTokens, 130);
+      assert.deepEqual(await parse(), first);
+      process.env.TZ = 'Asia/Kathmandu';
+      assert.equal((await parse()).buckets[0].bucketStart, '2023-11-14T22:15:00.000Z');
+    } finally {
+      if (tz === undefined) delete process.env.TZ;
+      else process.env.TZ = tz;
+    }
+  });
+});
