@@ -11,7 +11,7 @@ import { parsers } from './parsers/index.js';
 import { aggregateToBuckets } from './parsers/aggregate.js';
 import { normalizeParserResult } from './parsers/contract.js';
 import { extraRootList } from './extra-roots.js';
-import { planKikiMigration } from './kiki-migration.js';
+import { bucketStartRange, planKikiMigration } from './kiki-migration.js';
 import { MAGPIE_SOURCES, chooseMagpieStartAt, planMagpieMigration } from './magpie-migration.js';
 import { createMagpieContext } from './parsers/magpie.js';
 import { isDaemonInstalled } from './daemon-service.js';
@@ -674,13 +674,13 @@ async function runSyncPasses({
       // plan did; report that as withheld so the diagnostic is not silent.
       const droppedBuckets = allBuckets.filter(b => b.source === 'kiki');
       const droppedSessions = allSessions.filter(s => s.source === 'kiki');
-      const droppedStarts = droppedBuckets.map(b => Date.parse(b.bucketStart)).filter(Number.isFinite);
+      const droppedRange = bucketStartRange(droppedBuckets);
       migration.withheld = {
         buckets: droppedBuckets.length,
         sessions: droppedSessions.length,
         totalTokens: droppedBuckets.reduce((sum, b) => sum + (Number(b.totalTokens) || 0), 0),
-        earliest: droppedStarts.length > 0 ? new Date(Math.min(...droppedStarts)).toISOString() : null,
-        latest: droppedStarts.length > 0 ? new Date(Math.max(...droppedStarts)).toISOString() : null,
+        earliest: droppedRange.earliest,
+        latest: droppedRange.latest,
       };
       okSources.delete('kiki');
     }
