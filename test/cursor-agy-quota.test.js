@@ -2,6 +2,7 @@ import test from 'node:test';
 import assert from 'node:assert/strict';
 import { mkdtempSync, mkdirSync, rmSync, readFileSync, writeFileSync, existsSync } from 'node:fs';
 import { tmpdir } from 'node:os';
+import net from 'node:net';
 import { dirname, join } from 'node:path';
 import { execFileSync, spawn } from 'node:child_process';
 import { fetchCursorQuota, parseCursorQuota, readCursorQuotaToken, cursorQuotaDbPath } from '../src/quotas/providers/cursor.js';
@@ -186,6 +187,35 @@ test('AGY finds the official Windows install outside PATH, after an agy on PATH'
   // Only Windows looks under LOCALAPPDATA.
   touch(join(localAppData, 'agy', 'bin', 'agy'));
   assert.equal(antigravityBinary({ PATH: '', LOCALAPPDATA: localAppData }, home, 'linux'), undefined);
+});
+
+test('AGY quota request goes straight to 127.0.0.1 even with an environment proxy', async t => {
+  const hits = { proxy: 0, target: 0 };
+  const proxy = net.createServer(socket => { hits.proxy++; socket.destroy(); });
+  const target = net.createServer(socket => { hits.target++; socket.destroy(); });
+  await Promise.all([proxy, target].map(server => new Promise(resolve => server.listen(0, '127.0.0.1', resolve))));
+  t.after(() => { proxy.close(); target.close(); });
+  const proxyUrl = `http://127.0.0.1:${proxy.address().port}`;
+  const module = new URL('../src/quotas/providers/antigravity.js', import.meta.url).href;
+  const port = target.address().port;
+  const scripts = {
+    // What the global agent does under the same environment (Node 22.21+/24).
+    global: `import https from 'node:https';
+      await new Promise(done => { const r = https.request({ hostname: '127.0.0.1', port: ${port}, method: 'POST',
+        rejectUnauthorized: false }); r.on('error', done); r.on('response', done); r.end('{}'); });`,
+    agy: `import { requestAntigravityQuota } from ${JSON.stringify(module)};
+      await requestAntigravityQuota({ port: ${port}, token: 'private-csrf', timeoutMs: 1000 }).catch(() => {});`,
+  };
+  const run = script => new Promise((resolve, reject) => {
+    hits.proxy = 0; hits.target = 0;
+    const child = spawn(process.execPath, ['--input-type=module', '-e', script], { stdio: 'ignore',
+      env: { PATH: process.env.PATH, NODE_USE_ENV_PROXY: '1', HTTPS_PROXY: proxyUrl, HTTP_PROXY: proxyUrl } });
+    child.once('error', reject);
+    child.once('close', () => resolve({ ...hits }));
+  });
+  const global = await run(scripts.global);
+  if (global.proxy === 0) t.diagnostic(`${process.version} has no NODE_USE_ENV_PROXY; only the direct path is checked`);
+  assert.deepEqual(await run(scripts.agy), { proxy: 0, target: 1 });
 });
 
 test('AGY owns and cleans its prompt-free child on success and timeout', async t => {

@@ -94,9 +94,12 @@ export function requestAntigravityQuota({ port, token, timeoutMs = 2000 }) {
   if (!Number.isInteger(port) || port < 1 || port > 65535) throw new Error('Invalid local port');
   return new Promise((resolve, reject) => {
     // The self-signed exception is hard-coded to loopback. No remote URL or
-    // redirect can receive this process-scoped CSRF token.
+    // redirect can receive this process-scoped CSRF token. A fresh agent, not
+    // the global one: under NODE_USE_ENV_PROXY (which the Windows app sets)
+    // Node 22.21+/24 sends even 127.0.0.1 through HTTPS_PROXY unless NO_PROXY
+    // lists it, and a remote proxy cannot reach agy's loopback port.
     const request = https.request({ hostname: '127.0.0.1', port, path: QUOTA_PATH,
-      method: 'POST', rejectUnauthorized: false,
+      method: 'POST', rejectUnauthorized: false, agent: new https.Agent(),
       headers: { 'Content-Type': 'application/json', 'Connect-Protocol-Version': '1',
         'X-Codeium-Csrf-Token': token } }, response => {
       const chunks = [];
