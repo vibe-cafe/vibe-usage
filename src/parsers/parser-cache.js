@@ -163,14 +163,30 @@ export function dirJsonStatToken(dir, excludeName = null) {
   return h.digest('hex').slice(0, 24);
 }
 
+function companionSize(path) {
+  try {
+    return statSync(path).size;
+  } catch {
+    return 0;
+  }
+}
+
 /**
- * Build a stat signature for a SQLite database including its -wal companion.
- * Under WAL mode, active writes update the -wal file before checkpointing the
- * main .db file, so including -wal guarantees cache invalidation on every write.
+ * Stat signature of a SQLite store, or null when a result read from it must
+ * not be cached: its -wal still holds frames (the app has it open and has not
+ * checkpointed) or a -journal exists (a rollback-mode write in progress).
+ * SQLite appends a transaction to the WAL before it publishes it in the
+ * wal-index, so a read in between returns the old rows while every stat
+ * already shows the committed files; a result cached under that stat stayed
+ * old until the store changed again (cross-review 2026-11-19: 10 tokens, 20
+ * added, the cache kept returning 10). An idle store -- the app closed, or a
+ * checkpoint truncated the WAL -- has an absent or empty -wal and holds every
+ * committed row in the main file, whose stat changes with every checkpoint.
  */
 export function sqliteStatToken(dbPath) {
   const main = fileStatToken(dbPath);
   if (!main) return null;
+  if (companionSize(`${dbPath}-wal`) > 0 || companionSize(`${dbPath}-journal`) > 0) return null;
   const wal = fileStatToken(`${dbPath}-wal`) || '0';
   return `${main}|w:${wal}`;
 }

@@ -1,6 +1,6 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { mkdirSync, mkdtempSync, rmSync, statSync, writeFileSync, utimesSync } from 'node:fs';
+import { chmodSync, existsSync, mkdirSync, mkdtempSync, rmSync, statSync, writeFileSync, utimesSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { createRequire } from 'node:module';
 import { join } from 'node:path';
@@ -81,21 +81,31 @@ test('L2 file entries support batch upsert and selective delete', { skip: !hasNo
   assert.equal(entries.has('/b.db'), false);
 });
 
-test('sqliteStatToken detects changes in both main .db and -wal companion', (t) => {
+test('sqliteStatToken: an idle store is cacheable, an open WAL or a journal is not', (t) => {
   const dir = withTempCache(t);
   const dbPath = join(dir, 'sample.db');
-  const walPath = `${dbPath}-wal`;
   writeFileSync(dbPath, 'main-v1');
-  const tok1 = sqliteStatToken(dbPath);
-  assert.ok(tok1);
+  const idle = sqliteStatToken(dbPath);
+  assert.ok(idle, 'no -wal: every committed row is in the main file');
 
-  writeFileSync(walPath, 'wal-append-1');
-  const tok2 = sqliteStatToken(dbPath);
-  assert.notEqual(tok2, tok1);
+  writeFileSync(`${dbPath}-wal`, '');
+  const emptyWal = sqliteStatToken(dbPath);
+  assert.ok(emptyWal, 'an empty -wal (closed app, truncating checkpoint) is idle too');
 
-  writeFileSync(walPath, 'wal-append-1-and-more');
-  const tok3 = sqliteStatToken(dbPath);
-  assert.notEqual(tok3, tok2);
+  // Frames in the WAL may not be published in the wal-index yet: a read now
+  // can return older rows than the files' stat describes.
+  writeFileSync(`${dbPath}-wal`, 'frames');
+  assert.equal(sqliteStatToken(dbPath), null);
+
+  writeFileSync(`${dbPath}-wal`, '');
+  writeFileSync(`${dbPath}-journal`, 'rollback journal');
+  assert.equal(sqliteStatToken(dbPath), null, 'a rollback-mode write in progress');
+  rmSync(`${dbPath}-journal`);
+
+  writeFileSync(dbPath, 'main-v2 after a checkpoint');
+  const checkpointed = sqliteStatToken(dbPath);
+  assert.ok(checkpointed);
+  assert.notEqual(checkpointed, emptyWal);
 });
 
 test('dirJsonStatToken detects in-place edits to cached json files', (t) => {
@@ -170,10 +180,24 @@ test('after an upgrade a parser recomputes instead of returning the older releas
   assert.deepStrictEqual(await parse(), fresh, 'a new release recomputes from the store');
 });
 
-test('the cache database is owner-only', { skip: !hasNodeSqlite || process.platform === 'win32' }, (t) => {
+test('the cache database and its -wal / -shm are owner-only', { skip: !hasNodeSqlite || process.platform === 'win32' }, (t) => {
   withTempCache(t);
   assert.equal(saveSourceSnapshot('dsh', 1, hashManifest(['x']), { buckets: [], sessions: [] }), true);
-  assert.equal(statSync(parserCachePath()).mode & 0o777, 0o600);
+  const path = parserCachePath();
+  assert.equal(statSync(path).mode & 0o777, 0o600);
+  // Another process (a second collector) holding the database open keeps its
+  // -wal and -shm on disk; companions found wider than 0600 are narrowed.
+  const { DatabaseSync } = require('node:sqlite');
+  const other = new DatabaseSync(path);
+  t.after(() => other.close());
+  other.exec('PRAGMA wal_autocheckpoint = 0');
+  other.prepare('INSERT OR REPLACE INTO source_snapshots VALUES (?, 1, ?, ?, 0)').run('other', 'm', '{}');
+  for (const suffix of ['-wal', '-shm']) chmodSync(path + suffix, 0o644);
+  assert.equal(saveSourceSnapshot('dsh', 1, hashManifest(['y']), { buckets: [], sessions: [] }), true);
+  for (const suffix of ['', '-wal', '-shm']) {
+    assert.ok(existsSync(path + suffix), `${suffix || 'db'} exists while another connection is open`);
+    assert.equal(statSync(path + suffix).mode & 0o777, 0o600, `${suffix || 'db'} is 0600`);
+  }
 });
 
 test('VIBE_USAGE_PARSER_CACHE=0 disables reads and writes cleanly', (t) => {

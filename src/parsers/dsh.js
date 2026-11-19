@@ -549,7 +549,8 @@ export async function parse() {
   // every session file's stat signature is unchanged, reuse the pre-aggregated
   // buckets/sessions directly without opening or decompressing any file.
   const fileStats = [];
-  let canUseManifest = !anyFailure;
+  const cacheOn = parserCacheEnabled();
+  let canUseManifest = !anyFailure && cacheOn;
   for (const item of files) {
     let stat = null;
     try {
@@ -560,12 +561,13 @@ export async function parse() {
     if (stat && (!stat.isFile() || stat.size > MAX_SESSION_FILE_BYTES)) {
       canUseManifest = false;
     }
-    fileStats.push({ ...item, stat, sig: stat ? `${item.version}:${item.compressed ? 1 : 0}:${statToken(stat)}` : null });
+    // With the parser cache off, no per-file signature is built either.
+    fileStats.push({ ...item, stat, sig: stat && cacheOn ? `${item.version}:${item.compressed ? 1 : 0}:${statToken(stat)}` : null });
   }
 
   // One snapshot per source; the sessions directory is in the manifest.
   const snapshotKey = SOURCE;
-  const manifest = canUseManifest && parserCacheEnabled()
+  const manifest = canUseManifest
     ? hashManifest([`tz|${localTimeZoneToken()}`, `dir|${sessionsDir}`, ...fileStats.map((f) => `${f.file}|${f.sig}`)])
     : null;
   if (manifest) {
