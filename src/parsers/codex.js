@@ -32,6 +32,7 @@ import {
   loadCodexFileTail,
   loadCodexManifest,
   loadOlderCodexFileCache,
+  olderEntryRecordable,
   olderSummaryAccepted,
   sameSignature,
   saveCodexFileCache,
@@ -730,14 +731,15 @@ function manifestRecord(cache, signature, src, boundaryParent, filePath, withDig
  * Whether a manifest record stands for what the lookup would find for this
  * exact file state. This version's: a summary, or (a file) a header and an
  * index -- startingCache() stops at either. An older version's: only a whole
- * entry, under the same rules olderEntryFor() applies.
+ * version-6 entry (olderEntryRecordable()), under the same rules olderEntryFor()
+ * applies; a version-5 entry is never served from the manifest.
  */
 function manifestRecordUsable(record, signature, cacheOptions, ultrafastStartMs, { group = false } = {}) {
   if (!record || !sameSignature(record.signature, signature)) return false;
   if (record.src === CODEX_PARSER_ALGORITHM_VERSION) {
     return !!record.result || (!group && !!record.header && !!record.index);
   }
-  return !!record.result && olderSummaryAccepted(record.src, cacheOptions)
+  return !!record.result && olderEntryRecordable(record.src) && olderSummaryAccepted(record.src, cacheOptions)
     && summaryMatchesCut(record.result, ultrafastStartMs);
 }
 
@@ -1410,7 +1412,9 @@ function writeCodexManifests(manifests, files, complete, parentIds = new Set()) 
     const records = next.get(file.codexHome);
     if (!records) continue;
     const previous = manifests.get(file.codexHome).get(file.filePath);
-    const usable = !!file.cache && file.cacheSource != null && (file.cache.result
+    const recordableSource = file.cacheSource === CODEX_PARSER_ALGORITHM_VERSION
+      || (file.cacheSource != null && olderEntryRecordable(file.cacheSource));
+    const usable = !!file.cache && recordableSource && (file.cache.result
       || (!file.members && file.cacheSource === CODEX_PARSER_ALGORITHM_VERSION && file.cache.header && file.cache.index));
     const changedSinceRecorded = file.cacheWritten && previous && !sameSignature(previous.signature, file.signature);
     if (usable && !changedSinceRecorded) {

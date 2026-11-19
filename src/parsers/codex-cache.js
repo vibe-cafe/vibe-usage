@@ -314,6 +314,21 @@ export function olderSummaryAccepted(version, { magpieFree = false } = {}) {
   return acceptedOlderSummaryAlgorithm(version, magpieFree);
 }
 
+/**
+ * Whether the manifest may hold an older version's entry at all: only one whose
+ * summary stands in without conditions (version 6; its header and index are
+ * computed as this version's). A version-5 entry, taken only while Magpie has
+ * never been active, is not recorded and not served from an older manifest,
+ * so those rollouts take exactly the lookup they take without a manifest --
+ * this version's own entry first, then the older one under its rules. (Served
+ * from the manifest, its index outlived a version-7 entry an older collector
+ * rebuilt for the same file state, and a new fork was checked against it;
+ * GPT-6.2-Astra review, 2026-11-20.)
+ */
+export function olderEntryRecordable(version) {
+  return MERGED_ULTRAFAST_SUMMARY_ALGORITHM_VERSIONS.has(version);
+}
+
 /** Removes this version's entry only; an older collector's files are not ours to delete. */
 export function removeCodexFileCache(codexHome, filePath) {
   if (!codexCacheEnabled()) return;

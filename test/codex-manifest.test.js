@@ -545,3 +545,54 @@ test('a full index that has to be built from the rollout again counts against th
     assert.equal(totalInput(next), 3345);
   });
 });
+
+test('an algorithm-5 entry is never served from the manifest, so an entry an older collector rebuilt is used', async () => {
+  await withHomes(async ({ homes, file, run, uncached }) => {
+    const single = { extraRoots: [] };
+    // A second fork of the same parent, which appears only at the end.
+    const fork2 = jsonl([
+      sessionMeta('2026-07-10T09:30:00.000Z', 'fork-2', { forked_from_id: 'parent-1' }),
+      { ...tokenCount('2026-07-10T08:05:00.000Z', 1000, 1001), timestamp: '2026-07-10T09:30:00.000Z' },
+      { ...tokenCount('2026-07-10T08:20:00.000Z', 2000, 3002), timestamp: '2026-07-10T09:30:00.000Z' },
+      tokenCount('2026-07-10T09:31:00.000Z', 7, 3010),
+    ]);
+    const fork2File = 'rollout-2026-07-10T09-30-00-fork-2.jsonl';
+    writeFileSync(file('codex', parentFile), parent);
+    writeFileSync(file('codex', forkFile), fork);
+    await run(single);
+    const dir = codexCacheDir(homes.codex);
+    // This version's entry for the parent: what a collector still running
+    // 0.15.x (also algorithm 7) writes back when its audit rebuilds it.
+    const own = entries(homes).find(({ entry }) => entry.filePath === file('codex', parentFile));
+    assert.ok(own?.entry.index, 'the parent has a replay index');
+    const rebuilt = readFileSync(join(dir, own.name), 'utf8');
+    // The parent as an algorithm-5 collector left it (index fingerprinted
+    // differently, see above), with no entry of this version and no manifest.
+    const older = { ...own.entry, algorithmVersion: 5, header: { ...own.entry.header }, result: { ...own.entry.result },
+      index: { ...own.entry.index, tokenFingerprints: own.entry.index.tokenFingerprints.map(fingerprint => `v5-${fingerprint}`) } };
+    delete older.header.modelProvider;
+    delete older.result.magpieEntries;
+    delete older.result.ultrafastBuckets;
+    writeFileSync(join(olderCodexCacheDir(homes.codex), own.name), JSON.stringify(older));
+    unlinkSync(join(dir, own.name));
+    rmSync(join(dir, 'manifest.v1'), { force: true });
+    await run(single);
+    await run(single);
+    const path = join(dir, 'manifest.v1');
+    const manifest = JSON.parse(readFileSync(path, 'utf8'));
+    assert.equal(manifest.records[file('codex', parentFile)], undefined, 'an algorithm-5 entry is not recorded');
+    // A manifest written before this rule would hold it anyway.
+    const { tokenTimes, tokenFingerprints, taskBoundaries, ...slim } = older.index;
+    manifest.records[file('codex', parentFile)] = { signature: older.signature, src: 5, header: older.header,
+      index: slim, result: older.result, lastAuditedAt: older.lastAuditedAt ?? null };
+    writeFileSync(path, JSON.stringify(manifest));
+    // The older collector's audit rebuilds the parent's entry, same file state;
+    // then a second fork of it appears.
+    writeFileSync(join(dir, own.name), rebuilt);
+    writeFileSync(file('codex', fork2File), fork2);
+    const result = await run(single);
+    assert.deepEqual(view(result), view(await uncached(single)));
+    assert.equal(totalInput(result), 3012, 'parent 3000 + the forks\' own 5 and 7');
+    assert.equal(totalInput(await run(single)), 3012);
+  });
+});
