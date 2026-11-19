@@ -81,12 +81,16 @@ function readSqlite(path) {
     // Read both shapes when a migrated store keeps both: copies are merged by
     // (session, message id), and the legacy row is seen first so an equal copy
     // never renames a project that earlier uploads already used.
+    // Append row by row: `rows.push(...result)` passes every row as a call
+    // argument and overflows the stack past ~110k rows (issue #175).
     const rows = [];
-    if (tables.has('message')) rows.push(...queryDbJson(path, V1_QUERY));
+    if (tables.has('message')) {
+      for (const row of queryDbJson(path, V1_QUERY)) rows.push(row);
+    }
     if (tables.has('session_message')) {
       const sessionTable = tables.has('session_v2') ? 'session_v2'
         : (tables.has('session') ? 'session' : null);
-      rows.push(...queryDbJson(path, v2Query(sessionTable)));
+      for (const row of queryDbJson(path, v2Query(sessionTable))) rows.push(row);
     }
     return rows;
   } catch (err) {

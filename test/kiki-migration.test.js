@@ -95,6 +95,18 @@ test('withheld reports the excluded Kiki history and its range, and is zero othe
   assert.deepEqual(none.withheld, { buckets: 0, sessions: 0, totalTokens: 0, earliest: null, latest: null });
 });
 
+// Issue #175 class: the withheld range must not spread a history-sized array
+// into Math.min / Math.max call arguments (overflows past ~110k-150k elements).
+test('withheld range survives a 200k-bucket Kiki history', () => {
+  const first = Date.parse(oldTime) - 200_000 * 1_800_000;
+  const many = Array.from({ length: 200_000 }, (_, i) => bucket('kiki', new Date(first + i * 1_800_000).toISOString(), 1));
+  const plan = planKikiMigration(many, [], { buckets: {}, sessions: {} }, T);
+  assert.equal(plan.withheld.buckets, 200_000);
+  assert.equal(plan.withheld.totalTokens, 200_000);
+  assert.equal(plan.withheld.earliest, new Date(first).toISOString());
+  assert.equal(plan.withheld.latest, new Date(first + 199_999 * 1_800_000).toISOString());
+});
+
 test('frozen counts report the kimi-code rows the guard holds this run', () => {
   const legacyKey = bucketKey(bucket('kimi-code'));
   const legacySession = 'kimi-code|copied-session';
