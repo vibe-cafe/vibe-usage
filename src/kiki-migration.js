@@ -50,6 +50,22 @@ function legacyBucketKeys(state, kikiBucket, kimiHashes) {
   return keys;
 }
 
+// Earliest and latest `bucketStart` (ISO) of a bucket list, or null when none
+// parses. A loop, not Math.min(...starts): spreading a history-sized array into
+// call arguments overflows the stack past ~110k elements (issue #175).
+export function bucketStartRange(buckets) {
+  let earliest = Infinity;
+  let latest = -Infinity;
+  for (const b of buckets) {
+    const time = Date.parse(b.bucketStart);
+    if (!Number.isFinite(time)) continue;
+    if (time < earliest) earliest = time;
+    if (time > latest) latest = time;
+  }
+  if (earliest === Infinity) return { earliest: null, latest: null };
+  return { earliest: new Date(earliest).toISOString(), latest: new Date(latest).toISOString() };
+}
+
 // The unpublished compatibility collector reported Kiki as kimi-code. Its
 // state contains hashes, not source contributions: overlap is a conservative
 // migration signal, never proof that a particular Kimi bucket contains Kiki.
@@ -89,7 +105,7 @@ export function planKikiMigration(buckets, sessions, state, startAt) {
   const plannedKikiSessions = new Set(nextSessions.filter(s => s.source === 'kiki'));
   const withheldBuckets = kikiBuckets.filter(b => !plannedKikiBuckets.has(b));
   const withheldSessions = kikiSessions.filter(s => !plannedKikiSessions.has(s));
-  const starts = withheldBuckets.map(b => Date.parse(b.bucketStart)).filter(Number.isFinite);
+  const range = bucketStartRange(withheldBuckets);
   return {
     blocked,
     preserveBuckets,
@@ -100,8 +116,8 @@ export function planKikiMigration(buckets, sessions, state, startAt) {
       buckets: withheldBuckets.length,
       sessions: withheldSessions.length,
       totalTokens: withheldBuckets.reduce((sum, b) => sum + (Number(b.totalTokens) || 0), 0),
-      earliest: starts.length > 0 ? new Date(Math.min(...starts)).toISOString() : null,
-      latest: starts.length > 0 ? new Date(Math.max(...starts)).toISOString() : null,
+      earliest: range.earliest,
+      latest: range.latest,
     },
     frozenBuckets: preserveBuckets.size,
     frozenSessions: preserveSessions.size,
