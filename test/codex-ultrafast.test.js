@@ -365,6 +365,8 @@ function downgradeCacheToAlgorithm6(cacheDir) {
       writeFileSync(join(dirname(dir), entry.name), asAlgorithm6(JSON.parse(readFileSync(path, 'utf8'))));
       rmSync(path);
     }
+    // An algorithm-6 collector has no v7 directory, so no manifest either.
+    if (basename(dir) === 'v7') rmSync(join(dir, 'manifest.v1'), { force: true });
   };
   visit(cacheDir);
 }
