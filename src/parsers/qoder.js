@@ -12,6 +12,7 @@ import {
   loadFileEntries,
   loadSourceSnapshot,
   localTimeZoneToken,
+  parserCacheEnabled,
   pruneFileEntries,
   saveSourceSnapshot,
   sqliteStatToken,
@@ -378,15 +379,19 @@ async function parseEdition(edition) {
   const rawFiles = existsSync(root) ? listJsonlFiles(root, ctx).sort() : [];
   const dbPath = getQoderDbPath(edition);
   const hasDb = existsSync(dbPath);
-  const snapshotKey = JSON.stringify([source, root, dbPath]);
+  // One snapshot per source (edition); the paths are in the manifest.
+  const snapshotKey = source;
+  // With the parser cache off, nothing is stat'ed or hashed for it.
+  const cacheOn = parserCacheEnabled();
 
-  const filesWithSig = rawFiles.map((file) => ({ file, sig: fileStatToken(file) }));
-  const dbSig = hasDb ? sqliteStatToken(dbPath) : 'none';
+  const filesWithSig = rawFiles.map((file) => ({ file, sig: cacheOn ? fileStatToken(file) : null }));
+  const dbSig = !cacheOn ? null : (hasDb ? sqliteStatToken(dbPath) : 'none');
 
   let manifest = null;
-  if (!ctx.skipped && filesWithSig.every((f) => f.sig) && dbSig) {
+  if (cacheOn && !ctx.skipped && filesWithSig.every((f) => f.sig) && dbSig) {
     manifest = hashManifest([
       `tz|${localTimeZoneToken()}`,
+      `root|${root}`,
       `db|${dbPath}|${dbSig}`,
       ...filesWithSig.map((f) => `jsonl|${f.file}|${f.sig}`),
     ]);

@@ -13,6 +13,7 @@ import {
 import {
   commitFileEntries,
   loadFileEntries,
+  parserCacheEnabled,
   pruneFileEntries,
   sqliteStatToken,
 } from './parser-cache.js';
@@ -569,12 +570,13 @@ export async function parse({ extraRoots = [] } = {}) {
     candidates.map(({ dir, cascadeId }) => join(dir, `${cascadeId}.db`)),
   );
   const cacheUpdates = [];
+  const cacheOn = parserCacheEnabled();
 
   for (const { dir, cascadeId, strict } of candidates) {
     const selected = selectedConfiguredCopies.get(cascadeId);
     if (selected && selected.dir !== dir) continue;
     const dbPath = join(dir, `${cascadeId}.db`);
-    const sig = sqliteStatToken(dbPath);
+    const sig = cacheOn ? sqliteStatToken(dbPath) : null;
     const cached = sig ? cachedEntries.get(dbPath) : null;
     let parsedCascade = null;
 

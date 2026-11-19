@@ -8,6 +8,7 @@ import {
   loadSourceSnapshot,
   localTimeZoneToken,
   magpieManifestToken,
+  parserCacheEnabled,
   saveSourceSnapshot,
   sqliteStatToken,
 } from './parser-cache.js';
@@ -132,10 +133,11 @@ export async function parse({ extraRoots = [], magpie } = {}) {
   const stores = getOpenCodeStores({ extraRoots, onWarning: message => warnings.push(message) });
 
   // L1 whole-source snapshot fast path for SQLite-backed OpenCode stores.
-  // Checks main .db + -wal stat signatures plus the Magpie ledger signature.
-  const magpieToken = magpieManifestToken(magpie);
+  // Checks main .db + -wal stat signatures (store paths are in the manifest;
+  // one snapshot per source). Off on a machine with a Magpie ledger.
+  const magpieToken = parserCacheEnabled() ? magpieManifestToken(magpie) : null;
   const magpiePendingBefore = magpie?.pending?.length ?? 0;
-  const snapshotKey = JSON.stringify(['opencode', ...stores.map(store => store.path)]);
+  const snapshotKey = 'opencode';
   let manifest = null;
   if (warnings.length === 0 && stores.length > 0 && magpieToken && stores.every(s => s.kind === 'sqlite')) {
     const parts = [magpieToken];

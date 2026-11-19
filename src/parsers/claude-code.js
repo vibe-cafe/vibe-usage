@@ -22,11 +22,11 @@ import {
 } from './claude-cache.js';
 import {
   dirJsonStatToken,
-  fileStatToken,
   hashManifest,
   loadSourceSnapshot,
   localTimeZoneToken,
   magpieManifestToken,
+  parserCacheEnabled,
   saveSourceSnapshot,
 } from './parser-cache.js';
 
@@ -723,47 +723,40 @@ export async function parse({ extraRoots = [], magpie } = {}) {
   // directory warnings occurred, and no audit-interval test override is
   // active, check whether every discovered transcript's stat signature plus
   // Magpie ledger state matches the previous complete run.
-  const snapshotKey = JSON.stringify(['claude-code', ...roots]);
+  // One snapshot per source: the roots go into the manifest, not the key,
+  // because Claude Desktop Cowork adds a root per session and a key per root
+  // combination would keep a full copy of the result for each of them.
+  const snapshotKey = 'claude-code';
   const magpieToken = magpieManifestToken(magpie);
   const magpiePendingBefore = magpie?.pending?.length ?? 0;
   let manifestParts = null;
   if (
-    ctx.cacheEnabled
+    parserCacheEnabled()
+    && ctx.cacheEnabled
     && magpieToken
     && !ctx.incomplete
     && ctx.warnings.length === 0
     && !process.env.VIBE_USAGE_CLAUDE_AUDIT_INTERVAL_MS
     && !process.env.VIBE_USAGE_CLAUDE_WORK_BUDGET_MS
   ) {
-    const parts = [`tz|${localTimeZoneToken()}`, magpieToken];
-    let ok = true;
+    // The signature captured at discovery, never a fresh stat: each file is
+    // read only up to the size captured then, so a fresh stat taken after an
+    // append would store the shorter result under the longer file's manifest.
+    const sig = (c) => `${c.signature.size}:${c.signature.mtimeMs}:${c.signature.dev}:${c.signature.ino}`;
+    const parts = [`tz|${localTimeZoneToken()}`, magpieToken, ...roots.map(root => `root|${root}`)];
     for (const [sessionId, candidates] of projectGroups) {
-      for (const c of candidates) {
-        const tok = fileStatToken(c.filePath);
-        if (!tok) { ok = false; break; }
-        parts.push(`p|${sessionId}|${c.filePath}|${tok}`);
-      }
-      if (!ok) break;
+      for (const c of candidates) parts.push(`p|${sessionId}|${c.filePath}|${sig(c)}`);
     }
-    if (ok) {
-      for (const [sessionId, candidates] of transcriptGroups) {
-        for (const c of candidates) {
-          const tok = fileStatToken(c.filePath);
-          if (!tok) { ok = false; break; }
-          parts.push(`t|${sessionId}|${c.filePath}|${tok}`);
-        }
-        if (!ok) break;
-      }
+    for (const [sessionId, candidates] of transcriptGroups) {
+      for (const c of candidates) parts.push(`t|${sessionId}|${c.filePath}|${sig(c)}`);
     }
-    if (ok) {
-      manifestParts = parts;
-      const manifest = hashManifest([...parts, `l2|${dirJsonStatToken(claudeCacheDir())}`]);
-      const snap = loadSourceSnapshot(snapshotKey, CLAUDE_SNAPSHOT_ALGO, manifest);
-      if (snap && Date.now() < snap.nextAuditAt
-        && magpieManifestToken(magpie) === magpieToken
-        && Array.isArray(snap.buckets) && Array.isArray(snap.sessions)) {
-        return { buckets: snap.buckets, sessions: snap.sessions };
-      }
+    manifestParts = parts;
+    const manifest = hashManifest([...parts, `l2|${dirJsonStatToken(claudeCacheDir())}`]);
+    const snap = loadSourceSnapshot(snapshotKey, CLAUDE_SNAPSHOT_ALGO, manifest);
+    if (snap && Date.now() < snap.nextAuditAt
+      && magpieManifestToken(magpie) === magpieToken
+      && Array.isArray(snap.buckets) && Array.isArray(snap.sessions)) {
+      return { buckets: snap.buckets, sessions: snap.sessions };
     }
   }
 

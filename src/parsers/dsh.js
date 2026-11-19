@@ -10,13 +10,15 @@ import {
   loadFileEntries,
   loadSourceSnapshot,
   localTimeZoneToken,
+  parserCacheEnabled,
   pruneFileEntries,
   saveSourceSnapshot,
   statToken,
 } from './parser-cache.js';
 
 const SOURCE = 'dsh';
-const DSH_CACHE_ALGO = 1;
+// 2: cached models carry `project` instead of the session's full `cwd`.
+const DSH_CACHE_ALGO = 2;
 
 // Verified against deepseek-ai/deepseek-harness, released formats V0-V4:
 // packages/session/session-format/src/filename.ts, session-format-v0-to-v1,
@@ -324,7 +326,9 @@ function buildSessionModel(text, fileVersion) {
       Number.isSafeInteger(header.seedLength) && header.seedLength > 0
         ? header.seedLength
         : 0,
-    cwd: header.cwd,
+    // Only the project name is kept (it is all the output uses), so the
+    // parser cache never stores a session's full working directory.
+    project: projectFromCwd(header.cwd),
     messages,
   };
 }
@@ -422,7 +426,7 @@ function replaySkipCount(child, parent) {
 /** Fold a (possibly replay-trimmed) model into flat usage entries + timing events. */
 function modelToResult(model, skipCount) {
   const sessionId = model.sessionId;
-  const project = projectFromCwd(model.cwd);
+  const project = model.project;
   const entries = [];
   const events = [];
   for (let i = skipCount; i < model.messages.length; i++) {
@@ -559,9 +563,10 @@ export async function parse() {
     fileStats.push({ ...item, stat, sig: stat ? `${item.version}:${item.compressed ? 1 : 0}:${statToken(stat)}` : null });
   }
 
-  const snapshotKey = JSON.stringify([SOURCE, sessionsDir]);
-  const manifest = canUseManifest
-    ? hashManifest([`tz|${localTimeZoneToken()}`, ...fileStats.map((f) => `${f.file}|${f.sig}`)])
+  // One snapshot per source; the sessions directory is in the manifest.
+  const snapshotKey = SOURCE;
+  const manifest = canUseManifest && parserCacheEnabled()
+    ? hashManifest([`tz|${localTimeZoneToken()}`, `dir|${sessionsDir}`, ...fileStats.map((f) => `${f.file}|${f.sig}`)])
     : null;
   if (manifest) {
     const snap = loadSourceSnapshot(snapshotKey, DSH_CACHE_ALGO, manifest);

@@ -1,8 +1,9 @@
 import { createHash } from 'node:crypto';
-import { mkdirSync, readdirSync, statSync } from 'node:fs';
+import { chmodSync, existsSync, mkdirSync, readdirSync, statSync } from 'node:fs';
 import { createRequire } from 'node:module';
 import { homedir } from 'node:os';
 import { join } from 'node:path';
+import { COLLECTOR_VERSION } from '../client-meta.js';
 
 const require = createRequire(import.meta.url);
 
@@ -11,6 +12,19 @@ const require = createRequire(import.meta.url);
 // any miss, corruption, lock failure, or older Node runtime without node:sqlite
 // falls back cleanly to raw parsing with identical output.
 const SCHEMA_VERSION = 2;
+
+// Every snapshot manifest and every file entry signature is stamped with the
+// CLI version. A cache written by another release is never reused, so a parser
+// fix reaches unchanged files (and a `reset` re-uploads what this release
+// computes) without anyone remembering to bump a per-parser constant.
+// VIBE_USAGE_PARSER_CACHE_VERSION is a test hook that stands in for a release.
+function cacheVersion() {
+  return process.env.VIBE_USAGE_PARSER_CACHE_VERSION?.trim() || COLLECTOR_VERSION;
+}
+
+function stampVersion(value) {
+  return `${cacheVersion()}|${value}`;
+}
 
 let nodeSqlite; // undefined = not tried, null = unavailable
 
@@ -73,6 +87,19 @@ function ensureSchema(db) {
   `);
 }
 
+// Usage-derived rows (project names, timings): owner-only, like the Codex and
+// Claude cache files. SQLite creates -wal / -shm with the database's mode.
+function restrictCacheFiles(dbPath) {
+  if (process.platform === 'win32') return;
+  for (const path of [dbPath, `${dbPath}-wal`, `${dbPath}-shm`]) {
+    try {
+      if (existsSync(path) && (statSync(path).mode & 0o777) !== 0o600) chmodSync(path, 0o600);
+    } catch {
+      // Best effort; the directory itself is created 0700.
+    }
+  }
+}
+
 function withCacheDb(fn) {
   if (!parserCacheEnabled()) return undefined;
   const mod = getNodeSqlite();
@@ -83,6 +110,7 @@ function withCacheDb(fn) {
     mkdirSync(join(dbPath, '..'), { recursive: true, mode: 0o700 });
     db = new mod.DatabaseSync(dbPath);
     ensureSchema(db);
+    restrictCacheFiles(dbPath);
     return fn(db);
   } catch {
     return undefined;
@@ -184,7 +212,7 @@ export function loadSourceSnapshot(source, algoVersion, manifest) {
   if (!manifest) return null;
   const raw = withCacheDb((db) => {
     return db.prepare('SELECT payload FROM source_snapshots WHERE source = ? AND algo_version = ? AND manifest = ?')
-      .get(source, algoVersion, manifest)?.payload;
+      .get(source, algoVersion, stampVersion(manifest))?.payload;
   });
   if (typeof raw !== 'string') return null;
   try {
@@ -208,7 +236,7 @@ export function saveSourceSnapshot(source, algoVersion, manifest, payload) {
     db.prepare(
       `INSERT OR REPLACE INTO source_snapshots (source, algo_version, manifest, payload, updated_at)
        VALUES (?, ?, ?, ?, ?)`,
-    ).run(source, algoVersion, manifest, serialized, Date.now());
+    ).run(source, algoVersion, stampVersion(manifest), serialized, Date.now());
     return true;
   }));
 }
@@ -223,7 +251,12 @@ export function loadFileEntries(source, algoVersion, keys = null) {
       ? db.prepare(select).all(source, algoVersion)
       : db.prepare(select + ' AND entry_key IN (SELECT value FROM json_each(?))')
         .all(source, algoVersion, JSON.stringify(keys));
-    for (const row of rows) map.set(row.entry_key, { sig: row.sig, payload: row.payload });
+    const prefix = stampVersion('');
+    for (const row of rows) {
+      // Entries written by another release are ignored and get overwritten.
+      if (typeof row.sig !== 'string' || !row.sig.startsWith(prefix)) continue;
+      map.set(row.entry_key, { sig: row.sig.slice(prefix.length), payload: row.payload });
+    }
   });
   return map;
 }
@@ -244,7 +277,7 @@ export function commitFileEntries(source, algoVersion, updates = [], deleteKeys 
     try {
       for (const { key, sig, payload } of updates) {
         const serialized = typeof payload === 'string' ? payload : JSON.stringify(payload);
-        upsert.run(source, algoVersion, key, sig, serialized, now);
+        upsert.run(source, algoVersion, key, stampVersion(sig), serialized, now);
       }
       for (const key of deleteKeys) {
         del.run(source, algoVersion, key);
