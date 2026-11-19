@@ -60,12 +60,16 @@ function readSqlite(path) {
       if (!tables.has('message') && !tables.has('session_message')) {
         throw new Error(`不认识的表结构（没有 message / session_message 表）: ${path}`);
       }
+      // Same order and row-by-row append as the fallback below (issue #175:
+      // spreading every row into one push() call overflows the stack).
       const rows = [];
-      if (tables.has('message')) rows.push(...db.prepare(V1_QUERY).all());
+      if (tables.has('message')) {
+        for (const row of db.prepare(V1_QUERY).all()) rows.push(row);
+      }
       if (tables.has('session_message')) {
         const sessionTable = tables.has('session_v2') ? 'session_v2'
           : (tables.has('session') ? 'session' : null);
-        rows.push(...db.prepare(v2Query(sessionTable)).all());
+        for (const row of db.prepare(v2Query(sessionTable)).all()) rows.push(row);
       }
       return rows;
     });
