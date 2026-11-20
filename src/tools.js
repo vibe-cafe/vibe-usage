@@ -345,8 +345,32 @@ export function getDimAgentDbPath() {
   return join(home, 'dimcode.sqlite');
 }
 
+/**
+ * Every Rust Dim store (`<home>/rust/dimcode.sqlite`, crates/dim-cli
+ * `default_home()`): `$DIMCODE_HOME`, then the alpha home `~/.dimcode-alpha`,
+ * the release home `~/.dimcode` and the global home `~/.dim`. All of them are
+ * read; copies of one store are deduplicated by event id in the parser.
+ *
+ * `VIBE_USAGE_DIMAGENT_RUST_DBS` (path-delimited database files) replaces
+ * discovery for fixtures. A fixture that sets only the legacy
+ * `VIBE_USAGE_DIMAGENT_DB` gets no Rust store, so it never reads the
+ * developer's real homes.
+ */
+export function getDimAgentRustDbPaths() {
+  const override = process.env.VIBE_USAGE_DIMAGENT_RUST_DBS;
+  if (override !== undefined) {
+    return [...new Set(override.split(delimiter).map(p => p.trim()).filter(Boolean).map(p => resolve(p)))];
+  }
+  if (process.env.VIBE_USAGE_DIMAGENT_DB?.trim()) return [];
+  const homes = [];
+  const explicitHome = process.env.DIMCODE_HOME?.trim();
+  if (explicitHome) homes.push(resolve(explicitHome));
+  for (const name of ['.dimcode-alpha', '.dimcode', '.dim']) homes.push(join(homedir(), name));
+  return [...new Set(homes.map(home => join(home, 'rust', 'dimcode.sqlite')))];
+}
+
 export function findDimAgentDataDirs() {
-  return [getDimAgentDbPath()].filter(existsSync);
+  return [getDimAgentDbPath(), ...getDimAgentRustDbPaths()].filter(existsSync);
 }
 
 export const TOOLS = [
