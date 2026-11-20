@@ -596,3 +596,52 @@ test('an algorithm-5 entry is never served from the manifest, so an entry an old
     assert.equal(totalInput(await run(single)), 3012);
   });
 });
+
+test('a full index is taken from this version\'s entry first, also behind a record of an older entry', async () => {
+  await withHomes(async ({ homes, file, run, uncached }) => {
+    const single = { extraRoots: [] };
+    // A second fork of the parent, which appears only at the end.
+    const fork2 = jsonl([
+      sessionMeta('2026-07-10T09:30:00.000Z', 'fork-2', { forked_from_id: 'parent-1' }),
+      { ...tokenCount('2026-07-10T08:05:00.000Z', 1000, 1001), timestamp: '2026-07-10T09:30:00.000Z' },
+      { ...tokenCount('2026-07-10T08:20:00.000Z', 2000, 3002), timestamp: '2026-07-10T09:30:00.000Z' },
+      tokenCount('2026-07-10T09:31:00.000Z', 7, 3010),
+    ]);
+    const fork2File = 'rollout-2026-07-10T09-30-00-fork-2.jsonl';
+    // A first fork gives the parent a replay index, then goes away.
+    writeFileSync(file('codex', parentFile), parent);
+    writeFileSync(file('codex', forkFile), fork);
+    await run(single);
+    unlinkSync(file('codex', forkFile));
+    const dir = codexCacheDir(homes.codex);
+    // This version's entry for the parent: what a collector still running
+    // 0.15.x writes back when its rolling audit rebuilds it.
+    const own = entries(homes).find(({ entry }) => entry.filePath === file('codex', parentFile));
+    assert.ok(own?.entry.index && own.entry.result, 'the parent has an index and a summary');
+    const rebuilt = readFileSync(join(dir, own.name), 'utf8');
+    // The parent as an algorithm-6 collector left it, carrying an index an
+    // earlier algorithm computed (an incremental rewrite keeps the index it
+    // had; here its fingerprints are simply made different), and nothing of
+    // this version.
+    const older = { ...own.entry, algorithmVersion: 6, result: { ...own.entry.result },
+      index: { ...own.entry.index, tokenFingerprints: own.entry.index.tokenFingerprints.map(fingerprint => `v5-${fingerprint}`) } };
+    delete older.result.ultrafastBuckets;
+    writeFileSync(join(olderCodexCacheDir(homes.codex), own.name), JSON.stringify(older));
+    unlinkSync(join(dir, own.name));
+    rmSync(join(dir, 'manifest.v1'), { force: true });
+    await run(single);
+    await run(single);
+    const manifest = JSON.parse(readFileSync(join(dir, 'manifest.v1'), 'utf8'));
+    const record = manifest.records[file('codex', parentFile)];
+    assert.equal(record?.src, 6, 'the parent is recorded from its algorithm-6 entry');
+    assert.ok(record.index, 'with its (slim) index');
+    // The older collector's audit rebuilds the parent's entry, same file
+    // state; then a new fork of it appears.
+    writeFileSync(join(dir, own.name), rebuilt);
+    writeFileSync(file('codex', fork2File), fork2);
+    const result = await run(single);
+    assert.deepEqual(view(result), view(await uncached(single)));
+    assert.equal(totalInput(result), 3007, 'parent 3000 + the new fork\'s own 7');
+    assert.equal(totalInput(await run(single)), 3007);
+  });
+});

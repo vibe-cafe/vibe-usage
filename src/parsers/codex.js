@@ -628,30 +628,37 @@ function replayIndexDigest(index) {
 }
 
 /**
- * Fill a slim index, in place (every holder of the object sees it), from the
- * entry it was recorded from: this version's, or the older version's whose
- * entry the manifest record stands for (taken whole, as startingCache() takes
- * it). False when that entry no longer holds the same index.
+ * Fill a slim index, in place (every holder of the object sees it), in the
+ * order the lookup takes: this version's entry for exactly this file state
+ * first, whatever the record was written from -- a collector of this version
+ * that is still running (0.15.x) may have rebuilt it since, and an older
+ * entry's index can itself be one an earlier algorithm computed (GPT-6.2-Astra
+ * review, 2026-11-20) -- and only then the older version's entry the record
+ * stands for (taken whole, as startingCache() takes it). False when neither
+ * holds the same index.
  */
 function fillFullIndex(index) {
   const source = index?.[SLIM_INDEX_SOURCE];
   if (!source) return true;
   const { codexHome, filePath, signature, src, cacheOptions } = source;
+  const sameIndex = full => !!full && HEAVY_INDEX_FIELDS.every(key => Array.isArray(full[key]))
+    && full.sessionId === index.sessionId
+    && full.parsedRecordCount === index.parsedRecordCount
+    && full.rawTokenCount === index.rawTokenCount;
   let full = null;
   try {
-    if (src === CODEX_PARSER_ALGORITHM_VERSION) {
-      full = loadCodexFileCache(codexHome, filePath, signature)?.index;
-    } else {
+    const own = loadCodexFileCache(codexHome, filePath, signature)?.index;
+    if (sameIndex(own)) {
+      full = own;
+    } else if (src !== CODEX_PARSER_ALGORITHM_VERSION) {
       const older = loadOlderCodexFileCache(codexHome, filePath, signature, cacheOptions);
-      full = older?.entry?.index ?? older?.index;
+      const candidate = older?.entry?.index ?? older?.index;
+      if (sameIndex(candidate)) full = candidate;
     }
   } catch {
     full = null;
   }
-  if (!full || !HEAVY_INDEX_FIELDS.every(key => Array.isArray(full[key]))
-    || full.sessionId !== index.sessionId
-    || full.parsedRecordCount !== index.parsedRecordCount
-    || full.rawTokenCount !== index.rawTokenCount) return false;
+  if (!full) return false;
   delete index[SLIM_INDEX_SOURCE];
   delete index.indexDigest;
   delete index[INDEX_DIGEST];
