@@ -1068,6 +1068,7 @@ test('a corrupt parser cache fails open and rebuilds from raw logs', async () =>
       const [entry] = readdirSync(dir).filter(name => name.endsWith('.json') && !name.endsWith('.tail.json'));
       assert.ok(entry);
       writeFileSync(join(dir, entry), '{broken');
+      writeFileSync(join(dir, 'manifest.v1'), '{broken');
 
       const rebuilt = await parse();
       assert.deepEqual(rebuilt.buckets, expected.buckets);
@@ -1521,6 +1522,8 @@ function downgradeCacheToAlgorithm5(cacheDir) {
       writeFileSync(join(dirname(dir), entry.name), `${JSON.stringify(data)}\n`);
       rmSync(path);
     }
+    // An algorithm-5 collector has no v7 directory, so no manifest either.
+    if (basename(dir) === 'v7') rmSync(join(dir, 'manifest.v1'), { force: true });
   };
   visit(cacheDir);
 }

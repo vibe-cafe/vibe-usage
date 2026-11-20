@@ -1,9 +1,12 @@
 import {
+  closeSync,
   mkdirSync,
+  openSync,
   readFileSync,
   renameSync,
   rmSync,
   writeFileSync,
+  writeSync,
 } from 'node:fs';
 import { createHash, randomBytes } from 'node:crypto';
 import { homedir } from 'node:os';
@@ -234,6 +237,96 @@ export function saveCodexFileTail(codexHome, filePath, signature, tail) {
   } finally {
     rmSync(tempPath, { force: true });
   }
+}
+
+// The manifest: one file per Codex home, next to this version's entries, that
+// lets a warm sync start without opening every entry (see "Codex parser cache"
+// in AGENTS.md). It holds, per rollout and per duplicate-session group, what
+// the last sync used for one exact stat signature -- the header, the replay
+// index without its per-record arrays, the summary -- and where it came from
+// (`src`: this version, or the older version whose entry was taken). It is an
+// accelerator only: a record is used for exactly its signature and source rules,
+// anything else is looked up in the entries as before, and the entries stay
+// what a full index is read from. Not named `*.json`, so nothing that walks
+// the entries mistakes it for one.
+const CODEX_MANIFEST_SCHEMA_VERSION = 1;
+
+function manifestPath(codexHome) {
+  return join(codexCacheDir(codexHome), 'manifest.v1');
+}
+
+/** The records of one home's manifest by file path; empty when there is none or it is not this version's. */
+export function loadCodexManifest(codexHome) {
+  if (!codexCacheEnabled()) return new Map();
+  try {
+    const parsed = JSON.parse(readFileSync(manifestPath(codexHome), 'utf8'));
+    if (parsed.schemaVersion !== CODEX_MANIFEST_SCHEMA_VERSION
+      || parsed.cacheSchemaVersion !== CODEX_CACHE_SCHEMA_VERSION
+      || parsed.algorithmVersion !== CODEX_PARSER_ALGORITHM_VERSION
+      || parsed.codexHome !== codexHome
+      || !parsed.records || typeof parsed.records !== 'object') return new Map();
+    return new Map(Object.entries(parsed.records));
+  } catch {
+    return new Map();
+  }
+}
+
+// Written in pieces: the same bytes as JSON.stringify() of the whole manifest
+// (records in Map order), without holding that string -- tens of megabytes for
+// a home with many shared sessions, on top of everything a sync holds.
+export function saveCodexManifest(codexHome, records) {
+  if (!codexCacheEnabled()) return;
+  const dir = codexCacheDir(codexHome);
+  mkdirSync(dir, { recursive: true, mode: 0o700 });
+  const path = manifestPath(codexHome);
+  const tempPath = `${path}.${process.pid}.${randomBytes(6).toString('hex')}.tmp`;
+  const head = JSON.stringify({
+    schemaVersion: CODEX_MANIFEST_SCHEMA_VERSION,
+    cacheSchemaVersion: CODEX_CACHE_SCHEMA_VERSION,
+    algorithmVersion: CODEX_PARSER_ALGORITHM_VERSION,
+    codexHome,
+  });
+  let fd;
+  try {
+    fd = openSync(tempPath, 'w', 0o600);
+    let chunk = `${head.slice(0, -1)},"records":{`;
+    let first = true;
+    for (const [filePath, record] of records) {
+      chunk += `${first ? '' : ','}${JSON.stringify(filePath)}:${JSON.stringify(record)}`;
+      first = false;
+      if (chunk.length >= 1 << 20) {
+        writeSync(fd, chunk);
+        chunk = '';
+      }
+    }
+    writeSync(fd, `${chunk}}}\n`);
+    closeSync(fd);
+    fd = undefined;
+    renameSync(tempPath, path);
+  } finally {
+    if (fd !== undefined) closeSync(fd);
+    rmSync(tempPath, { force: true });
+  }
+}
+
+/** Whether an older version's summary may stand in for this version's (before the cut check). */
+export function olderSummaryAccepted(version, { magpieFree = false } = {}) {
+  return acceptedOlderSummaryAlgorithm(version, magpieFree);
+}
+
+/**
+ * Whether the manifest may hold an older version's entry at all: only one whose
+ * summary stands in without conditions (version 6; its header and index are
+ * computed as this version's). A version-5 entry, taken only while Magpie has
+ * never been active, is not recorded and not served from an older manifest,
+ * so those rollouts take exactly the lookup they take without a manifest --
+ * this version's own entry first, then the older one under its rules. (Served
+ * from the manifest, its index outlived a version-7 entry an older collector
+ * rebuilt for the same file state, and a new fork was checked against it;
+ * GPT-6.2-Astra review, 2026-11-20.)
+ */
+export function olderEntryRecordable(version) {
+  return MERGED_ULTRAFAST_SUMMARY_ALGORITHM_VERSIONS.has(version);
 }
 
 /** Removes this version's entry only; an older collector's files are not ours to delete. */
