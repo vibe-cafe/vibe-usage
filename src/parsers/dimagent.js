@@ -2,7 +2,8 @@ import { existsSync } from 'node:fs';
 import { aggregateToBuckets, extractSessions } from './aggregate.js';
 import { toCount } from './fs-utils.js';
 import { queryDbJson, sqliteUnavailableError, isSqliteUnavailableError } from './sqlite.js';
-import { getDimAgentDbPath } from '../tools.js';
+import { getDimAgentDbPath, getDimAgentRustDbPaths } from '../tools.js';
+import { readDimAgentRustStores } from './dimagent-rust.js';
 
 const SOURCE = 'dimagent';
 const FORKED_LEDGER_ID = /^ledger_[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
@@ -81,10 +82,8 @@ function queryDb(dbPath, sql) {
   }
 }
 
-export async function parse() {
-  const dbPath = getDimAgentDbPath();
-  if (!existsSync(dbPath)) return { buckets: [], sessions: [] };
-
+// The legacy TypeScript DimAgent store (`~/.dimcode/v2/dimcode.sqlite`).
+function readLegacyStore(dbPath) {
   const usageRows = queryDb(dbPath, `SELECT
     u.ledgerId,
     u.runId,
@@ -120,8 +119,46 @@ export async function parse() {
     });
   }
 
+  return { entries: parseUsageRows(usageRows), events: sessionEvents };
+}
+
+// One source for both generations: the legacy store and every Rust Dim store
+// (dimagent-rust.js). Imported legacy history carries no usage in the Rust
+// store, so the two never count the same call. Each store is read on its own:
+// one that fails is reported as a warning and the others still sync, while
+// `skipped` keeps sync.js from pruning what the failed one uploaded before.
+export async function parse() {
+  let entries = [];
+  let events = [];
+  const warnings = [];
+  let skipped = false;
+
+  const dbPath = getDimAgentDbPath();
+  if (existsSync(dbPath)) {
+    try {
+      ({ entries, events } = readLegacyStore(dbPath));
+    } catch (err) {
+      skipped = true;
+      // queryDb() already turned a missing SQLite into the standard hint.
+      warnings.push(/sqlite3 CLI not found/.test(err?.message || '')
+        ? err.message
+        : `DimAgent: 无法读取 ${dbPath}: ${err.message}`);
+    }
+  }
+
+  const rust = readDimAgentRustStores(getDimAgentRustDbPaths());
+  // Loops, not push(...rows): a large store overflows the argument stack.
+  for (const entry of rust.entries) entries.push(entry);
+  for (const event of rust.events) events.push(event);
+  for (const warning of rust.warnings) {
+    if (!warnings.includes(warning)) warnings.push(warning);
+  }
+  if (rust.failed) skipped = true;
+
   return {
-    buckets: aggregateToBuckets(parseUsageRows(usageRows)),
-    sessions: extractSessions(sessionEvents),
+    buckets: aggregateToBuckets(entries),
+    sessions: extractSessions(events),
+    ...(skipped ? { skipped: true } : {}),
+    ...(warnings.length > 0 ? { warnings } : {}),
   };
 }
