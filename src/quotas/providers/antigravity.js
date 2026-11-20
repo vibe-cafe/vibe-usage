@@ -1,11 +1,13 @@
-import { accessSync, constants, mkdtempSync, readFileSync, rmSync, statSync } from 'node:fs';
-import { homedir, tmpdir } from 'node:os';
-import { delimiter, join, isAbsolute } from 'node:path';
-import { spawn, execFile } from 'node:child_process';
-import { randomBytes } from 'node:crypto';
+import { accessSync, constants, statSync } from 'node:fs';
+import { homedir } from 'node:os';
+import { delimiter, join, isAbsolute, resolve } from 'node:path';
+import { execFile } from 'node:child_process';
 import https from 'node:https';
-import { setTimeout as delay } from 'node:timers/promises';
+import { promisify } from 'node:util';
 import { quotaResult } from '../schema.js';
+import { Interrupted, LoginRequired, requiresLogin, runAntigravityCommand, withAntigravitySession } from './antigravity-process.js';
+
+export { withAntigravitySession };
 
 const QUOTA_PATH = '/exa.language_server_pb.LanguageServerService/RetrieveUserQuotaSummary';
 
@@ -34,8 +36,12 @@ export function antigravityBinary(environment = process.env, home = homedir(), p
     userBin,
     ...(environment.PATH || '').split(platform === 'win32' ? ';' : delimiter)
       .filter(Boolean).map(root => join(root, name)),
-    ...installed,
+    ...installed, ...(platform === 'darwin' ? ['/opt/homebrew/bin/agy', '/usr/local/bin/agy'] : []),
   ];
+  return firstExecutable(candidates, platform);
+}
+
+function firstExecutable(candidates, platform) {
   return candidates.find(path => {
     if (!isAbsolute(path)) return false;
     try {
@@ -43,6 +49,42 @@ export function antigravityBinary(environment = process.env, home = homedir(), p
       return statSync(path).isFile();
     } catch { return false; }
   });
+}
+
+export function antigravityDesktopPaths(environment, home, platform) {
+  if (platform === 'darwin') return ['/Applications', join(home, 'Applications')]
+    .map(root => join(root, 'Antigravity.app', 'Contents', 'Resources', 'bin', 'language_server'));
+  const local = environment.LOCALAPPDATA?.trim();
+  return platform === 'win32' && local
+    ? [join(local, 'Programs', 'antigravity', 'resources', 'bin', 'language_server.exe')] : [];
+}
+
+async function desktopVersion(binary, platform) {
+  const run = promisify(execFile);
+  const options = { timeout: 2000, windowsHide: true, maxBuffer: 4096 };
+  try {
+    // Read installed application metadata, without starting the desktop app.
+    const { stdout } = platform === 'darwin'
+      ? await run('/usr/bin/plutil', ['-extract', 'CFBundleShortVersionString', 'raw', '-o', '-',
+        resolve(binary, '../../../Info.plist')], options)
+      : await run('powershell.exe', ['-NoProfile', '-NonInteractive', '-Command',
+        '(Get-Item -LiteralPath $env:AGY_DESKTOP_EXE).VersionInfo.ProductVersion'], {
+        ...options, env: { ...process.env, AGY_DESKTOP_EXE: resolve(binary, '../../../Antigravity.exe') },
+      });
+    if (/^\d+\.\d+\.\d+(?:\.\d+)?$/.test(stdout.trim())) return stdout.trim();
+  } catch { /* Some packages omit readable version metadata. */ }
+  return '2.33.0'; // Quota protocol verified with this desktop version.
+}
+
+// Older releases treat "/usage" as a billable prompt. Accept only an
+// unambiguous release version from a successful --version invocation.
+export function supportsAntigravityUsage(output) {
+  const match = /^(?:(?:agy|antigravity(?: cli)?)(?: version)?\s+)?v?(\d+)\.(\d+)\.(\d+)(-[\w.-]+)?(?:\+[\w.-]+)?$/i.exec(output.trim());
+  if (!match) return false;
+  const [major, minor, patch] = match.slice(1, 4).map(Number);
+  if (major !== 1) return major > 1;
+  if (minor !== 1) return minor > 1;
+  return patch > 11 || (patch === 11 && !match[4]);
 }
 
 const isGeminiGroup = group => Array.isArray(group?.buckets)
@@ -76,8 +118,8 @@ export function parseAntigravityQuota(payload) {
         throw new Error('Invalid quota bucket identity');
       }
       seen.add(id);
-      const weekly = /weekly/i.test(id);
-      const fiveHour = /(?:^|-)5h$/.test(id);
+      const weekly = bucket.window === 'weekly' || /weekly/i.test(id);
+      const fiveHour = bucket.window === '5h' || /(?:^|-)5h$/.test(id);
       const reset = typeof bucket.resetTime === 'string' ? Date.parse(bucket.resetTime) : NaN;
       meters.push({ id, label: weekly ? '7d' : fiveHour ? '5h' : family, utilization: (1 - fraction) * 100,
         ...(Number.isFinite(reset) ? { resetsAt: new Date(reset).toISOString() } : {}),
@@ -88,6 +130,24 @@ export function parseAntigravityQuota(payload) {
   const shown = families.find(family => family.gemini) ?? families.find(family => family.meters.length);
   return (shown?.meters ?? [])
     .sort((a,b) => (a.windowSeconds || Infinity) - (b.windowSeconds || Infinity));
+}
+
+function parseUsage({ code, stdout, stderr }) {
+  let payload;
+  try { payload = JSON.parse(stdout); } catch { /* Errors may be plain text. */ }
+  if (code !== 0 || payload?.status !== 'SUCCESS' || !payload.command?.data?.groups?.length) {
+    if (requiresLogin(stdout) || requiresLogin(stderr)) throw new LoginRequired();
+    throw new Error('Antigravity usage command failed');
+  }
+  if (payload.command?.name !== 'usage') throw new Error('Missing usage command');
+  const groups = payload.command.data.groups.map(group => ({
+    displayName: group.name,
+    buckets: group.buckets.map(bucket => ({ bucketId: bucket.id, disabled: bucket.disabled,
+      window: bucket.window, remainingFraction: bucket.remaining_fraction, resetTime: bucket.reset_time })),
+  }));
+  const meters = parseAntigravityQuota({ groups });
+  if (!meters.length) throw new Error('Missing usage windows');
+  return meters;
 }
 
 export function requestAntigravityQuota({ port, token, timeoutMs = 2000 }) {
@@ -111,6 +171,10 @@ export function requestAntigravityQuota({ port, token, timeoutMs = 2000 }) {
       });
       response.on('error', reject);
       response.on('end', () => {
+        if ([401, 403].includes(response.statusCode)) {
+          resolve({ status: response.statusCode });
+          return;
+        }
         try { resolve({ status: response.statusCode, payload: JSON.parse(Buffer.concat(chunks)) }); }
         catch { reject(new Error('Invalid quota response')); }
       });
@@ -122,98 +186,65 @@ export function requestAntigravityQuota({ port, token, timeoutMs = 2000 }) {
   });
 }
 
-/** Own one short-lived, prompt-free CLI process. Never attach to or stop the
- * user's agy, read its keychain, scrape its UI, or send model input. The CLI
- * owns its normal login/refresh. stdin stays open and empty until teardown. */
-export async function withAntigravitySession(binary, callback, {
-  environment = process.env, timeoutMs = 20000, spawnImpl = spawn,
-} = {}) {
-  const directory = mkdtempSync(join(tmpdir(), 'vibe-usage-agy-quota-'));
-  const logPath = join(directory, 'cli.log');
-  const token = randomBytes(32).toString('hex');
-  let child, timer, launchError, closed = false;
-  let closePromise = Promise.resolve();
-  const terminate = () => {
-    if (!child?.pid) return;
-    if (process.platform === 'win32') {
-      if (closed) return;
-      execFile('taskkill.exe', ['/PID', String(child.pid), '/T', '/F'],
-        { windowsHide: true, timeout: 2000 }, () => {});
-    } else {
-      try { process.kill(-child.pid, 'SIGTERM'); } catch { /* Already exited. */ }
-    }
-  };
-  const onSignal = () => { terminate(); };
-  try {
-    child = spawnImpl(binary, ['--print', '', '--input-format', 'stream-json',
-      '--output-format', 'stream-json', '--csrf_token', token, '--log-file', logPath], {
-      cwd: directory, env: environment, stdio: ['pipe', 'ignore', 'ignore'],
-      detached: process.platform !== 'win32', windowsHide: true,
-    });
-    child.stdin.on('error', () => {});
-    closePromise = new Promise(resolve => {
-      child.once('close', () => { closed = true; resolve(); });
-      child.once('error', error => { launchError = error; });
-    });
-    process.once('SIGTERM', onSignal);
-    process.once('SIGINT', onSignal);
-    timer = setTimeout(terminate, timeoutMs);
-    const deadline = Date.now() + timeoutMs;
-    while (Date.now() < deadline && !closed && !launchError) {
-      let port;
-      try {
-        // Only our disposable startup log, never the user's chat/session logs.
-        if (statSync(logPath).size > 1024 * 1024) throw new Error('Startup log too large');
-        const text = readFileSync(logPath, 'utf8');
-        port = Number(/listening on random port at (\d+) for HTTPS/.exec(text)?.[1]);
-      } catch { /* The CLI has not opened its log yet. */ }
-      if (port) {
-        const value = await callback({ port, token, timeoutMs: Math.min(2000, Math.max(1, deadline - Date.now())) });
-        if (value !== undefined) return value;
-      }
-      await delay(Math.min(200, Math.max(1, deadline - Date.now())));
-    }
-    throw new Error('Antigravity quota service unavailable');
-  } finally {
-    clearTimeout(timer);
-    terminate();
-    child?.stdin.destroy();
-    await Promise.race([closePromise, delay(1000)]);
-    if (!closed && child?.pid) {
-      if (process.platform === 'win32') terminate();
-      else { try { process.kill(-child.pid, 'SIGKILL'); } catch {} }
-      await Promise.race([closePromise, delay(500)]);
-    }
-    process.removeListener('SIGTERM', onSignal);
-    process.removeListener('SIGINT', onSignal);
-    rmSync(directory, { recursive: true, force: true });
-  }
-}
-
 export async function fetchAntigravityQuota({
   environment = process.env, home = homedir(), platform = process.platform,
-  now = new Date(), timeoutMs = 20000, sessionImpl = withAntigravitySession,
-  requestImpl = requestAntigravityQuota,
+  now = new Date(), timeoutMs = 24000, sessionImpl = withAntigravitySession,
+  requestImpl = requestAntigravityQuota, commandImpl = runAntigravityCommand,
+  desktopVersionImpl = desktopVersion,
 } = {}) {
   const result = (status, extra = {}) => quotaResult({ id: 'antigravity', status, fetchedAt: now, ...extra });
-  const binary = antigravityBinary(environment, home, platform);
-  if (!binary) return result('missing_credentials', { message: 'Install agy and sign in, then retry' });
-  try {
-    return await sessionImpl(binary, async endpoint => {
-      let response;
-      try { response = await requestImpl(endpoint); } catch { return undefined; }
-      if ([401,403].includes(response.status) || response.payload?.code === 'unauthenticated') {
-        return result('unauthorized', { message: 'Sign in with agy, then retry' });
-      }
-      if (response.status !== 200) return undefined;
-      let meters;
-      try { meters = parseAntigravityQuota(response.payload); } catch { return undefined; }
-      if (!meters.length) return undefined; // Startup may precede keyring login.
-      // No disk cache: process-owned credentials are opaque, so we cannot bind
-      // a stale snapshot to the current account safely.
-      return result('ok', { meters });
-    }, { environment, timeoutMs });
-  } catch {
-    return result('retryable_error', { message: 'Open agy, sign in and check its connection, then retry' });
+  const ok = meters => result('ok', { meters });
+  const unauthorized = () => result('unauthorized', { message: 'Sign in to Antigravity and retry' });
+  const retry = () => result('retryable_error', { message: 'Check the Antigravity connection and retry' });
+  // Both desktop clients stop the CLI after 30s. Reserve a share of the
+  // remaining time for each fallback, even when a previous attempt hangs.
+  const deadline = Date.now() + timeoutMs;
+  const optionsFor = (attemptsLeft, cap = timeoutMs) => ({ environment,
+    timeoutMs: Math.min(cap, Math.max(1, Math.floor((deadline - Date.now()) / attemptsLeft))) });
+
+  async function readMeters(endpoint) {
+    let response;
+    try { response = await requestImpl(endpoint); } catch { return undefined; }
+    if ([401, 403].includes(response.status) || response.payload?.code === 'unauthenticated') {
+      throw new LoginRequired();
+    }
+    if (response.status !== 200) return undefined;
+    let meters;
+    try { meters = parseAntigravityQuota(response.payload); } catch { return undefined; }
+    if (meters.length) return meters;
+    // The service can listen before its account and quota are ready.
   }
+
+  const binary = antigravityBinary(environment, home, platform);
+  const desktop = firstExecutable(antigravityDesktopPaths(environment, home, platform), platform);
+  let loginRequired = false;
+  if (binary) {
+    try {
+      const version = await commandImpl(binary, ['--version'], optionsFor(1, 2000));
+      if (version.code === 0 && supportsAntigravityUsage(version.stdout.trim() || version.stderr)) {
+        const usage = await commandImpl(binary, ['-p', '/usage', '--output-format', 'json'], optionsFor(desktop ? 3 : 2));
+        return ok(parseUsage(usage));
+      }
+    } catch (error) {
+      if (error instanceof LoginRequired) return unauthorized();
+      if (error instanceof Interrupted) return retry();
+    }
+    try {
+      return ok(await sessionImpl(binary, readMeters, optionsFor(desktop ? 2 : 1)));
+    } catch (error) {
+      if (error instanceof Interrupted) return retry();
+      loginRequired = error instanceof LoginRequired;
+    }
+  }
+
+  if (desktop) {
+    try {
+      const version = await desktopVersionImpl(desktop, platform);
+      return ok(await sessionImpl(desktop, readMeters, { ...optionsFor(1), desktopVersion: version }));
+    } catch (error) {
+      loginRequired ||= error instanceof LoginRequired;
+    }
+  }
+  if (!binary && !desktop) return result('missing_credentials', { message: 'Install agy or Antigravity Desktop and sign in' });
+  return loginRequired ? unauthorized() : retry();
 }
