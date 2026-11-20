@@ -13,6 +13,10 @@ export const requiresLogin = text => LOGIN_MESSAGE.test(text) || LOGIN_URL.test(
 const unavailable = () => new Error('Antigravity quota service unavailable');
 export class LoginRequired extends Error {}
 export class Interrupted extends Error {}
+export class TimedOut extends Error {}
+
+// Leave room for stopTree's two waits and rmSync's 100 + 200 + 300 ms retry delays.
+export const cleanupAllowanceMs = platform => (platform === 'win32' ? 2000 : 750) + 500 + 600;
 
 async function stopTree(child, closed) {
   if (!child.pid) return;
@@ -36,7 +40,7 @@ async function withProcess(binary, argsFor, { environment, timeoutMs, spawnImpl 
   const controller = new AbortController();
   const abort = error => controller.abort(error);
   const onSignal = () => abort(new Interrupted());
-  const timer = setTimeout(() => abort(unavailable()), timeoutMs);
+  const timer = setTimeout(() => abort(new TimedOut('Antigravity quota service unavailable')), timeoutMs);
   let child, closed;
   try {
     child = spawnImpl(binary, argsFor(directory), {
@@ -65,7 +69,7 @@ async function withProcess(binary, argsFor, { environment, timeoutMs, spawnImpl 
     } finally {
       process.removeListener('SIGTERM', onSignal);
       process.removeListener('SIGINT', onSignal);
-      rmSync(directory, { recursive: true, force: true });
+      try { rmSync(directory, { recursive: true, force: true, maxRetries: 3, retryDelay: 100 }); } catch {}
     }
   }
 }

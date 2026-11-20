@@ -1,11 +1,9 @@
-import { accessSync, constants, statSync } from 'node:fs';
+import { accessSync, constants, readFileSync, statSync } from 'node:fs';
 import { homedir } from 'node:os';
 import { delimiter, join, isAbsolute, resolve } from 'node:path';
-import { execFile } from 'node:child_process';
 import https from 'node:https';
-import { promisify } from 'node:util';
 import { quotaResult } from '../schema.js';
-import { Interrupted, LoginRequired, requiresLogin, runAntigravityCommand, withAntigravitySession } from './antigravity-process.js';
+import { cleanupAllowanceMs, Interrupted, LoginRequired, requiresLogin, runAntigravityCommand, TimedOut, withAntigravitySession } from './antigravity-process.js';
 
 export { withAntigravitySession };
 
@@ -59,20 +57,14 @@ export function antigravityDesktopPaths(environment, home, platform) {
     ? [join(local, 'Programs', 'antigravity', 'resources', 'bin', 'language_server.exe')] : [];
 }
 
-async function desktopVersion(binary, platform) {
-  const run = promisify(execFile);
-  const options = { timeout: 2000, windowsHide: true, maxBuffer: 4096 };
-  try {
-    // Read installed application metadata, without starting the desktop app.
-    const { stdout } = platform === 'darwin'
-      ? await run('/usr/bin/plutil', ['-extract', 'CFBundleShortVersionString', 'raw', '-o', '-',
-        resolve(binary, '../../../Info.plist')], options)
-      : await run('powershell.exe', ['-NoProfile', '-NonInteractive', '-Command',
-        '(Get-Item -LiteralPath $env:AGY_DESKTOP_EXE).VersionInfo.ProductVersion'], {
-        ...options, env: { ...process.env, AGY_DESKTOP_EXE: resolve(binary, '../../../Antigravity.exe') },
-      });
-    if (/^\d+\.\d+\.\d+(?:\.\d+)?$/.test(stdout.trim())) return stdout.trim();
-  } catch { /* Some packages omit readable version metadata. */ }
+function desktopVersion(binary, platform) {
+  if (platform === 'darwin') {
+    try {
+      const plist = readFileSync(resolve(binary, '../../../Info.plist'), 'utf8');
+      const match = /<key>CFBundleShortVersionString<\/key>\s*<string>\s*(\d+\.\d+\.\d+(?:\.\d+)?)\s*<\/string>/.exec(plist);
+      if (match) return match[1];
+    } catch { /* Some packages omit readable version metadata. */ }
+  }
   return '2.33.0'; // Quota protocol verified with this desktop version.
 }
 
@@ -188,19 +180,24 @@ export function requestAntigravityQuota({ port, token, timeoutMs = 2000 }) {
 
 export async function fetchAntigravityQuota({
   environment = process.env, home = homedir(), platform = process.platform,
-  now = new Date(), timeoutMs = 24000, sessionImpl = withAntigravitySession,
+  now = new Date(), timeoutMs = 20000, sessionImpl = withAntigravitySession,
   requestImpl = requestAntigravityQuota, commandImpl = runAntigravityCommand,
-  desktopVersionImpl = desktopVersion,
 } = {}) {
   const result = (status, extra = {}) => quotaResult({ id: 'antigravity', status, fetchedAt: now, ...extra });
   const ok = meters => result('ok', { meters });
   const unauthorized = () => result('unauthorized', { message: 'Sign in to Antigravity and retry' });
   const retry = () => result('retryable_error', { message: 'Check the Antigravity connection and retry' });
-  // Both desktop clients stop the CLI after 30s. Reserve a share of the
-  // remaining time for each fallback, even when a previous attempt hangs.
-  const deadline = Date.now() + timeoutMs;
-  const optionsFor = (attemptsLeft, cap = timeoutMs) => ({ environment,
-    timeoutMs: Math.min(cap, Math.max(1, Math.floor((deadline - Date.now()) / attemptsLeft))) });
+  // Both clients allow 30s, including up to 10s for the Windows launcher.
+  // Earlier attempts' cleanup consumes this same clock. Keep the final cleanup
+  // allowance even on a desktop-only installation.
+  const budget = Math.min(timeoutMs, 20000 - cleanupAllowanceMs(platform));
+  const deadline = performance.now() + budget;
+  const fallbackMs = Math.min(7000, Math.floor(budget / 2));
+  function optionsFor(reserveMs = 0, capMs = budget) {
+    const remaining = Math.floor(deadline - performance.now()) - reserveMs;
+    if (remaining <= 0) throw new TimedOut();
+    return { environment, timeoutMs: Math.min(capMs, remaining) };
+  }
 
   async function readMeters(endpoint) {
     let response;
@@ -217,34 +214,39 @@ export async function fetchAntigravityQuota({
 
   const binary = antigravityBinary(environment, home, platform);
   const desktop = firstExecutable(antigravityDesktopPaths(environment, home, platform), platform);
-  let loginRequired = false;
+  if (!binary && !desktop) return result('missing_credentials', { message: 'Install agy or Antigravity Desktop and sign in' });
+  let tryCliService = Boolean(binary);
   if (binary) {
+    let supportsUsage = false;
     try {
-      const version = await commandImpl(binary, ['--version'], optionsFor(1, 2000));
-      if (version.code === 0 && supportsAntigravityUsage(version.stdout.trim() || version.stderr)) {
-        const usage = await commandImpl(binary, ['-p', '/usage', '--output-format', 'json'], optionsFor(desktop ? 3 : 2));
+      const version = await commandImpl(binary, ['--version'], optionsFor(0, 2000));
+      supportsUsage = version.code === 0 && supportsAntigravityUsage(version.stdout.trim() || version.stderr);
+      if (supportsUsage) {
+        const usage = await commandImpl(binary, ['-p', '/usage', '--output-format', 'json'], optionsFor(fallbackMs));
         return ok(parseUsage(usage));
       }
     } catch (error) {
       if (error instanceof LoginRequired) return unauthorized();
       if (error instanceof Interrupted) return retry();
+      if (supportsUsage && error instanceof TimedOut && desktop) tryCliService = false;
     }
+  }
+  if (tryCliService) {
     try {
-      return ok(await sessionImpl(binary, readMeters, optionsFor(desktop ? 2 : 1)));
+      return ok(await sessionImpl(binary, readMeters, optionsFor(desktop ? fallbackMs : 0)));
     } catch (error) {
+      if (error instanceof LoginRequired) return unauthorized();
       if (error instanceof Interrupted) return retry();
-      loginRequired = error instanceof LoginRequired;
     }
   }
 
   if (desktop) {
     try {
-      const version = await desktopVersionImpl(desktop, platform);
-      return ok(await sessionImpl(desktop, readMeters, { ...optionsFor(1), desktopVersion: version }));
+      const version = desktopVersion(desktop, platform);
+      return ok(await sessionImpl(desktop, readMeters, { ...optionsFor(), desktopVersion: version }));
     } catch (error) {
-      loginRequired ||= error instanceof LoginRequired;
+      if (error instanceof LoginRequired) return unauthorized();
     }
   }
-  if (!binary && !desktop) return result('missing_credentials', { message: 'Install agy or Antigravity Desktop and sign in' });
-  return loginRequired ? unauthorized() : retry();
+  return retry();
 }

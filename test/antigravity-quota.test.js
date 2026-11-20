@@ -8,7 +8,7 @@ import test from 'node:test';
 import { setTimeout as delay } from 'node:timers/promises';
 import { fileURLToPath } from 'node:url';
 import { antigravityBinary, antigravityDesktopPaths, supportsAntigravityUsage, withAntigravitySession } from '../src/quotas/providers/antigravity.js';
-import { LoginRequired, runAntigravityCommand } from '../src/quotas/providers/antigravity-process.js';
+import { LoginRequired, runAntigravityCommand, TimedOut } from '../src/quotas/providers/antigravity-process.js';
 import { fetchQuotaProducts } from '../src/quotas/registry.js';
 
 // Allow-listed fields from the sanitized agy 1.5.13 /usage sample.
@@ -84,22 +84,28 @@ function install(t, { cli = true, desktop = true } = {}) {
   }
   return async ({
     version = output('1.5.13'), command = output(JSON.stringify(usage)), legacy = rpc, hub = rpc,
+    onAttempt = () => {},
   } = {}) => {
     const calls = [];
+    function record(name, options) {
+      calls.push(name);
+      onAttempt(name, options.timeoutMs);
+    }
     const { products: [result], schemaVersion } = await fetchQuotaProducts(['antigravity'], {
-      environment, home, platform: 'win32', desktopVersionImpl: async () => '2.33.0',
-      commandImpl: async (binary, args) => {
+      environment, home, platform: 'win32',
+      commandImpl: async (binary, args, options) => {
         assert.equal(binary, agy);
         const probe = args[0] === '--version';
-        calls.push(probe ? 'version' : 'usage');
+        record(probe ? 'version' : 'usage', options);
         assert.deepEqual(args, probe ? ['--version'] : ['-p', '/usage', '--output-format', 'json']);
         const response = probe ? version : command;
         if (response instanceof Error) throw response;
         return response;
       },
       sessionImpl: async (binary, callback, options) => {
-        calls.push(binary === engine ? 'desktop' : 'legacy');
+        record(binary === engine ? 'desktop' : 'legacy', options);
         assert.equal(binary, options.desktopVersion ? engine : agy);
+        if (binary === engine) assert.equal(options.desktopVersion, '2.33.0');
         const meters = await callback({ port: binary === engine ? 1235 : 1234 });
         if (!meters) throw new Error('fixture startup timed out');
         return meters;
@@ -129,30 +135,81 @@ test('a new CLI uses the structured Gemini windows even with the desktop install
 
 test('old, missing, failed and timed-out version probes never send a slash command', async t => {
   const fetch = install(t, { desktop: false });
-  for (const version of [output('1.1.10'), output('unknown'), output('1.5.13', 1), new Error('timeout')]) {
+  for (const version of [output('1.1.10'), output('unknown'), output('1.5.13', 1), new TimedOut()]) {
     const { calls, result } = await fetch({ version });
     assert.deepEqual(calls, ['version', 'legacy']);
     assert.equal(result.status, 'ok');
   }
 });
 
-test('usage errors try the CLI service once, then the desktop engine only when needed', async t => {
+test('fast usage failures try the CLI service once, then the desktop engine only when needed', async t => {
   const fetch = install(t);
   const invalid = structuredClone(usage);
   invalid.command.data.groups[1].buckets[0].remaining_fraction = 1.01;
-  for (const command of [new Error('timeout'), output('{'), output('{"status":"FAILURE"}'),
+  for (const command of [new Error('spawn failed'), output('{'), output('{"status":"FAILURE"}'),
     output(JSON.stringify(invalid)), output(JSON.stringify(usage), 1)]) {
     const { calls, result } = await fetch({ command });
     assert.deepEqual(calls, ['version', 'usage', 'legacy']);
     assert.equal(result.status, 'ok');
   }
-  for (const status of [503, 401]) {
-    const { calls, result } = await fetch({ command: output(''), legacy: { status } });
-    assert.deepEqual(calls, ['version', 'usage', 'legacy', 'desktop']);
-    assert.equal(result.status, 'ok');
-  }
+  const recovered = await fetch({ command: output(''), legacy: { status: 503 } });
+  assert.deepEqual(recovered.calls, ['version', 'usage', 'legacy', 'desktop']);
+  assert.equal(recovered.result.status, 'ok');
   const failed = await fetch({ command: output(''), legacy: { status: 503 }, hub: { status: 503 } });
   assert.equal(failed.result.status, 'retryable_error');
+});
+
+test('all attempts share one deadline, including version detection and cleanup', async t => {
+  let elapsed = 0;
+  t.mock.method(performance, 'now', () => elapsed);
+  const unavailable = { status: 503 };
+  // The version probe takes 1s. Timeouts use their full allocation, a fast /usage
+  // failure takes 2s, and the failed process takes another 0.5s to clean up.
+  const timedOut = new TimedOut();
+  const old = output('1.1.10');
+  const fast = output('');
+  for (const [devices, version, command, expected] of [
+    [{ desktop: false }, undefined, timedOut, [['version', 2000], ['usage', 8900], ['legacy', 6500]]],
+    [{}, undefined, timedOut, [['version', 2000], ['usage', 8900], ['desktop', 6500]]],
+    [{}, undefined, fast, [['version', 2000], ['usage', 8900], ['legacy', 6400], ['desktop', 6500]]],
+    [{ desktop: false }, old, undefined, [['version', 2000], ['legacy', 15900]]],
+    [{}, timedOut, undefined, [['version', 2000], ['legacy', 7400], ['desktop', 6500]]],
+    [{ cli: false }, undefined, undefined, [['desktop', 16900]]],
+  ]) {
+    elapsed = 0;
+    const attempts = [];
+    const { result } = await install(t, devices)({
+      version, command, legacy: unavailable, hub: unavailable,
+      onAttempt(name, limit) {
+        attempts.push([name, limit]);
+        if (name === 'version' && version !== timedOut) elapsed += 1000;
+        else if (name === 'usage' && command === fast) elapsed += 2500;
+        else elapsed += limit + (name === expected.at(-1)[0] ? 3100 : 500);
+      },
+    });
+    assert.deepEqual(attempts, expected);
+    assert.equal(elapsed, 20000);
+    assert.equal(result.status, 'retryable_error');
+  }
+});
+
+test('cleanup that exhausts the shared deadline prevents another launch', async t => {
+  let elapsed = 0;
+  t.mock.method(performance, 'now', () => elapsed);
+  const { calls, result } = await install(t)({
+    command: new TimedOut(), onAttempt(name) { if (name === 'usage') elapsed = 20000; },
+  });
+  assert.deepEqual(calls, ['version', 'usage']);
+  assert.equal(result.status, 'retryable_error');
+});
+
+test('a CLI service login failure ends the fetch even with a working desktop engine', async t => {
+  const fetch = install(t);
+  for (const legacy of [{ status: 401 }, { status: 403 }, { status: 200, payload: { code: 'unauthenticated' } }]) {
+    const { calls, result } = await fetch({ command: output(''), legacy });
+    assert.deepEqual(calls, ['version', 'usage', 'legacy']);
+    assert.equal(result.status, 'unauthorized');
+  }
 });
 
 test('explicit /usage login failures are terminal and keep account text out of the result', async t => {
@@ -175,6 +232,39 @@ test('desktop-only installations can return quota or a sign-in status', async t 
     assert.deepEqual(calls, ['desktop']);
     assert.equal(result.status, expected);
   }
+});
+
+test('Mac desktop sessions use the bundle short version or the verified fallback', async t => {
+  const home = mkdtempSync(join(tmpdir(), 'vbu-agy-plist-'));
+  t.after(() => rmSync(home, { recursive: true, force: true }));
+  const environment = { PATH: '', ANTIGRAVITY_CLI_PATH: join(home, 'absent') };
+  const engine = antigravityDesktopPaths(environment, home, 'darwin').at(-1);
+  mkdirSync(dirname(engine), { recursive: true });
+  writeFileSync(engine, '', { mode: 0o700 });
+  const plist = join(home, 'Applications', 'Antigravity.app', 'Contents', 'Info.plist');
+  const versions = [];
+  // Keep an installed system-wide bundle out of this user-bundle fixture.
+  const access = t.mock.method(fs, 'accessSync', path => { if (path !== engine) throw new Error('missing'); });
+  syncBuiltinESMExports();
+  try {
+    for (const content of [null, '<key>CFBundleVersion</key><string>99.9.9</string>',
+      '<key>CFBundleShortVersionString</key>\n  <string>2.45.1</string>']) {
+      if (content !== null) writeFileSync(plist, content);
+      const { products: [result] } = await fetchQuotaProducts(['antigravity'], {
+        environment, home, platform: 'darwin',
+        sessionImpl: async (_, callback, options) => {
+          versions.push(options.desktopVersion);
+          return callback({});
+        },
+        requestImpl: async () => rpc,
+      });
+      assert.equal(result.status, 'ok');
+    }
+  } finally {
+    access.mock.restore();
+    syncBuiltinESMExports();
+  }
+  assert.deepEqual(versions, ['2.33.0', '2.33.0', '2.45.1']);
 });
 
 test('all agy commands inherit the login directory and only the desktop engine gets a temporary --gemini_dir', async () => {
@@ -264,9 +354,30 @@ test('print-mode commands bound output and clean their process and cwd on timeou
       },
     });
     if (mode === 'success') assert.deepEqual(await action, output('ok\n'));
-    else await assert.rejects(action, /unavailable/);
+    else await assert.rejects(action, mode === 'timeout' ? TimedOut : /unavailable/);
     assert.ok(child.exitCode !== null || child.signalCode !== null);
     assert.equal(existsSync(cwd), false);
+  }
+});
+
+test('a locked temporary directory leaves the command result intact', async t => {
+  let leftover;
+  let retryOptions;
+  const remove = t.mock.method(fs, 'rmSync', (path, options) => {
+    leftover = path;
+    retryOptions = options;
+    throw Object.assign(new Error('directory in use'), { code: 'EBUSY' });
+  });
+  syncBuiltinESMExports();
+  try {
+    const response = await runAntigravityCommand(process.execPath, ['-e', 'console.log("ok")'], { timeoutMs: 3000 });
+    assert.deepEqual(response, output('ok\n'));
+    assert.deepEqual(retryOptions, { recursive: true, force: true, maxRetries: 3, retryDelay: 100 });
+    assert.ok(existsSync(leftover));
+  } finally {
+    remove.mock.restore();
+    syncBuiltinESMExports();
+    if (leftover) rmSync(leftover, { recursive: true, force: true });
   }
 });
 
