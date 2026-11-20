@@ -1,11 +1,12 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import { execFileSync } from 'node:child_process';
-import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from 'node:fs';
+import { mkdirSync, mkdtempSync, rmSync, symlinkSync, writeFileSync } from 'node:fs';
 import { delimiter, join } from 'node:path';
 import { tmpdir } from 'node:os';
 import { parse } from '../src/parsers/dimagent.js';
 import { getDimAgentRustDbPaths } from '../src/tools.js';
+import { classifyWarning } from '../src/warning-codes.js';
 
 // Synthetic Rust Dim stores shaped like arcships/dim store formats 52 (alpha)
 // and 23 (no leader column) -- only the tables and columns the parser reads.
@@ -54,8 +55,8 @@ class Store {
     this.sequence = new Map();
   }
 
-  session(id, { cwd = '/work/demo-app', model = 'config-model', createdAt = T0, leaderId = null } = {}) {
-    this.sessions.push({ id, cwd, model, createdAt, leaderId });
+  session(id, { cwd = '/work/demo-app', model = 'config-model', createdAt = T0, leaderId = null, config } = {}) {
+    this.sessions.push({ id, cwd, model, createdAt, leaderId, config });
     return this;
   }
 
@@ -86,10 +87,10 @@ class Store {
     this.push(sessionId, 'main', 'input/applied', { input_id: eventId }, { at: at(minutes) });
   }
 
-  call(sessionId, minutes, requestId, usage, { branchId = 'main', model = 'gpt-test', usageId } = {}) {
+  call(sessionId, minutes, requestId, usage, { branchId = 'main', model = 'gpt-test', usageId, config } = {}) {
     this.push(sessionId, branchId, 'model/call', {
       turn_id: 'turn', request_id: requestId,
-      request: { providerId: 'dim', modelId: model, messages: [] },
+      request: { providerId: 'dim', modelId: model, messages: [], config },
     }, { at: at(minutes) });
     return this.push(sessionId, branchId, 'model/usage', { turn_id: 'turn', request_id: requestId, usage },
       { at: at(minutes) + 1000, id: usageId });
@@ -106,7 +107,7 @@ class Store {
       'CREATE TABLE timeline_events (session_id TEXT NOT NULL, branch_id TEXT NOT NULL, sequence INTEGER NOT NULL, last_sequence INTEGER NOT NULL, kind TEXT NOT NULL, body TEXT NOT NULL, event_id TEXT, PRIMARY KEY (session_id, branch_id, sequence));',
     ];
     for (const s of this.sessions) {
-      const config = JSON.stringify({ cwd: s.cwd, model: { providerId: 'dim', modelId: s.model } });
+      const config = JSON.stringify({ cwd: s.cwd, model: { providerId: 'dim', modelId: s.model, config: s.config } });
       rows.push(this.leader
         ? `INSERT INTO agent_sessions VALUES (${q(s.id)}, ${q(config)}, ${s.createdAt}, ${s.leaderId ? q(s.leaderId) : 'NULL'}, 'client');`
         : `INSERT INTO agent_sessions VALUES (${q(s.id)}, ${q(config)}, ${s.createdAt});`);
@@ -119,14 +120,14 @@ class Store {
   }
 }
 
-async function legacyStore(dbPath) {
+async function legacyStore(dbPath, model = 'legacy-model') {
   await runSql(dbPath, `
     CREATE TABLE sessions (sessionId TEXT PRIMARY KEY, cwd TEXT NOT NULL);
     CREATE TABLE usage_ledger (ledgerId TEXT PRIMARY KEY, sessionId TEXT NOT NULL, runId TEXT,
       providerId TEXT NOT NULL, modelId TEXT NOT NULL, usage TEXT NOT NULL, cost REAL, createdAt TEXT NOT NULL);
     CREATE TABLE messages (messageId TEXT PRIMARY KEY, sessionId TEXT NOT NULL, role TEXT NOT NULL, createdAt TEXT NOT NULL);
     INSERT INTO sessions VALUES ('legacy', '/work/legacy-app');
-    INSERT INTO usage_ledger VALUES ('usage_run-1', 'legacy', 'run-1', 'dim', 'legacy-model',
+    INSERT INTO usage_ledger VALUES ('usage_run-1', 'legacy', 'run-1', 'dim', ${q(model)},
       '{"promptTokens":100,"completionTokens":20,"totalTokens":120,"cacheReadTokens":40}', NULL, '2026-07-01T00:10:00.000Z');
     INSERT INTO messages VALUES
       ('u1', 'legacy', 'user', '2026-07-01T00:00:00.000Z'),
@@ -157,6 +158,12 @@ function tempRoot(t) {
 }
 
 const byModel = buckets => Object.fromEntries(buckets.map(bucket => [bucket.model, bucket]));
+const SMALL_USAGE = { promptTokens: 50, completionTokens: 5, totalTokens: 55 };
+const tier = (provider, serviceTier) => ({ providerOptions: { [provider]: { serviceTier } } });
+
+function parseStores(root, paths, legacyPath = join(root, 'absent.sqlite')) {
+  return withEnv({ VIBE_USAGE_DIMAGENT_DB: legacyPath, VIBE_USAGE_DIMAGENT_RUST_DBS: paths.join(delimiter) }, parse);
+}
 
 test('Rust Dim usage: token split, request model, compaction, branches, forks and member Sessions', async t => {
   const root = tempRoot(t);
@@ -319,6 +326,207 @@ test('legacy and Rust stores merge; a failing store warns, the others still sync
   assert.equal(foreignResult.skipped, true);
   assert.match(foreignResult.warnings[0], /不认识的表结构/);
   assert.deepEqual(Object.keys(byModel(foreignResult.buckets)), ['legacy-model']);
+
+  const missingColumn = join(root, 'missing-column.sqlite');
+  await runSql(missingColumn, 'CREATE TABLE agent_sessions (session_id TEXT); CREATE TABLE timeline_events (kind TEXT);');
+  const incompatible = await withEnv({
+    VIBE_USAGE_DIMAGENT_DB: legacyPath, VIBE_USAGE_DIMAGENT_RUST_DBS: missingColumn,
+  }, () => parse());
+  assert.equal(incompatible.skipped, true);
+  assert.equal(classifyWarning(incompatible.warnings[0]), 'unsupported_format');
+  assert.deepEqual(Object.keys(byModel(incompatible.buckets)), ['legacy-model']);
+});
+
+test('Rust Dim reads a store reached through a directory link only once', async t => {
+  const root = tempRoot(t);
+  const home = join(root, 'home');
+  const alias = join(root, 'alias');
+  mkdirSync(home);
+  symlinkSync(home, alias, 'junction');
+  const broken = join(home, 'dimcode.sqlite');
+  writeFileSync(broken, 'not a SQLite database');
+
+  const result = await withEnv({
+    VIBE_USAGE_DIMAGENT_DB: join(root, 'absent.sqlite'),
+    VIBE_USAGE_DIMAGENT_RUST_DBS: [broken, join(alias, 'dimcode.sqlite')].join(delimiter),
+  }, () => parse());
+  assert.equal(result.skipped, true);
+  assert.equal(result.warnings.length, 1);
+});
+
+test('Rust Dim ignores Timeline rows whose session was deleted from that store', async t => {
+  const root = tempRoot(t);
+  const first = join(root, 'deleted.sqlite');
+  const second = join(root, 'other-home.sqlite');
+  const deleted = new Store();
+  deleted.prompt('deleted-everywhere', 0);
+  deleted.call('deleted-everywhere', 1, 'old', SMALL_USAGE, { model: 'deleted-model' });
+  // The same session id is visible in a second home, where only a different
+  // request remains. It must not make the first store's orphan rows eligible.
+  deleted.prompt('shared', 0, { id: 'deleted-shared-prompt' });
+  deleted.call('shared', 1, 'old-shared', SMALL_USAGE, { model: 'deleted-shared-model', usageId: 'deleted-shared-usage' });
+  await deleted.write(first);
+
+  const live = new Store().session('shared', { cwd: '/work/live-app' });
+  live.prompt('shared', 5);
+  live.call('shared', 6, 'live', SMALL_USAGE, { model: 'live-model' });
+  await live.write(second);
+
+  const result = await parseStores(root, [first, second]);
+  assert.deepEqual(result.buckets.map(({ model, project, inputTokens }) => ({ model, project, inputTokens })), [
+    { model: 'live-model', project: 'live-app', inputTokens: 50 },
+  ]);
+  assert.equal(result.sessions.length, 1);
+  assert.equal(result.sessions[0].firstMessageAt, new Date(at(5)).toISOString());
+  assert.equal(result.sessions[0].messageCount, 2);
+  assert.equal(result.skipped, undefined);
+});
+
+test('Rust Dim namespaces bare auto in calls and session fallback', async t => {
+  const root = tempRoot(t);
+  const rustPath = join(root, 'rust.sqlite');
+  const legacyPath = join(root, 'legacy.sqlite');
+  const store = new Store().session('s', { model: 'auto' });
+  store.call('s', 1, 'selected', SMALL_USAGE, { model: 'auto' });
+  store.push('s', 'main', 'model/usage', { turn_id: 'turn', request_id: 'missing', usage: SMALL_USAGE }, { at: at(2) });
+  store.call('s', 3, 'concrete', SMALL_USAGE, { model: 'provider/auto' });
+  await store.write(rustPath);
+  await legacyStore(legacyPath, 'auto');
+
+  const { buckets } = await parseStores(root, [rustPath], legacyPath);
+  const models = byModel(buckets);
+  assert.deepEqual(Object.keys(models).sort(), ['auto', 'dimagent-auto', 'provider/auto']);
+  assert.equal(models['dimagent-auto'].inputTokens, 100);
+  assert.equal(models['provider/auto'].inputTokens, 50);
+  assert.equal(models.auto.project, 'legacy-app');
+});
+
+test('Rust Dim names only known price-changing service tiers for each request', async t => {
+  const root = tempRoot(t);
+  const dbPath = join(root, 'rust.sqlite');
+  const store = new Store().session('s');
+  const tiers = [
+    ['openai', 'priority'],
+    ['openai-compatible', 'flex'],
+    ['openai', 'batch'],
+    ['openai-compatible', 'ultrafast'],
+    ['openai-compatible', 'fast'],
+    ['openai', 'default'],
+    ['openai-compatible', 'auto'],
+    ['openai', 'unrecognized'],
+  ];
+  // Automatic compaction precedes its model/call within the same branch.
+  store.push('s', 'main', 'context/compaction', {
+    turn_id: 'turn', request_id: 'priority', status: 'completed', diagnostics: { modelCallCount: 1, modelUsage: SMALL_USAGE },
+  }, { at: at(0) });
+  for (const [provider, serviceTier] of tiers) {
+    store.call('s', 1, serviceTier, SMALL_USAGE, { model: 'gpt-test', config: tier(provider, serviceTier) });
+  }
+  await store.write(dbPath);
+
+  const { buckets } = await parseStores(root, [dbPath]);
+  const models = byModel(buckets);
+  assert.deepEqual(Object.keys(models).sort(), [
+    'gpt-test', 'gpt-test-batch', 'gpt-test-fast', 'gpt-test-flex', 'gpt-test-priority', 'gpt-test-ultrafast',
+  ]);
+  assert.equal(models['gpt-test'].inputTokens, 150);
+  assert.equal(models['gpt-test-priority'].inputTokens, 100);
+});
+
+test('Rust Dim attributes manual compaction to the last earlier configuration on its own branch', async t => {
+  const root = tempRoot(t);
+  const dbPath = join(root, 'rust.sqlite');
+  const store = new Store()
+    .session('s', { model: 'initial-model', config: tier('openai', 'batch') })
+    .session('fallback', { model: 'fallback-model', config: tier('openai', 'flex') });
+  const configure = (branch, minute, modelId, config) => store.push('s', branch, 'context/configured', {
+    timeline: branch, revision: `${branch}-${modelId}`, settings: { providerId: 'dim', modelId, config },
+  }, { at: at(minute) });
+  const compact = (session, branch, minute) => store.push(session, branch, 'context/compaction', {
+    status: 'completed', diagnostics: { modelCallCount: 1, modelUsage: SMALL_USAGE },
+  }, { at: at(minute) });
+  configure('side', 0, 'previous-model', tier('openai', 'batch'));
+  configure('side', 3, 'switched-model', tier('openai-compatible', 'priority'));
+  configure('main', 4, 'other-branch-model', tier('openai', 'ultrafast'));
+  compact('s', 'side', 5);
+  // Sequence is authoritative even if timestamps are tied or move backwards.
+  configure('side', 2, 'later-model', tier('openai', 'flex'));
+  compact('s', 'side', 6);
+  compact('fallback', 'main', 1);
+  await store.write(dbPath);
+
+  const { buckets } = await parseStores(root, [dbPath]);
+  assert.deepEqual(buckets.map(bucket => bucket.model).sort(), [
+    'fallback-model-flex', 'later-model-flex', 'switched-model-priority',
+  ]);
+  assert.ok(buckets.every(bucket => bucket.inputTokens === 50));
+});
+
+test('Rust Dim excludes inherited fork timing after the original session is deleted', async t => {
+  const root = tempRoot(t);
+  const dbPath = join(root, 'fork.sqlite');
+  const store = new Store().session('fork', { createdAt: at(10) });
+  store.prompt('fork', 0);
+  store.call('fork', 1, 'original', SMALL_USAGE);
+  store.push('fork', 'main', 'session/forked', {}, { at: at(2) });
+  store.prompt('fork', 3);
+  store.call('fork', 4, 'first-fork', SMALL_USAGE);
+  store.push('fork', 'main', 'session/forked', {}, { at: at(10) });
+  store.prompt('fork', 11);
+  store.call('fork', 12, 'second-fork', SMALL_USAGE);
+  // A real child branch uses its own sequence numbers, starting after a
+  // different origin. The main branch's sequence cutoff cannot apply to it.
+  store.prompt('fork', 13, { branchId: 'side' });
+  store.call('fork', 14, 'side-request', SMALL_USAGE, { branchId: 'side' });
+  await store.write(dbPath);
+
+  const { buckets, sessions } = await parseStores(root, [dbPath]);
+  assert.equal(buckets.length, 1);
+  assert.equal(buckets[0].inputTokens, 200);
+  assert.equal(sessions.length, 1);
+  assert.equal(sessions[0].userMessageCount, 2);
+  assert.equal(sessions[0].messageCount, 4);
+  assert.equal(sessions[0].firstMessageAt, new Date(at(11)).toISOString());
+  assert.equal(sessions[0].lastMessageAt, new Date(at(14) + 1000).toISOString());
+});
+
+test('Rust Dim keeps sessions with cyclic leaders independent', async t => {
+  const root = tempRoot(t);
+  const dbPath = join(root, 'rust.sqlite');
+  const store = new Store()
+    .session('one', { leaderId: 'two', cwd: '/work/one' })
+    .session('two', { leaderId: 'one', cwd: '/work/two' });
+  store.prompt('one', 1);
+  store.call('one', 2, 'r1', SMALL_USAGE);
+  store.prompt('two', 3);
+  store.call('two', 4, 'r2', SMALL_USAGE);
+  await store.write(dbPath);
+
+  const { sessions } = await parseStores(root, [dbPath]);
+  const counts = sessions.map(s => [s.project, s.userMessageCount, s.messageCount]);
+  assert.deepEqual(counts.sort(([a], [b]) => a.localeCompare(b)), [['one', 1, 2], ['two', 1, 2]]);
+});
+
+test('Rust Dim uses completed output for timing when usage is missing', async t => {
+  const root = tempRoot(t);
+  const dbPath = join(root, 'rust.sqlite');
+  const store = new Store().session('s');
+  store.prompt('s', 0);
+  store.call('s', 1, 'with-usage', SMALL_USAGE);
+  const completes = requestId => ({ turn_id: 'turn', request_id: requestId, status: 'completed', finish_reason: 'stop' });
+  store.push('s', 'main', 'step/model-output-end', completes('with-usage'), { at: at(2) });
+  store.push('s', 'main', 'model/call', {
+    turn_id: 'turn', request_id: 'without-usage', request: { providerId: 'dim', modelId: 'gpt-test', messages: [] },
+  }, { at: at(3) });
+  store.push('s', 'main', 'step/model-output-end', completes('without-usage'), { at: at(4) });
+  await store.write(dbPath);
+
+  const { sessions, buckets } = await parseStores(root, [dbPath]);
+  assert.equal(buckets.length, 1);
+  assert.equal(buckets[0].totalTokens, SMALL_USAGE.totalTokens);
+  assert.equal(sessions.length, 1);
+  assert.equal(sessions[0].messageCount, 3);
+  assert.equal(sessions[0].lastMessageAt, new Date(at(4)).toISOString());
 });
 
 test('Rust Dim discovery reads every product home', async t => {

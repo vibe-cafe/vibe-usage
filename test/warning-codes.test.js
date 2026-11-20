@@ -40,6 +40,7 @@ const CASES = [
   [`Kilo: 无法读取数据库 ${HOME}/.local/share/kilo/kilo.db: EACCES`, 'read_failed'],
   [`DimAgent: 无法读取 ${HOME}/.dimcode-alpha/rust/dimcode.sqlite: file is not a database`, 'read_failed'],
   [`DimAgent: 无法读取 ${HOME}/.dimcode/rust/dimcode.sqlite: 不认识的表结构`, 'unsupported_format'],
+  [`DimAgent: 无法读取 ${HOME}/.dimcode/rust/dimcode.sqlite: 不认识的表结构（缺少必要列）`, 'unsupported_format'],
   ['Kilo: KILO_DB=:memory: 无法从另一进程读取，已跳过', 'store_unavailable'],
   [`OpenCode: 无法读取 ${HOME}/.local/share/opencode/opencode.db: 不认识的表结构（没有 message / session_message 表）: ${HOME}/x.db`, 'unsupported_format'],
   [`OpenCode: 额外目录缺少 opencode.db 或 storage/message/: ${HOME}/备份`, 'extra_root_unavailable'],
