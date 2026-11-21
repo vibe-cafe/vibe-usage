@@ -3,7 +3,7 @@ import { homedir } from 'node:os';
 import { delimiter, join } from 'node:path';
 import { loadCachedQuota, saveCachedQuota } from './cache.js';
 import { fetchCursorQuota } from './providers/cursor.js';
-import { antigravityInstallPaths, fetchAntigravityQuota } from './providers/antigravity.js';
+import { antigravityDesktopPaths, antigravityInstallPaths, fetchAntigravityQuota } from './providers/antigravity.js';
 import { fetchGrokQuota } from './providers/grok.js';
 import { fetchKimiCodeQuota } from './providers/kimi-code.js';
 import { fetchOpenCodeGoQuota } from './providers/opencode-go.js';
@@ -96,6 +96,7 @@ export function discoverQuotaProducts({
       id: 'antigravity',
       detected: existsAny([join(home, '.gemini', 'antigravity-cli'),
         join(home, '.gemini', 'antigravity'), ...antigravityInstallPaths(environment, home, platform),
+        ...antigravityDesktopPaths(environment, home, platform),
         ...applications.map(path => join(path, 'Antigravity.app'))])
         || executableExists('agy', environment, platform)
         || !!environment.ANTIGRAVITY_CLI_PATH && existsSync(environment.ANTIGRAVITY_CLI_PATH),

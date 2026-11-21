@@ -2,14 +2,14 @@ import assert from 'node:assert/strict';
 import { execFileSync, spawn } from 'node:child_process';
 import fs, { existsSync, mkdirSync, mkdtempSync, rmSync, writeFileSync } from 'node:fs';
 import { syncBuiltinESMExports } from 'node:module';
-import { tmpdir } from 'node:os';
+import { homedir, tmpdir } from 'node:os';
 import { dirname, join } from 'node:path';
 import test from 'node:test';
 import { setTimeout as delay } from 'node:timers/promises';
 import { fileURLToPath } from 'node:url';
 import { antigravityBinary, antigravityDesktopPaths, supportsAntigravityUsage, withAntigravitySession } from '../src/quotas/providers/antigravity.js';
 import { LoginRequired, runAntigravityCommand, TimedOut } from '../src/quotas/providers/antigravity-process.js';
-import { fetchQuotaProducts } from '../src/quotas/registry.js';
+import { discoverQuotaProducts, fetchQuotaProducts } from '../src/quotas/registry.js';
 
 // Allow-listed fields from the sanitized agy 1.5.13 /usage sample.
 const usage = { status: 'SUCCESS', num_turns: 0, command: { name: 'usage', data: { groups: [
@@ -42,17 +42,32 @@ test('only a confirmed agy release with read-only slash commands can receive /us
   }
 });
 
-test('Mac GUI launches find either system agy even with an empty PATH', t => {
+test('quota discovery and fetch find both Mac system CLIs and prefer agy on PATH', t => {
   const paths = ['/opt/homebrew/bin/agy', '/usr/local/bin/agy'];
-  let installed;
+  const installed = new Set();
+  const exists = t.mock.method(fs, 'existsSync', path => installed.has(path));
   const access = t.mock.method(fs, 'accessSync', path => {
-    if (path !== installed) throw new Error('fixture missing');
+    if (!installed.has(path)) throw new Error('fixture missing');
   });
   const stat = t.mock.method(fs, 'statSync', () => ({ isFile: () => true }));
   syncBuiltinESMExports();
   try {
-    for (installed of paths) assert.equal(antigravityBinary({ PATH: '' }, '/fixture', 'darwin'), installed);
+    const environment = { PATH: '' };
+    const detected = () => discoverQuotaProducts({ environment, home: '/fixture', platform: 'darwin' })
+      .products.find(p => p.id === 'antigravity').detected;
+    assert.equal(detected(), false);
+    for (const path of paths) {
+      installed.add(path);
+      assert.equal(detected(), true);
+      assert.equal(antigravityBinary(environment, '/fixture', 'darwin'), path);
+      installed.delete(path);
+    }
+    installed.add(paths[0]);
+    const onPath = join('/fixture', 'bin', 'agy');
+    installed.add(onPath);
+    assert.equal(antigravityBinary({ PATH: dirname(onPath) }, '/fixture', 'darwin'), onPath);
   } finally {
+    exists.mock.restore();
     access.mock.restore();
     stat.mock.restore();
     syncBuiltinESMExports();
@@ -60,6 +75,7 @@ test('Mac GUI launches find either system agy even with an empty PATH', t => {
 });
 
 test('desktop executable paths use the system and user Mac bundles or the Windows per-user install', () => {
+  assert.deepEqual(antigravityDesktopPaths(), antigravityDesktopPaths(process.env, homedir(), process.platform));
   const home = '/fixture';
   const suffix = join('Antigravity.app', 'Contents', 'Resources', 'bin', 'language_server');
   assert.deepEqual(antigravityDesktopPaths({}, home, 'darwin'), [
@@ -70,6 +86,25 @@ test('desktop executable paths use the system and user Mac bundles or the Window
   ]);
   assert.deepEqual(antigravityDesktopPaths({}, home, 'win32'), []);
   assert.deepEqual(antigravityDesktopPaths({}, home, 'linux'), []);
+});
+
+test('discovery recognizes each desktop engine as the only installation signal', t => {
+  const home = '/fixture';
+  const environment = { PATH: '', LOCALAPPDATA: home };
+  let installed;
+  const exists = t.mock.method(fs, 'existsSync', path => path === installed);
+  syncBuiltinESMExports();
+  try {
+    for (const platform of ['darwin', 'win32']) {
+      for (installed of antigravityDesktopPaths(environment, home, platform)) {
+        const { products } = discoverQuotaProducts({ home, environment, platform });
+        assert.equal(products.find(p => p.id === 'antigravity').detected, true, installed);
+      }
+    }
+  } finally {
+    exists.mock.restore();
+    syncBuiltinESMExports();
+  }
 });
 
 // Exercise discovery + fetch + schema/cache through the same registry as the apps.
@@ -133,7 +168,7 @@ test('a working CLI service returns its meters without checking the version or s
 
 test('agy waits for silent auth but stops when interactive login is impossible', async t => {
   for (const channel of ['cli.log', 'stdout', 'stderr']) {
-    for (const diagnostic of [silentAuth, noTerminal]) {
+    for (const diagnostic of [silentAuth, noTerminal, 'Print mode: not logged in']) {
       await t.test(`${channel}: ${diagnostic}`, async () => {
         const { products: [result] } = await fetchQuotaProducts(['antigravity'], {
           environment: { ANTIGRAVITY_CLI_PATH: process.execPath }, platform: 'linux',
@@ -165,6 +200,31 @@ test('agy waits for silent auth but stops when interactive login is impossible',
   }
 });
 
+test('service polling resumes after transient cli.log read errors', async t => {
+  const errors = ['EBUSY', 'EPERM', 'EACCES'];
+  let logPath;
+  const readFile = fs.readFileSync;
+  const read = t.mock.method(fs, 'readFileSync', (path, ...args) => {
+    if (path === logPath && errors.length) throw Object.assign(new Error('log busy'), { code: errors.shift() });
+    return readFile(path, ...args);
+  });
+  syncBuiltinESMExports();
+  try {
+    const port = await withAntigravitySession(process.execPath, endpoint => endpoint.port, {
+      timeoutMs: 3000, environment: {}, spawnImpl(binary, args, options) {
+        logPath = args[args.indexOf('--log-file') + 1];
+        writeFileSync(logPath, 'listening on dynamic port at 12345 for HTTPS');
+        return spawn(binary, ['-e', 'process.stdin.resume()'], options);
+      },
+    });
+    assert.equal(port, 12345);
+    assert.deepEqual(errors, []);
+  } finally {
+    read.mock.restore();
+    syncBuiltinESMExports();
+  }
+});
+
 test('a failed service checks the version and reads structured /usage windows on a supported CLI', async t => {
   const fetch = install(t);
   for (const service of [new TimedOut(), { status: 503 }, { status: 200, payload: { groups: [] } }]) {
@@ -177,6 +237,36 @@ test('a failed service checks the version and reads structured /usage windows on
       { id: 'gemini-weekly', label: '7d', utilization: (1 - 0.4239039123058319) * 100,
         resetsAt: '2026-11-26T02:30:47.000Z', windowSeconds: 604800 },
     ]);
+  }
+});
+
+test('the running service waits for readiness and falls back immediately on an unsupported quota RPC', async () => {
+  for (const [responses, expected] of [
+    [[{ status: 503 }, { status: 200, payload: { groups: [] } }, rpc], ['rpc', 'rpc', 'rpc']],
+    [[{ status: 404 }], ['rpc', 'version', 'usage']],
+    [[{ status: 200, payload: { code: 'unimplemented' } }], ['rpc', 'version', 'usage']],
+  ]) {
+    const calls = [];
+    const { products: [result] } = await fetchQuotaProducts(['antigravity'], {
+      home: '/fixture', platform: 'linux', environment: { ANTIGRAVITY_CLI_PATH: process.execPath },
+      sessionImpl: (binary, callback, options) => withAntigravitySession(binary, callback, {
+        ...options, spawnImpl(executable, args, opts) {
+          writeFileSync(args[args.indexOf('--log-file') + 1], 'listening on dynamic port at 12345 for HTTPS');
+          return spawn(executable, ['-e', 'process.stdin.resume()'], opts);
+        },
+      }),
+      requestImpl: async () => {
+        calls.push('rpc');
+        return responses.shift() ?? rpc;
+      },
+      commandImpl: async (_, args) => {
+        const probe = args[0] === '--version';
+        calls.push(probe ? 'version' : 'usage');
+        return probe ? output('1.1.11') : output(JSON.stringify(usage));
+      },
+    });
+    assert.deepEqual(calls, expected);
+    assert.equal(result.status, 'ok');
   }
 });
 
@@ -209,6 +299,28 @@ test('a failed or timed-out /usage goes straight to the installed desktop engine
   assert.equal(failed.result.status, 'retryable_error');
 });
 
+test('a service ready at 9s or 11s succeeds with either installation layout', async t => {
+  let elapsed = 0;
+  t.mock.method(performance, 'now', () => elapsed);
+  for (const desktop of [true, false]) {
+    const fetch = install(t, { desktop });
+    for (const readyAt of [9000, 11000]) {
+      elapsed = 0;
+      const { calls, result } = await fetch({
+        version: output('1.1.10'),
+        onAttempt(name, limit) {
+          if (name !== 'service') return;
+          elapsed += Math.min(readyAt, limit);
+          if (elapsed < readyAt) throw new TimedOut();
+        },
+      });
+      assert.deepEqual(calls, ['service']);
+      assert.equal(result.status, 'ok');
+      assert.equal(elapsed, readyAt);
+    }
+  }
+});
+
 test('all attempts share one deadline, including version detection and cleanup', async t => {
   let elapsed = 0;
   t.mock.method(performance, 'now', () => elapsed);
@@ -222,34 +334,46 @@ test('all attempts share one deadline, including version detection and cleanup',
   syncBuiltinESMExports();
   t.after(() => { access.mock.restore(); syncBuiltinESMExports(); });
   const unavailable = { status: 503 };
-  // Earlier cleanup consumes 0.5s per step. Unspecified steps use their full limit.
-  for (const [devices, spent, version, expected] of [
-    [{ desktop: false }, { version: 500 }, undefined, [['service', 8900], ['version', 2000], ['usage', 6500]]],
-    [{}, { version: 500 }, undefined, [['service', 8000], ['version', 2000], ['usage', 3700], ['desktop', 3200]]],
-    [{}, { service: 1000, version: 500, usage: 1000 }, undefined,
-      [['service', 8000], ['version', 2000], ['usage', 7400], ['desktop', 12900]]],
-    [{}, {}, new TimedOut(), [['service', 8000], ['version', 2000], ['desktop', 5900]]],
-    [{}, { version: 500 }, output('1.1.10'), [['service', 8000], ['version', 2000], ['desktop', 7400]]],
-    [{ cli: false }, {}, undefined, [['desktop', 16900]]],
-    [{ platform: 'darwin', desktop: false }, { version: 500 }, undefined,
-      [['service', 10150], ['version', 2000], ['usage', 6500]]],
-    [{ platform: 'darwin' }, { version: 500 }, undefined,
-      [['service', 8000], ['version', 2000], ['usage', 4325], ['desktop', 3825]]],
-    [{ platform: 'darwin', cli: false }, {}, undefined, [['desktop', 18150]]],
-  ]) {
-    elapsed = 0;
-    const attempts = [];
-    const finalCleanup = devices.platform === 'darwin' ? 1850 : 3100;
-    const { result } = await install(t, devices)({
-      version, command: new TimedOut(), service: unavailable, hub: unavailable,
-      onAttempt(name, limit) {
-        attempts.push([name, limit]);
-        elapsed += (spent[name] ?? limit) + (name === expected.at(-1)[0] ? finalCleanup : 500);
-      },
-    });
-    assert.deepEqual(attempts, expected);
-    assert.equal(elapsed, 20000);
-    assert.equal(result.status, 'retryable_error');
+  for (const [platform, readMs, cleanupMs] of [['darwin', 18150, 1850], ['win32', 16900, 3100]]) {
+    const dual = install(t, { platform });
+    const cli = install(t, { platform, desktop: false });
+    const desktop = install(t, { platform, cli: false });
+    const dualThreshold = 6000 + cleanupMs + 5000;
+    const service = ['service', readMs];
+    const version = ['version', 2000];
+    // A fast service fails and finishes cleanup within 900ms. The probe takes 1s with cleanup.
+    const fast = { service: 400, version: 500 };
+    const afterProbe = readMs - 1900;
+    const serviceLeaving = remaining => readMs - 500 - remaining;
+    for (const [fetch, spent, expected] of [
+      [dual, {}, [service]],
+      [cli, {}, [service]],
+      [desktop, {}, [['desktop', readMs]]],
+      [cli, fast, [service, version, ['usage', afterProbe]]],
+      [dual, fast, [service, version, ['usage', afterProbe - cleanupMs - 5000], ['desktop', 5000]]],
+      [dual, { service: serviceLeaving(dualThreshold), version: 500 },
+        [service, version, ['usage', 5000], ['desktop', 5000]]],
+      [dual, { service: serviceLeaving(dualThreshold - 1) }, [service, ['desktop', dualThreshold - 1]]],
+      [dual, { service: serviceLeaving(3000) }, [service, ['desktop', 3000]]],
+      [dual, { service: serviceLeaving(2999) }, [service]],
+      [cli, { service: serviceLeaving(2999) }, [service]],
+      [cli, { service: serviceLeaving(3500), version: 500 }, [service, version]],
+    ]) {
+      elapsed = 0;
+      const attempts = [];
+      const { result } = await fetch({
+        command: new TimedOut(), service: unavailable, hub: unavailable,
+        onAttempt(name, limit) {
+          attempts.push([name, limit]);
+          const read = spent[name] ?? limit;
+          // Model maximum cleanup after a timeout, including /usage before desktop.
+          elapsed += read + (read === limit ? cleanupMs : 500);
+        },
+      });
+      assert.deepEqual(attempts, expected, platform);
+      assert.ok(elapsed <= 20000, `${platform} exceeded deadline at ${elapsed}ms`);
+      assert.equal(result.status, 'retryable_error');
+    }
   }
 });
 
@@ -277,6 +401,7 @@ test('explicit /usage login failures are terminal and keep account text out of t
   const service = { status: 503 };
   for (const command of [output('{"status":"ERROR","error":"UNAUTHENTICATED","email":"private@example.invalid"}'),
     output('{"status":"UNAUTHENTICATED"}'), output('', 1, noTerminal),
+    output('', 1, 'I1121 08:59:49.787026  1 printmode.go:409] Print mode: not logged in'),
     output('https://accounts.google.com/o/oauth2/auth?private@example.invalid', 1)]) {
     const { calls, result } = await fetch({ command, service });
     assert.deepEqual(calls, ['service', 'version', 'usage']);
@@ -328,18 +453,22 @@ test('Mac desktop sessions use the bundle short version or the verified fallback
   assert.deepEqual(versions, ['2.33.0', '2.33.0', '2.45.1']);
 });
 
-test('all agy commands inherit the login directory and only the desktop engine gets a temporary --gemini_dir', async () => {
+test('all four child environments exclude ZCode keys and preserve their intended login directory', async () => {
   const stopAtSpawn = new Error('fixture stopped at spawn');
-  for (const environment of [{}, { ANTIGRAVITY_GEMINI_DIR: '/fixture/custom-login' }]) {
+  for (const overrides of [{}, { ANTIGRAVITY_GEMINI_DIR: '/fixture/custom-login' }]) {
+    const inherited = { PATH: '/fixture/bin', HTTPS_PROXY: 'http://proxy.invalid', ...overrides };
+    const environment = Object.freeze({
+      ...inherited, BIGMODEL_API_KEY: 'fixture-domestic', Z_AI_API_KEY: 'fixture-overseas',
+    });
     const options = {
-      environment: Object.freeze(environment), timeoutMs: 3000,
+      environment, timeoutMs: 3000,
       spawnImpl(binary, args, { env, cwd }) {
         if (binary === 'fixture-engine') {
-          assert.ok(args.includes('--gemini_dir'));
+          // Both inputs must point at the temporary directory even if the user set a different one.
           assert.equal(args[args.indexOf('--gemini_dir') + 1], cwd);
-          assert.equal(env.ANTIGRAVITY_VSCODE_HOST, '1');
+          assert.deepEqual(env, { ...inherited, ANTIGRAVITY_GEMINI_DIR: cwd, ANTIGRAVITY_VSCODE_HOST: '1' });
         } else {
-          assert.deepEqual(env, environment);
+          assert.deepEqual(env, inherited);
           assert.ok(!args.includes('--gemini_dir'));
         }
         throw stopAtSpawn;
@@ -380,6 +509,7 @@ test('the owned desktop engine uses a temporary data root, closes stdin and stop
           process.stderr.write('ANTIGRAVITY_OPEN_');
           setTimeout(() => process.stderr.write('URL: https://example.invalid/private'), 20);
         } else {
+          process.stdout.write('Print mode: not logged in\\n');
           process.stdout.write('listening on dynamic port at ');
           setTimeout(() => process.stdout.write('12345 for HTTPS\\n'), 20);
           if (mode === 'oauth') setTimeout(() => process.stderr.write('https://accounts.google.com/o/oauth2/auth?private'), 500);

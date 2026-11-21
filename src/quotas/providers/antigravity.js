@@ -8,6 +8,9 @@ import { agyRequiresLogin, cleanupAllowanceMs, Interrupted, LoginRequired, runAn
 export { withAntigravitySession };
 
 const QUOTA_PATH = '/exa.language_server_pb.LanguageServerService/RetrieveUserQuotaSummary';
+const MIN_PATH_MS = 3000;
+const VERSION_AND_USAGE_MS = 6000;
+const DESKTOP_READ_MS = 5000;
 
 /** Fixed places to look for agy besides PATH. On Windows the official
  * installers (antigravity.google/cli/install.ps1 and install.cmd) put
@@ -20,6 +23,7 @@ export function antigravityInstallPaths(environment = process.env, home = homedi
   const localAppData = environment.LOCALAPPDATA?.trim();
   return [
     join(home, '.local', 'bin', name),
+    ...(platform === 'darwin' ? ['/opt/homebrew/bin/agy', '/usr/local/bin/agy'] : []),
     ...(platform === 'win32' && localAppData ? [join(localAppData, 'agy', 'bin', name)] : []),
   ];
 }
@@ -34,7 +38,7 @@ export function antigravityBinary(environment = process.env, home = homedir(), p
     userBin,
     ...(environment.PATH || '').split(platform === 'win32' ? ';' : delimiter)
       .filter(Boolean).map(root => join(root, name)),
-    ...installed, ...(platform === 'darwin' ? ['/opt/homebrew/bin/agy', '/usr/local/bin/agy'] : []),
+    ...installed,
   ];
   return firstExecutable(candidates, platform);
 }
@@ -49,7 +53,7 @@ function firstExecutable(candidates, platform) {
   });
 }
 
-export function antigravityDesktopPaths(environment, home, platform) {
+export function antigravityDesktopPaths(environment = process.env, home = homedir(), platform = process.platform) {
   if (platform === 'darwin') return ['/Applications', join(home, 'Applications')]
     .map(root => join(root, 'Antigravity.app', 'Contents', 'Resources', 'bin', 'language_server'));
   const local = environment.LOCALAPPDATA?.trim();
@@ -172,7 +176,10 @@ export function requestAntigravityQuota({ port, token, timeoutMs = 2000 }) {
           return;
         }
         try { resolve({ status: response.statusCode, payload: JSON.parse(Buffer.concat(chunks)) }); }
-        catch { reject(new Error('Invalid quota response')); }
+        catch {
+          if (response.statusCode === 200) reject(new Error('Invalid quota response'));
+          else resolve({ status: response.statusCode });
+        }
       });
     });
     const timer = setTimeout(() => request.destroy(new Error('Quota request timed out')), timeoutMs);
@@ -194,13 +201,12 @@ export async function fetchAntigravityQuota({
   // Both clients allow 30s, including up to 10s for the Windows launcher.
   // Earlier attempts' cleanup consumes this same clock. Keep the final cleanup
   // allowance even on a desktop-only installation.
-  const budget = Math.min(timeoutMs, 20000 - cleanupAllowanceMs(platform));
-  const deadline = performance.now() + budget;
-  function optionsFor(capMs = budget, reserveMs = 0) {
-    const remaining = Math.floor(deadline - performance.now());
-    if (remaining <= 0) throw new TimedOut();
-    const reserve = Math.min(reserveMs, Math.floor(remaining / 2));
-    return { environment, timeoutMs: Math.min(capMs, remaining - reserve) };
+  const cleanupMs = cleanupAllowanceMs(platform);
+  const deadline = performance.now() + Math.min(timeoutMs, 20000) - cleanupMs;
+  function optionsFor({ reserve = 0, minimum = MIN_PATH_MS, cap = Infinity } = {}) {
+    const available = Math.floor(deadline - performance.now()) - reserve;
+    if (available < minimum) throw new TimedOut();
+    return { environment, timeoutMs: Math.min(cap, available) };
   }
 
   async function readMeters(endpoint) {
@@ -208,6 +214,11 @@ export async function fetchAntigravityQuota({
     try { response = await requestImpl(endpoint); } catch { return undefined; }
     if ([401, 403].includes(response.status) || response.payload?.code === 'unauthenticated') {
       throw new LoginRequired();
+    }
+    // An engine without this RPC cannot produce a later window. A service still
+    // starting up (e.g. HTTP 503 or empty groups) keeps its full reading budget.
+    if ([404, 405, 501].includes(response.status) || response.payload?.code === 'unimplemented') {
+      throw new Error('Antigravity quota RPC unavailable');
     }
     if (response.status !== 200) return undefined;
     let meters;
@@ -220,12 +231,8 @@ export async function fetchAntigravityQuota({
   const desktop = firstExecutable(antigravityDesktopPaths(environment, home, platform), platform);
   if (!binary && !desktop) return result('missing_credentials', { message: 'Install agy or Antigravity Desktop and sign in' });
   if (binary) {
-    // Keep 8s for the version probe + /usage and 7s for an installed desktop,
-    // but give the faster primary service at least 8s of the normal budget.
-    const desktopReserveMs = desktop ? 7000 : 0;
-    const serviceMs = Math.max(8000, budget - 8000 - desktopReserveMs);
     try {
-      const meters = await sessionImpl(binary, readMeters, optionsFor(serviceMs));
+      const meters = await sessionImpl(binary, readMeters, optionsFor());
       if (meters?.length) return ok(meters);
     } catch (error) {
       if (error instanceof LoginRequired) return unauthorized();
@@ -233,10 +240,14 @@ export async function fetchAntigravityQuota({
     }
 
     try {
-      const version = await commandImpl(binary, ['--version'], optionsFor(2000, desktopReserveMs));
+      // If /usage times out, its process must be gone before desktop can start.
+      const reserve = desktop ? DESKTOP_READ_MS + cleanupMs : 0;
+      const version = await commandImpl(binary, ['--version'], optionsFor({
+        reserve, minimum: desktop ? VERSION_AND_USAGE_MS : MIN_PATH_MS, cap: 2000,
+      }));
       if (version.code === 0 && supportsAntigravityUsage(version.stdout.trim() || version.stderr)) {
         const usage = await commandImpl(binary, ['-p', '/usage', '--output-format', 'json'],
-          optionsFor(budget, desktopReserveMs));
+          optionsFor({ reserve }));
         return ok(parseUsage(usage));
       }
     } catch (error) {

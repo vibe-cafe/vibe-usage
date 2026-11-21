@@ -8,9 +8,10 @@ import { setTimeout as delay } from 'node:timers/promises';
 const OUTPUT_LIMIT = 1024 * 1024;
 const PORT = /listening on \w+ port at (\d+) for HTTPS\b/i;
 const LOGIN_URL = /ANTIGRAVITY_OPEN_URL:|https:\/\/accounts\.google\.com\/o\/oauth2\b/i;
-const startupRequiresLogin = text => LOGIN_URL.test(text) || /^Print mode: not logged in/im.test(text);
 // agy also logs "not authenticated, trying silent auth" before a successful login.
-export const agyRequiresLogin = text => startupRequiresLogin(text) || /cannot complete interactive login/i.test(text);
+export const agyRequiresLogin = text => LOGIN_URL.test(text)
+  || /Print mode: not logged in\b|cannot complete interactive login/i.test(text);
+const RETRYABLE_LOG_ERRORS = new Set(['ENOENT', 'EBUSY', 'EPERM', 'EACCES']);
 const unavailable = () => new Error('Antigravity quota service unavailable');
 export class LoginRequired extends Error {}
 export class Interrupted extends Error {}
@@ -36,7 +37,7 @@ async function stopTree(child, closed) {
 }
 
 // Every entry point owns its cwd, streams, time limit and process tree.
-async function withProcess(binary, argsFor, { environment, timeoutMs, spawnImpl = spawn, desktopVersion }, read) {
+async function withProcess(binary, argsFor, { environment = process.env, timeoutMs, spawnImpl = spawn, desktopVersion }, read) {
   const directory = mkdtempSync(join(tmpdir(), 'vibe-usage-agy-quota-'));
   const controller = new AbortController();
   const abort = error => controller.abort(error);
@@ -44,12 +45,17 @@ async function withProcess(binary, argsFor, { environment, timeoutMs, spawnImpl 
   const timer = setTimeout(() => abort(new TimedOut('Antigravity quota service unavailable')), timeoutMs);
   let child, closed;
   try {
+    // Desktop apps can fetch ZCode in this same CLI invocation. Windows env names are case-insensitive.
+    const env = Object.fromEntries(Object.entries(environment)
+      .filter(([key]) => !/^(BIGMODEL_API_KEY|Z_AI_API_KEY)$/i.test(key)));
+    if (desktopVersion) {
+      // Match --gemini_dir even when the caller set a login directory, so desktop migrations stay in our cwd.
+      env.ANTIGRAVITY_GEMINI_DIR = directory;
+      env.ANTIGRAVITY_VSCODE_HOST = '1';
+    }
     child = spawnImpl(binary, argsFor(directory), {
       cwd: directory, detached: process.platform !== 'win32', windowsHide: true,
-      stdio: ['pipe', 'pipe', 'pipe'],
-      env: desktopVersion
-        ? { ...environment, ANTIGRAVITY_GEMINI_DIR: directory, ANTIGRAVITY_VSCODE_HOST: '1' }
-        : environment,
+      stdio: ['pipe', 'pipe', 'pipe'], env,
     });
     child.stdin.on('error', () => {});
     child.once('error', () => abort(unavailable()));
@@ -119,9 +125,8 @@ export function withAntigravitySession(binary, callback, {
   return withProcess(binary, argsFor, { environment, timeoutMs, spawnImpl, desktopVersion },
     async ({ child, directory, closed, abort, signal }) => {
       let port;
-      const loginDiagnostic = desktopVersion ? startupRequiresLogin : agyRequiresLogin;
       const inspect = (text, reportsPort) => {
-        if (loginDiagnostic(text)) abort(new LoginRequired());
+        if (desktopVersion ? LOGIN_URL.test(text) : agyRequiresLogin(text)) abort(new LoginRequired());
         if (reportsPort) port ||= Number(PORT.exec(text)?.[1]);
       };
       for (const stream of [child.stdout, child.stderr]) {
@@ -139,7 +144,7 @@ export function withAntigravitySession(binary, callback, {
         try {
           if (statSync(logPath).size > OUTPUT_LIMIT) throw unavailable();
           inspect(readFileSync(logPath, 'utf8'), true);
-        } catch (error) { if (error.code !== 'ENOENT') throw error; }
+        } catch (error) { if (!RETRYABLE_LOG_ERRORS.has(error.code)) throw error; }
       }
       closed.then(() => {
         // A headless agy can log its final login diagnostic and exit between polls.
