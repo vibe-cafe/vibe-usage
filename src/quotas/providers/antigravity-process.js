@@ -1,0 +1,167 @@
+import { execFile, spawn } from 'node:child_process';
+import { randomBytes } from 'node:crypto';
+import { mkdtempSync, readFileSync, rmSync, statSync } from 'node:fs';
+import { tmpdir } from 'node:os';
+import { join } from 'node:path';
+import { setTimeout as delay } from 'node:timers/promises';
+
+const OUTPUT_LIMIT = 1024 * 1024;
+const PORT = /listening on \w+ port at (\d+) for HTTPS\b/i;
+const LOGIN_URL = /ANTIGRAVITY_OPEN_URL:|https:\/\/accounts\.google\.com\/o\/oauth2\b/i;
+// agy also logs "not authenticated, trying silent auth" before a successful login.
+export const agyRequiresLogin = text => LOGIN_URL.test(text)
+  || /Print mode: not logged in\b|cannot complete interactive login/i.test(text);
+const RETRYABLE_LOG_ERRORS = new Set(['ENOENT', 'EBUSY', 'EPERM', 'EACCES']);
+const unavailable = () => new Error('Antigravity quota service unavailable');
+export class LoginRequired extends Error {}
+export class Interrupted extends Error {}
+export class TimedOut extends Error {}
+
+// Leave room for stopTree's two waits and rmSync's 100 + 200 + 300 ms retry delays.
+export const cleanupAllowanceMs = platform => (platform === 'win32' ? 2000 : 750) + 500 + 600;
+
+async function stopTree(child, closed) {
+  if (!child.pid) return;
+  if (process.platform === 'win32') {
+    if (child.exitCode === null && child.signalCode === null) {
+      await new Promise(resolve => execFile('taskkill.exe', ['/PID', String(child.pid), '/T', '/F'],
+        { windowsHide: true, timeout: 2000 }, resolve));
+    }
+  } else {
+    // The group can still have helpers even after its leader has exited.
+    try { process.kill(-child.pid, 'SIGTERM'); } catch { return; }
+    await Promise.race([closed, delay(750, undefined, { ref: false })]);
+    try { process.kill(-child.pid, 'SIGKILL'); } catch { /* Group already gone. */ }
+  }
+  await Promise.race([closed, delay(500, undefined, { ref: false })]);
+}
+
+// Every entry point owns its cwd, streams, time limit and process tree.
+async function withProcess(binary, argsFor, { environment = process.env, timeoutMs, spawnImpl = spawn, desktopVersion }, read) {
+  const directory = mkdtempSync(join(tmpdir(), 'vibe-usage-agy-quota-'));
+  const controller = new AbortController();
+  const abort = error => controller.abort(error);
+  const onSignal = () => abort(new Interrupted());
+  const timer = setTimeout(() => abort(new TimedOut('Antigravity quota service unavailable')), timeoutMs);
+  let child, closed;
+  try {
+    // Desktop apps can fetch ZCode in this same CLI invocation. Windows env names are case-insensitive.
+    const env = Object.fromEntries(Object.entries(environment)
+      .filter(([key]) => !/^(BIGMODEL_API_KEY|Z_AI_API_KEY)$/i.test(key)));
+    if (desktopVersion) {
+      // Match --gemini_dir even when the caller set a login directory, so desktop migrations stay in our cwd.
+      env.ANTIGRAVITY_GEMINI_DIR = directory;
+      env.ANTIGRAVITY_VSCODE_HOST = '1';
+    }
+    child = spawnImpl(binary, argsFor(directory), {
+      cwd: directory, detached: process.platform !== 'win32', windowsHide: true,
+      stdio: ['pipe', 'pipe', 'pipe'], env,
+    });
+    child.stdin.on('error', () => {});
+    child.once('error', () => abort(unavailable()));
+    closed = new Promise(resolve => child.once('close', resolve));
+    process.once('SIGTERM', onSignal);
+    process.once('SIGINT', onSignal);
+    const interrupted = new Promise((_, reject) =>
+      controller.signal.addEventListener('abort', () => reject(controller.signal.reason), { once: true }));
+    return await Promise.race([interrupted, read({ child, directory, closed, abort, signal: controller.signal })]);
+  } finally {
+    clearTimeout(timer);
+    controller.abort();
+    try {
+      if (child) {
+        await stopTree(child, closed);
+        child.stdin.destroy();
+      }
+    } finally {
+      process.removeListener('SIGTERM', onSignal);
+      process.removeListener('SIGINT', onSignal);
+      try { rmSync(directory, { recursive: true, force: true, maxRetries: 3, retryDelay: 100 }); } catch {}
+    }
+  }
+}
+
+export function runAntigravityCommand(binary, args, options) {
+  return withProcess(binary, () => args, options, async ({ child, closed, abort }) => {
+    child.stdin.end();
+    let bytes = 0;
+    function capture(stream) {
+      const chunks = [];
+      let tail = '';
+      stream.on('data', chunk => {
+        bytes += chunk.length;
+        if (bytes > OUTPUT_LIMIT) return abort(unavailable());
+        chunks.push(chunk);
+        // An unauthenticated CLI can wait for interactive input after its diagnostic.
+        if (args.includes('/usage')) {
+          const text = tail + chunk.toString();
+          if (agyRequiresLogin(text)) abort(new LoginRequired());
+          tail = text.slice(-128);
+        }
+      });
+      return chunks;
+    }
+    const stdout = capture(child.stdout);
+    const stderr = capture(child.stderr);
+    const code = await closed;
+    return { code, stdout: Buffer.concat(stdout).toString(), stderr: Buffer.concat(stderr).toString() };
+  });
+}
+
+export function withAntigravitySession(binary, callback, {
+  environment = process.env, timeoutMs = 20000, spawnImpl, desktopVersion,
+} = {}) {
+  const token = randomBytes(32).toString('hex');
+  const argsFor = directory => desktopVersion ? [
+    '--standalone', '--override_ide_name', 'antigravity', '--subclient_type', 'hub',
+    '--override_ide_version', desktopVersion, '--override_user_agent_name', 'antigravity',
+    '--https_server_port', '0', '--csrf_token', token, '--app_data_dir', 'antigravity',
+    '--api_server_url', 'https://generativelanguage.googleapis.com',
+    '--cloud_code_endpoint', 'https://daily-cloudcode-pa.googleapis.com', '--gemini_dir', directory,
+  ] : [
+    '--print', '', '--input-format', 'stream-json', '--output-format', 'stream-json',
+    '--csrf_token', token, '--log-file', join(directory, 'cli.log'),
+  ];
+  return withProcess(binary, argsFor, { environment, timeoutMs, spawnImpl, desktopVersion },
+    async ({ child, directory, closed, abort, signal }) => {
+      let port;
+      const inspect = (text, reportsPort) => {
+        if (desktopVersion ? LOGIN_URL.test(text) : agyRequiresLogin(text)) abort(new LoginRequired());
+        if (reportsPort) port ||= Number(PORT.exec(text)?.[1]);
+      };
+      for (const stream of [child.stdout, child.stderr]) {
+        // Both services can print login diagnostics. Only the desktop prints its port.
+        let tail = '';
+        stream.on('data', chunk => {
+          const text = tail + chunk.toString();
+          inspect(text, Boolean(desktopVersion));
+          tail = text.slice(-128);
+        });
+      }
+      if (desktopVersion) child.stdin.end(); // The legacy CLI waits on an empty, open stdin.
+      const logPath = join(directory, 'cli.log');
+      function inspectLog() {
+        try {
+          if (statSync(logPath).size > OUTPUT_LIMIT) throw unavailable();
+          inspect(readFileSync(logPath, 'utf8'), true);
+        } catch (error) { if (!RETRYABLE_LOG_ERRORS.has(error.code)) throw error; }
+      }
+      closed.then(() => {
+        // A headless agy can log its final login diagnostic and exit between polls.
+        if (!desktopVersion && !signal.aborted) {
+          try { inspectLog(); } catch (error) { return abort(error); }
+        }
+        abort(unavailable());
+      });
+      const deadline = Date.now() + timeoutMs;
+      while (!signal.aborted) {
+        if (!desktopVersion && !port) inspectLog();
+        if (port && !signal.aborted) {
+          const value = await callback({ port, token, timeoutMs: Math.min(2000, Math.max(1, deadline - Date.now())) });
+          if (value !== undefined) return value;
+        }
+        await delay(150, undefined, { signal });
+      }
+      throw signal.reason;
+    });
+}

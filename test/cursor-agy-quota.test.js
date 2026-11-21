@@ -145,20 +145,23 @@ test('AGY shows only the Gemini family as 5h/7d; other families are validated bu
 
 test('AGY never reads credentials during discovery or falls back to another account cache', async () => {
   const environment = { ANTIGRAVITY_CLI_PATH: process.execPath, PATH: '' };
+  const legacy = { environment, home: '/missing', platform: 'linux',
+    commandImpl: async () => ({ code: 0, stdout: '1.1.10', stderr: '' }) };
   assert.equal(discoverQuotaProducts({ environment, home: '/missing' }).products.find(p => p.id === 'antigravity').detected,true);
-  const result = await fetchAntigravityQuota({ environment,
+  const result = await fetchAntigravityQuota({ ...legacy,
     sessionImpl: async (binary, callback) => callback({ port: 1234, token: 'private-csrf' }),
     requestImpl: async () => ({ status:200, payload: agyPayload }),
   });
   assert.equal(result.status,'ok');
   assert.equal(result.cacheScope,undefined);
   assert.ok(!JSON.stringify(result).includes('private-csrf'));
-  const rejected = await fetchAntigravityQuota({ environment,
+  const rejected = await fetchAntigravityQuota({ ...legacy,
     sessionImpl: async (binary, callback) => callback({}), requestImpl: async () => ({status:401}),
   });
   assert.equal(rejected.status,'unauthorized');
-  const missing = await fetchAntigravityQuota({ environment: {PATH:''}, home: '/missing' });
+  const missing = await fetchAntigravityQuota({ ...legacy, environment: {PATH:''} });
   assert.equal(missing.status,'missing_credentials');
+  assert.match(missing.message, /agy.*Antigravity Desktop/);
 });
 
 test('AGY finds the official Windows install outside PATH, after an agy on PATH', t => {
