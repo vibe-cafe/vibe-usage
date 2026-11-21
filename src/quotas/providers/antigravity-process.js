@@ -8,8 +8,9 @@ import { setTimeout as delay } from 'node:timers/promises';
 const OUTPUT_LIMIT = 1024 * 1024;
 const PORT = /listening on \w+ port at (\d+) for HTTPS\b/i;
 const LOGIN_URL = /ANTIGRAVITY_OPEN_URL:|https:\/\/accounts\.google\.com\/o\/oauth2\b/i;
-const LOGIN_MESSAGE = /\b(?:unauthenticated|unauthorized|auth_error|not[ _](?:logged[ _]in|signed[ _]in|authenticated)|(?:login|sign[ _-]in|authentication)[ _]required|please (?:log|sign) in)\b/i;
-export const requiresLogin = text => LOGIN_MESSAGE.test(text) || LOGIN_URL.test(text);
+const startupRequiresLogin = text => LOGIN_URL.test(text) || /^Print mode: not logged in/im.test(text);
+// agy also logs "not authenticated, trying silent auth" before a successful login.
+export const agyRequiresLogin = text => startupRequiresLogin(text) || /cannot complete interactive login/i.test(text);
 const unavailable = () => new Error('Antigravity quota service unavailable');
 export class LoginRequired extends Error {}
 export class Interrupted extends Error {}
@@ -88,7 +89,7 @@ export function runAntigravityCommand(binary, args, options) {
         // An unauthenticated CLI can wait for interactive input after its diagnostic.
         if (args.includes('/usage')) {
           const text = tail + chunk.toString();
-          if (LOGIN_URL.test(text) || (stream === child.stderr && /^Print mode: not logged in/im.test(text))) abort(new LoginRequired());
+          if (agyRequiresLogin(text)) abort(new LoginRequired());
           tail = text.slice(-128);
         }
       });
@@ -118,34 +119,38 @@ export function withAntigravitySession(binary, callback, {
   return withProcess(binary, argsFor, { environment, timeoutMs, spawnImpl, desktopVersion },
     async ({ child, directory, closed, abort, signal }) => {
       let port;
-      const inspect = text => {
-        if (LOGIN_URL.test(text)) abort(new LoginRequired());
-        port ||= Number(PORT.exec(text)?.[1]);
+      const loginDiagnostic = desktopVersion ? startupRequiresLogin : agyRequiresLogin;
+      const inspect = (text, reportsPort) => {
+        if (loginDiagnostic(text)) abort(new LoginRequired());
+        if (reportsPort) port ||= Number(PORT.exec(text)?.[1]);
       };
       for (const stream of [child.stdout, child.stderr]) {
-        if (!desktopVersion) {
-          stream.resume(); // The CLI publishes its port in our --log-file.
-          continue;
-        }
-        // Startup markers can straddle chunks. Keep only enough for a split marker.
+        // Both services can print login diagnostics. Only the desktop prints its port.
         let tail = '';
         stream.on('data', chunk => {
           const text = tail + chunk.toString();
-          inspect(text);
+          inspect(text, Boolean(desktopVersion));
           tail = text.slice(-128);
         });
       }
       if (desktopVersion) child.stdin.end(); // The legacy CLI waits on an empty, open stdin.
-      closed.then(() => abort(unavailable()));
       const logPath = join(directory, 'cli.log');
+      function inspectLog() {
+        try {
+          if (statSync(logPath).size > OUTPUT_LIMIT) throw unavailable();
+          inspect(readFileSync(logPath, 'utf8'), true);
+        } catch (error) { if (error.code !== 'ENOENT') throw error; }
+      }
+      closed.then(() => {
+        // A headless agy can log its final login diagnostic and exit between polls.
+        if (!desktopVersion && !signal.aborted) {
+          try { inspectLog(); } catch (error) { return abort(error); }
+        }
+        abort(unavailable());
+      });
       const deadline = Date.now() + timeoutMs;
       while (!signal.aborted) {
-        if (!desktopVersion && !port) {
-          try {
-            if (statSync(logPath).size > OUTPUT_LIMIT) throw unavailable();
-            inspect(readFileSync(logPath, 'utf8'));
-          } catch (error) { if (error.code !== 'ENOENT') throw error; }
-        }
+        if (!desktopVersion && !port) inspectLog();
         if (port && !signal.aborted) {
           const value = await callback({ port, token, timeoutMs: Math.min(2000, Math.max(1, deadline - Date.now())) });
           if (value !== undefined) return value;

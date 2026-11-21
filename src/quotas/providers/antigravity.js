@@ -3,7 +3,7 @@ import { homedir } from 'node:os';
 import { delimiter, join, isAbsolute, resolve } from 'node:path';
 import https from 'node:https';
 import { quotaResult } from '../schema.js';
-import { cleanupAllowanceMs, Interrupted, LoginRequired, requiresLogin, runAntigravityCommand, TimedOut, withAntigravitySession } from './antigravity-process.js';
+import { agyRequiresLogin, cleanupAllowanceMs, Interrupted, LoginRequired, runAntigravityCommand, TimedOut, withAntigravitySession } from './antigravity-process.js';
 
 export { withAntigravitySession };
 
@@ -124,14 +124,18 @@ export function parseAntigravityQuota(payload) {
     .sort((a,b) => (a.windowSeconds || Infinity) - (b.windowSeconds || Infinity));
 }
 
+const USAGE_LOGIN_CODES = new Set(['UNAUTHENTICATED', 'UNAUTHORIZED', 'AUTH_ERROR', 'LOGIN_REQUIRED', 'NOT_LOGGED_IN']);
+
 function parseUsage({ code, stdout, stderr }) {
   let payload;
   try { payload = JSON.parse(stdout); } catch { /* Errors may be plain text. */ }
-  if (code !== 0 || payload?.status !== 'SUCCESS' || !payload.command?.data?.groups?.length) {
-    if (requiresLogin(stdout) || requiresLogin(stderr)) throw new LoginRequired();
+  if (code !== 0 || payload?.status !== 'SUCCESS') {
+    const codes = [payload?.status, payload?.code, payload?.error, payload?.error?.code];
+    if (codes.some(value => typeof value === 'string' && USAGE_LOGIN_CODES.has(value.toUpperCase()))
+      || agyRequiresLogin(stdout) || agyRequiresLogin(stderr)) throw new LoginRequired();
     throw new Error('Antigravity usage command failed');
   }
-  if (payload.command?.name !== 'usage') throw new Error('Missing usage command');
+  if (payload.command?.name !== 'usage' || !payload.command.data?.groups?.length) throw new Error('Missing usage command data');
   const groups = payload.command.data.groups.map(group => ({
     displayName: group.name,
     buckets: group.buckets.map(bucket => ({ bucketId: bucket.id, disabled: bucket.disabled,
@@ -192,11 +196,11 @@ export async function fetchAntigravityQuota({
   // allowance even on a desktop-only installation.
   const budget = Math.min(timeoutMs, 20000 - cleanupAllowanceMs(platform));
   const deadline = performance.now() + budget;
-  const fallbackMs = Math.min(7000, Math.floor(budget / 2));
-  function optionsFor(reserveMs = 0, capMs = budget) {
-    const remaining = Math.floor(deadline - performance.now()) - reserveMs;
+  function optionsFor(capMs = budget, reserveMs = 0) {
+    const remaining = Math.floor(deadline - performance.now());
     if (remaining <= 0) throw new TimedOut();
-    return { environment, timeoutMs: Math.min(capMs, remaining) };
+    const reserve = Math.min(reserveMs, Math.floor(remaining / 2));
+    return { environment, timeoutMs: Math.min(capMs, remaining - reserve) };
   }
 
   async function readMeters(endpoint) {
@@ -215,25 +219,26 @@ export async function fetchAntigravityQuota({
   const binary = antigravityBinary(environment, home, platform);
   const desktop = firstExecutable(antigravityDesktopPaths(environment, home, platform), platform);
   if (!binary && !desktop) return result('missing_credentials', { message: 'Install agy or Antigravity Desktop and sign in' });
-  let tryCliService = Boolean(binary);
   if (binary) {
-    let supportsUsage = false;
+    // Keep 8s for the version probe + /usage and 7s for an installed desktop,
+    // but give the faster primary service at least 8s of the normal budget.
+    const desktopReserveMs = desktop ? 7000 : 0;
+    const serviceMs = Math.max(8000, budget - 8000 - desktopReserveMs);
     try {
-      const version = await commandImpl(binary, ['--version'], optionsFor(0, 2000));
-      supportsUsage = version.code === 0 && supportsAntigravityUsage(version.stdout.trim() || version.stderr);
-      if (supportsUsage) {
-        const usage = await commandImpl(binary, ['-p', '/usage', '--output-format', 'json'], optionsFor(fallbackMs));
-        return ok(parseUsage(usage));
-      }
+      const meters = await sessionImpl(binary, readMeters, optionsFor(serviceMs));
+      if (meters?.length) return ok(meters);
     } catch (error) {
       if (error instanceof LoginRequired) return unauthorized();
       if (error instanceof Interrupted) return retry();
-      if (supportsUsage && error instanceof TimedOut && desktop) tryCliService = false;
     }
-  }
-  if (tryCliService) {
+
     try {
-      return ok(await sessionImpl(binary, readMeters, optionsFor(desktop ? fallbackMs : 0)));
+      const version = await commandImpl(binary, ['--version'], optionsFor(2000, desktopReserveMs));
+      if (version.code === 0 && supportsAntigravityUsage(version.stdout.trim() || version.stderr)) {
+        const usage = await commandImpl(binary, ['-p', '/usage', '--output-format', 'json'],
+          optionsFor(budget, desktopReserveMs));
+        return ok(parseUsage(usage));
+      }
     } catch (error) {
       if (error instanceof LoginRequired) return unauthorized();
       if (error instanceof Interrupted) return retry();
