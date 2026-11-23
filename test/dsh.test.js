@@ -4,7 +4,7 @@ import { chmodSync, mkdirSync, mkdtempSync, readdirSync, rmSync, writeFileSync }
 import { homedir, tmpdir } from 'node:os';
 import { join, resolve } from 'node:path';
 import zlib from 'node:zlib';
-import { parse, splitZstdFrames } from '../src/parsers/dsh.js';
+import { findZstdCli, parse, splitZstdFrames } from '../src/parsers/dsh.js';
 import { parsers } from '../src/parsers/index.js';
 import { detectInstalledTools, getDshHome, TOOLS } from '../src/tools.js';
 
@@ -102,6 +102,25 @@ test('tool detection follows the sessions fixture override', async () => {
     mkdirSync(sessions);
     assert.equal(detectInstalledTools().some((tool) => tool.id === 'dsh'), true);
   });
+});
+
+test('DSH probes PATH before the macOS Homebrew zstd locations', () => {
+  const mac = ['zstd', '/opt/homebrew/bin/zstd', '/usr/local/bin/zstd'];
+  for (const [platform, available, expectedProbes] of [
+    ['darwin', mac[0], mac.slice(0, 1)],
+    ['darwin', mac[1], mac.slice(0, 2)],
+    ['darwin', mac[2], mac],
+    ['darwin', null, mac],
+    ['linux', null, ['zstd']],
+  ]) {
+    const probes = [];
+    const binary = findZstdCli(platform, (command, args) => {
+      probes.push([command, args]);
+      if (command !== available) throw Object.assign(new Error(), { code: 'ENOENT' });
+    });
+    assert.equal(binary, available);
+    assert.deepEqual(probes, expectedProbes.map(command => [command, ['--version']]));
+  }
 });
 
 test('splitZstdFrames walks complete frames and ignores only an incomplete tail', () => {

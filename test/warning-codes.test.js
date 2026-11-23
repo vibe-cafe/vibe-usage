@@ -87,6 +87,7 @@ const CASES = [
   ['antigravity: 额外根目录读取失败，已保留上次同步数据: /Volumes/备份/antigravity', 'extra_root_read_failed'],
   ['antigravity: 额外根目录不可用，已跳过本次 Antigravity 同步: /Volumes/备份/antigravity', 'extra_root_unavailable'],
   ['antigravity: 3 个旧格式会话未能读取，请打开对应的 Antigravity IDE/App 后重新同步；已保留上次同步状态。', 'legacy_sessions_pending'],
+  ['antigravity: 找不到系统命令 lsof，旧格式会话未能读取。', 'legacy_sessions_pending'],
   // DeepSeek Harness
   [`dsh: cannot read sessions directory ${HOME}/.dsh/sessions (EACCES)`, 'dir_unreadable'],
   ['dsh: cannot read project directory -Users-张-三-Coding-秘密项目 (EACCES)', 'dir_unreadable'],

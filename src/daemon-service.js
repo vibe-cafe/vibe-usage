@@ -133,7 +133,7 @@ function serviceArgv(nodePath, binPath, launcher) {
 // npx is a `#!/usr/bin/env node` script and launchd / systemd start services
 // with a minimal PATH that has no node on it.
 function servicePath(launcher) {
-  return [launcher.nodeDir, '/usr/local/bin', '/usr/bin', '/bin'].join(':');
+  return [launcher.nodeDir, '/usr/local/bin', '/usr/bin', '/bin', '/usr/sbin', '/sbin'].join(':');
 }
 
 function getServicePaths(plat) {

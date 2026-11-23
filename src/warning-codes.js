@@ -25,7 +25,7 @@ export const WARNING_CODES = Object.freeze({
   extra_root_read_failed: '额外目录读取失败',
   unsupported_format: '格式不认识（工具可能改了格式，或文件损坏）',
   usage_missing: '有会话但没读到用量（工具可能改了格式）',
-  legacy_sessions_pending: '旧格式会话待读取（需打开对应 App）',
+  legacy_sessions_pending: '旧格式会话待读取',
   merge_failed: '同一会话的分段无法合并',
   store_unavailable: '数据库无法从本进程读取',
   sqlite_unavailable: '没有可用的 SQLite（node:sqlite 和 sqlite3 命令都没有）',

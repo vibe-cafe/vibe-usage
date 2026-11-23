@@ -231,7 +231,7 @@ const NPX_LAUNCHER = { mode: 'npx', npxPath: '/opt/homebrew/bin/npx', nodeDir: '
 test('systemd unit in npx mode runs npx --yes @latest with node on PATH and a slower restart', () => {
   const unit = generateSystemdUnit('/opt/homebrew/bin/node', '/x/_npx/h/bin.js', undefined, {}, NPX_LAUNCHER);
   assert.match(unit, new RegExp(`ExecStart=/opt/homebrew/bin/npx --yes ${PACKAGE_SPEC.replace('/', '\\/')} daemon`));
-  assert.match(unit, /Environment="PATH=\/opt\/homebrew\/bin:\/usr\/local\/bin:\/usr\/bin:\/bin"/);
+  assert.match(unit, /Environment="PATH=\/opt\/homebrew\/bin:\/usr\/local\/bin:\/usr\/bin:\/bin:\/usr\/sbin:\/sbin"/);
   assert.match(unit, /RestartSec=60/);
   assert.doesNotMatch(unit, /_npx/);
 });
@@ -246,7 +246,7 @@ test('systemd unit without a launcher is byte-for-byte the pinned form', () => {
 test('launchd plist in npx mode runs npx --yes @latest, sets PATH, and throttles relaunches', () => {
   const plist = generateLaunchdPlist('/opt/homebrew/bin/node', '/x/_npx/h/bin.js', undefined, {}, NPX_LAUNCHER);
   assert.match(plist, /<string>\/opt\/homebrew\/bin\/npx<\/string>\s*<string>--yes<\/string>\s*<string>@vibe-cafe\/vibe-usage@latest<\/string>\s*<string>daemon<\/string>/);
-  assert.match(plist, /<key>PATH<\/key>\s*<string>\/opt\/homebrew\/bin:\/usr\/local\/bin:\/usr\/bin:\/bin<\/string>/);
+  assert.match(plist, /<key>PATH<\/key>\s*<string>\/opt\/homebrew\/bin:\/usr\/local\/bin:\/usr\/bin:\/bin:\/usr\/sbin:\/sbin<\/string>/);
   assert.match(plist, /<key>ThrottleInterval<\/key>\s*<integer>60<\/integer>/);
   assert.doesNotMatch(plist, /_npx/);
 });

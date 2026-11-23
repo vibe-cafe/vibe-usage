@@ -1,5 +1,5 @@
-import { execSync } from 'node:child_process';
-import { readdirSync, statSync } from 'node:fs';
+import { execFileSync, execSync } from 'node:child_process';
+import { existsSync, readdirSync, statSync } from 'node:fs';
 import { delimiter, join } from 'node:path';
 import { homedir } from 'node:os';
 import { antigravityConversationDirs, normalizeExtraRoot } from '../extra-roots.js';
@@ -164,16 +164,11 @@ export function parseWinProcessList(out) {
   return servers;
 }
 
-function findListeningPorts(pid) {
-  try {
-    return IS_WIN ? findListeningPortsWin(pid) : findListeningPortsUnix(pid);
-  } catch {
-    return [];
-  }
-}
-
 function findListeningPortsUnix(pid) {
-  const out = execSync(`lsof -iTCP -sTCP:LISTEN -nP -a -p ${pid}`, {
+  if (!/^\d+$/.test(pid)) return [];
+  // Already-installed npx services can have a PATH without /usr/sbin.
+  const lsof = process.platform === 'darwin' && existsSync('/usr/sbin/lsof') ? '/usr/sbin/lsof' : 'lsof';
+  const out = execFileSync(lsof, ['-iTCP', '-sTCP:LISTEN', '-nP', '-a', '-p', pid], {
     encoding: 'utf-8',
     timeout: 5000,
   });
@@ -682,8 +677,18 @@ export async function parse({ extraRoots = [] } = {}) {
     .filter((id) => !dbHandled.has(id));
   if (pbCascades.length > 0) {
     const pending = new Set(pbCascades);
+    let lsofMissing = false;
     for (const server of findLanguageServers()) {
-      const ports = findListeningPorts(server.pid);
+      let ports;
+      try {
+        ports = IS_WIN ? findListeningPortsWin(server.pid) : findListeningPortsUnix(server.pid);
+      } catch (err) {
+        if (!IS_WIN && err.code === 'ENOENT') {
+          lsofMissing = true;
+          break;
+        }
+        continue;
+      }
       const baseUrl = ports.length > 0 ? await probeHttpPort(ports, server.csrfToken) : null;
       if (!baseUrl) continue;
       const rpc = (method, body) =>
@@ -764,7 +769,9 @@ export async function parse({ extraRoots = [] } = {}) {
       }
       if (pending.size === 0) break;
     }
-    if (pending.size > 0) {
+    if (lsofMissing) {
+      warnings.push('antigravity: 找不到系统命令 lsof，旧格式会话未能读取。');
+    } else if (pending.size > 0) {
       warnings.push(`antigravity: ${pending.size} 个旧格式会话未能读取，请打开对应的 Antigravity IDE/App 后重新同步；已保留上次同步状态。`);
     }
   }
