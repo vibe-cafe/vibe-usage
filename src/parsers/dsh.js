@@ -125,16 +125,18 @@ export function splitZstdFrames(buffer) {
 }
 
 const hasBuiltinZstd = typeof zlib.zstdDecompressSync === 'function';
-let zstdCliProbe = null;
-function hasZstdCli() {
-  if (zstdCliProbe !== null) return zstdCliProbe;
-  try {
-    execFileSync('zstd', ['--version'], { stdio: 'ignore', timeout: 5000 });
-    zstdCliProbe = true;
-  } catch {
-    zstdCliProbe = false;
+let zstdCli;
+export function findZstdCli(platform = process.platform, run = execFileSync) {
+  const candidates = platform === 'darwin' ? ['zstd', '/opt/homebrew/bin/zstd', '/usr/local/bin/zstd'] : ['zstd'];
+  for (const candidate of candidates) {
+    try {
+      run(candidate, ['--version'], { stdio: 'ignore', timeout: 5000 });
+      return candidate;
+    } catch {
+      // Try the next installation if this one is missing or unusable.
+    }
   }
-  return zstdCliProbe;
+  return null;
 }
 
 const ZSTD_HINT =
@@ -161,7 +163,8 @@ function decompressSessionLog(buffer, file) {
     return Buffer.concat(parts).toString('utf8');
   }
 
-  if (!hasZstdCli()) {
+  if (zstdCli === undefined) zstdCli = findZstdCli();
+  if (!zstdCli) {
     const error = new Error('zstd unavailable for ' + file + ': ' + ZSTD_HINT);
     error.code = 'ENOENT';
     throw error;
@@ -175,7 +178,7 @@ function decompressSessionLog(buffer, file) {
   const completeInput = contiguous
     ? buffer.subarray(first.start, last.end)
     : Buffer.concat(frames.map(({ start, end }) => buffer.subarray(start, end)));
-  return execFileSync('zstd', ['-d', '-c'], {
+  return execFileSync(zstdCli, ['-d', '-c'], {
     input: completeInput,
     maxBuffer: MAX_DECOMPRESSED_SESSION_BYTES,
     stdio: ['pipe', 'pipe', 'ignore'],

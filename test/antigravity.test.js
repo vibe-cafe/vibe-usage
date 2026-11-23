@@ -1,7 +1,7 @@
 import { test } from 'node:test';
 import assert from 'node:assert';
 import childProcess from 'node:child_process';
-import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from 'node:fs';
+import fs, { mkdirSync, mkdtempSync, rmSync, writeFileSync } from 'node:fs';
 import { syncBuiltinESMExports } from 'node:module';
 import { tmpdir } from 'node:os';
 import { delimiter, dirname, join } from 'node:path';
@@ -576,21 +576,23 @@ function mockServers(t, servers) {
     if (command.includes('Get-CimInstance') || command.includes('wmic process')) {
       return servers.map(({ pid, token }) => `---\nProcessId=${pid}\nCommandLine=Antigravity IDE/language_server --csrf_token ${token}`).join('\n');
     }
-    if (command.includes('lsof')) {
-      const pid = command.match(/-p (\d+)/)?.[1];
-      const server = servers.find(server => String(server.pid) === pid);
-      return server ? `language_server ${pid} user TCP 127.0.0.1:${server.port} (LISTEN)` : '';
-    }
     if (command.includes('netstat')) {
       return servers.map(({ pid, port }) => `TCP 127.0.0.1:${port} 0.0.0.0:0 LISTENING ${pid}`).join('\n');
     }
     throw new Error(`Unexpected subprocess: ${command}`);
   });
+  const lsofMock = t.mock.method(childProcess, 'execFileSync', (_command, args) => {
+    const pid = args.at(-1);
+    const server = servers.find(server => String(server.pid) === pid);
+    return server ? `language_server ${pid} user TCP 127.0.0.1:${server.port} (LISTEN)` : '';
+  });
   syncBuiltinESMExports();
   t.after(() => {
     processMock.mock.restore();
+    lsofMock.mock.restore();
     syncBuiltinESMExports();
   });
+  return lsofMock;
 }
 
 function legacyTrajectory(id, input = 100) {
@@ -645,6 +647,43 @@ test('a closed IDE soft-skips unreadable legacy history with a diagnostic', asyn
   assert.equal(result.skipped, true);
   assert.deepEqual(result.buckets, []);
   assert.match(result.warnings[0], /1 个旧格式会话.*Antigravity IDE\/App/);
+});
+
+for (const installed of [true, false]) {
+  const binary = installed ? '/usr/sbin/lsof' : 'lsof';
+  test(`macOS discovers legacy sessions with ${binary}`, { skip: process.platform !== 'darwin' }, async t => {
+    legacyFixture(t, [[2, ['ide-chat']]]);
+    const exists = fs.existsSync;
+    const existsMock = t.mock.method(fs, 'existsSync', path => path === '/usr/sbin/lsof' ? installed : exists(path));
+    t.after(() => {
+      existsMock.mock.restore();
+      syncBuiltinESMExports();
+    });
+    const lsof = mockServers(t, [
+      { pid: '123,456', token: 'bbb' }, // lsof -p accepts lists; the parser accepts one PID.
+      { pid: 123, port: 40123, token: 'aaa' },
+    ]);
+    t.mock.method(globalThis, 'fetch', async url => Response.json(
+      url.pathname.endsWith('/GetWorkspaceInfos') ? {} : legacyTrajectory('ide-chat'),
+    ));
+    const result = await parse();
+    assert.equal(result.buckets[0]?.inputTokens, 100);
+    assert.equal(result.skipped, undefined);
+    assert.deepEqual(lsof.mock.calls.map(call => call.arguments.slice(0, 2)), [
+      [binary, ['-iTCP', '-sTCP:LISTEN', '-nP', '-a', '-p', '123']],
+    ]);
+  });
+}
+
+test('missing lsof reports why legacy sessions are pending', { skip: process.platform === 'win32' }, async t => {
+  legacyFixture(t, [[2, ['one', 'two']]]);
+  const lsof = mockServers(t, [{ pid: 123, token: 'aaa' }]);
+  lsof.mock.mockImplementation(() => {
+    throw Object.assign(new Error('spawnSync ENOENT'), { code: 'ENOENT' });
+  });
+  const result = await parse();
+  assert.equal(result.skipped, true);
+  assert.deepEqual(result.warnings, ['antigravity: 找不到系统命令 lsof，旧格式会话未能读取。']);
 });
 
 test('partial legacy reads retain available usage and protect the source from pruning', async (t) => {
