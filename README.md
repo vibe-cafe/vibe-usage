@@ -1,6 +1,6 @@
 # vibe-usage
 
-Track your AI coding tool token usage and sync to [vibecafe.ai](https://vibecafe.ai).
+Track your AI coding tool token usage and sync to [VibeCafé](https://vibefriends.com).
 
 ## Quick Start
 
@@ -11,7 +11,7 @@ npx @vibe-cafe/vibe-usage
 ```
 
 On the first run it:
-1. Opens [vibecafe.ai/usage/device](https://vibecafe.ai/usage/device) in your browser — sign in, confirm the code shown in the terminal, click 「确认链接」; the key is saved to `~/.vibe-usage/config.json`
+1. Opens [vibefriends.com/usage/device](https://vibefriends.com/usage/device) in your browser — sign in, confirm the code shown in the terminal, click 「确认链接」; the key is saved to `~/.vibe-usage/config.json`
 2. Detects the AI coding tools installed on this machine
 3. Uploads your usage history
 4. Turns on background sync (every 30 minutes, starts at login) — no prompt, nothing else to install
@@ -22,7 +22,7 @@ Prefer a menu-bar app? [Vibe Usage for Mac](https://github.com/vibe-cafe/vibe-us
 
 ### CI / Headless
 
-If you don't have a local browser (CI, remote SSH session, container), pre-issue a key at [vibecafe.ai/usage/setup](https://vibecafe.ai/usage/setup) and pass it on the command line. Non-interactive runs never install the background service:
+If you don't have a local browser (CI, remote SSH session, container), pre-issue a key at [vibefriends.com/usage/setup](https://vibefriends.com/usage/setup) and pass it on the command line. Non-interactive runs never install the background service:
 
 ```bash
 npx @vibe-cafe/vibe-usage init --manual-key vbu_xxxxxxxxxxxx --no-daemon
@@ -150,7 +150,7 @@ To relabel old history, the maintainer needs the old bucket keys, raw per-tool t
 - Parses local session logs from each AI coding tool
 - Aggregates token usage into 30-minute buckets
 - Extracts session metadata where the source safely exposes user/assistant timing: active time (AI generation time, excluding queue/TTFT wait), total duration, and message counts. Alma intentionally emits buckets only; Cindy's daily-ledger augmentation adds no timing data to the native Codex/pi sessions because doing so would require reading Cindy chat records.
-- Uploads buckets + sessions to your vibecafe.ai dashboard (always gzip-compressed, ~94% smaller)
+- Uploads buckets + sessions to your VibeCafé dashboard (always gzip-compressed, ~94% smaller)
 - Incremental upload: every parser emits a complete local snapshot, then only buckets/sessions that are new or changed since the last successful upload are sent — a quiet machine uploads nothing. Upload state remains in `~/.vibe-usage/state.json`; failed or still-indexing parsers retain their prior state, while deleted local logs are pruned. Deleting the state file triggers a one-time full re-upload, and `reset` clears it automatically after deleting cloud data
 - Incremental Codex parsing: a versioned, disposable cache under `~/.vibe-usage/cache/codex/` stores per-rollout aggregate results and parser continuation state. Unchanged rollouts require no raw-log reads; an ordinary append reads only the new tail; forks, sub-agents, replacements, truncations, and failed safety checks fall back to the full correctness path. Multi-file sessions have a combined cache that rebuilds when any segment changes. A bounded rolling audit occasionally re-reads one historical file or continuation group. Very large first-time indexes checkpoint before the Mac app timeout and resume on the next sync instead of restarting
 - Interactive `sync` shows a live status line (`正在读取上传设置` → `正在扫描本地日志 12/35 · 已用时 2m10s`) while it reads backend settings and scans/indexes local logs. A first sync, a cold Codex index rebuild, or a Cursor account with a long event history can take minutes, so that line is what separates a slow sync from a hung one. It is printed only on a TTY — the Mac and Windows apps read the piped stdout as the result text and must keep receiving plain output. Interrupting a sync is safe: finished batches are already committed, and the Codex index checkpoints and resumes on the next run
@@ -333,7 +333,7 @@ Config stored at `~/.vibe-usage/config.json` (dev: `config.dev.json`).
 | Key | Description |
 |-----|-------------|
 | `apiKey` | Your API key (starts with `vbu_`) |
-| `apiUrl` | Server URL (default: `https://vibecafe.ai`) |
+| `apiUrl` | Server URL (default: `https://vibefriends.com`; a stored `https://vibecafe.ai` is rewritten to it) |
 | `hostname` | Stable device name for usage tracking (set at init, reused across syncs) |
 | `codexExtraHome` | Optional additional Codex Home scanned together with `$CODEX_HOME` / `~/.codex` |
 | `kikiStartAt` | Explicit UTC half-hour cut for migrating a collector that reported Kiki as `kimi-code`; see the Kiki migration steps above. Unset for new installations; `config set kikiStartAt none` clears an existing cut. Re-running `init` keeps it: a re-bind starts from an empty `state.json`, so the cut is then the only thing keeping pre-cut Kiki history from being sent again |

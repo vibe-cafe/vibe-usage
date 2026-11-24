@@ -2,6 +2,7 @@ import { readFileSync, writeFileSync, chmodSync, mkdirSync, existsSync } from 'n
 import { join } from 'node:path';
 import { homedir } from 'node:os';
 import { moveDirectoryOutOfFilePath } from './path-repair.js';
+import { migrateConfigApiUrl } from './api-url.js';
 
 // VIBE_USAGE_CONFIG_DIR overrides the dir (test hook).
 const CONFIG_DIR = process.env.VIBE_USAGE_CONFIG_DIR?.trim() || join(homedir(), '.vibe-usage');
@@ -14,11 +15,18 @@ export function getConfigPath() {
 
 export function loadConfig() {
   if (!existsSync(CONFIG_FILE)) return null;
+  let config;
   try {
-    return JSON.parse(readFileSync(CONFIG_FILE, 'utf-8'));
+    config = JSON.parse(readFileSync(CONFIG_FILE, 'utf-8'));
   } catch {
     return null;
   }
+  // 2026-11-24 domain move (see api-url.js). Persist it so the desktop apps,
+  // which read this file for the dashboard, follow without an app update.
+  if (!isDev && migrateConfigApiUrl(config)) {
+    try { saveConfig(config); } catch { /* Use the migrated value for this run anyway. */ }
+  }
+  return config;
 }
 
 export function saveConfig(config) {

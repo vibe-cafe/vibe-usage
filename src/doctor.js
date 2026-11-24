@@ -1,4 +1,5 @@
 import http from 'node:http';
+import { DEFAULT_API_URL } from './api-url.js';
 import https from 'node:https';
 import { existsSync } from 'node:fs';
 import { arch, homedir, hostname as osHostname, release } from 'node:os';
@@ -29,7 +30,7 @@ import { sqliteImplementation } from './parsers/sqlite.js';
  */
 
 export const DOCTOR_SCHEMA_VERSION = 1;
-const DEFAULT_API_URL = 'https://vibecafe.ai';
+
 const OFFICIAL_REGISTRY = 'https://registry.npmjs.org/';
 const PROBE_TIMEOUT_MS = 10_000;
 

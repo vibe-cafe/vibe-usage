@@ -1,4 +1,5 @@
 import { loadConfig } from './config.js';
+import { currentApiUrl } from './api-url.js';
 import { getJson } from './api.js';
 import { failure } from './output.js';
 import { TOOLS } from './tools.js';
@@ -16,7 +17,7 @@ export async function runSummary(args = []) {
     process.exit(1);
   }
 
-  const apiUrl = config.apiUrl || 'https://vibecafe.ai';
+  const apiUrl = currentApiUrl(config.apiUrl);
 
   let data;
   try {

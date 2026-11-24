@@ -1,4 +1,5 @@
 import { readFileSync, writeFileSync, unlinkSync, mkdirSync, existsSync, renameSync, rmSync } from 'node:fs';
+import { sameApiServer } from './api-url.js';
 import { join } from 'node:path';
 import { homedir } from 'node:os';
 import { createHash, randomBytes } from 'node:crypto';
@@ -46,7 +47,7 @@ function isIdentity(value) {
 }
 
 function sameIdentity(a, b) {
-  return a.apiUrl === b.apiUrl && a.keyFingerprint === b.keyFingerprint;
+  return sameApiServer(a.apiUrl, b.apiUrl) && a.keyFingerprint === b.keyFingerprint;
 }
 
 // `identity` is optional: callers that only read the recorded counts (e.g.

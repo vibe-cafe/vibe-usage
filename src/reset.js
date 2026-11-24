@@ -1,4 +1,5 @@
 import { createInterface } from 'node:readline';
+import { currentApiUrl } from './api-url.js';
 import { hostname as getHostname } from 'node:os';
 import { loadConfig, saveConfig } from './config.js';
 import { deleteAllData } from './api.js';
@@ -38,7 +39,7 @@ export async function runReset(args = [], deps = {}) {
   // under. A fresh os.hostname() can have drifted since (macOS mDNS adds -2
   // suffixes), which would delete zero rows, or another machine's rows.
   const currentHost = config.hostname || getHostname().replace(/\.local$/, '');
-  const apiUrl = config.apiUrl || 'https://vibecafe.ai';
+  const apiUrl = currentApiUrl(config.apiUrl);
 
   if (hostOnly) {
     const answer = await ask(`将删除当前机器（${currentHost}）的用量数据并从本地日志重新上传，继续? (y/N) `);

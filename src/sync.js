@@ -1,4 +1,5 @@
 import { hostname as osHostname } from 'node:os';
+import { currentApiUrl, sameApiServer } from './api-url.js';
 import { setTimeout as sleep } from 'node:timers/promises';
 import { loadConfig, saveConfig } from './config.js';
 import {
@@ -92,7 +93,7 @@ export function resolveUploadProjectSetting(settings) {
 }
 
 export function resolveCachedUploadProjectSetting(config, apiUrl) {
-  if (config?.lastUploadProjectApiUrl !== apiUrl) return undefined;
+  if (!sameApiServer(config?.lastUploadProjectApiUrl, apiUrl)) return undefined;
   return typeof config.lastUploadProject === 'boolean'
     ? config.lastUploadProject
     : undefined;
@@ -279,7 +280,7 @@ async function runSyncPasses({
   // incremental identity to `unknown` and can trigger a full-history upload.
   // Resolve it before parsing or loading upload state so failure is a true
   // no-op: no data upload and no state mutation.
-  const apiUrl = config.apiUrl || 'https://vibecafe.ai';
+  const apiUrl = currentApiUrl(config.apiUrl);
   // The stable upload hostname, captured once (see AGENTS.md "Stable
   // hostname"). Resolved before the settings request because the server keys
   // this machine's Codex Ultrafast cut by it.
@@ -316,7 +317,7 @@ async function runSyncPasses({
     // different server during its first settings outage.
     if (
       config.lastUploadProject !== uploadProject
-      || config.lastUploadProjectApiUrl !== apiUrl
+      || !sameApiServer(config.lastUploadProjectApiUrl, apiUrl)
     ) {
       config.lastUploadProject = uploadProject;
       config.lastUploadProjectApiUrl = apiUrl;

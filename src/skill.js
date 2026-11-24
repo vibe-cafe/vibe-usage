@@ -38,7 +38,7 @@ description: 查询和同步 AI 编程工具的 token 用量（VibeCafé 旗下 
 
 # Vibe Usage
 
-Track and answer questions about the user's AI coding token spend via [Vibe Usage](https://vibecafe.ai/usage) (VibeCafé).
+Track and answer questions about the user's AI coding token spend via [Vibe Usage](https://vibefriends.com/usage) (VibeCafé).
 
 ## 查询用量（默认行为）
 
