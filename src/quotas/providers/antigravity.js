@@ -459,9 +459,12 @@ export async function fetchAntigravityQuota(options = {}) {
   if (!tried) {
     // Nothing could be tried (agy retired, no desktop to ask): Google was not
     // asked, so this round neither counts as an attempt nor lengthens the backoff.
+    // It still says what it found: agy needs sign-in, or the last numbers are
+    // not from this read (a read was due: Antigravity was used or the last read failed).
     state.attemptAt = previousAttempt;
     saveAntigravityState(statePath, state);
-    return state.reading || state.failure ? rememberedResult(state, now, before) : result;
+    if (result.status === 'unauthorized' || !state.reading) return result;
+    return rememberedResult({ ...state, failure: state.failure ?? 'retryable' }, now, before);
   }
 
   // Taken after the read, so a read that touched a store cannot look like use.

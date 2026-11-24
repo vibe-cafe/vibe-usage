@@ -675,6 +675,24 @@ test('a round that could try nothing neither counts as an attempt nor lengthens 
   assert.equal(m.reads.at(-1).skipAgy, false);
   assert.equal(back.source, 'live');
 
+  // agy signed out, the desktop read worked, then the desktop was used and closed: nothing
+  // can be tried, and the card says so instead of passing the old numbers off as current.
+  const signedOut = machine(t);
+  signedOut.answer(options => ({ result: signedOut.reading(options.now), agyUnusable: 'login' }));
+  await signedOut.fetch(signedOut.at(0));
+  signedOut.use('desktop');
+  signedOut.answer(options => ({ result: quotaResult({ id: 'antigravity', status: 'unauthorized', fetchedAt: options.now }),
+    tried: false }));
+  assert.equal((await signedOut.fetch(signedOut.at(5))).status, 'unauthorized');
+  const hungOnly = machine(t);
+  await hungOnly.fetch(hungOnly.at(0));
+  hungOnly.use('desktop');
+  hungOnly.answer(options => ({ result: quotaResult({ id: 'antigravity', status: 'retryable_error', fetchedAt: options.now }),
+    tried: false }));
+  const stale = await hungOnly.fetch(hungOnly.at(5));
+  assert.equal(stale.status, 'ok');
+  assert.equal(stale.source, 'cache', 'marked as not from this read');
+
   // Through the real read: agy retired and no desktop installed tries nothing.
   const read = install(t, { desktop: false });
   const idle = await read({ skipAgy: true });
