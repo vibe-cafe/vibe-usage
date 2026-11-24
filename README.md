@@ -184,10 +184,10 @@ Cursor 用量优先读取 `cursor.com` 的 CSV 导出（模型名最准确）。
 - X 订阅（The X Subscription）账号的用量由 Cursor 与 Grok 共享：如果 Cursor 仪表盘本身没有新事件，请到 `grok.com/dashboard` 的 Usage 查看；CLI 只能读取 Cursor 仪表盘返回的 Cursor 事件。
 - 只有 X Premium+ / Grok 订阅、但 Cursor 里显示 `Free`：X Premium+ 不会自动把 Cursor 计划升级，需要在 `cursor.com/unify` 合并到 The X Subscription 后，Cursor 用量才进入共享池。`cursor.com/api/dashboard/get-sand-usage-status` 返回 `includedUsageSuperGrokPlan: "x-premium-plus"` 且 `cursorPlanName: "Free"` 就是这种状态。
 
-**代理**：环境变量里设了代理时，CLI 能照着走就让所有请求照着走。读法和 curl 一致：每种协议先看自己的变量（`HTTPS_PROXY` / `HTTP_PROXY`，大小写均可），再看 `ALL_PROXY`；只设 `HTTP_PROXY` 时 https 也走它（兼容做法，Node 的 fetch 本来如此）；`NO_PROXY` / `no_proxy` 按 Node 的规矩小写优先；能在运行时开启代理时（Node.js 24.14+），本机回环地址不走代理。Node.js **24.14+** 会自动启用，没写协议头的地址（`127.0.0.1:7890`）按 `http://` 处理；Node.js **22.21+ / 24.5+** 需要同时设 `NODE_USE_ENV_PROXY=1`，而且只认写在 `HTTPS_PROXY` / `HTTP_PROXY` 里的完整地址（[Node.js 官方说明](https://nodejs.org/en/learn/http/enterprise-network-configuration)）；Bun 自己认这两个变量（https 只认 `HTTPS_PROXY`）。只能靠启动开关时，只设 `HTTP_PROXY` 的话厂商请求（fetch）会走它，但上传到我们服务器的请求不会，建议同时写 `HTTPS_PROXY`。代理是 SOCKS，或当前运行环境无法照着走时，CLI **不会让带厂商账号的请求改走直连**：Cursor 同步和 Kimi / ZCode / OpenCode Go / Cursor 配额会跳过并说明原因，其他工具照常同步（要访问的地址都写在 `NO_PROXY` 里的，按你的直连规则照常读取；这里从严理解：`example.com` 只算它本身，子域名要写 `.example.com`，带端口的只算那个端口）；同步到我们服务器和 `doctor` 的 npm 探测不带厂商账号，这时仍会发出。以下为 macOS/Linux 终端示例，代理地址须替换为实际地址：
+**代理**：环境变量里设了代理时，CLI 的所有请求都照着走，包括同步到我们服务器的请求。读法和 curl 一致：每种协议先看自己的变量（`HTTPS_PROXY` / `HTTP_PROXY`，大小写均可），再看 `ALL_PROXY`；只设 `HTTP_PROXY` 时 https 也走它（兼容做法，Node 的 fetch 本来如此）；没写协议头的地址（`127.0.0.1:7890`）按 `http://` 处理；`NO_PROXY` / `no_proxy` 按 Node 的规矩小写优先；本机回环地址不走代理。Node.js 能自己照着走时（24.14+ 自动启用；22.21+ / 24.5+ 设了 `NODE_USE_ENV_PROXY=1` 并写成完整的 `HTTPS_PROXY` / `HTTP_PROXY`，见 [Node.js 官方说明](https://nodejs.org/en/learn/http/enterprise-network-configuration)）就交给它；照不了时——代理是 SOCKS5，Node.js 版本较旧，或代理只写在 `ALL_PROXY` 里——CLI 用自带的隧道（HTTP CONNECT / SOCKS5，支持用户名密码）照样走代理。走 SOCKS5 时只把主机名交给代理，不在本机解析厂商域名。只有 SOCKS4 这类无法识别的代理，或在 Bun 下运行且代理不是完整的 `HTTPS_PROXY=http://…` 时，CLI **不会让带厂商账号的请求改走直连**：Cursor 同步和 Kimi / ZCode / OpenCode Go / Cursor 配额会跳过并说明原因，其他工具照常同步（要访问的地址都写在 `NO_PROXY` 里的，按你的直连规则照常读取；这里从严理解：`example.com` 只算它本身，子域名要写 `.example.com`，带端口的只算那个端口）。以下为 macOS/Linux 终端示例，代理地址须替换为实际地址：
 
 ```bash
-HTTPS_PROXY=http://127.0.0.1:7890 NODE_USE_ENV_PROXY=1 npx @vibe-cafe/vibe-usage sync
+HTTPS_PROXY=http://127.0.0.1:7890 npx @vibe-cafe/vibe-usage sync
 ```
 
 这些环境变量只影响当前命令；已经运行的桌面应用和后台服务有各自的进程环境（后台服务目前不带代理变量）。持续失败时，请提供完整的 Cursor 报错、操作系统、`node -v` 和 CLI 版本，以便区分具体原因。

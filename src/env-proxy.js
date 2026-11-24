@@ -1,10 +1,10 @@
 // Follow the proxy the environment names, or do not send requests that carry
-// a vendor account (network-privacy principle, rules 1 and 2, workspace
+// a vendor account (network-privacy principle, rules 1, 2 and 6, workspace
 // AGENTS.md).
 //
-// The CLI has no proxy code of its own: Node's built-in fetch and https follow
-// HTTP_PROXY / HTTPS_PROXY / NO_PROXY only when told to. Measured 2026-11-24 with
-// a local stand-in proxy that never connects out:
+// Node's built-in fetch and https follow HTTP_PROXY / HTTPS_PROXY / NO_PROXY
+// only when told to. Measured 2026-11-24 with a local stand-in proxy that never
+// connects out:
 //   - Node 22.19 ignores NODE_USE_ENV_PROXY entirely and connects directly.
 //   - Node 24.22.3 (the Mac app's bundled runtime) honours an http:// proxy for
 //     both fetch and https, with NODE_USE_ENV_PROXY=1 or after
@@ -16,18 +16,21 @@
 //     from 22.21 / 24.5 (Node docs, Built-in Proxy Support).
 //   - Bun 1.3.14 honours http:// for fetch and https on its own and rejects
 //     socks5:// with an error, so nothing leaks there.
-// A terminal user who exports HTTPS_PROXY without NODE_USE_ENV_PROXY therefore
-// got direct connections. `setupEnvProxy()` runs once at start: it turns the
-// environment's proxy on for this process where the runtime can do that, and
-// otherwise records why it cannot, so callers holding a vendor credential can
-// refuse to send (`envProxyBlock()`). Requests without a vendor account (our
-// server, npm) are not blocked here; they follow the proxy whenever it is on.
+// `setupEnvProxy()` runs once at start. Where the runtime can follow the
+// proxy, it is turned on for this process. Where it cannot — a SOCKS5 proxy,
+// an older Node, a value Node never reads such as ALL_PROXY — our own tunnel
+// takes over (`proxy-tunnel.js`: HTTP CONNECT and SOCKS5 over node:net/tls), so
+// those requests still go through the user's proxy instead of being skipped.
+// Only what neither can follow (SOCKS4 and other unknown kinds, and Bun, which
+// cannot host the tunnel) is recorded, so callers holding a vendor credential
+// refuse to send (`envProxyBlock()`).
 //
-// Loopback is always bypassed where this module configures the runtime: the
-// Antigravity quota and parser talk to a language server on 127.0.0.1, which
-// must never be sent to a proxy.
+// Loopback is always bypassed: the Antigravity quota and parser talk to a
+// language server on 127.0.0.1, which must never be sent to a proxy.
 
 import http from 'node:http';
+import net from 'node:net';
+import { installProxyTunnel } from './proxy-tunnel.js';
 
 const PROXY_VARIABLES = ['HTTPS_PROXY', 'https_proxy', 'HTTP_PROXY', 'http_proxy'];
 const LOOPBACK = ['localhost', '127.0.0.1', '::1', '[::1]'];
@@ -107,8 +110,10 @@ export function mergedNoProxy(env = process.env) {
  * proxy. Returns and remembers `{ state }`:
  *   - `none`: no proxy variable set (nothing to follow);
  *   - `active`: requests go through the proxy;
- *   - `socks`: a SOCKS proxy, which Node's https cannot follow;
- *   - `unsupported`: a proxy is set but this runtime cannot be made to follow it.
+ *   - `tunnel`: the runtime cannot follow it, our tunnel does (`proxy-tunnel.js`);
+ *   - `socks`: a SOCKS proxy neither the runtime nor the tunnel can follow
+ *     (SOCKS4, or Bun);
+ *   - `unsupported`: a proxy is set that neither can follow.
  * The environment itself is never changed (children such as `agy` see what
  * the user or the app set). Where the runtime can be configured at run time
  * (`http.setGlobalProxyFromEnv`, Node 24.14+ / 25.4+), it gets the chosen
@@ -123,15 +128,37 @@ export function setupEnvProxy({
   versions = process.versions,
   execArgv = process.execArgv,
   httpModule = http,
+  installTunnel = installProxyTunnel,
 } = {}) {
+  current.uninstall?.();
+  current = runtimeProxyState({ env, versions, execArgv, httpModule });
+  // What the runtime cannot follow goes through our own tunnel instead of
+  // being skipped (rule 6: no "not sent" while a way through exists). Bun
+  // cannot host the tunnel's sockets; its cases stay blocked.
+  if ((current.state === 'socks' || current.state === 'unsupported') && !versions.bun) {
+    const { https, http: plain } = chosenProxies(env);
+    const installed = installTunnel({
+      proxies: { https: https?.value, http: plain?.value },
+      bypass: (host, port) => isLoopback(host)
+        || noProxyMatches(`http://${net.isIPv6(host) ? `[${host}]` : host}:${port}`, env),
+    });
+    if (installed) current = { state: 'tunnel', uninstall: typeof installed === 'function' ? installed : undefined };
+  }
+  return current;
+}
+
+function isLoopback(host) {
+  const name = String(host).toLowerCase().replace(/^\[|\]$/g, '');
+  return name === 'localhost' || name.endsWith('.localhost') || /^127\./.test(name) || name === '::1';
+}
+
+function runtimeProxyState({ env, versions, execArgv, httpModule }) {
   const { https, http: plain } = chosenProxies(env);
   if (!https && !plain) {
-    current = { state: 'none' };
-    return current;
+    return { state: 'none' };
   }
   if ([https, plain].some(choice => choice && isSocks(choice.value))) {
-    current = { state: 'socks' };
-    return current;
+    return { state: 'socks' };
   }
   // Bun and the startup switch read only these variables, as they were.
   const readAtStartup = proxyVariables(env).every(({ value }) => value.includes('://'))
@@ -140,8 +167,7 @@ export function setupEnvProxy({
   if (versions.bun) {
     // Bun's https requests read only HTTPS_PROXY / https_proxy.
     const httpsOwn = https && ['https_proxy', 'HTTPS_PROXY'].includes(https.name);
-    current = { state: readAtStartup && httpsOwn ? 'active' : 'unsupported' };
-    return current;
+    return { state: readAtStartup && httpsOwn ? 'active' : 'unsupported' };
   }
   if (typeof httpModule.setGlobalProxyFromEnv === 'function') {
     try {
@@ -150,28 +176,28 @@ export function setupEnvProxy({
         HTTP_PROXY: plain ? withScheme(plain.value) : undefined,
         NO_PROXY: mergedNoProxy(env),
       });
-      current = { state: 'active' };
+      return { state: 'active' };
     } catch {
-      current = { state: 'unsupported' };
+      return { state: 'unsupported' };
     }
-    return current;
   }
-  current = {
+  return {
     state: readAtStartup && envProxyFlagOn(env, execArgv) && nodeHonoursEnvProxyFlag(versions.node)
       ? 'active'
       : 'unsupported',
   };
-  return current;
 }
 
+// Left only for what the tunnel cannot speak: SOCKS4 and other unknown
+// proxy kinds, and Bun.
 const BLOCK_MESSAGES = {
-  socks: 'The configured proxy is SOCKS, which this runtime cannot follow; not sent, to avoid a direct connection.',
-  unsupported: 'A proxy is configured but this runtime does not follow it (write it as a full HTTPS_PROXY=http://… and, on Node.js 22.21+ / 24.5+, set NODE_USE_ENV_PROXY=1; or use Node.js 24.14+); not sent, to avoid a direct connection.',
+  socks: 'The configured SOCKS proxy cannot be followed here (only SOCKS5 is supported, and not under Bun); not sent, to avoid a direct connection.',
+  unsupported: 'A proxy is configured but cannot be followed here (an unrecognised proxy address, or Bun without a full HTTPS_PROXY=http://…); not sent, to avoid a direct connection.',
 };
 
 const BLOCK_NOTICES = {
-  socks: '设置的代理是 SOCKS，当前运行环境无法照着走，为避免直连已跳过',
-  unsupported: '设置了代理，但当前运行环境没有照着走（请把代理写成完整的 HTTPS_PROXY=http://…，Node.js 22.21 / 24.5 以上同时设置 NODE_USE_ENV_PROXY=1，或改用 Node.js 24.14 以上），为避免直连已跳过',
+  socks: '设置的 SOCKS 代理无法照着走（只支持 SOCKS5，Bun 下不支持），为避免直连已跳过',
+  unsupported: '设置了代理但无法照着走（代理地址无法识别，或在 Bun 下没有写成完整的 HTTPS_PROXY=http://…），为避免直连已跳过',
 };
 
 /**
@@ -241,5 +267,6 @@ export function envProxyBlockFor(urls, { env = process.env, state = current.stat
 
 /** Test hook: forget the decision made by the last `setupEnvProxy()`. */
 export function resetEnvProxyForTests() {
+  current.uninstall?.();
   current = { state: 'none' };
 }

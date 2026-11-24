@@ -6,6 +6,7 @@ import net from 'node:net';
 import { mkdtempSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
+import { fileURLToPath } from 'node:url';
 import {
   chosenProxies,
   envProxyBlock,
@@ -35,6 +36,10 @@ function fakeHttp({ throws = false } = {}) {
 }
 
 const NODE_24 = { node: '24.22.3' };
+
+// Runtime decisions alone: the tunnel that takes over what the runtime cannot
+// follow is tested below and in child processes.
+const setup = options => setupEnvProxy({ installTunnel: () => false, ...options });
 const LOOP = 'localhost,127.0.0.1,::1,[::1]';
 
 test.afterEach(() => resetEnvProxyForTests());
@@ -42,7 +47,7 @@ test.afterEach(() => resetEnvProxyForTests());
 test('no proxy variable: nothing to follow', () => {
   const env = { PATH: '/bin', HTTPS_PROXY: '  ' };
   const httpModule = fakeHttp();
-  assert.deepEqual(setupEnvProxy({ env, versions: NODE_24, execArgv: [], httpModule }), { state: 'none' });
+  assert.deepEqual(setup({ env, versions: NODE_24, execArgv: [], httpModule }), { state: 'none' });
   assert.deepEqual(httpModule.calls, []);
   assert.equal(envProxyBlock(), null);
 });
@@ -58,7 +63,7 @@ test('the runtime gets the chosen proxies directly; the environment is never cha
   const env = { HTTPS_PROXY: 'http://127.0.0.1:7890' };
   const before = { ...env };
   const httpModule = fakeHttp();
-  assert.equal(setupEnvProxy({ env, versions: NODE_24, execArgv: [], httpModule }).state, 'active');
+  assert.equal(setup({ env, versions: NODE_24, execArgv: [], httpModule }).state, 'active');
   assert.deepEqual(httpModule.calls, [{ HTTPS_PROXY: 'http://127.0.0.1:7890', HTTP_PROXY: undefined, NO_PROXY: LOOP }]);
   assert.deepEqual(env, before);
   assert.equal(envProxyBlock(), null);
@@ -67,7 +72,7 @@ test('the runtime gets the chosen proxies directly; the environment is never cha
 test('a value without a scheme is read as http://, as curl does', () => {
   const env = { https_proxy: '127.0.0.1:7890', NO_PROXY: 'corp.example' };
   const httpModule = fakeHttp();
-  setupEnvProxy({ env, versions: NODE_24, execArgv: [], httpModule });
+  setup({ env, versions: NODE_24, execArgv: [], httpModule });
   assert.equal(httpModule.calls[0].HTTPS_PROXY, 'http://127.0.0.1:7890');
   assert.equal(httpModule.calls[0].NO_PROXY, `corp.example,${LOOP}`);
   assert.equal(env.https_proxy, '127.0.0.1:7890');
@@ -95,20 +100,20 @@ test('each scheme takes its own variable, then ALL_PROXY, as curl does', () => {
 
 test('http_proxy plus a SOCKS ALL_PROXY: https would go through SOCKS, so blocked', () => {
   const env = { http_proxy: 'http://a:1', ALL_PROXY: 'socks5h://b:2' };
-  assert.equal(setupEnvProxy({ env, versions: NODE_24, execArgv: [], httpModule: fakeHttp() }).state, 'socks');
+  assert.equal(setup({ env, versions: NODE_24, execArgv: [], httpModule: fakeHttp() }).state, 'socks');
 });
 
 test('ALL_PROXY alone: SOCKS blocks; HTTP is followed only where the runtime can be told', () => {
-  assert.equal(setupEnvProxy({
+  assert.equal(setup({
     env: { all_proxy: 'socks5://127.0.0.1:7891' }, versions: NODE_24, execArgv: [], httpModule: fakeHttp(),
   }).state, 'socks');
   const httpModule = fakeHttp();
-  assert.equal(setupEnvProxy({
+  assert.equal(setup({
     env: { ALL_PROXY: 'http://127.0.0.1:7890' }, versions: NODE_24, execArgv: [], httpModule,
   }).state, 'active');
   assert.deepEqual(httpModule.calls[0], { HTTPS_PROXY: 'http://127.0.0.1:7890', HTTP_PROXY: 'http://127.0.0.1:7890', NO_PROXY: LOOP });
   // Startup switch only: Node never read ALL_PROXY, so it is not followed.
-  assert.equal(setupEnvProxy({
+  assert.equal(setup({
     env: { ALL_PROXY: 'http://127.0.0.1:7890', NODE_USE_ENV_PROXY: '1' }, versions: { node: '22.23.1' }, execArgv: [], httpModule: {},
   }).state, 'unsupported');
 });
@@ -117,7 +122,7 @@ test('SOCKS cannot be followed by Node https, so vendor requests are blocked', (
   for (const value of ['socks5://127.0.0.1:7891', 'SOCKS5H://127.0.0.1:7891', 'socks://h:1']) {
     const env = { HTTPS_PROXY: value };
     const httpModule = fakeHttp();
-    assert.equal(setupEnvProxy({ env, versions: NODE_24, execArgv: [], httpModule }).state, 'socks');
+    assert.equal(setup({ env, versions: NODE_24, execArgv: [], httpModule }).state, 'socks');
     assert.deepEqual(httpModule.calls, []);
     const block = envProxyBlock();
     assert.equal(block.reason, 'socks');
@@ -127,12 +132,12 @@ test('SOCKS cannot be followed by Node https, so vendor requests are blocked', (
 
 test('an invalid value that the runtime rejects blocks instead of going direct', () => {
   const env = { HTTPS_PROXY: 'http://[bad' };
-  assert.equal(setupEnvProxy({ env, versions: NODE_24, execArgv: [], httpModule: fakeHttp({ throws: true }) }).state, 'unsupported');
+  assert.equal(setup({ env, versions: NODE_24, execArgv: [], httpModule: fakeHttp({ throws: true }) }).state, 'unsupported');
   assert.equal(envProxyBlock().reason, 'unsupported');
 });
 
 test('without setGlobalProxyFromEnv the startup switch decides, by Node version', () => {
-  const run = (node, { flag = '1', execArgv = [], NODE_OPTIONS, value = 'http://p:1' } = {}) => setupEnvProxy({
+  const run = (node, { flag = '1', execArgv = [], NODE_OPTIONS, value = 'http://p:1' } = {}) => setup({
     env: { HTTPS_PROXY: value, ...(flag ? { NODE_USE_ENV_PROXY: flag } : {}), ...(NODE_OPTIONS ? { NODE_OPTIONS } : {}) },
     versions: { node }, execArgv, httpModule: {},
   }).state;
@@ -151,10 +156,10 @@ test('without setGlobalProxyFromEnv the startup switch decides, by Node version'
 
 test('Bun follows the proxy variables it read itself', () => {
   const bun = { bun: '1.3.14', node: '24.3.0' };
-  assert.equal(setupEnvProxy({ env: { HTTPS_PROXY: 'http://p:1' }, versions: bun, execArgv: [], httpModule: {} }).state, 'active');
-  assert.equal(setupEnvProxy({ env: { ALL_PROXY: 'http://p:1' }, versions: bun, execArgv: [], httpModule: {} }).state, 'unsupported');
+  assert.equal(setup({ env: { HTTPS_PROXY: 'http://p:1' }, versions: bun, execArgv: [], httpModule: {} }).state, 'active');
+  assert.equal(setup({ env: { ALL_PROXY: 'http://p:1' }, versions: bun, execArgv: [], httpModule: {} }).state, 'unsupported');
   // Bun's https requests read only HTTPS_PROXY.
-  assert.equal(setupEnvProxy({ env: { HTTP_PROXY: 'http://p:1' }, versions: bun, execArgv: [], httpModule: {} }).state, 'unsupported');
+  assert.equal(setup({ env: { HTTP_PROXY: 'http://p:1' }, versions: bun, execArgv: [], httpModule: {} }).state, 'unsupported');
 });
 
 // The real runtime running this suite (CI: Node 20 / 22 / 24): with a proxy
@@ -178,7 +183,7 @@ async function runChild(t, extraEnv) {
     const { setupEnvProxy } = await import(${JSON.stringify(moduleUrl)});
     const { state } = setupEnvProxy();
     const out = { state };
-    if (state === 'active') {
+    if (state === 'active' || state === 'tunnel') {
       out.https = await new Promise(res => {
         const req = https.get('https://https-path.vibe-usage-proxy-test.invalid/', r => { r.resume(); res('status ' + r.statusCode); });
         req.on('error', e => res('error ' + (e.code || e.message)));
@@ -203,32 +208,30 @@ async function runChild(t, extraEnv) {
   return { out: JSON.parse(stdout.trim().split('\n').pop()), seen };
 }
 
-function assertFollowedOrBlocked({ out, seen }, expectActive) {
-  assert.equal(out.state, expectActive ? 'active' : 'unsupported', `Node ${process.version}: ${JSON.stringify(out)}`);
-  if (expectActive) {
-    assert.ok(seen.includes('CONNECT https-path.vibe-usage-proxy-test.invalid:443 HTTP/1.1'), `https: ${JSON.stringify(seen)}`);
-    assert.ok(seen.includes('CONNECT fetch-path.vibe-usage-proxy-test.invalid:443 HTTP/1.1'), `fetch: ${JSON.stringify(seen)}`);
-  } else {
-    assert.ok(envProxyBlock('unsupported'));
-  }
+// Either the runtime follows the proxy itself (`active`) or our tunnel takes
+// over (`tunnel`); both reach the stand-in proxy, never the target directly.
+function assertFollowed({ out, seen }, runtimeFollows) {
+  assert.equal(out.state, runtimeFollows ? 'active' : 'tunnel', `Node ${process.version}: ${JSON.stringify(out)}`);
+  assert.ok(seen.includes('CONNECT https-path.vibe-usage-proxy-test.invalid:443 HTTP/1.1'), `https: ${JSON.stringify(seen)}`);
+  assert.ok(seen.includes('CONNECT fetch-path.vibe-usage-proxy-test.invalid:443 HTTP/1.1'), `fetch: ${JSON.stringify(seen)}`);
 }
 
 const canSetAtRuntime = typeof http.setGlobalProxyFromEnv === 'function';
 
 test('on this runtime: a terminal-style proxy variable (no switch, no scheme)', async (t) => {
-  assertFollowedOrBlocked(await runChild(t, port => ({ HTTPS_PROXY: `127.0.0.1:${port}` })), canSetAtRuntime);
+  assertFollowed(await runChild(t, port => ({ HTTPS_PROXY: `127.0.0.1:${port}` })), canSetAtRuntime);
 });
 
 test('on this runtime: only ALL_PROXY plus the switch (Node never reads ALL_PROXY)', async (t) => {
   const result = await runChild(t, port => ({ ALL_PROXY: `http://127.0.0.1:${port}`, NODE_USE_ENV_PROXY: '1' }));
-  assertFollowedOrBlocked(result, canSetAtRuntime);
+  assertFollowed(result, canSetAtRuntime);
 });
 
 test('on this runtime: the Windows app style (full URL plus NODE_USE_ENV_PROXY=1)', async (t) => {
   const result = await runChild(t, port => ({
     HTTPS_PROXY: `http://127.0.0.1:${port}`, HTTP_PROXY: `http://127.0.0.1:${port}`, NODE_USE_ENV_PROXY: '1',
   }));
-  assertFollowedOrBlocked(result, canSetAtRuntime || nodeHonoursEnvProxyFlag(process.versions.node));
+  assertFollowed(result, canSetAtRuntime || nodeHonoursEnvProxyFlag(process.versions.node));
 });
 
 test('quota providers that carry a vendor credential are not run while blocked', async (t) => {
@@ -285,7 +288,7 @@ test('the guard checks the addresses the provider will actually use', async (t) 
   const { fetchQuotaProducts } = await import('../src/quotas/registry.js');
   const home = mkdtempSync(join(tmpdir(), 'vibe-usage-env-proxy-'));
   t.after(() => rmSync(home, { recursive: true, force: true }));
-  setupEnvProxy({ env: { HTTPS_PROXY: 'socks5://127.0.0.1:7891' }, versions: NODE_24, execArgv: [], httpModule: fakeHttp() });
+  setup({ env: { HTTPS_PROXY: 'socks5://127.0.0.1:7891' }, versions: NODE_24, execArgv: [], httpModule: fakeHttp() });
   const base = { HOME: home, VIBE_USAGE_QUOTA_CACHE_DIR: join(home, 'quota-cache') };
   const run = async (ids, environment) => Object.fromEntries((await fetchQuotaProducts(ids, {
     fetchImpl: () => { throw new Error('no network in tests'); }, home, environment: { ...base, ...environment },
@@ -313,7 +316,7 @@ test('SOCKS blocks only the providers whose hosts are not bypassed', async (t) =
   const { fetchQuotaProducts } = await import('../src/quotas/registry.js');
   const home = mkdtempSync(join(tmpdir(), 'vibe-usage-env-proxy-'));
   t.after(() => rmSync(home, { recursive: true, force: true }));
-  setupEnvProxy({ env: { HTTPS_PROXY: 'socks5://127.0.0.1:7891' }, versions: NODE_24, execArgv: [], httpModule: fakeHttp() });
+  setup({ env: { HTTPS_PROXY: 'socks5://127.0.0.1:7891' }, versions: NODE_24, execArgv: [], httpModule: fakeHttp() });
   const envelope = await fetchQuotaProducts(['kimi-code', 'cursor'], {
     fetchImpl: () => { throw new Error('no network in tests'); },
     home,
@@ -325,4 +328,135 @@ test('SOCKS blocks only the providers whose hosts are not bypassed', async (t) =
   const byId = Object.fromEntries(envelope.products.map(product => [product.id, product]));
   assert.notEqual(byId['kimi-code'].status, 'unsupported');
   assert.equal(byId.cursor.status, 'unsupported');
+});
+
+// --- Our own tunnel (SOCKS5, HTTP CONNECT) for what the runtime cannot follow.
+
+test('proxy values the tunnel can speak', async () => {
+  const { parseProxy } = await import('../src/proxy-tunnel.js');
+  assert.deepEqual(parseProxy('socks5://127.0.0.1:7891'), { kind: 'socks5', host: '127.0.0.1', port: 7891, auth: undefined });
+  assert.deepEqual(parseProxy('socks5h://u:p%40ss@proxy.lan'), { kind: 'socks5', host: 'proxy.lan', port: 1080, auth: { user: 'u', pass: 'p@ss' } });
+  assert.deepEqual(parseProxy('127.0.0.1:7890'), { kind: 'http', host: '127.0.0.1', port: 7890, auth: undefined });
+  assert.equal(parseProxy('https://proxy.lan:8443').kind, 'https');
+  assert.equal(parseProxy('socks4://127.0.0.1:1080'), null);
+  assert.equal(parseProxy('socks://127.0.0.1:1080'), null);
+  assert.equal(parseProxy(''), null);
+});
+
+test('a SOCKS proxy on Node goes through the tunnel instead of being skipped', () => {
+  let installed;
+  const state = setupEnvProxy({
+    env: { HTTPS_PROXY: 'socks5://127.0.0.1:7891', NO_PROXY: 'corp.example' },
+    versions: NODE_24, execArgv: [], httpModule: fakeHttp(),
+    installTunnel: options => { installed = options; return () => {}; },
+  }).state;
+  assert.equal(state, 'tunnel');
+  assert.equal(envProxyBlock(), null);
+  assert.deepEqual(installed.proxies, { https: 'socks5://127.0.0.1:7891', http: undefined });
+  assert.equal(installed.bypass('127.0.0.1', 8080), true);
+  assert.equal(installed.bypass('localhost', 443), true);
+  assert.equal(installed.bypass('corp.example', 443), true);
+  assert.equal(installed.bypass('api.kimi.com', 443), false);
+  // What the tunnel cannot speak stays blocked.
+  assert.equal(setupEnvProxy({ env: { HTTPS_PROXY: 'socks4://127.0.0.1:1080' }, versions: NODE_24, execArgv: [],
+    httpModule: fakeHttp() }).state, 'socks');
+  assert.ok(envProxyBlock());
+});
+
+const FIXTURE = new URL('./fixtures/proxy-tunnel/', import.meta.url);
+const TARGET_HOST = 'tunnel-target.vibe-usage-proxy-test.invalid';
+
+async function tunnelHarness(t, kind) {
+  const { readFileSync } = await import('node:fs');
+  const https = await import('node:https');
+  const target = https.createServer({
+    key: readFileSync(new URL('key.pem', FIXTURE)), cert: readFileSync(new URL('cert.pem', FIXTURE)),
+  }, (req, res) => { res.setHeader('content-type', 'text/plain'); res.end(`ok ${req.method} ${req.url}`); });
+  await new Promise(resolve => target.listen(0, '127.0.0.1', resolve));
+  t.after(() => target.close());
+  const seen = [];
+  const forward = (socket, host, port, reply) => {
+    seen.push(`${host}:${port}`);
+    const upstream = net.connect(target.address().port, '127.0.0.1', () => {
+      socket.write(reply);
+      upstream.pipe(socket);
+      socket.pipe(upstream);
+    });
+    upstream.on('error', () => socket.destroy());
+    socket.on('error', () => upstream.destroy());
+  };
+  const proxy = net.createServer(socket => {
+    if (kind === 'socks5') {
+      socket.once('data', () => {
+        socket.write(Buffer.from([5, 0]));
+        socket.once('data', request => {
+          const length = request[4];
+          const host = request.subarray(5, 5 + length).toString();
+          const port = request.readUInt16BE(5 + length);
+          forward(socket, request[3] === 3 ? host : `type-${request[3]}`, port, Buffer.from([5, 0, 0, 1, 0, 0, 0, 0, 0, 0]));
+        });
+      });
+    } else {
+      socket.once('data', data => {
+        const [, hostPort] = data.toString().split('\r\n')[0].split(' ');
+        const [host, port] = hostPort.split(':');
+        forward(socket, host, Number(port), 'HTTP/1.1 200 Connection Established\r\n\r\n');
+      });
+    }
+  });
+  await new Promise(resolve => proxy.listen(0, '127.0.0.1', resolve));
+  t.after(() => proxy.close());
+  return { port: proxy.address().port, seen };
+}
+
+async function runTunnelChild(env) {
+  const moduleUrl = new URL('../src/env-proxy.js', import.meta.url).href;
+  const script = `
+    import https from 'node:https';
+    const { setupEnvProxy } = await import(${JSON.stringify(moduleUrl)});
+    const out = { state: setupEnvProxy().state };
+    try {
+      const r = await fetch('https://${TARGET_HOST}/fetch?x=1', { method: 'POST', body: new URLSearchParams({ a: 'b' }) });
+      out.fetch = r.status + ' ' + await r.text();
+    } catch (e) { out.fetch = 'error ' + (e.cause?.code || e.message); }
+    out.https = await new Promise(res => {
+      const req = https.get('https://${TARGET_HOST}/https', r => { let d = ''; r.on('data', c => d += c); r.on('end', () => res(r.statusCode + ' ' + d)); });
+      req.on('error', e => res('error ' + (e.code || e.message)));
+    });
+    console.log(JSON.stringify(out));
+  `;
+  const childEnv = { ...process.env };
+  for (const name of ['NODE_USE_ENV_PROXY', 'NODE_OPTIONS', 'HTTPS_PROXY', 'https_proxy', 'HTTP_PROXY', 'http_proxy',
+    'ALL_PROXY', 'all_proxy', 'NO_PROXY', 'no_proxy']) delete childEnv[name];
+  Object.assign(childEnv, { NODE_EXTRA_CA_CERTS: fileURLToPath(new URL('cert.pem', FIXTURE)) }, env);
+  const stdout = await new Promise((resolve, reject) => {
+    const child = spawn(process.execPath, ['--input-type=module', '-e', script], { env: childEnv });
+    const timer = setTimeout(() => { child.kill(); reject(new Error('child timed out')); }, 20_000);
+    let text = '';
+    child.stdout.on('data', chunk => { text += chunk; });
+    child.on('error', reject);
+    child.on('close', () => { clearTimeout(timer); resolve(text); });
+  });
+  return JSON.parse(stdout.trim().split('\n').pop());
+}
+
+test('on this runtime: a SOCKS5 proxy is followed through the tunnel (fetch and https)', async (t) => {
+  const { port, seen } = await tunnelHarness(t, 'socks5');
+  const out = await runTunnelChild({ ALL_PROXY: `socks5://127.0.0.1:${port}` });
+  assert.equal(out.state, 'tunnel', JSON.stringify(out));
+  assert.equal(out.fetch, '200 ok POST /fetch?x=1', JSON.stringify(out));
+  assert.equal(out.https, '200 ok GET /https', JSON.stringify(out));
+  // The proxy got the host name, never a locally resolved address.
+  assert.deepEqual(seen, [`${TARGET_HOST}:443`, `${TARGET_HOST}:443`]);
+});
+
+test('on this runtime: an HTTP proxy the runtime cannot follow goes through the tunnel', async (t) => {
+  const { port, seen } = await tunnelHarness(t, 'connect');
+  // ALL_PROXY is never read by Node itself.
+  const out = await runTunnelChild({ ALL_PROXY: `http://127.0.0.1:${port}` });
+  const runtimeFollows = typeof http.setGlobalProxyFromEnv === 'function';
+  assert.equal(out.state, runtimeFollows ? 'active' : 'tunnel', JSON.stringify(out));
+  assert.equal(out.fetch, '200 ok POST /fetch?x=1', JSON.stringify(out));
+  assert.equal(out.https, '200 ok GET /https', JSON.stringify(out));
+  assert.equal(seen.length, 2);
 });
