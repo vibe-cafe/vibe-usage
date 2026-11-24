@@ -133,6 +133,7 @@ maintainer (Hogan), 一键诊断 plan, step 2.
 | `sqlite_unavailable` | 没有可用的 SQLite |
 | `decoder_unavailable` | 缺少解压组件（zstd） |
 | `cursor_token_encrypted` | 本地登录令牌已加密（Cursor 3.27+，#144） |
+| `proxy_unsupported` | 设置了代理但无法照着走（SOCKS，或运行环境不支持），带厂商账号的请求已跳过，避免直连 |
 | `auth_rejected` | 登录凭证被拒绝，需要在该工具里重新登录 |
 | `network_timeout` | 网络请求超时 |
 | `network_failed` | 网络请求失败 |

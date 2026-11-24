@@ -6,6 +6,7 @@ import { mkdtempSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import * as cursor from '../src/parsers/cursor.js';
+import { envProxyBlock } from '../src/env-proxy.js';
 import { roundToHalfHour } from '../src/parsers/aggregate.js';
 
 const TOKEN = `header.${Buffer.from(JSON.stringify({ sub: 'auth0|cursor-test-user' })).toString('base64url')}.test-signature`;
@@ -252,6 +253,31 @@ test('Cursor reads a token stored as a SQLite BLOB', async (t) => {
   const result = await cursor.parse();
   assert.equal(result.buckets.length, 1);
   assert.match(result.info.account, /^auth0\|/);
+});
+
+// Network-privacy principle: with a proxy this process cannot follow
+// (env-proxy.js), the readable token is never sent. Same shape as the
+// encrypted-token skip: no request, no info, state and progress kept.
+for (const reason of ['socks', 'unsupported']) {
+  test(`Cursor sends nothing while the configured proxy cannot be followed (${reason})`, async (t) => {
+    await withCursorDb(t);
+    const fetchMock = t.mock.method(globalThis, 'fetch', async () => {
+      throw new Error('must not reach cursor.com directly');
+    });
+    const result = await cursor.parse({ previousInfo: RECENT_INFO(), envProxyBlock: envProxyBlock(reason) });
+    assert.equal(fetchMock.mock.callCount(), 0);
+    assert.deepEqual(Object.keys(result).sort(), ['buckets', 'sessions', 'skipped', 'warnings']);
+    assert.equal(result.skipped, true);
+    assert.equal(result.warnings.length, 1);
+    assert.match(result.warnings[0], /^cursor: Cursor 本次未同步：.*为避免直连已跳过，其他工具照常同步。$/);
+    assert.ok(!result.warnings[0].includes(TOKEN));
+  });
+}
+
+test('Cursor without a token says nothing about the proxy', async (t) => {
+  await withCursorDb(t, { value: '' });
+  const result = await cursor.parse({ envProxyBlock: envProxyBlock('socks') });
+  assert.deepEqual(result, { buckets: [], sessions: [] });
 });
 
 // Issue #144: Cursor 3.27+ stores `cursor-safe-storage:<version>:<base64>`.

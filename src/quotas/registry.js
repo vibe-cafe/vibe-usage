@@ -9,6 +9,13 @@ import { fetchKimiCodeQuota } from './providers/kimi-code.js';
 import { fetchOpenCodeGoQuota } from './providers/opencode-go.js';
 import { fetchZaiQuota } from './providers/zai.js';
 import { FETCHABLE_QUOTA_PRODUCT_IDS, quotaEnvelope, quotaResult } from './schema.js';
+import { envProxyBlock } from '../env-proxy.js';
+
+// Providers whose own request carries the user's vendor credential. When the
+// environment names a proxy this process cannot follow, they are not run
+// (network-privacy principle). Grok reads a local log; Antigravity talks to a
+// local language server and the official program makes its own requests.
+const VENDOR_NETWORK_PROVIDERS = new Set(['kimi-code', 'zcode', 'opencode-go', 'cursor']);
 
 const providers = new Map([
   ['kimi-code', fetchKimiCodeQuota],
@@ -110,7 +117,13 @@ export async function fetchQuotaProducts(ids, options = {}) {
   const invalid = unique.filter(id => !FETCHABLE_QUOTA_PRODUCT_IDS.includes(id));
   if (invalid.length) throw new Error(`Unsupported quota product: ${invalid.join(', ')}`);
 
+  const block = options.envProxyBlock !== undefined ? options.envProxyBlock : envProxyBlock();
   const fetched = await Promise.all(unique.map(async id => {
+    if (block && VENDOR_NETWORK_PROVIDERS.has(id)) {
+      // Not a failure: nothing was sent. `unsupported` keeps the desktop apps
+      // from offering a retry and the cache from answering in its place.
+      return quotaResult({ id, status: 'unsupported', message: block.message });
+    }
     try {
       return await providers.get(id)(options);
     } catch {
