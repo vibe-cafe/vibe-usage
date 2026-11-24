@@ -29,7 +29,7 @@ import { mkdirSync, readFileSync, renameSync, writeFileSync } from 'node:fs';
 import https from 'node:https';
 import { homedir, networkInterfaces } from 'node:os';
 import { dirname, join } from 'node:path';
-import { chosenProxies, noProxyMatches } from './env-proxy.js';
+import { chosenProxies } from './env-proxy.js';
 
 /** Regions the paused vendors do not serve and our users may be in. */
 export const UNSUPPORTED_EGRESS_REGIONS = Object.freeze(['CN', 'HK', 'MO']);
@@ -77,11 +77,37 @@ export function proxyRequired(environment = process.env) {
 }
 
 /**
+ * A bypass list (`NO_PROXY`) read broadly, as any runtime might: `*`, an
+ * exact host, or a domain and its subdomains (with or without a leading `.`
+ * / `*.`); ports are ignored. `agy` (Go) reads a bare `googleapis.com` as its
+ * subdomains too, while `env-proxy.js` reads it narrowly for our own
+ * requests. For this check, reading a host as direct costs one check and
+ * reading it as proxied would skip one.
+ */
+export function bypassedBroadly(url, environment = process.env) {
+  let host;
+  try {
+    host = new URL(String(url).includes('://') ? url : `https://${url}`).hostname.toLowerCase().replace(/^\[|\]$/g, '');
+  } catch {
+    return false;
+  }
+  const list = ['no_proxy', 'NO_PROXY'].map(name => String(environment[name] ?? '').trim()).find(Boolean) || '';
+  return list.split(/[,\s]+/).filter(Boolean).some(raw => {
+    let entry = raw.toLowerCase();
+    if (entry === '*') return true;
+    if (!entry.startsWith('[')) entry = entry.replace(/:\d+$/, '');
+    entry = entry.replace(/^\*?\./, '');
+    return Boolean(entry) && (host === entry || host.endsWith(`.${entry}`));
+  });
+}
+
+/**
  * `proxy` when a request to `url` would go through the environment's proxy,
- * `direct` otherwise (no proxy variable, or the URL is on the bypass list).
+ * `direct` otherwise (no proxy variable, or the URL on the bypass list as
+ * any runtime might read it).
  */
 export function routeFor(url, environment = process.env) {
-  return chosenProxies(environment).https && !noProxyMatches(url, environment) ? 'proxy' : 'direct';
+  return chosenProxies(environment).https && !bypassedBroadly(url, environment) ? 'proxy' : 'direct';
 }
 
 /** The two-letter country in a trace body, or null (unknown, Tor, absent). */
@@ -135,7 +161,8 @@ export function fetchTraceRegion(host, { timeoutMs = TRACE_TIMEOUT_MS, httpsModu
         headers: { accept: 'text/plain' },
       }, response => {
         if (response.statusCode !== 200) {
-          response.resume();
+          // No country here: stop reading at once.
+          request.destroy();
           done(null);
           return;
         }

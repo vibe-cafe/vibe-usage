@@ -45,6 +45,15 @@ test('routeFor follows the environment proxy and its bypass list', () => {
   assert.equal(routeFor('https://daily-cloudcode-pa.googleapis.com/', {
     HTTPS_PROXY: 'http://127.0.0.1:7890', NO_PROXY: '.googleapis.com',
   }), 'direct');
+  // Read broadly: agy takes a bare domain for its subdomains too.
+  for (const list of ['googleapis.com', '*.googleapis.com:443', 'localhost, googleapis.com', '*']) {
+    assert.equal(routeFor('https://daily-cloudcode-pa.googleapis.com/', {
+      HTTPS_PROXY: 'http://127.0.0.1:7890', no_proxy: list,
+    }), 'direct', list);
+  }
+  assert.equal(routeFor('https://daily-cloudcode-pa.googleapis.com/', {
+    HTTPS_PROXY: 'http://127.0.0.1:7890', NO_PROXY: 'notgoogleapis.com',
+  }), 'proxy');
 });
 
 test('a product whose hosts all go through a proxy is never checked', async t => {
@@ -84,6 +93,18 @@ test('a direct read pauses for an unsupported egress and goes ahead for a suppor
       assert.match(result.message, /^Paused: /);
     }
   }
+});
+
+test('a bare bypass entry for Google with a proxy set still checks (and the manual setting still pauses)', async t => {
+  const { trace, calls } = tracer('CN');
+  const base = { HTTPS_PROXY: 'http://127.0.0.1:7890', NO_PROXY: 'googleapis.com,chatgpt.com', VIBE_USAGE_QUOTA_CACHE_DIR: cacheDir(t) };
+  const paused = await egressPauseFor('antigravity', { environment: base, now: NOW, trace, fingerprint: 'a' });
+  assert.equal(paused.pauseReason, 'egressRegionUnsupported');
+  assert.deepEqual(calls, ['chatgpt.com']);
+  const manual = await egressPauseFor('antigravity', {
+    environment: { ...base, VIBE_USAGE_REQUIRE_PROXY: '1' }, now: NOW, trace, fingerprint: 'a',
+  });
+  assert.equal(manual.pauseReason, 'proxyNotDetected');
 });
 
 test('the manual "relies on a local proxy" setting pauses a direct read without a check', async t => {
@@ -229,8 +250,10 @@ test('the trace request is anonymous, direct and bounded', async () => {
   assert.notEqual(options.agent, module.globalAgent);
   assert.deepEqual(options.headers, { accept: 'text/plain' });
 
-  const status = fakeHttps((request, onResponse) => onResponse(response(403, ['loc=US\n'])));
+  let destroyed;
+  const status = fakeHttps((request, onResponse) => { destroyed = request; onResponse(response(403, ['loc=US\n'])); });
   assert.equal(await fetchTraceRegion('chatgpt.com', { httpsModule: status.module }), null);
+  assert.equal(destroyed.destroyed, true);
   const failing = fakeHttps(request => request.emit('error', new Error('ECONNRESET')));
   assert.equal(await fetchTraceRegion('chatgpt.com', { httpsModule: failing.module }), null);
   const silent = fakeHttps(() => {});
