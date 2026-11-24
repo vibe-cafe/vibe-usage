@@ -49,9 +49,15 @@ export function parseProxy(value) {
   const kind = { 'http:': 'http', 'https:': 'https', 'socks5:': 'socks5', 'socks5h:': 'socks5' }[url.protocol];
   if (!kind || !url.hostname) return null;
   const port = Number(url.port || DEFAULT_PORTS[url.protocol]);
-  const auth = url.username
-    ? { user: decodeURIComponent(url.username), pass: decodeURIComponent(url.password) }
-    : undefined;
+  let auth;
+  try {
+    auth = url.username
+      ? { user: decodeURIComponent(url.username), pass: decodeURIComponent(url.password) }
+      : undefined;
+  } catch {
+    // A stray `%` in the credentials: an address we cannot use, not a crash.
+    return null;
+  }
   return { kind, host: url.hostname.replace(/^\[|\]$/g, ''), port, auth };
 }
 
@@ -96,7 +102,9 @@ function openProxySocket(proxy) {
     const socket = proxy.kind === 'https'
       ? tls.connect({ host: proxy.host, port: proxy.port, servername: net.isIP(proxy.host) ? undefined : proxy.host })
       : net.connect({ host: proxy.host, port: proxy.port });
-    const timer = setTimeout(() => socket.destroy(new Error('proxy connect timed out')), CONNECT_TIMEOUT_MS);
+    const timer = setTimeout(() => {
+      socket.destroy(Object.assign(new Error('proxy connect timed out'), { code: 'ETIMEDOUT' }));
+    }, CONNECT_TIMEOUT_MS);
     socket.once(proxy.kind === 'https' ? 'secureConnect' : 'connect', () => { clearTimeout(timer); resolve(socket); });
     socket.once('error', error => { clearTimeout(timer); reject(error); });
   });
@@ -291,7 +299,8 @@ function decoded(response) {
   return decoder;
 }
 
-const CREDENTIAL_HEADERS = ['authorization', 'cookie', 'proxy-authorization'];
+// Antigravity's local endpoint takes its token in a header of its own.
+const CREDENTIAL_HEADERS = ['authorization', 'cookie', 'proxy-authorization', 'x-codeium-csrf-token'];
 
 /**
  * `fetch` over the tunnel agents: the subset the CLI uses (method, headers,

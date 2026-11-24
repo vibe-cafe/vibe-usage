@@ -349,6 +349,8 @@ async function requestTokenRefresh({
     try {
       const response = await fetchImpl(oauthURL, {
         method: 'POST',
+        // A refresh token is never handed on to wherever a redirect points.
+        redirect: 'error',
         headers: {
           Accept: 'application/json',
           'Content-Type': 'application/x-www-form-urlencoded',

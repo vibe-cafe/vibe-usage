@@ -336,6 +336,8 @@ test('proxy values the tunnel can speak', async () => {
   const { parseProxy } = await import('../src/proxy-tunnel.js');
   assert.deepEqual(parseProxy('socks5://127.0.0.1:7891'), { kind: 'socks5', host: '127.0.0.1', port: 7891, auth: undefined });
   assert.deepEqual(parseProxy('socks5h://u:p%40ss@proxy.lan'), { kind: 'socks5', host: 'proxy.lan', port: 1080, auth: { user: 'u', pass: 'p@ss' } });
+  // A stray `%` in the password: unusable, not a crash before the CLI starts.
+  assert.equal(parseProxy('socks5://u:50%@proxy.lan'), null);
   assert.deepEqual(parseProxy('127.0.0.1:7890'), { kind: 'http', host: '127.0.0.1', port: 7890, auth: undefined });
   assert.equal(parseProxy('https://proxy.lan:8443').kind, 'https');
   assert.equal(parseProxy('socks4://127.0.0.1:1080'), null);
