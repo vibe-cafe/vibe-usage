@@ -10,6 +10,7 @@ import { fetchOpenCodeGoQuota, openCodeGoNetworkURLs } from './providers/opencod
 import { fetchZaiQuota, zaiNetworkURLs } from './providers/zai.js';
 import { FETCHABLE_QUOTA_PRODUCT_IDS, quotaEnvelope, quotaResult } from './schema.js';
 import { envProxyBlockFor } from '../env-proxy.js';
+import { egressPauseFor } from '../egress-check.js';
 
 // Providers whose own request carries the user's vendor credential. When the
 // environment names a proxy this process cannot follow, they are not run
@@ -135,6 +136,15 @@ export async function fetchQuotaProducts(ids, options = {}) {
       // Not a failure: nothing was sent. `unsupported` keeps the desktop apps
       // from offering a retry and the cache from answering in its place.
       return quotaResult({ id, status: 'unsupported', message: block.message });
+    }
+    // A vendor that pauses when the egress is wrong, read direct: check the
+    // egress first (`egress-check.js`). Paused is not a failure either.
+    const paused = await (options.egressPause || egressPauseFor)(id, { environment, now: options.now || new Date() });
+    if (paused) {
+      return quotaResult({
+        id, status: 'unsupported', message: paused.message,
+        pauseReason: paused.pauseReason, egressRegion: paused.region,
+      });
     }
     try {
       return await providers.get(id)(options);

@@ -31,6 +31,19 @@ export const QUOTA_EMPTY_REASONS = Object.freeze([
   'sessionWithoutPlanLimits',
 ]);
 
+/**
+ * Why a read was not sent on purpose (network-privacy principle), additive
+ * within schema v1 and only with status `unsupported`. Shared with the desktop
+ * clients, which show a fixed line for each and offer no retry: the next read
+ * checks again. `egressRegion` (two letters) comes with
+ * `egressRegionUnsupported`. The reserved #190 vocabulary may add more.
+ */
+export const QUOTA_PAUSE_REASONS = Object.freeze([
+  'egressRegionUnsupported',
+  'egressUnconfirmed',
+  'proxyNotDetected',
+]);
+
 const FETCH_STATUSES = new Set([
   'ok',
   'no_data',
@@ -158,6 +171,8 @@ export function quotaResult({
   message,
   source = 'live',
   emptyReason,
+  pauseReason,
+  egressRegion,
 }) {
   if (!FETCHABLE_QUOTA_PRODUCT_IDS.includes(id)) {
     throw new TypeError(`unsupported quota product: ${id}`);
@@ -181,6 +196,13 @@ export function quotaResult({
       throw new TypeError(`invalid quota emptyReason: ${emptyReason}`);
     }
     result.emptyReason = emptyReason;
+  }
+  if (pauseReason !== undefined && pauseReason !== null) {
+    if (!QUOTA_PAUSE_REASONS.includes(pauseReason) || status !== 'unsupported') {
+      throw new TypeError(`invalid quota pauseReason: ${pauseReason}`);
+    }
+    result.pauseReason = pauseReason;
+    if (typeof egressRegion === 'string' && /^[A-Z]{2}$/.test(egressRegion)) result.egressRegion = egressRegion;
   }
   return result;
 }
