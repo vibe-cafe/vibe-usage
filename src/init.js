@@ -1,9 +1,9 @@
 import { createInterface } from 'node:readline';
-import { DEFAULT_API_URL } from './api-url.js';
-import { execFile } from 'node:child_process';
-import { hostname as osHostname, platform } from 'node:os';
+import { DEFAULT_API_URL, isPlaintextRemoteApiUrl } from './api-url.js';
+import { hostname as osHostname } from 'node:os';
 import { loadConfig, saveConfig } from './config.js';
 import { fetchAccount, ingest, requestDeviceCode, pollDeviceCode } from './api.js';
+import { planLoginPage, printableLink, runBrowserCommand } from './login-page.js';
 import { runSync } from './sync.js';
 import { detectInstalledTools } from './tools.js';
 import { bigHeader, success, failure, warn, arrow, link, dim, divider } from './output.js';
@@ -19,22 +19,6 @@ function prompt(question) {
       resolve(answer.trim());
     });
   });
-}
-
-function openBrowser(url) {
-  // `start` is a cmd.exe builtin, not an executable: execFile('start', …) fails
-  // outright on Windows, so the device-flow login never opened a tab and the
-  // user was left staring at the code with no browser to type it into. Go
-  // through cmd, and escape a bare `&` (present in verificationUriComplete's
-  // query string) or cmd would read it as a command separator.
-  if (platform() === 'win32') {
-    execFile('cmd', ['/c', 'start', '', url.replace(/&/g, '^&')], { windowsHide: true }, () => {});
-    return;
-  }
-  const cmds = { darwin: 'open', linux: 'xdg-open' };
-  const cmd = cmds[platform()] || cmds.linux;
-  // Use execFile with args array to avoid shell injection via VIBE_USAGE_API_URL
-  execFile(cmd, [url], () => {});
 }
 
 export async function runInit(options = {}) {
@@ -59,6 +43,10 @@ export async function runInit(options = {}) {
 
   const apiUrl = process.env.VIBE_USAGE_API_URL || DEFAULT_API_URL;
   const host = existing?.hostname || osHostname().replace(/\.local$/, '');
+  // A warning, not a refusal: self-hosting on a LAN over http is a real setup.
+  if (isPlaintextRemoteApiUrl(apiUrl)) {
+    console.log(warn(`服务器 ${apiUrl} 用的是明文 http，API Key 和用量数据会不加密传输；局域网自托管可以忽略，公网服务器请改用 https。`));
+  }
 
   let apiKey;
   if (providedKey) {
@@ -144,11 +132,19 @@ async function runDeviceFlow(apiUrl, hostname) {
     return null;
   }
 
-  console.log(`${arrow('登录确认')} ${link(device.verificationUriComplete)}`);
+  // The link comes from the server's reply: see login-page.js for what is
+  // checked before a browser is opened.
+  const loginPage = planLoginPage(device.verificationUriComplete, apiUrl);
+  const shown = loginPage.url ? link(loginPage.url) : printableLink(device.verificationUriComplete);
+  console.log(`${arrow('登录确认')} ${shown}`);
   console.log(`  验证码: ${device.userCode}`);
-  console.log(dim('  浏览器会自动打开；如果没反应，请手动复制上方链接。'));
+  if (loginPage.command) {
+    console.log(dim('  浏览器会自动打开；如果没反应，请手动复制上方链接。'));
+  } else {
+    console.log(warn('登录链接不像是本服务器的登录页，为安全起见没有自动打开浏览器；确认可信再手动复制打开。'));
+  }
   console.log();
-  openBrowser(device.verificationUriComplete);
+  if (loginPage.command) runBrowserCommand(loginPage.command);
 
   const intervalMs = (device.interval || 5) * 1000;
   const deadline = Date.now() + (device.expiresIn || 900) * 1000;

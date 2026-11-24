@@ -5,7 +5,7 @@ import { mkdtempSync, readFileSync, rmSync, statSync, writeFileSync } from 'node
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import {
-  DEFAULT_API_URL, currentApiUrl, isLegacyApiUrl, migrateConfigApiUrl, sameApiServer,
+  DEFAULT_API_URL, currentApiUrl, isLegacyApiUrl, isPlaintextRemoteApiUrl, migrateConfigApiUrl, sameApiServer,
 } from '../src/api-url.js';
 
 function probe(source, env) {
@@ -155,5 +155,15 @@ test('upload state recorded against the old name survives the switch (no full re
     assert.equal(result.otherKey, 'mismatch');
   } finally {
     rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test('plain http to another machine is flagged; loopback and https are not', () => {
+  for (const url of ['http://192.168.1.5:3000', 'http://usage.example.com', 'HTTP://Example.com/vibe', 'http://10.0.0.2']) {
+    assert.equal(isPlaintextRemoteApiUrl(url), true, url);
+  }
+  for (const url of ['http://localhost:3000', 'http://LOCALHOST', 'http://127.0.0.1:3456', 'http://[::1]:3000',
+    'https://vibefriends.com', 'https://192.168.1.5:3000', 'not a url', '', undefined]) {
+    assert.equal(isPlaintextRemoteApiUrl(url), false, String(url));
   }
 });
