@@ -29,6 +29,7 @@
 import http from 'node:http';
 
 const PROXY_VARIABLES = ['HTTPS_PROXY', 'https_proxy', 'HTTP_PROXY', 'http_proxy'];
+const ALL_PROXY_VARIABLES = ['ALL_PROXY', 'all_proxy'];
 const LOOPBACK = ['localhost', '127.0.0.1', '::1'];
 
 let current = { state: 'none' };
@@ -64,14 +65,49 @@ export function nodeHonoursEnvProxyFlag(version) {
   return false;
 }
 
+/**
+ * One bypass list from both spellings (Node prefers lowercase, other programs
+ * uppercase), plus loopback, written back to `NO_PROXY` and to `no_proxy`
+ * when that exists, so no reader loses an entry the user wrote in either.
+ */
 function addLoopbackToNoProxy(env) {
-  for (const name of ['NO_PROXY', 'no_proxy']) {
-    if (name === 'no_proxy' && env.no_proxy === undefined) continue;
-    const entries = (env[name] || '').split(/[,\s]+/).filter(Boolean);
-    if (entries.includes('*')) continue;
-    const missing = LOOPBACK.filter(host => !entries.includes(host));
-    if (missing.length) env[name] = [...entries, ...missing].join(',');
+  const entries = [];
+  for (const name of ['no_proxy', 'NO_PROXY']) {
+    for (const entry of (env[name] || '').split(/[,\s]+/).filter(Boolean)) {
+      if (!entries.includes(entry)) entries.push(entry);
+    }
   }
+  if (entries.includes('*')) return;
+  const merged = [...entries, ...LOOPBACK.filter(host => !entries.includes(host))].join(',');
+  env.NO_PROXY = merged;
+  if (env.no_proxy !== undefined) env.no_proxy = merged;
+}
+
+/**
+ * curl's reading of the variables Node ignores: `ALL_PROXY` stands for every
+ * scheme, and an `HTTP_PROXY` alone also covers https (Node's fetch already
+ * does that, its https agent does not). Copied in this process only, so both
+ * request paths and every child see the same proxy. Returns the variables.
+ */
+function fillFromCurlConventions(env) {
+  let variables = proxyVariables(env);
+  if (variables.length === 0) {
+    const all = ALL_PROXY_VARIABLES
+      .map(name => (typeof env[name] === 'string' ? env[name].trim() : ''))
+      .find(Boolean);
+    if (all) {
+      env.HTTPS_PROXY = all;
+      env.HTTP_PROXY = all;
+      variables = proxyVariables(env);
+    }
+  }
+  const https = env.https_proxy?.trim() || env.HTTPS_PROXY?.trim();
+  const http = env.http_proxy?.trim() || env.HTTP_PROXY?.trim();
+  if (!https && http) {
+    env.HTTPS_PROXY = http;
+    variables = proxyVariables(env);
+  }
+  return variables;
 }
 
 /**
@@ -81,8 +117,10 @@ function addLoopbackToNoProxy(env) {
  *   - `active`: requests go through the proxy;
  *   - `socks`: a SOCKS proxy, which Node's https cannot follow;
  *   - `unsupported`: a proxy is set but this runtime cannot be made to follow it.
- * Mutates only this process's environment: a value without a scheme becomes
- * `http://…` (as curl reads it) and loopback joins NO_PROXY.
+ * Mutates only this process's environment, the way curl reads the same
+ * variables: `ALL_PROXY` alone stands for every scheme, `HTTP_PROXY` alone
+ * also covers https, a value without a scheme is `http://…`, and loopback
+ * joins NO_PROXY.
  */
 export function setupEnvProxy({
   env = process.env,
@@ -90,7 +128,7 @@ export function setupEnvProxy({
   execArgv = process.execArgv,
   httpModule = http,
 } = {}) {
-  const variables = proxyVariables(env);
+  const variables = fillFromCurlConventions(env);
   if (variables.length === 0) {
     current = { state: 'none' };
     return current;

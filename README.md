@@ -184,7 +184,7 @@ Cursor 用量优先读取 `cursor.com` 的 CSV 导出（模型名最准确）。
 - X 订阅（The X Subscription）账号的用量由 Cursor 与 Grok 共享：如果 Cursor 仪表盘本身没有新事件，请到 `grok.com/dashboard` 的 Usage 查看；CLI 只能读取 Cursor 仪表盘返回的 Cursor 事件。
 - 只有 X Premium+ / Grok 订阅、但 Cursor 里显示 `Free`：X Premium+ 不会自动把 Cursor 计划升级，需要在 `cursor.com/unify` 合并到 The X Subscription 后，Cursor 用量才进入共享池。`cursor.com/api/dashboard/get-sand-usage-status` 返回 `includedUsageSuperGrokPlan: "x-premium-plus"` 且 `cursorPlanName: "Free"` 就是这种状态。
 
-**代理**：环境变量里设了 `HTTPS_PROXY` / `HTTP_PROXY`（大小写均可）时，CLI 的所有请求都照着走。Node.js **24.14+**（以及 Bun）会自动启用；Node.js **22.21+ / 24.5+** 需要同时设 `NODE_USE_ENV_PROXY=1`（[Node.js 官方说明](https://nodejs.org/en/learn/http/enterprise-network-configuration)）。没写协议头的地址（`127.0.0.1:7890`）按 `http://` 处理，本机回环地址永远不走代理。如果代理是 SOCKS，或当前 Node.js 无法按代理联网，CLI **不会改走直连**：Cursor 同步、Kimi / ZCode / OpenCode Go / Cursor 配额这些带厂商账号的请求会跳过并说明原因，其他工具照常同步。以下为 macOS/Linux 终端示例，代理地址须替换为实际地址：
+**代理**：环境变量里设了 `HTTPS_PROXY` / `HTTP_PROXY`（大小写均可）时，CLI 的所有请求都照着走。Node.js **24.14+**（以及 Bun）会自动启用；Node.js **22.21+ / 24.5+** 需要同时设 `NODE_USE_ENV_PROXY=1`（[Node.js 官方说明](https://nodejs.org/en/learn/http/enterprise-network-configuration)）。读法和 curl 一致：只设 `ALL_PROXY` 时代表所有协议，只设 `HTTP_PROXY` 时 https 也走它，没写协议头的地址（`127.0.0.1:7890`）按 `http://` 处理（但同时设了 `NODE_USE_ENV_PROXY=1` 时请写完整地址，否则 Node 在 CLI 启动前就会报错退出）；`NO_PROXY` / `no_proxy` 两种写法合并生效，本机回环地址永远不走代理。如果代理是 SOCKS，或当前 Node.js 无法按代理联网，CLI **不会改走直连**：Cursor 同步、Kimi / ZCode / OpenCode Go / Cursor 配额这些带厂商账号的请求会跳过并说明原因，其他工具照常同步。以下为 macOS/Linux 终端示例，代理地址须替换为实际地址：
 
 ```bash
 HTTPS_PROXY=http://127.0.0.1:7890 NODE_USE_ENV_PROXY=1 npx @vibe-cafe/vibe-usage sync
