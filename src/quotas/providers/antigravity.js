@@ -193,6 +193,7 @@ export async function fetchAntigravityQuota({
   environment = process.env, home = homedir(), platform = process.platform,
   now = new Date(), timeoutMs = 20000, sessionImpl = withAntigravitySession,
   requestImpl = requestAntigravityQuota, commandImpl = runAntigravityCommand,
+  egressGate = async () => null,
 } = {}) {
   const result = (status, extra = {}) => quotaResult({ id: 'antigravity', status, fetchedAt: now, ...extra });
   const ok = meters => result('ok', { meters });
@@ -230,6 +231,17 @@ export async function fetchAntigravityQuota({
   const binary = antigravityBinary(environment, home, platform);
   const desktop = firstExecutable(antigravityDesktopPaths(environment, home, platform), platform);
   if (!binary && !desktop) return result('missing_credentials', { message: 'Install agy or Antigravity Desktop and sign in' });
+  // Every path below makes Google see the account (agy or the language server
+  // asks with the user's login): check the egress first (`egress-check.js`,
+  // handed in by the registry). Keep this call right before the first step
+  // that asks Google, after any rule that decides not to ask at all, so a
+  // read that sends nothing never checks.
+  const paused = await egressGate();
+  if (paused) {
+    return result('unsupported', {
+      message: paused.message, pauseReason: paused.pauseReason, egressRegion: paused.region,
+    });
+  }
   if (binary) {
     try {
       const meters = await sessionImpl(binary, readMeters, optionsFor());

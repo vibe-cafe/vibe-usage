@@ -181,6 +181,8 @@ test('networkFingerprint covers external addresses only and changes with them', 
   assert.equal(networkFingerprint({ en0: [wifi], lo0: [lo] }), base);
   assert.equal(networkFingerprint({ en0: [wifi] }), base);
   assert.notEqual(networkFingerprint({ lo0: [lo], en0: [wifi], utun4: [tun] }), base);
+  const linkLocal = { address: 'fe80::1c2b:3cff:fe4d:5e6f', family: 'IPv6', internal: false };
+  assert.equal(networkFingerprint({ lo0: [lo], en0: [wifi], awdl0: [linkLocal] }), base);
   assert.match(base, /^[0-9a-f]{16}$/);
 });
 
@@ -260,6 +262,16 @@ test('quota fetch reports a pause as unsupported with its reason and starts noth
   assert.equal(manual.pauseReason, 'proxyNotDetected');
   assert.equal(manual.egressRegion, undefined);
   assert.deepEqual(started, []);
+
+  // Nothing installed: nothing would reach Google, so nothing is checked.
+  let checked = 0;
+  const { products: [missing] } = await fetchQuotaProducts(['antigravity'], {
+    environment: { VIBE_USAGE_QUOTA_CACHE_DIR: environment.VIBE_USAGE_QUOTA_CACHE_DIR, PATH: '' },
+    home: cacheDir(t), platform: 'linux', commandImpl: never, sessionImpl: never,
+    egressPause: async () => { checked += 1; return { pauseReason: 'egressUnconfirmed', message: 'Paused' }; },
+  });
+  assert.equal(missing.status, 'missing_credentials');
+  assert.equal(checked, 0);
 });
 
 test('pauseReason is a closed vocabulary and only travels with unsupported', () => {

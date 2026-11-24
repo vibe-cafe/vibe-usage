@@ -94,12 +94,15 @@ export function traceRegion(body) {
 /**
  * The machine's network addresses, hashed: switching networks or turning a
  * TUN adapter on or off changes it, and with it every cached answer.
+ * Loopback and IPv6 link-local addresses are left out (macOS's AirDrop
+ * interfaces come and go with link-local addresses only), as in the apps.
  */
 export function networkFingerprint(interfaces = networkInterfaces()) {
   const entries = [];
   for (const [name, addresses] of Object.entries(interfaces || {})) {
     for (const address of addresses || []) {
-      if (!address.internal) entries.push(`${name}|${address.family}|${address.address}`);
+      if (address.internal || /^fe[89ab]/i.test(address.address)) continue;
+      entries.push(`${name}|${address.family}|${address.address}`);
     }
   }
   return createHash('sha256').update(entries.sort().join('\n')).digest('hex').slice(0, 16);

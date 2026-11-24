@@ -10,7 +10,7 @@ import { fetchOpenCodeGoQuota, openCodeGoNetworkURLs } from './providers/opencod
 import { fetchZaiQuota, zaiNetworkURLs } from './providers/zai.js';
 import { FETCHABLE_QUOTA_PRODUCT_IDS, quotaEnvelope, quotaResult } from './schema.js';
 import { envProxyBlockFor } from '../env-proxy.js';
-import { egressPauseFor } from '../egress-check.js';
+import { EGRESS_GATED_PRODUCTS, egressPauseFor } from '../egress-check.js';
 
 // Providers whose own request carries the user's vendor credential. When the
 // environment names a proxy this process cannot follow, they are not run
@@ -137,17 +137,14 @@ export async function fetchQuotaProducts(ids, options = {}) {
       // from offering a retry and the cache from answering in its place.
       return quotaResult({ id, status: 'unsupported', message: block.message });
     }
-    // A vendor that pauses when the egress is wrong, read direct: check the
-    // egress first (`egress-check.js`). Paused is not a failure either.
-    const paused = await (options.egressPause || egressPauseFor)(id, { environment, now: options.now || new Date() });
-    if (paused) {
-      return quotaResult({
-        id, status: 'unsupported', message: paused.message,
-        pauseReason: paused.pauseReason, egressRegion: paused.region,
-      });
-    }
+    // A vendor that pauses when the egress is wrong: the provider calls this
+    // right before it would make the vendor see the account
+    // (`egress-check.js`), so a read that sends nothing checks nothing.
+    const gated = Object.hasOwn(EGRESS_GATED_PRODUCTS, id) ? {
+      egressGate: () => (options.egressPause || egressPauseFor)(id, { environment, now: options.now || new Date() }),
+    } : {};
     try {
-      return await providers.get(id)(options);
+      return await providers.get(id)({ ...options, ...gated });
     } catch {
       return quotaResult({ id, status: 'retryable_error', message: 'Provider failed unexpectedly' });
     }
