@@ -1,7 +1,10 @@
-import { readFileSync, writeFileSync, chmodSync, mkdirSync, existsSync } from 'node:fs';
+import { readFileSync, writeFileSync, chmodSync, mkdirSync, existsSync, renameSync, rmSync } from 'node:fs';
+import { randomBytes } from 'node:crypto';
 import { join } from 'node:path';
 import { homedir } from 'node:os';
 import { moveDirectoryOutOfFilePath } from './path-repair.js';
+import { migrateConfigApiUrl, sameApiServer, DEFAULT_API_URL } from './api-url.js';
+import { migrateStateIdentityApiUrl } from './state.js';
 
 // VIBE_USAGE_CONFIG_DIR overrides the dir (test hook).
 const CONFIG_DIR = process.env.VIBE_USAGE_CONFIG_DIR?.trim() || join(homedir(), '.vibe-usage');
@@ -14,11 +17,45 @@ export function getConfigPath() {
 
 export function loadConfig() {
   if (!existsSync(CONFIG_FILE)) return null;
+  let config;
   try {
-    return JSON.parse(readFileSync(CONFIG_FILE, 'utf-8'));
+    config = JSON.parse(readFileSync(CONFIG_FILE, 'utf-8'));
   } catch {
     return null;
   }
+  // 2026-11-24 domain move (see api-url.js): every command talks to the new
+  // host. Only in memory here — `doctor` and the other readers must not write;
+  // `sync` persists it through persistApiUrlMigration().
+  if (!isDev) migrateConfigApiUrl(config);
+  return config;
+}
+
+/**
+ * Write the domain move to config.json so the desktop apps, which read the
+ * file for their dashboard, follow without an app update. Re-reads the file
+ * right before writing and patches only the URL fields, so a key or setting a
+ * desktop app saved a moment ago is kept; the replace is atomic, so a crash
+ * cannot leave a half-written key file.
+ */
+export function persistApiUrlMigration() {
+  if (isDev || !existsSync(CONFIG_FILE)) return false;
+  let current;
+  try {
+    current = JSON.parse(readFileSync(CONFIG_FILE, 'utf-8'));
+  } catch {
+    return false;
+  }
+  if (!migrateConfigApiUrl(current)) return false;
+  const tempPath = `${CONFIG_FILE}.${process.pid}.${randomBytes(6).toString('hex')}.tmp`;
+  try {
+    writeFileSync(tempPath, JSON.stringify(current, null, 2) + '\n', { encoding: 'utf-8', mode: 0o600 });
+    renameSync(tempPath, CONFIG_FILE);
+  } catch (err) {
+    try { rmSync(tempPath, { force: true }); } catch { /* best effort */ }
+    throw err;
+  }
+  try { chmodSync(CONFIG_FILE, 0o600); } catch { /* rename kept the temp file's 0600 */ }
+  return true;
 }
 
 export function saveConfig(config) {
@@ -36,5 +73,11 @@ export function saveConfig(config) {
     // Windows permission models vary; on POSIX, do not silently leave an API
     // key file broader than owner-only if hardening a pre-existing file fails.
     if (process.platform !== 'win32') throw err;
+  }
+  // Any save of the new production URL (e.g. `config set` before the first
+  // sync on this version) renames state.json's server too, keeping the pair
+  // consistent for an older CLI that compares them as plain strings.
+  if (!isDev && sameApiServer(config?.apiUrl, DEFAULT_API_URL)) {
+    try { migrateStateIdentityApiUrl(); } catch { /* sync retries this */ }
   }
 }

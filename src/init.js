@@ -1,4 +1,5 @@
 import { createInterface } from 'node:readline';
+import { DEFAULT_API_URL } from './api-url.js';
 import { execFile } from 'node:child_process';
 import { hostname as osHostname, platform } from 'node:os';
 import { loadConfig, saveConfig } from './config.js';
@@ -56,7 +57,7 @@ export async function runInit(options = {}) {
     }
   }
 
-  const apiUrl = process.env.VIBE_USAGE_API_URL || 'https://vibecafe.ai';
+  const apiUrl = process.env.VIBE_USAGE_API_URL || DEFAULT_API_URL;
   const host = existing?.hostname || osHostname().replace(/\.local$/, '');
 
   let apiKey;

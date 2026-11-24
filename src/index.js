@@ -1,4 +1,5 @@
 import { loadConfig, saveConfig, getConfigPath } from './config.js';
+import { currentApiUrl } from './api-url.js';
 import { detectInstalledTools, TOOLS } from './tools.js';
 import { existsSync } from 'node:fs';
 import { validateExtraCodexHome } from './codex-roots.js';
@@ -51,9 +52,9 @@ async function showStatus() {
   } else {
     console.log(`  Config: ${getConfigPath()}`);
     console.log(`  API key: ${config.apiKey.slice(0, 8)}...`);
-    console.log(`  API URL: ${config.apiUrl || 'https://vibecafe.ai'}`);
+    console.log(`  API URL: ${currentApiUrl(config.apiUrl)}`);
     // 数据算在谁名下,是这里最该回答、以前偏偏答不出的一件事。
-    await printBoundAccount(config.apiUrl || 'https://vibecafe.ai', config.apiKey);
+    await printBoundAccount(currentApiUrl(config.apiUrl), config.apiKey);
     if (config.codexExtraHome) {
       console.log(`  Extra Codex Home: ${config.codexExtraHome}`);
     }

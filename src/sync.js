@@ -1,8 +1,9 @@
 import { hostname as osHostname } from 'node:os';
+import { currentApiUrl, sameApiServer } from './api-url.js';
 import { setTimeout as sleep } from 'node:timers/promises';
-import { loadConfig, saveConfig } from './config.js';
+import { loadConfig, saveConfig, persistApiUrlMigration } from './config.js';
 import {
-  loadState, saveState, pruneState, stateIdentity,
+  loadState, saveState, pruneState, stateIdentity, migrateStateIdentityApiUrl,
   bucketKey, bucketHash, sessionKey, sessionHash,
 } from './state.js';
 import { ingest, fetchSettings, registerCodexUltrafastStart } from './api.js';
@@ -92,7 +93,7 @@ export function resolveUploadProjectSetting(settings) {
 }
 
 export function resolveCachedUploadProjectSetting(config, apiUrl) {
-  if (config?.lastUploadProjectApiUrl !== apiUrl) return undefined;
+  if (!sameApiServer(config?.lastUploadProjectApiUrl, apiUrl)) return undefined;
   return typeof config.lastUploadProject === 'boolean'
     ? config.lastUploadProject
     : undefined;
@@ -249,6 +250,13 @@ export async function runSync(options = {}) {
     if (options.throws) throw new Error('NOT_CONFIGURED');
     process.exit(1);
   }
+  // 2026-11-24 domain move: rename the server in state.json and config.json
+  // together (state first), so an older CLI that compares the two as plain
+  // strings still sees a matching pair. Never let this fail a sync.
+  try {
+    migrateStateIdentityApiUrl();
+    persistApiUrlMigration();
+  } catch { /* The in-memory URL is already the new one for this run. */ }
   const record = beginSyncRecord({ surface: options.surface ?? 'cli' });
   try {
     const ingested = await runSyncPasses(options, config, record);
@@ -279,7 +287,7 @@ async function runSyncPasses({
   // incremental identity to `unknown` and can trigger a full-history upload.
   // Resolve it before parsing or loading upload state so failure is a true
   // no-op: no data upload and no state mutation.
-  const apiUrl = config.apiUrl || 'https://vibecafe.ai';
+  const apiUrl = currentApiUrl(config.apiUrl);
   // The stable upload hostname, captured once (see AGENTS.md "Stable
   // hostname"). Resolved before the settings request because the server keys
   // this machine's Codex Ultrafast cut by it.
@@ -316,7 +324,7 @@ async function runSyncPasses({
     // different server during its first settings outage.
     if (
       config.lastUploadProject !== uploadProject
-      || config.lastUploadProjectApiUrl !== apiUrl
+      || !sameApiServer(config.lastUploadProjectApiUrl, apiUrl)
     ) {
       config.lastUploadProject = uploadProject;
       config.lastUploadProjectApiUrl = apiUrl;

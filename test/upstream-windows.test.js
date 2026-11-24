@@ -35,7 +35,8 @@ test('a directory occupying the config file path is moved aside instead of block
     );
     // The run saved, and the thing that was in the way still exists under a
     // backup name — a repair must never delete what it moved.
-    assert.deepEqual(JSON.parse(out.trim()), { apiKey: 'vbu_fixture' });
+    // loadConfig() also writes the default server for a configured install (api-url.js).
+    assert.deepEqual(JSON.parse(out.trim()), { apiKey: 'vbu_fixture', apiUrl: 'https://vibefriends.com' });
     const backup = readdirSync(configDir).find(name => name.startsWith('config.json.directory-backup-'));
     assert.ok(backup, 'the moved directory keeps a backup name');
     assert.equal(readFileSync(join(configDir, backup, 'leftover.txt'), 'utf8'), 'user data');
