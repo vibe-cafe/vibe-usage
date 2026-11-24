@@ -143,7 +143,7 @@ function install(t, { cli = true, desktop = true, platform = 'win32', version: i
   }
   const read = async ({
     version = output('1.5.13'), command = output(JSON.stringify(usage)), running = [],
-    answer = () => ({ status: 404 }), hub = rpc, onAttempt = () => {}, skipAgy, agyVersion,
+    answer = () => ({ status: 404 }), hub = rpc, onAttempt = () => {}, skipAgy, agyLoggedOut, agyVersion,
   } = {}) => {
     const calls = [];
     const record = (name, limit) => {
@@ -152,7 +152,7 @@ function install(t, { cli = true, desktop = true, platform = 'win32', version: i
     };
     const outcome = await readAntigravityQuota({
       environment, platform, binary: cli ? agy : undefined, desktop: desktop ? engine : undefined,
-      skipAgy, agyVersion,
+      skipAgy, agyLoggedOut, agyVersion,
       discoverImpl: async () => structuredClone(running),
       commandImpl: async (binary, args, options) => {
         assert.equal(binary, agy);
@@ -192,7 +192,7 @@ test('the official command comes first and needs nothing else when it works', as
     assert.equal(result.status, 'ok');
     assert.equal(result.source, 'live');
     assert.deepEqual(result.meters, usageMeters);
-    assert.equal(agyUnusable, false);
+    assert.equal(agyUnusable, null);
     const stat = statSync(read.agy);
     assert.deepEqual(agyVersion, { binary: `${read.agy}\0${stat.size}\0${stat.mtimeMs}`, supported: true });
   }
@@ -272,26 +272,30 @@ test('agy sign-in failures fall through to the desktop and are reported for the 
       const { calls, result, agyUnusable } = await read({ command });
       assert.deepEqual(calls, desktop ? ['version', 'usage', 'desktop'] : ['version', 'usage']);
       assert.equal(result.status, desktop ? 'ok' : 'unauthorized');
-      assert.equal(agyUnusable, true);
+      assert.equal(agyUnusable, 'login');
       assert.ok(!JSON.stringify(result).includes('private@example.invalid'));
     }
-    const skipped = await read({ skipAgy: true });
+    const skipped = await read({ skipAgy: true, agyLoggedOut: true });
     assert.deepEqual(skipped.calls, desktop ? ['desktop'] : []);
     assert.equal(skipped.result.status, desktop ? 'ok' : 'unauthorized');
-    assert.equal(skipped.agyUnusable, false);
+    assert.equal(skipped.agyUnusable, null);
+    // agy skipped because it hung last time: that was never a sign-in answer.
+    assert.equal((await read({ skipAgy: true, hub: { status: 503 } })).result.status, 'retryable_error');
     if (desktop) {
       // A desktop that merely failed: not a sign-in problem, whatever agy said.
-      assert.equal((await read({ skipAgy: true, hub: { status: 503 } })).result.status, 'retryable_error');
+      assert.equal((await read({ skipAgy: true, agyLoggedOut: true, hub: { status: 503 } })).result.status, 'retryable_error');
       assert.equal((await read({ command: new LoginRequired(), hub: { status: 503 } })).result.status, 'retryable_error');
-      assert.equal((await read({ skipAgy: true, hub: { status: 401 } })).result.status, 'unauthorized');
+      assert.equal((await read({ skipAgy: true, agyLoggedOut: true, hub: { status: 401 } })).result.status, 'unauthorized');
     }
   }
   // A /usage that hangs (an interactive login waits a minute) also retires agy until it is used again;
   // running out of time before agy even starts does not.
   const read = install(t, { desktop: false });
-  assert.equal((await read({ command: new TimedOut() })).agyUnusable, true);
-  assert.equal((await read({ command: new Error('exit 1') })).agyUnusable, false);
-  assert.equal((await read({ version: new TimedOut() })).agyUnusable, false);
+  const hung = await read({ command: new TimedOut() });
+  assert.equal(hung.agyUnusable, 'hang');
+  assert.equal(hung.result.status, 'retryable_error');
+  assert.equal((await read({ command: new Error('exit 1') })).agyUnusable, null);
+  assert.equal((await read({ version: new TimedOut() })).agyUnusable, null);
 });
 
 test('desktop-only installations can return quota or a sign-in status', async t => {
@@ -511,7 +515,18 @@ test('windows that reset while Antigravity sat unused show as recovered', async 
   const failed = await busy.fetch(busy.at(63));
   assert.equal(failed.source, 'cache');
   assert.deepEqual(failed.meters, [busy.reading().meters[1]]);
-  assert.equal(failed.dataAsOf, new Date(busy.T0 + 3_600_000).toISOString());
+  // Newer than the reset, so a client that already shows 0% for the window replaces it.
+  assert.equal(failed.dataAsOf, busy.at(63).toISOString());
+
+  const shown = machine(t);
+  await shown.fetch(shown.at(0));
+  const recovered = await shown.fetch(shown.at(61));
+  assert.equal(recovered.meters[0].utilization, 0);
+  shown.use();
+  const afterUse = await shown.fetch(shown.at(62), { egressGate: async () => null });
+  assert.equal(afterUse.status, 'ok', 'asked again');
+  const withinFloor = await shown.fetch(shown.at(63));
+  assert.equal(withinFloor.dataAsOf, shown.at(62).toISOString());
 
   // A window without a reset time is over once its whole length has passed.
   const rolling = machine(t);
@@ -597,12 +612,13 @@ test('a sign-in failure is remembered and retried only after Antigravity is used
 test('agy is skipped after it asked for sign-in until agy itself is used or replaced', async t => {
   const m = machine(t);
   const memo = { binary: 'fixture build', supported: true };
-  m.answer(options => ({ result: m.reading(options.now), agyUnusable: true, agyVersion: memo }));
+  m.answer(options => ({ result: m.reading(options.now), agyUnusable: 'login', agyVersion: memo }));
   await m.fetch(m.at(0));
   m.answer(options => ({ result: m.reading(options.now) }));
   m.use('desktop');
   await m.fetch(m.at(5));
   assert.equal(m.reads.at(-1).skipAgy, true);
+  assert.equal(m.reads.at(-1).agyLoggedOut, true);
   assert.deepEqual(m.reads.at(-1).agyVersion, memo);
   m.use('desktop', 'second.db');
   await m.fetch(m.at(10));
@@ -611,7 +627,7 @@ test('agy is skipped after it asked for sign-in until agy itself is used or repl
   await m.fetch(m.at(15));
   assert.equal(m.reads.at(-1).skipAgy, false);
 
-  m.answer(options => ({ result: m.reading(options.now), agyUnusable: true }));
+  m.answer(options => ({ result: m.reading(options.now), agyUnusable: 'login' }));
   m.use('cli', 'again.db');
   await m.fetch(m.at(20));
   const replaced = join(m.home, 'agy-copy');
@@ -620,6 +636,19 @@ test('agy is skipped after it asked for sign-in until agy itself is used or repl
   m.use('desktop', 'third.db');
   await m.fetch(m.at(25), { environment: { ...m.environment, ANTIGRAVITY_CLI_PATH: replaced } });
   assert.equal(m.reads.at(-1).skipAgy, false);
+
+  // A hang retires agy too, but is not remembered as a sign-in answer, and keeps the numbers.
+  m.answer(options => ({ result: quotaResult({ id: 'antigravity', status: 'retryable_error', fetchedAt: options.now }),
+    agyUnusable: 'hang' }));
+  m.use('desktop', 'fourth.db');
+  const hung = await m.fetch(m.at(30));
+  assert.equal(hung.source, 'cache');
+  m.answer(options => ({ result: quotaResult({ id: 'antigravity', status: 'retryable_error', fetchedAt: options.now }) }));
+  const next = await m.fetch(m.at(35));
+  assert.equal(m.reads.at(-1).skipAgy, true);
+  assert.equal(m.reads.at(-1).agyLoggedOut, false);
+  assert.equal(next.status, 'ok');
+  assert.equal(next.source, 'cache');
 });
 
 test('the egress check runs only when Google would be asked, and a pause records no attempt', async t => {

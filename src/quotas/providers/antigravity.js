@@ -257,13 +257,14 @@ const RETRY = { message: 'Check the Antigravity connection and retry' };
  */
 export async function readAntigravityQuota({
   environment = process.env, platform = process.platform, now = new Date(), timeoutMs = 20000,
-  binary, desktop, skipAgy = false, agyVersion = null,
+  binary, desktop, skipAgy = false, agyLoggedOut = false, agyVersion = null,
   sessionImpl = withAntigravitySession, requestImpl = requestAntigravityQuota,
   commandImpl = runAntigravityCommand, discoverImpl = findRunningAntigravityServers,
 } = {}) {
-  // `agyUnusable`: agy asked for sign-in or hung (an interactive login can wait
-  // a minute); the caller skips agy until agy itself is used again.
-  const outcome = { agyVersion, agyUnusable: false };
+  // `agyUnusable`: agy asked for sign-in ('login') or hung ('hang': an
+  // interactive login can wait a minute); the caller skips agy until agy itself
+  // is used again. Only 'login' is a sign-in answer.
+  const outcome = { agyVersion, agyUnusable: null };
   const done = (status, extra) => ({ ...outcome, result: quota(status, now, extra) });
   // Both clients allow 30s, including up to 10s for the Windows launcher.
   // Earlier attempts' cleanup consumes this same clock. Keep the final cleanup
@@ -283,7 +284,7 @@ export async function readAntigravityQuota({
   const version = desktop ? desktopVersion(desktop, platform) : undefined;
   // A desktop that said "sign in" decides; a desktop that merely failed means
   // this was not a sign-in problem, whatever agy said earlier.
-  let agyLogin = skipAgy, desktopLogin = false, desktopTried = false;
+  let agyLogin = skipAgy && agyLoggedOut, desktopLogin = false, desktopTried = false;
 
   // 1. The official, documented command.
   if (binary && !skipAgy) {
@@ -310,8 +311,8 @@ export async function readAntigravityQuota({
         return done('ok', { meters: parseUsage(usage) });
       }
     } catch (error) {
-      if (error instanceof LoginRequired) { agyLogin = true; outcome.agyUnusable = true; }
-      else if (error instanceof TimedOut && started) outcome.agyUnusable = true;
+      if (error instanceof LoginRequired) { agyLogin = true; outcome.agyUnusable = 'login'; }
+      else if (error instanceof TimedOut && started) outcome.agyUnusable = 'hang';
       else if (error instanceof Interrupted) return done('retryable_error', RETRY);
     }
   }
@@ -444,14 +445,15 @@ export async function fetchAntigravityQuota(options = {}) {
   const blocked = state.agyLoginBlocked;
   const skipAgy = Boolean(blocked && blocked.cli === before.cli && blocked.binary === key);
   const { result, agyVersion, agyUnusable } = await readImpl({
-    ...options, environment, platform, now, binary, desktop, skipAgy, agyVersion: state.agyVersion,
+    ...options, environment, platform, now, binary, desktop, skipAgy,
+    agyLoggedOut: skipAgy && blocked.reason === 'login', agyVersion: state.agyVersion,
   });
 
   // Taken after the read, so a read that touched a store cannot look like use.
   const after = activityImpl(home);
   state.seen = after.all;
   state.agyVersion = agyVersion ?? state.agyVersion;
-  if (agyUnusable && key) state.agyLoginBlocked = { cli: after.cli, binary: key };
+  if (agyUnusable && key) state.agyLoginBlocked = { cli: after.cli, binary: key, reason: agyUnusable };
   else if (!skipAgy) state.agyLoginBlocked = null;
   if (result.status === 'ok') {
     state.reading = { readAt: now.toISOString(), meters: result.meters, seen: after.all };
