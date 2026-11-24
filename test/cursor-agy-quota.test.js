@@ -153,7 +153,7 @@ test('AGY never reads credentials during discovery or falls back to another acco
   assert.equal(result.status,'ok');
   assert.equal(result.cacheScope,undefined);
   assert.ok(!JSON.stringify(result).includes('private-csrf'));
-  const rejected = await readAntigravityQuota({ ...read, requestImpl: async () => ({status:401}) });
+  const rejected = await readAntigravityQuota({ ...read, requestImpl: async () => ({ status: 401, payload: { code: 'unauthenticated' } }) });
   assert.equal(rejected.result.status,'unauthorized');
   const missing = await fetchAntigravityQuota({ environment: {PATH:''}, home: '/missing', platform: 'linux' });
   assert.equal(missing.status,'missing_credentials');

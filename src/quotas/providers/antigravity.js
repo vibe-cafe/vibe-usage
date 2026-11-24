@@ -3,6 +3,7 @@ import { homedir } from 'node:os';
 import { delimiter, join, isAbsolute, resolve } from 'node:path';
 import http from 'node:http';
 import https from 'node:https';
+import { setTimeout as delay } from 'node:timers/promises';
 import { quotaResult } from '../schema.js';
 import {
   agyRequiresLogin, cleanupAllowanceMs, findRunningAntigravityServers, Interrupted, LoginRequired,
@@ -223,10 +224,6 @@ export function requestAntigravityQuota({ port, token, timeoutMs = 2000, scheme 
       });
       response.on('error', reject);
       response.on('end', () => {
-        if ([401, 403].includes(response.statusCode)) {
-          resolve({ status: response.statusCode });
-          return;
-        }
         try { resolve({ status: response.statusCode, payload: JSON.parse(Buffer.concat(chunks)) }); }
         catch {
           if (response.statusCode === 200) reject(new Error('Invalid quota response'));
@@ -264,7 +261,9 @@ export async function readAntigravityQuota({
   sessionImpl = withAntigravitySession, requestImpl = requestAntigravityQuota,
   commandImpl = runAntigravityCommand, discoverImpl = findRunningAntigravityServers,
 } = {}) {
-  const outcome = { agyVersion, agyLoginRequired: false };
+  // `agyUnusable`: agy asked for sign-in or hung (an interactive login can wait
+  // a minute); the caller skips agy until agy itself is used again.
+  const outcome = { agyVersion, agyUnusable: false };
   const done = (status, extra) => ({ ...outcome, result: quota(status, now, extra) });
   // Both clients allow 30s, including up to 10s for the Windows launcher.
   // Earlier attempts' cleanup consumes this same clock. Keep the final cleanup
@@ -278,30 +277,41 @@ export async function readAntigravityQuota({
     return { environment, platform, timeoutMs: Math.min(cap, available) };
   }
   // Only local process and socket tables; nothing is sent until step 2.
-  const running = Promise.resolve().then(() => discoverImpl({ platform })).catch(() => []);
+  let found;
+  const running = Promise.resolve().then(() => discoverImpl({ platform })).catch(() => [])
+    .then(servers => (found = servers));
   const version = desktop ? desktopVersion(desktop, platform) : undefined;
-  let loginRequired = skipAgy;
+  // A desktop that said "sign in" decides; a desktop that merely failed means
+  // this was not a sign-in problem, whatever agy said earlier.
+  let agyLogin = skipAgy, desktopLogin = false, desktopTried = false;
 
   // 1. The official, documented command.
   if (binary && !skipAgy) {
     // The later steps, if this installation has them, plus this step's own cleanup.
-    const reserve = desktop ? RUNNING_READ_MS + (version ? DESKTOP_READ_MS : 0) + cleanupMs : 0;
+    const reserveFor = () => (desktop
+      ? (found && !found.length ? 0 : RUNNING_READ_MS) + (version ? DESKTOP_READ_MS : 0) + cleanupMs : 0);
+    let started = false;
     try {
       const key = binaryKey(binary);
       let supported = key && agyVersion?.binary === key ? agyVersion.supported : undefined;
       if (supported === undefined) {
         // Older releases treat "/usage" as a billable prompt.
-        const version = await commandImpl(binary, ['--version'], optionsFor({ reserve, cap: 2000 }));
+        const version = await commandImpl(binary, ['--version'], optionsFor({ reserve: reserveFor(), cap: 2000 }));
         supported = version.code === 0 && supportsAntigravityUsage(version.stdout.trim() || version.stderr);
         if (version.code === 0 && key) outcome.agyVersion = { binary: key, supported };
       }
       if (supported) {
-        const usage = await commandImpl(binary, ['-p', '/usage', '--output-format', 'json'],
-          optionsFor({ reserve }));
+        // The local scan usually finishes first (about 50 ms on macOS); a short wait lets
+        // a desktop that is not running hand its share of the time back to /usage.
+        if (desktop && found === undefined) await Promise.race([running, delay(300, undefined, { ref: false })]);
+        const options = optionsFor({ reserve: reserveFor() });
+        started = true;
+        const usage = await commandImpl(binary, ['-p', '/usage', '--output-format', 'json'], options);
         return done('ok', { meters: parseUsage(usage) });
       }
     } catch (error) {
-      if (error instanceof LoginRequired) { loginRequired = true; outcome.agyLoginRequired = true; }
+      if (error instanceof LoginRequired) { agyLogin = true; outcome.agyUnusable = true; }
+      else if (error instanceof TimedOut && started) outcome.agyUnusable = true;
       else if (error instanceof Interrupted) return done('retryable_error', RETRY);
     }
   }
@@ -313,12 +323,13 @@ export async function readAntigravityQuota({
         const limit = Math.min(RUNNING_READ_MS, remaining() - (version ? DESKTOP_READ_MS : 0));
         if (limit < 1000) break;
         let response;
+        desktopTried = true;
         try {
           response = await requestImpl({ port, token: server.token, scheme, timeoutMs: limit });
         } catch { continue; } // Not this protocol on this port.
-        if ([401, 403].includes(response.status) || response.payload?.code === 'unauthenticated') {
-          return done('unauthorized', UNAUTHORIZED);
-        }
+        // Only the quota service's own answer means the account; another port
+        // of the same process can refuse the token with a bare 401/403.
+        if (response.payload?.code === 'unauthenticated') return done('unauthorized', UNAUTHORIZED);
         if (response.status === 200) {
           try {
             const meters = parseAntigravityQuota(response.payload);
@@ -335,11 +346,13 @@ export async function readAntigravityQuota({
     try {
       return done('ok', { meters: await sessionImpl(desktop, readMeters, { ...optionsFor(), desktopVersion: version }) });
     } catch (error) {
-      if (error instanceof LoginRequired) loginRequired = true;
+      if (error instanceof LoginRequired) desktopLogin = true;
       else if (error instanceof Interrupted) return done('retryable_error', RETRY);
+      else desktopTried = true;
     }
   }
-  return loginRequired ? done('unauthorized', UNAUTHORIZED) : done('retryable_error', RETRY);
+  if (desktopLogin || (agyLogin && !desktopTried)) return done('unauthorized', UNAUTHORIZED);
+  return done('retryable_error', RETRY);
 
   async function readMeters(endpoint) {
     let response;
@@ -360,11 +373,22 @@ export async function readAntigravityQuota({
   }
 }
 
+const NEVER_USED = { message: 'Use Antigravity once on this computer to show its quota' };
+const NOT_YET = { message: 'Antigravity quota has not been read yet' };
+const USED_SINCE = { message: 'Antigravity was used after its window reset; the next read shows it' };
+
 /** What to show without asking Google: the remembered outcome. */
-function rememberedResult(state, now) {
+function rememberedResult(state, now, activity) {
   if (state.failure === 'unauthorized') return quota('unauthorized', now, UNAUTHORIZED);
-  if (!state.reading) return quota('retryable_error', now, RETRY);
-  const { meters, dataAsOf } = settledReading(state.reading, now);
+  if (!state.reading) {
+    if (state.failure) return quota('retryable_error', now, RETRY);
+    return quota('no_data', now, activity?.files === 0 ? NEVER_USED : NOT_YET);
+  }
+  // A window that reset while Antigravity sat unused is full again; after use
+  // its new usage is unknown until the next read, so it is not shown.
+  const idle = activity?.all === state.reading.seen;
+  const { meters, dataAsOf } = settledReading(state.reading, now, idle);
+  if (!meters.length) return state.failure ? quota('retryable_error', now, RETRY) : quota('no_data', now, USED_SINCE);
   // After a failed read the numbers are the last good ones: the clients mark
   // `source: "cache"` as "live read failed".
   return quota('ok', now, { meters, dataAsOf, source: state.failure ? 'cache' : 'live' });
@@ -391,9 +415,11 @@ export async function fetchAntigravityQuota(options = {}) {
   // A clock set back past the last attempt does not lock reading out.
   const waited = last <= now.getTime() ? now.getTime() - last : Infinity;
   const used = before.all !== state.seen;
-  const wanted = state.failure === 'unauthorized' ? used
+  // Never used on this computer (no conversation at all): nothing to show, nothing asked.
+  const wanted = before.files === 0 ? false
+    : state.failure === 'unauthorized' ? used
     : state.failure === 'retryable' || !state.reading || used;
-  if (!wanted || waited < backoffMs(state.failures)) return rememberedResult(state, now);
+  if (!wanted || waited < backoffMs(state.failures)) return rememberedResult(state, now, before);
 
   // Every step below makes Google see the account. The egress check (the
   // network-privacy work, handed in by the registry) goes here: after every
@@ -407,15 +433,17 @@ export async function fetchAntigravityQuota(options = {}) {
 
   // The check can take seconds: another process may have started a read meanwhile.
   const current = loadAntigravityState(statePath);
-  if (current.attemptAt !== state.attemptAt) return rememberedResult(current, now);
+  if (current.attemptAt !== state.attemptAt) return rememberedResult(current, now, before);
   // Recorded first, so a second process in the same minute sees this attempt.
   state.attemptAt = now.toISOString();
-  if (!saveAntigravityState(statePath, state)) return rememberedResult(state, now);
+  if (!saveAntigravityState(statePath, state)) {
+    return state.reading ? rememberedResult(state, now, before) : quota('retryable_error', now, RETRY);
+  }
 
   const key = binary && binaryKey(binary);
   const blocked = state.agyLoginBlocked;
   const skipAgy = Boolean(blocked && blocked.cli === before.cli && blocked.binary === key);
-  const { result, agyVersion, agyLoginRequired } = await readImpl({
+  const { result, agyVersion, agyUnusable } = await readImpl({
     ...options, environment, platform, now, binary, desktop, skipAgy, agyVersion: state.agyVersion,
   });
 
@@ -423,17 +451,19 @@ export async function fetchAntigravityQuota(options = {}) {
   const after = activityImpl(home);
   state.seen = after.all;
   state.agyVersion = agyVersion ?? state.agyVersion;
-  if (agyLoginRequired && key) state.agyLoginBlocked = { cli: after.cli, binary: key };
+  if (agyUnusable && key) state.agyLoginBlocked = { cli: after.cli, binary: key };
   else if (!skipAgy) state.agyLoginBlocked = null;
   if (result.status === 'ok') {
-    state.reading = { readAt: now.toISOString(), meters: result.meters };
+    state.reading = { readAt: now.toISOString(), meters: result.meters, seen: after.all };
     state.failures = 0;
     state.failure = null;
   } else {
     state.failures += 1;
     state.failure = result.status === 'unauthorized' ? 'unauthorized' : 'retryable';
+    // Signed out: the numbers may belong to an account that is gone.
+    if (state.failure === 'unauthorized') state.reading = null;
   }
   saveAntigravityState(statePath, state);
   if (result.status === 'ok' || state.failure === 'unauthorized' || !state.reading) return result;
-  return rememberedResult(state, now);
+  return rememberedResult(state, now, after);
 }

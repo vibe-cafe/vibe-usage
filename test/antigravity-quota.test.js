@@ -187,12 +187,12 @@ function install(t, { cli = true, desktop = true, platform = 'win32', version: i
 test('the official command comes first and needs nothing else when it works', async t => {
   for (const desktop of [true, false]) {
     const read = install(t, { desktop });
-    const { calls, result, agyVersion, agyLoginRequired } = await read();
+    const { calls, result, agyVersion, agyUnusable } = await read();
     assert.deepEqual(calls, ['version', 'usage']);
     assert.equal(result.status, 'ok');
     assert.equal(result.source, 'live');
     assert.deepEqual(result.meters, usageMeters);
-    assert.equal(agyLoginRequired, false);
+    assert.equal(agyUnusable, false);
     const stat = statSync(read.agy);
     assert.deepEqual(agyVersion, { binary: `${read.agy}\0${stat.size}\0${stat.mtimeMs}`, supported: true });
   }
@@ -240,12 +240,18 @@ test('a failed /usage asks a running desktop before starting an engine of our ow
     assert.equal(result.status, 'ok');
     assert.deepEqual(result.meters.map(m => [m.id, m.utilization]), [['gemini-5h', 100]]);
   }
-  for (const response of [{ status: 401 }, { status: 403 }, { status: 200, payload: { code: 'unauthenticated' } }]) {
+  for (const response of [{ status: 401, payload: { code: 'unauthenticated' } },
+    { status: 200, payload: { code: 'unauthenticated' } }]) {
     const { calls, result } = await read({ command: new TimedOut(), running, answer: () => response });
     assert.deepEqual(calls, ['version', 'usage', 'https:1111']);
     assert.equal(result.status, 'unauthorized');
   }
-  for (const response of [new Error('refused'), { status: 503 }, { status: 200, payload: { groups: [] } }]) {
+  // Another port of the same process refusing the token is not the account.
+  const refused = await read({ command: new TimedOut(), running,
+    answer: ({ port }) => (port === 1111 ? { status: 403 } : rpc) });
+  assert.deepEqual(refused.calls, ['version', 'usage', 'https:1111', 'https:2222']);
+  assert.equal(refused.result.status, 'ok');
+  for (const response of [new Error('refused'), { status: 401 }, { status: 503 }, { status: 200, payload: { groups: [] } }]) {
     const { calls, result } = await read({ command: new TimedOut(), running, answer: () => response });
     assert.equal(calls.at(-1), 'desktop');
     assert.equal(result.status, 'ok');
@@ -263,17 +269,29 @@ test('agy sign-in failures fall through to the desktop and are reported for the 
   for (const desktop of [true, false]) {
     const read = install(t, { desktop });
     for (const command of logins) {
-      const { calls, result, agyLoginRequired } = await read({ command });
+      const { calls, result, agyUnusable } = await read({ command });
       assert.deepEqual(calls, desktop ? ['version', 'usage', 'desktop'] : ['version', 'usage']);
       assert.equal(result.status, desktop ? 'ok' : 'unauthorized');
-      assert.equal(agyLoginRequired, true);
+      assert.equal(agyUnusable, true);
       assert.ok(!JSON.stringify(result).includes('private@example.invalid'));
     }
     const skipped = await read({ skipAgy: true });
     assert.deepEqual(skipped.calls, desktop ? ['desktop'] : []);
     assert.equal(skipped.result.status, desktop ? 'ok' : 'unauthorized');
-    assert.equal(skipped.agyLoginRequired, false);
+    assert.equal(skipped.agyUnusable, false);
+    if (desktop) {
+      // A desktop that merely failed: not a sign-in problem, whatever agy said.
+      assert.equal((await read({ skipAgy: true, hub: { status: 503 } })).result.status, 'retryable_error');
+      assert.equal((await read({ command: new LoginRequired(), hub: { status: 503 } })).result.status, 'retryable_error');
+      assert.equal((await read({ skipAgy: true, hub: { status: 401 } })).result.status, 'unauthorized');
+    }
   }
+  // A /usage that hangs (an interactive login waits a minute) also retires agy until it is used again;
+  // running out of time before agy even starts does not.
+  const read = install(t, { desktop: false });
+  assert.equal((await read({ command: new TimedOut() })).agyUnusable, true);
+  assert.equal((await read({ command: new Error('exit 1') })).agyUnusable, false);
+  assert.equal((await read({ version: new TimedOut() })).agyUnusable, false);
 });
 
 test('desktop-only installations can return quota or a sign-in status', async t => {
@@ -365,19 +383,24 @@ test('all steps share one deadline, including version detection and cleanup', as
     const cli = install(t, { platform, desktop: false });
     const desktop = install(t, { platform, cli: false });
     const reserve = 4000 + 5000 + cleanupMs;
+    // With no running desktop found, the time held for it goes back to /usage.
+    const idleReserve = 5000 + cleanupMs;
     const running = [{ pid: '7', token: 'running-token', ports: [1111] }];
     const version = ['version', 2000];
     for (const [read, spent, expected, extra = {}] of [
       [desktop, {}, [['desktop', readMs]]],
       [cli, { version: 500 }, [version, ['usage', readMs - 1000]]],
-      [dual, { version: 500 }, [version, ['usage', readMs - 1000 - reserve], ['desktop', reserve - cleanupMs]]],
+      [dual, { version: 500 }, [version, ['usage', readMs - 1000 - idleReserve], ['desktop', 5000]]],
       // A hanging desktop port still leaves the engine its 5s.
       [dual, { version: 500 }, [version, ['usage', readMs - 1000 - reserve], ['https:1111', 4000], ['desktop', 5000]],
         { running }],
       // A slow version check: /usage only if 3s remain beyond the desktop's share.
+      [dual, {}, [version, ['usage', readMs - 2000 - cleanupMs - idleReserve], ['desktop', 5000]]],
       [dual, {}, readMs - 2000 - cleanupMs - reserve >= 3000
-        ? [version, ['usage', readMs - 2000 - cleanupMs - reserve], ['desktop', 9000]]
-        : [version, ['desktop', readMs - 2000 - cleanupMs]]],
+        ? [version, ['usage', readMs - 2000 - cleanupMs - reserve], ['https:1111', 4000], ['desktop', 5000]]
+        // No time for /usage: the running desktop gets what the engine does not need, over both schemes.
+        : [version, ['https:1111', 4000], ['http:1111', readMs - 2000 - cleanupMs - 4000 - 5000], ['desktop', 5000]],
+        { running }],
     ]) {
       elapsed = 0;
       const attempts = [];
@@ -414,6 +437,7 @@ function machine(t) {
     cli: join(home, '.gemini', 'antigravity-cli', 'conversations'),
     ide: join(home, '.gemini', 'antigravity-ide', 'conversations') };
   for (const store of Object.values(stores)) mkdirSync(store, { recursive: true });
+  writeFileSync(join(stores.desktop, 'earlier.db'), 'used before');
   const reads = [];
   let written = 0;
   const T0 = Date.parse('2026-11-24T10:00:00Z');
@@ -475,6 +499,20 @@ test('windows that reset while Antigravity sat unused show as recovered', async 
   assert.deepEqual(afterWeek.meters.map(meter => [meter.utilization, meter.resetsAt]), [[0, undefined], [0, undefined]]);
   assert.equal(afterWeek.dataAsOf, new Date(m.T0 + 3 * 86_400_000).toISOString());
 
+  // Used after the reset: the new window's usage is unknown, so it is left out until the next read.
+  const busy = machine(t);
+  await busy.fetch(busy.at(0));
+  busy.use();
+  const unknown = await busy.fetch(busy.at(62), { egressGate: async () => ({ message: 'held back' }) });
+  assert.equal(unknown.status, 'unsupported', 'used and due: it would ask now');
+  const meanwhile = await busy.fetch(busy.at(3));
+  assert.deepEqual(meanwhile.meters, busy.reading().meters, 'before the reset nothing changes');
+  busy.answer(options => ({ result: quotaResult({ id: 'antigravity', status: 'retryable_error', fetchedAt: options.now }) }));
+  const failed = await busy.fetch(busy.at(63));
+  assert.equal(failed.source, 'cache');
+  assert.deepEqual(failed.meters, [busy.reading().meters[1]]);
+  assert.equal(failed.dataAsOf, new Date(busy.T0 + 3_600_000).toISOString());
+
   // A window without a reset time is over once its whole length has passed.
   const rolling = machine(t);
   rolling.answer(options => ({ result: quotaResult({ id: 'antigravity', status: 'ok', fetchedAt: options.now,
@@ -482,6 +520,18 @@ test('windows that reset while Antigravity sat unused show as recovered', async 
   await rolling.fetch(rolling.at(0));
   assert.equal((await rolling.fetch(rolling.at(299))).meters[0].utilization, 70);
   assert.equal((await rolling.fetch(rolling.at(300))).meters[0].utilization, 0);
+});
+
+test('a computer where Antigravity was never used asks nothing until a conversation exists', async t => {
+  const m = machine(t);
+  rmSync(join(m.stores.desktop, 'earlier.db'));
+  const never = await m.fetch(m.at(0));
+  assert.equal(never.status, 'no_data');
+  assert.equal(m.reads.length, 0);
+  assert.equal(existsSync(m.statePath), false);
+  m.use('ide');
+  assert.equal((await m.fetch(m.at(1))).status, 'ok');
+  assert.equal(m.reads.length, 1);
 });
 
 test('failed reads back off from 5 minutes to an hour, with or without use', async t => {
@@ -534,12 +584,20 @@ test('a sign-in failure is remembered and retried only after Antigravity is used
   m.answer(options => ({ result: m.reading(options.now) }));
   assert.equal((await m.fetch(m.at(121))).status, 'ok');
   assert.equal(m.reads.length, 2);
+
+  // After a sign-in failure the old numbers may be another account's: never shown again.
+  m.answer(options => ({ result: quotaResult({ id: 'antigravity', status: 'unauthorized', fetchedAt: options.now }) }));
+  m.use('cli', 'switch.db');
+  assert.equal((await m.fetch(m.at(130))).status, 'unauthorized');
+  m.answer(options => ({ result: quotaResult({ id: 'antigravity', status: 'retryable_error', fetchedAt: options.now }) }));
+  m.use('cli', 'other-account.db');
+  assert.equal((await m.fetch(m.at(140))).status, 'retryable_error');
 });
 
 test('agy is skipped after it asked for sign-in until agy itself is used or replaced', async t => {
   const m = machine(t);
   const memo = { binary: 'fixture build', supported: true };
-  m.answer(options => ({ result: m.reading(options.now), agyLoginRequired: true, agyVersion: memo }));
+  m.answer(options => ({ result: m.reading(options.now), agyUnusable: true, agyVersion: memo }));
   await m.fetch(m.at(0));
   m.answer(options => ({ result: m.reading(options.now) }));
   m.use('desktop');
@@ -553,7 +611,7 @@ test('agy is skipped after it asked for sign-in until agy itself is used or repl
   await m.fetch(m.at(15));
   assert.equal(m.reads.at(-1).skipAgy, false);
 
-  m.answer(options => ({ result: m.reading(options.now), agyLoginRequired: true }));
+  m.answer(options => ({ result: m.reading(options.now), agyUnusable: true }));
   m.use('cli', 'again.db');
   await m.fetch(m.at(20));
   const replaced = join(m.home, 'agy-copy');
@@ -595,7 +653,7 @@ test('two processes at the same moment ask only once', async t => {
   m.answer(async options => { await delay(50); return { result: m.reading(options.now) }; });
   const [one, two] = await Promise.all([m.fetch(m.at(0)), m.fetch(m.at(0))]);
   assert.equal(m.reads.length, 1);
-  assert.deepEqual([one.status, two.status].sort(), ['ok', 'retryable_error']);
+  assert.deepEqual([one.status, two.status].sort(), ['no_data', 'ok']);
   // Also while the egress check keeps both waiting before the attempt is recorded.
   m.use();
   const egressGate = async () => { await delay(20); return null; };
@@ -693,8 +751,10 @@ test('agy children turn off agy\'s self-update and get browser stubs first on PA
           const sep = platform === 'win32' ? ';' : delimiter;
           assert.equal(env[pathKey], `${stubs}${sep}${environment[pathKey]}`);
           if (platform === 'win32') {
-            assert.match(readFileSync(join(stubs, 'rundll32.bat'), 'utf8'), /exit \/b 1/);
-            assert.equal(env.BROWSER, undefined);
+            for (const name of ['rundll32.bat', 'browser.bat']) {
+              assert.match(readFileSync(join(stubs, name), 'utf8'), /exit \/b 1/);
+            }
+            assert.equal(env.BROWSER, join(stubs, 'browser.bat'));
           } else {
             for (const name of ['open', 'xdg-open', 'browser']) {
               assert.match(readFileSync(join(stubs, name), 'utf8'), /^#!\/bin\/sh\n/);
@@ -881,6 +941,9 @@ if (process.platform !== 'win32') {
       writeFileSync(join(system, 'open'), `#!/bin/sh\ntouch '${join(home, 'real-browser')}'\n`, { mode: 0o755 });
       const trace = join(home, 'calls');
       writeFileSync(trace, '');
+      const used = join(home, '.gemini', 'antigravity-cli', 'conversations');
+      mkdirSync(used, { recursive: true });
+      writeFileSync(join(used, 'earlier.db'), 'used before');
       const run = () => JSON.parse(execFileSync(process.execPath,
         ['--import', isolate, cli, 'quota', 'fetch', '--product', 'antigravity', '--json'], {
           timeout: 8000, env: { HOME: home, PATH: `${dirname(process.execPath)}${delimiter}${system}`,
@@ -900,9 +963,7 @@ if (process.platform !== 'win32') {
     assert.equal(again.status, 'ok');
     assert.equal(again.dataAsOf, first.products[0].dataAsOf);
     assert.equal(ok.calls(), 'version usage ');
-    const store = join(ok.home, '.gemini', 'antigravity-cli', 'conversations');
-    mkdirSync(store, { recursive: true });
-    writeFileSync(join(store, 'session.db'), 'used');
+    writeFileSync(join(ok.home, '.gemini', 'antigravity-cli', 'conversations', 'session.db'), 'used');
     ok.run();
     assert.equal(ok.calls(), 'version usage ', 'used, but within 5 minutes');
     const record = JSON.parse(readFileSync(ok.record, 'utf8'));

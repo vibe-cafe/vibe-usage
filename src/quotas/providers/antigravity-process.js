@@ -59,7 +59,10 @@ function installBrowserStubs(directory, env, platform) {
   if (platform === 'win32') {
     // Inside double quotes cmd keeps & | < > ^ literal; only % and " would change the command.
     if (/["%\r\n]/.test(mark)) throw unavailable();
-    writeFileSync(join(bin, 'rundll32.bat'), `@echo off\r\ntype nul > "${mark}"\r\nexit /b 1\r\n`);
+    const stub = `@echo off\r\ntype nul > "${mark}"\r\nexit /b 1\r\n`;
+    writeFileSync(join(bin, 'rundll32.bat'), stub);
+    writeFileSync(join(bin, 'browser.bat'), stub);
+    setVariable(env, 'BROWSER', join(bin, 'browser.bat'));
   } else {
     if (/['\n]/.test(mark)) throw unavailable();
     for (const name of ['open', 'xdg-open', 'browser']) {

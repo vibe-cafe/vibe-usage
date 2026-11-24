@@ -37,8 +37,10 @@ export function loadAntigravityState(path) {
   try { raw = JSON.parse(readFileSync(path, 'utf8')); } catch { return state; }
   if (!isRecord(raw) || raw.version !== VERSION) return state;
   if (isRecord(raw.reading) && isDate(raw.reading.readAt) && Array.isArray(raw.reading.meters)) {
-    try { state.reading = { readAt: raw.reading.readAt, meters: raw.reading.meters.map(normalizeMeter) }; }
-    catch { /* A malformed reading is no reading. */ }
+    try {
+      state.reading = { readAt: raw.reading.readAt, meters: raw.reading.meters.map(normalizeMeter),
+        seen: isHash(raw.reading.seen) ? raw.reading.seen : null };
+    } catch { /* A malformed reading is no reading. */ }
   }
   if (isHash(raw.seen)) state.seen = raw.seen;
   if (isDate(raw.attemptAt)) state.attemptAt = raw.attemptAt;
@@ -67,6 +69,7 @@ export function saveAntigravityState(path, state) {
 
 function fingerprint(directories) {
   const hash = createHash('sha256');
+  let files = 0;
   directories.forEach((directory, index) => {
     let names;
     try { names = readdirSync(directory); } catch { return; }
@@ -75,11 +78,14 @@ function fingerprint(directories) {
     for (const name of names.filter(name => /\.(?:db|db-wal|pb)$/.test(name)).sort()) {
       try {
         const stat = statSync(join(directory, name));
-        if (stat.isFile()) hash.update(`${index}/${name}\0${stat.size}\0${stat.mtimeMs}\n`);
+        if (stat.isFile()) {
+          hash.update(`${index}/${name}\0${stat.size}\0${stat.mtimeMs}\n`);
+          files += 1;
+        }
       } catch { /* Gone between listing and stat. */ }
     }
   });
-  return hash.digest('hex');
+  return { hash: hash.digest('hex'), files };
 }
 
 /**
@@ -89,7 +95,8 @@ function fingerprint(directories) {
  */
 export function antigravityActivity(home) {
   const [desktop, cli, ide] = antigravityConversationDirs(home);
-  return { all: fingerprint([desktop, cli, ide]), cli: fingerprint([cli]) };
+  const all = fingerprint([desktop, cli, ide]);
+  return { all: all.hash, files: all.files, cli: fingerprint([cli]).hash };
 }
 
 export function backoffMs(failures) {
@@ -97,21 +104,23 @@ export function backoffMs(failures) {
 }
 
 /**
- * The last reading as of `now`: a window whose reset has passed while
- * Antigravity sat unused is back to 0% used, with its next reset unknown.
+ * The last reading as of `now`. A window whose reset has passed is over:
+ * while Antigravity sat unused (`idle`) it is back to 0% used, with its next
+ * reset unknown; after use its new usage is unknown, so it is left out.
  * `dataAsOf` moves to that reset, so clients that keep the newer of two
  * snapshots replace the old percentage.
  */
-export function settledReading(reading, now) {
+export function settledReading(reading, now, idle = true) {
   const readAt = Date.parse(reading.readAt);
   let asOf = readAt;
-  const meters = reading.meters.map(meter => {
+  const meters = reading.meters.flatMap(meter => {
     const reset = meter.resetsAt ? Date.parse(meter.resetsAt)
       : meter.windowSeconds ? readAt + meter.windowSeconds * 1000 : Infinity;
-    if (!(reset <= now.getTime())) return meter;
+    if (!(reset <= now.getTime())) return [meter];
     asOf = Math.max(asOf, reset);
+    if (!idle) return [];
     const { resetsAt: _, ...rest } = meter;
-    return { ...rest, utilization: 0 };
+    return [{ ...rest, utilization: 0 }];
   });
   return { meters, dataAsOf: new Date(asOf) };
 }
