@@ -758,7 +758,8 @@ test('agy children turn off agy\'s self-update and get browser stubs first on PA
           } else {
             for (const name of ['open', 'xdg-open', 'browser']) {
               assert.match(readFileSync(join(stubs, name), 'utf8'), /^#!\/bin\/sh\n/);
-              assert.equal(statSync(join(stubs, name)).mode & 0o777, 0o700);
+              // Windows hosts have no POSIX permission bits to check.
+              if (process.platform !== 'win32') assert.equal(statSync(join(stubs, name)).mode & 0o777, 0o700);
             }
             assert.equal(env.BROWSER, join(stubs, 'browser'));
           }
