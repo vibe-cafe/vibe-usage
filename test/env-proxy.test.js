@@ -9,6 +9,8 @@ import { join } from 'node:path';
 import {
   chosenProxies,
   envProxyBlock,
+  envProxyBlockFor,
+  noProxyMatches,
   mergedNoProxy,
   nodeHonoursEnvProxyFlag,
   proxyVariables,
@@ -244,4 +246,40 @@ test('quota providers that carry a vendor credential are not run while blocked',
     assert.equal(product.status, 'unsupported', product.id);
     assert.equal(product.message, block.message);
   }
+});
+
+test('a host on the bypass list is the user\'s own direct rule', () => {
+  const env = { no_proxy: 'api.kimi.com,.bigmodel.cn,*.example.com,corp.example:8080' };
+  assert.equal(noProxyMatches('api.kimi.com', env), true);
+  assert.equal(noProxyMatches('open.bigmodel.cn', env), true);
+  assert.equal(noProxyMatches('bigmodel.cn', env), false);
+  assert.equal(noProxyMatches('a.example.com', env), true);
+  assert.equal(noProxyMatches('example.com', env), false);
+  assert.equal(noProxyMatches('corp.example', env), true);
+  assert.equal(noProxyMatches('cursor.com', env), false);
+  assert.equal(noProxyMatches('anything', { NO_PROXY: '*' }), true);
+  assert.equal(envProxyBlockFor(['api.kimi.com'], { env, state: 'socks' }), null);
+  assert.equal(envProxyBlockFor(['api.kimi.com', 'cursor.com'], { env, state: 'socks' }).reason, 'socks');
+  assert.equal(envProxyBlockFor(['cursor.com'], { env, state: 'active' }), null);
+});
+
+// A PAC that sends domestic hosts direct and the rest through SOCKS (the
+// desktop apps put the direct hosts in NO_PROXY): domestic providers keep
+// working, foreign ones are not sent.
+test('SOCKS blocks only the providers whose hosts are not bypassed', async (t) => {
+  const { fetchQuotaProducts } = await import('../src/quotas/registry.js');
+  const home = mkdtempSync(join(tmpdir(), 'vibe-usage-env-proxy-'));
+  t.after(() => rmSync(home, { recursive: true, force: true }));
+  setupEnvProxy({ env: { HTTPS_PROXY: 'socks5://127.0.0.1:7891' }, versions: NODE_24, execArgv: [], httpModule: fakeHttp() });
+  const envelope = await fetchQuotaProducts(['kimi-code', 'cursor'], {
+    fetchImpl: () => { throw new Error('no network in tests'); },
+    home,
+    environment: {
+      HOME: home, VIBE_USAGE_QUOTA_CACHE_DIR: join(home, 'quota-cache'),
+      NO_PROXY: 'localhost,127.0.0.1,::1,api.kimi.com,auth.kimi.com',
+    },
+  });
+  const byId = Object.fromEntries(envelope.products.map(product => [product.id, product]));
+  assert.notEqual(byId['kimi-code'].status, 'unsupported');
+  assert.equal(byId.cursor.status, 'unsupported');
 });

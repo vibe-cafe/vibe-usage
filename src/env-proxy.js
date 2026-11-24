@@ -184,6 +184,35 @@ export function envProxyBlock(state = current.state) {
   return { reason: state, message: BLOCK_MESSAGES[state], notice: BLOCK_NOTICES[state] };
 }
 
+/**
+ * Whether `host` is bypassed by the bypass list Node would use (curl-style:
+ * `*`, an exact host, `.example.com` / `*.example.com` for subdomains, a bare
+ * `example.com` for itself and its subdomains).
+ */
+export function noProxyMatches(host, env = process.env) {
+  const list = first(env, ['no_proxy', 'NO_PROXY'])?.value || '';
+  const target = String(host || '').toLowerCase().replace(/^\[|\]$/g, '');
+  return list.split(/[,\s]+/).filter(Boolean).some(raw => {
+    const entry = raw.toLowerCase().replace(/:\d+$/, '');
+    if (entry === '*') return true;
+    const sub = entry.startsWith('*.') ? entry.slice(2) : entry.startsWith('.') ? entry.slice(1) : null;
+    if (sub) return target.endsWith(`.${sub}`);
+    return target === entry || target.endsWith(`.${entry}`);
+  });
+}
+
+/**
+ * `envProxyBlock()` for a request to these hosts: none when every host is on
+ * the user's bypass list (a direct route is the user's own rule — the desktop
+ * apps put the hosts a PAC sends direct there), so a domestic provider keeps
+ * working when only foreign hosts would need the SOCKS proxy.
+ */
+export function envProxyBlockFor(hosts, { env = process.env, state = current.state } = {}) {
+  const block = envProxyBlock(state);
+  if (!block) return null;
+  return hosts.length > 0 && hosts.every(host => noProxyMatches(host, env)) ? null : block;
+}
+
 /** Test hook: forget the decision made by the last `setupEnvProxy()`. */
 export function resetEnvProxyForTests() {
   current = { state: 'none' };

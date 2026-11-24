@@ -3,7 +3,7 @@ import { join, resolve } from 'node:path';
 import { homedir } from 'node:os';
 import { aggregateToBuckets, roundToHalfHour } from './aggregate.js';
 import { queryDbJsonSnapshotOnLock, sqliteUnavailableError, isSqliteUnavailableError } from './sqlite.js';
-import { envProxyBlock } from '../env-proxy.js';
+import { envProxyBlockFor } from '../env-proxy.js';
 
 const STATE_DB_RELATIVE = join('User', 'globalStorage', 'state.vscdb');
 const ACCESS_TOKEN_KEY = 'cursorAuth/accessToken';
@@ -792,7 +792,10 @@ function exportSkipped(err) {
   return { buckets: [], sessions: [], skipped: true, warnings: [`cursor: ${err.message}`] };
 }
 
-export async function parse({ previousInfo, envProxyBlock: block = envProxyBlock() } = {}) {
+export async function parse({
+  previousInfo,
+  envProxyBlock: block = envProxyBlockFor([new URL(cursorWebBase()).hostname]),
+} = {}) {
   const dbPath = getCursorStateDbPath();
   let token = null;
   let sqliteUnavailable = false;

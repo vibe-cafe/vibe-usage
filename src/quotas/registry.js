@@ -9,13 +9,20 @@ import { fetchKimiCodeQuota } from './providers/kimi-code.js';
 import { fetchOpenCodeGoQuota } from './providers/opencode-go.js';
 import { fetchZaiQuota } from './providers/zai.js';
 import { FETCHABLE_QUOTA_PRODUCT_IDS, quotaEnvelope, quotaResult } from './schema.js';
-import { envProxyBlock } from '../env-proxy.js';
+import { envProxyBlockFor } from '../env-proxy.js';
 
 // Providers whose own request carries the user's vendor credential. When the
 // environment names a proxy this process cannot follow, they are not run
 // (network-privacy principle). Grok reads a local log; Antigravity talks to a
 // local language server and the official program makes its own requests.
-const VENDOR_NETWORK_PROVIDERS = new Set(['kimi-code', 'zcode', 'opencode-go', 'cursor']);
+// The hosts each request goes to: a host on the user's bypass list is the
+// user's own direct rule, so it is not blocked.
+const VENDOR_NETWORK_HOSTS = {
+  'kimi-code': () => ['api.kimi.com', 'auth.kimi.com'],
+  zcode: environment => (environment.BIGMODEL_API_KEY ? ['open.bigmodel.cn'] : ['api.z.ai']),
+  'opencode-go': () => ['opencode.ai'],
+  cursor: () => ['cursor.com'],
+};
 
 const providers = new Map([
   ['kimi-code', fetchKimiCodeQuota],
@@ -117,9 +124,13 @@ export async function fetchQuotaProducts(ids, options = {}) {
   const invalid = unique.filter(id => !FETCHABLE_QUOTA_PRODUCT_IDS.includes(id));
   if (invalid.length) throw new Error(`Unsupported quota product: ${invalid.join(', ')}`);
 
-  const block = options.envProxyBlock !== undefined ? options.envProxyBlock : envProxyBlock();
+  const environment = options.environment || process.env;
   const fetched = await Promise.all(unique.map(async id => {
-    if (block && VENDOR_NETWORK_PROVIDERS.has(id)) {
+    const hosts = VENDOR_NETWORK_HOSTS[id]?.(environment);
+    const block = !hosts ? null
+      : options.envProxyBlock !== undefined ? options.envProxyBlock
+      : envProxyBlockFor(hosts, { env: environment });
+    if (block) {
       // Not a failure: nothing was sent. `unsupported` keeps the desktop apps
       // from offering a retry and the cache from answering in its place.
       return quotaResult({ id, status: 'unsupported', message: block.message });
