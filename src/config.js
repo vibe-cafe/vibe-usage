@@ -1,4 +1,5 @@
-import { readFileSync, writeFileSync, chmodSync, mkdirSync, existsSync } from 'node:fs';
+import { readFileSync, writeFileSync, chmodSync, mkdirSync, existsSync, renameSync, rmSync } from 'node:fs';
+import { randomBytes } from 'node:crypto';
 import { join } from 'node:path';
 import { homedir } from 'node:os';
 import { moveDirectoryOutOfFilePath } from './path-repair.js';
@@ -21,12 +22,39 @@ export function loadConfig() {
   } catch {
     return null;
   }
-  // 2026-11-24 domain move (see api-url.js). Persist it so the desktop apps,
-  // which read this file for the dashboard, follow without an app update.
-  if (!isDev && migrateConfigApiUrl(config)) {
-    try { saveConfig(config); } catch { /* Use the migrated value for this run anyway. */ }
-  }
+  // 2026-11-24 domain move (see api-url.js): every command talks to the new
+  // host. Only in memory here — `doctor` and the other readers must not write;
+  // `sync` persists it through persistApiUrlMigration().
+  if (!isDev) migrateConfigApiUrl(config);
   return config;
+}
+
+/**
+ * Write the domain move to config.json so the desktop apps, which read the
+ * file for their dashboard, follow without an app update. Re-reads the file
+ * right before writing and patches only the URL fields, so a key or setting a
+ * desktop app saved a moment ago is kept; the replace is atomic, so a crash
+ * cannot leave a half-written key file.
+ */
+export function persistApiUrlMigration() {
+  if (isDev || !existsSync(CONFIG_FILE)) return false;
+  let current;
+  try {
+    current = JSON.parse(readFileSync(CONFIG_FILE, 'utf-8'));
+  } catch {
+    return false;
+  }
+  if (!migrateConfigApiUrl(current)) return false;
+  const tempPath = `${CONFIG_FILE}.${process.pid}.${randomBytes(6).toString('hex')}.tmp`;
+  try {
+    writeFileSync(tempPath, JSON.stringify(current, null, 2) + '\n', { encoding: 'utf-8', mode: 0o600 });
+    renameSync(tempPath, CONFIG_FILE);
+  } catch (err) {
+    try { rmSync(tempPath, { force: true }); } catch { /* best effort */ }
+    throw err;
+  }
+  try { chmodSync(CONFIG_FILE, 0o600); } catch { /* rename kept the temp file's 0600 */ }
+  return true;
 }
 
 export function saveConfig(config) {

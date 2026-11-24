@@ -31,6 +31,8 @@ test('the old production name maps to the new host; custom servers stay as writt
   assert.equal(sameApiServer('https://vibecafe.ai', 'https://vibefriends.com'), true);
   assert.equal(sameApiServer('https://vibecafe.ai/', DEFAULT_API_URL), true);
   assert.equal(sameApiServer('http://localhost:3000', DEFAULT_API_URL), false);
+  assert.equal(sameApiServer('https://vibefriends.com/', 'https://vibecafe.ai'), true);
+  assert.equal(sameApiServer('https://VibeFriends.com', DEFAULT_API_URL), true);
 });
 
 test('config migration rewrites only the old production URL and fills it in for configured installs', () => {
@@ -52,17 +54,54 @@ test('config migration rewrites only the old production URL and fills it in for 
   assert.equal(migrateConfigApiUrl(null), false);
 });
 
-test('loadConfig persists the migration and keeps the key file owner-only', () => {
+test('loadConfig migrates in memory only; persistApiUrlMigration patches the URL fields of the current file atomically', () => {
   const dir = mkdtempSync(join(tmpdir(), 'vibe-usage-api-url-'));
   try {
     const file = join(dir, 'config.json');
     writeFileSync(file, JSON.stringify({ apiKey: 'vbu_fixture', apiUrl: 'https://vibecafe.ai', hostname: 'h' }), { mode: 0o600 });
-    const out = probe(`import { loadConfig } from './src/config.js'; console.log(JSON.stringify(loadConfig()));`,
-      { VIBE_USAGE_CONFIG_DIR: dir, VIBE_USAGE_DEV: '0' });
-    assert.equal(JSON.parse(out).apiUrl, DEFAULT_API_URL);
-    const onDisk = JSON.parse(readFileSync(file, 'utf8'));
-    assert.deepEqual(onDisk, { apiKey: 'vbu_fixture', apiUrl: DEFAULT_API_URL, hostname: 'h' });
+    const env = { VIBE_USAGE_CONFIG_DIR: dir, VIBE_USAGE_STATE_DIR: dir, VIBE_USAGE_DEV: '0' };
+    // Readers (doctor, status) see the new host but never write.
+    const loaded = probe(`import { loadConfig } from './src/config.js'; console.log(JSON.stringify(loadConfig()));`, env);
+    assert.equal(JSON.parse(loaded).apiUrl, DEFAULT_API_URL);
+    assert.equal(JSON.parse(readFileSync(file, 'utf8')).apiUrl, 'https://vibecafe.ai');
+    // A desktop app saves a new key after this process read the file: the
+    // migration re-reads and keeps it, changing only the URL.
+    writeFileSync(file, JSON.stringify({ apiKey: 'vbu_new', apiUrl: 'https://vibecafe.ai', hostname: 'h', extra: 1 }), { mode: 0o600 });
+    const wrote = probe(`import { persistApiUrlMigration } from './src/config.js'; console.log(persistApiUrlMigration());`, env);
+    assert.equal(wrote.trim(), 'true');
+    assert.deepEqual(JSON.parse(readFileSync(file, 'utf8')), { apiKey: 'vbu_new', apiUrl: DEFAULT_API_URL, hostname: 'h', extra: 1 });
     if (process.platform !== 'win32') assert.equal(statSync(file).mode & 0o777, 0o600);
+    // Nothing left to migrate: no write.
+    assert.equal(probe(`import { persistApiUrlMigration } from './src/config.js'; console.log(persistApiUrlMigration());`, env).trim(), 'false');
+    // A custom server is left alone.
+    writeFileSync(file, JSON.stringify({ apiKey: 'vbu_new', apiUrl: 'http://localhost:3000' }), { mode: 0o600 });
+    assert.equal(probe(`import { persistApiUrlMigration } from './src/config.js'; console.log(persistApiUrlMigration());`, env).trim(), 'false');
+    assert.equal(JSON.parse(readFileSync(file, 'utf8')).apiUrl, 'http://localhost:3000');
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test('state.json identity is renamed in place, keeping every hash (old CLIs compare plain strings)', () => {
+  const dir = mkdtempSync(join(tmpdir(), 'vibe-usage-api-url-state-rename-'));
+  try {
+    const out = probe(`
+      import { saveState, migrateStateIdentityApiUrl, stateIdentity } from './src/state.js';
+      import { readFileSync } from 'node:fs';
+      import { join } from 'node:path';
+      saveState({ buckets: { a: 'h1' }, sessions: { s: 'h2' } }, stateIdentity({ apiUrl: 'https://vibecafe.ai', apiKey: 'vbu_k' }));
+      const first = migrateStateIdentityApiUrl();
+      const second = migrateStateIdentityApiUrl();
+      const onDisk = JSON.parse(readFileSync(join(process.env.VIBE_USAGE_STATE_DIR, 'state.json'), 'utf8'));
+      console.log(JSON.stringify({ first, second, onDisk, expectedFp: stateIdentity({ apiKey: 'vbu_k' }).keyFingerprint }));`,
+      { VIBE_USAGE_STATE_DIR: dir, VIBE_USAGE_CONFIG_DIR: dir, VIBE_USAGE_DEV: '0' });
+    const r = JSON.parse(out);
+    assert.equal(r.first, true);
+    assert.equal(r.second, false);
+    assert.deepEqual(r.onDisk.buckets, { a: 'h1' });
+    assert.deepEqual(r.onDisk.sessions, { s: 'h2' });
+    assert.equal(r.onDisk.identity.apiUrl, DEFAULT_API_URL);
+    assert.equal(r.onDisk.identity.keyFingerprint, r.expectedFp);
   } finally {
     rmSync(dir, { recursive: true, force: true });
   }

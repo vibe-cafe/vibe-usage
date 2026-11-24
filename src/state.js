@@ -1,5 +1,5 @@
 import { readFileSync, writeFileSync, unlinkSync, mkdirSync, existsSync, renameSync, rmSync } from 'node:fs';
-import { sameApiServer } from './api-url.js';
+import { DEFAULT_API_URL, isLegacyApiUrl, sameApiServer } from './api-url.js';
 import { join } from 'node:path';
 import { homedir } from 'node:os';
 import { createHash, randomBytes } from 'node:crypto';
@@ -90,6 +90,34 @@ export function loadState(identity) {
     // triggers a one-time full re-upload (same as a fresh install).
     return { buckets: {}, sessions: {} };
   }
+}
+
+/**
+ * The 2026-11-24 domain move renames the recorded server from vibecafe.ai to
+ * vibefriends.com without touching the hashes. Done together with the
+ * config.json rewrite, so a CLI older than this one (a long-running daemon,
+ * which compares the two URLs as plain strings) sees a matching pair instead
+ * of re-uploading the whole history.
+ */
+export function migrateStateIdentityApiUrl() {
+  if (!existsSync(STATE_FILE)) return false;
+  let parsed;
+  try {
+    parsed = JSON.parse(readFileSync(STATE_FILE, 'utf-8'));
+  } catch {
+    return false;
+  }
+  if (!isIdentity(parsed?.identity) || !isLegacyApiUrl(parsed.identity.apiUrl)) return false;
+  parsed.identity = { ...parsed.identity, apiUrl: DEFAULT_API_URL };
+  const tempPath = `${STATE_FILE}.${process.pid}.${randomBytes(6).toString('hex')}.tmp`;
+  try {
+    writeFileSync(tempPath, JSON.stringify(parsed) + '\n', 'utf-8');
+    renameSync(tempPath, STATE_FILE);
+  } catch (err) {
+    try { rmSync(tempPath, { force: true }); } catch { /* best effort */ }
+    throw err;
+  }
+  return true;
 }
 
 /**

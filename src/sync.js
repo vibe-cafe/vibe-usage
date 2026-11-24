@@ -1,9 +1,9 @@
 import { hostname as osHostname } from 'node:os';
 import { currentApiUrl, sameApiServer } from './api-url.js';
 import { setTimeout as sleep } from 'node:timers/promises';
-import { loadConfig, saveConfig } from './config.js';
+import { loadConfig, saveConfig, persistApiUrlMigration } from './config.js';
 import {
-  loadState, saveState, pruneState, stateIdentity,
+  loadState, saveState, pruneState, stateIdentity, migrateStateIdentityApiUrl,
   bucketKey, bucketHash, sessionKey, sessionHash,
 } from './state.js';
 import { ingest, fetchSettings, registerCodexUltrafastStart } from './api.js';
@@ -250,6 +250,13 @@ export async function runSync(options = {}) {
     if (options.throws) throw new Error('NOT_CONFIGURED');
     process.exit(1);
   }
+  // 2026-11-24 domain move: rename the server in state.json and config.json
+  // together (state first), so an older CLI that compares the two as plain
+  // strings still sees a matching pair. Never let this fail a sync.
+  try {
+    migrateStateIdentityApiUrl();
+    persistApiUrlMigration();
+  } catch { /* The in-memory URL is already the new one for this run. */ }
   const record = beginSyncRecord({ surface: options.surface ?? 'cli' });
   try {
     const ingested = await runSyncPasses(options, config, record);

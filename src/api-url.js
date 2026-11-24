@@ -26,7 +26,11 @@ export function currentApiUrl(url) {
 /** Compare two recorded server URLs, treating the old and new production names
  * as one server. */
 export function sameApiServer(a, b) {
-  const canonical = url => (isLegacyApiUrl(url) ? DEFAULT_API_URL : String(url ?? ''));
+  const canonical = url => {
+    if (isLegacyApiUrl(url)) return DEFAULT_API_URL;
+    if (typeof url === 'string' && trimUrl(url) === DEFAULT_API_URL) return DEFAULT_API_URL;
+    return String(url ?? '');
+  };
   return canonical(a) === canonical(b);
 }
 
