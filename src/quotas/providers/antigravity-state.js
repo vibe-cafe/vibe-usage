@@ -51,7 +51,7 @@ export function loadAntigravityState(path) {
   if (isRecord(raw.agyLoginBlocked) && isHash(raw.agyLoginBlocked.cli)
     && typeof raw.agyLoginBlocked.binary === 'string') {
     state.agyLoginBlocked = { cli: raw.agyLoginBlocked.cli, binary: raw.agyLoginBlocked.binary,
-      reason: raw.agyLoginBlocked.reason === 'hang' ? 'hang' : 'login' };
+      reason: raw.agyLoginBlocked.reason === 'login' ? 'login' : 'hang' };
   }
   if (!state.failure) state.failures = 0;
   return state;
@@ -110,22 +110,20 @@ export function backoffMs(failures) {
  * The last reading as of `now`. A window whose reset has passed is over:
  * while Antigravity sat unused (`idle`) it is back to 0% used, with its next
  * reset unknown; after use its new usage is unknown, so it is left out.
- * `dataAsOf` moves to that reset (or, when a window is left out, to `now`,
- * when the use was seen), so clients that keep the newer of two snapshots
- * replace the old row, including a 0% shown before that use.
+ * `dataAsOf` moves to that reset (the Mac app takes every Antigravity answer
+ * as is, so a 0% it showed before that use goes away with the row).
  */
 export function settledReading(reading, now, idle = true) {
   const readAt = Date.parse(reading.readAt);
   let asOf = readAt;
-  let dropped = false;
   const meters = reading.meters.flatMap(meter => {
     const reset = meter.resetsAt ? Date.parse(meter.resetsAt)
       : meter.windowSeconds ? readAt + meter.windowSeconds * 1000 : Infinity;
     if (!(reset <= now.getTime())) return [meter];
     asOf = Math.max(asOf, reset);
-    if (!idle) { dropped = true; return []; }
+    if (!idle) return [];
     const { resetsAt: _, ...rest } = meter;
     return [{ ...rest, utilization: 0 }];
   });
-  return { meters, dataAsOf: dropped ? now : new Date(asOf) };
+  return { meters, dataAsOf: new Date(asOf) };
 }

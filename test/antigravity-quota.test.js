@@ -515,8 +515,7 @@ test('windows that reset while Antigravity sat unused show as recovered', async 
   const failed = await busy.fetch(busy.at(63));
   assert.equal(failed.source, 'cache');
   assert.deepEqual(failed.meters, [busy.reading().meters[1]]);
-  // Newer than the reset, so a client that already shows 0% for the window replaces it.
-  assert.equal(failed.dataAsOf, busy.at(63).toISOString());
+  assert.equal(failed.dataAsOf, new Date(busy.T0 + 3_600_000).toISOString());
 
   const shown = machine(t);
   await shown.fetch(shown.at(0));
@@ -649,6 +648,39 @@ test('agy is skipped after it asked for sign-in until agy itself is used or repl
   assert.equal(m.reads.at(-1).agyLoggedOut, false);
   assert.equal(next.status, 'ok');
   assert.equal(next.source, 'cache');
+});
+
+test('a round that could try nothing neither counts as an attempt nor lengthens the backoff', async t => {
+  const m = machine(t);
+  await m.fetch(m.at(0));
+  m.use();
+  // agy hung; nothing else to ask on this machine.
+  m.answer(options => ({ result: quotaResult({ id: 'antigravity', status: 'retryable_error', fetchedAt: options.now }),
+    agyUnusable: 'hang' }));
+  await m.fetch(m.at(5));
+  m.answer(options => ({ result: quotaResult({ id: 'antigravity', status: 'retryable_error', fetchedAt: options.now }),
+    tried: false }));
+  for (const minutes of [10, 20, 40, 80]) {
+    const result = await m.fetch(m.at(minutes));
+    assert.equal(result.source, 'cache');
+    assert.equal(m.reads.at(-1).skipAgy, true);
+  }
+  const record = JSON.parse(readFileSync(m.statePath, 'utf8'));
+  assert.equal(record.failures, 1);
+  assert.equal(record.attemptAt, m.at(5).toISOString());
+  // Back online and agy used again: asked at once, not an hour later.
+  m.answer(options => ({ result: m.reading(options.now) }));
+  m.use('cli', 'back.db');
+  const back = await m.fetch(m.at(81));
+  assert.equal(m.reads.at(-1).skipAgy, false);
+  assert.equal(back.source, 'live');
+
+  // Through the real read: agy retired and no desktop installed tries nothing.
+  const read = install(t, { desktop: false });
+  const idle = await read({ skipAgy: true });
+  assert.equal(idle.tried, false);
+  assert.deepEqual(idle.calls, []);
+  assert.equal((await read()).tried, true);
 });
 
 test('the egress check runs only when Google would be asked, and a pause records no attempt', async t => {

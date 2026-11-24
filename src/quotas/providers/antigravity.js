@@ -264,7 +264,9 @@ export async function readAntigravityQuota({
   // `agyUnusable`: agy asked for sign-in ('login') or hung ('hang': an
   // interactive login can wait a minute); the caller skips agy until agy itself
   // is used again. Only 'login' is a sign-in answer.
-  const outcome = { agyVersion, agyUnusable: null };
+  // `tried`: whether anything was launched or requested; a round that could
+  // try nothing does not count as an attempt or a failure.
+  const outcome = { agyVersion, agyUnusable: null, tried: false };
   const done = (status, extra) => ({ ...outcome, result: quota(status, now, extra) });
   // Both clients allow 30s, including up to 10s for the Windows launcher.
   // Earlier attempts' cleanup consumes this same clock. Keep the final cleanup
@@ -297,7 +299,9 @@ export async function readAntigravityQuota({
       let supported = key && agyVersion?.binary === key ? agyVersion.supported : undefined;
       if (supported === undefined) {
         // Older releases treat "/usage" as a billable prompt.
-        const version = await commandImpl(binary, ['--version'], optionsFor({ reserve: reserveFor(), cap: 2000 }));
+        const versionOptions = optionsFor({ reserve: reserveFor(), cap: 2000 });
+        outcome.tried = true;
+        const version = await commandImpl(binary, ['--version'], versionOptions);
         supported = version.code === 0 && supportsAntigravityUsage(version.stdout.trim() || version.stderr);
         if (version.code === 0 && key) outcome.agyVersion = { binary: key, supported };
       }
@@ -306,7 +310,7 @@ export async function readAntigravityQuota({
         // a desktop that is not running hand its share of the time back to /usage.
         if (desktop && found === undefined) await Promise.race([running, delay(300, undefined, { ref: false })]);
         const options = optionsFor({ reserve: reserveFor() });
-        started = true;
+        started = outcome.tried = true;
         const usage = await commandImpl(binary, ['-p', '/usage', '--output-format', 'json'], options);
         return done('ok', { meters: parseUsage(usage) });
       }
@@ -324,7 +328,7 @@ export async function readAntigravityQuota({
         const limit = Math.min(RUNNING_READ_MS, remaining() - (version ? DESKTOP_READ_MS : 0));
         if (limit < 1000) break;
         let response;
-        desktopTried = true;
+        desktopTried = outcome.tried = true;
         try {
           response = await requestImpl({ port, token: server.token, scheme, timeoutMs: limit });
         } catch { continue; } // Not this protocol on this port.
@@ -345,7 +349,9 @@ export async function readAntigravityQuota({
   // 3. Only when neither worked: the installed desktop engine, under its real version.
   if (version) {
     try {
-      return done('ok', { meters: await sessionImpl(desktop, readMeters, { ...optionsFor(), desktopVersion: version }) });
+      const engineOptions = { ...optionsFor(), desktopVersion: version };
+      outcome.tried = true;
+      return done('ok', { meters: await sessionImpl(desktop, readMeters, engineOptions) });
     } catch (error) {
       if (error instanceof LoginRequired) desktopLogin = true;
       else if (error instanceof Interrupted) return done('retryable_error', RETRY);
@@ -436,6 +442,7 @@ export async function fetchAntigravityQuota(options = {}) {
   const current = loadAntigravityState(statePath);
   if (current.attemptAt !== state.attemptAt) return rememberedResult(current, now, before);
   // Recorded first, so a second process in the same minute sees this attempt.
+  const previousAttempt = state.attemptAt;
   state.attemptAt = now.toISOString();
   if (!saveAntigravityState(statePath, state)) {
     return state.reading ? rememberedResult(state, now, before) : quota('retryable_error', now, RETRY);
@@ -444,10 +451,18 @@ export async function fetchAntigravityQuota(options = {}) {
   const key = binary && binaryKey(binary);
   const blocked = state.agyLoginBlocked;
   const skipAgy = Boolean(blocked && blocked.cli === before.cli && blocked.binary === key);
-  const { result, agyVersion, agyUnusable } = await readImpl({
+  const { result, agyVersion, agyUnusable, tried = true } = await readImpl({
     ...options, environment, platform, now, binary, desktop, skipAgy,
     agyLoggedOut: skipAgy && blocked.reason === 'login', agyVersion: state.agyVersion,
   });
+
+  if (!tried) {
+    // Nothing could be tried (agy retired, no desktop to ask): Google was not
+    // asked, so this round neither counts as an attempt nor lengthens the backoff.
+    state.attemptAt = previousAttempt;
+    saveAntigravityState(statePath, state);
+    return state.reading || state.failure ? rememberedResult(state, now, before) : result;
+  }
 
   // Taken after the read, so a read that touched a store cannot look like use.
   const after = activityImpl(home);
