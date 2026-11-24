@@ -1,6 +1,6 @@
 ---
 name: vibe-usage
-description: Track and sync AI coding tool token usage to vibecafe.ai dashboard.
+description: Track and sync AI coding tool token usage to vibefriends.com dashboard.
 metadata:
   {
     "openclaw": {
@@ -13,7 +13,7 @@ metadata:
 
 # Vibe Usage
 
-Track your AI coding tool token usage and sync to [vibecafe.ai](https://vibecafe.ai/usage).
+Track your AI coding tool token usage and sync to [vibefriends.com](https://vibefriends.com/usage).
 
 ## Setup
 
@@ -23,7 +23,7 @@ First-time setup (interactive — opens the browser for login, then syncs and tu
 npx @vibe-cafe/vibe-usage
 ```
 
-Headless machines: pre-issue a key at https://vibecafe.ai/usage/setup and run `npx @vibe-cafe/vibe-usage init --manual-key <vbu_...> --no-daemon`.
+Headless machines: pre-issue a key at https://vibefriends.com/usage/setup and run `npx @vibe-cafe/vibe-usage init --manual-key <vbu_...> --no-daemon`.
 
 ## Commands
 

@@ -1,5 +1,5 @@
 import { createInterface } from 'node:readline';
-import { DEFAULT_API_URL, isPlaintextRemoteApiUrl } from './api-url.js';
+import { DEFAULT_API_URL, currentApiUrl, isPlaintextRemoteApiUrl } from './api-url.js';
 import { hostname as osHostname } from 'node:os';
 import { loadConfig, saveConfig } from './config.js';
 import { fetchAccount, ingest, requestDeviceCode, pollDeviceCode } from './api.js';
@@ -19,6 +19,11 @@ function prompt(question) {
       resolve(answer.trim());
     });
   });
+}
+
+export function resolveInitApiUrl(replyApiUrl, fallbackApiUrl = DEFAULT_API_URL) {
+  const reply = typeof replyApiUrl === 'string' ? replyApiUrl.trim() : '';
+  return currentApiUrl(reply || fallbackApiUrl);
 }
 
 export async function runInit(options = {}) {
@@ -41,14 +46,15 @@ export async function runInit(options = {}) {
     }
   }
 
-  const apiUrl = process.env.VIBE_USAGE_API_URL || DEFAULT_API_URL;
+  const requestedApiUrl = currentApiUrl(process.env.VIBE_USAGE_API_URL || DEFAULT_API_URL);
   const host = existing?.hostname || osHostname().replace(/\.local$/, '');
   // A warning, not a refusal: self-hosting on a LAN over http is a real setup.
-  if (isPlaintextRemoteApiUrl(apiUrl)) {
-    console.log(warn(`服务器 ${apiUrl} 用的是明文 http，API Key 和用量数据会不加密传输；局域网自托管可以忽略，公网服务器请改用 https。`));
+  if (isPlaintextRemoteApiUrl(requestedApiUrl)) {
+    console.log(warn(`服务器 ${requestedApiUrl} 用的是明文 http，API Key 和用量数据会不加密传输；局域网自托管可以忽略，公网服务器请改用 https。`));
   }
 
   let apiKey;
+  let apiUrl = requestedApiUrl;
   if (providedKey) {
     if (!providedKey.startsWith('vbu_')) {
       console.error(failure('API Key 无效，必须以 vbu_ 开头。'));
@@ -56,8 +62,13 @@ export async function runInit(options = {}) {
     }
     apiKey = providedKey;
   } else {
-    apiKey = await runDeviceFlow(apiUrl, host);
-    if (!apiKey) process.exit(1);
+    const auth = await runDeviceFlow(requestedApiUrl, host);
+    if (!auth) process.exit(1);
+    apiKey = auth.apiKey;
+    apiUrl = resolveInitApiUrl(auth.apiUrl, requestedApiUrl);
+    if (apiUrl !== requestedApiUrl && isPlaintextRemoteApiUrl(apiUrl)) {
+      console.log(warn(`服务器 ${apiUrl} 用的是明文 http，API Key 和用量数据会不加密传输；局域网自托管可以忽略，公网服务器请改用 https。`));
+    }
   }
 
   try {
@@ -123,7 +134,7 @@ export async function runInit(options = {}) {
   }
 }
 
-async function runDeviceFlow(apiUrl, hostname) {
+export async function runDeviceFlow(apiUrl, hostname) {
   let device;
   try {
     device = await requestDeviceCode(apiUrl, { clientName: CLIENT_NAME, hostname });
@@ -172,7 +183,7 @@ async function runDeviceFlow(apiUrl, hostname) {
       if (res.apiKey) {
         process.stdout.write('\n');
         console.log(success('已批准，获取到 API Key。'));
-        return res.apiKey;
+        return { apiKey: res.apiKey, apiUrl: res.apiUrl };
       }
       if (res.error === 'authorization_pending') {
         process.stdout.write(dim('.'));

@@ -60,7 +60,7 @@ maintainer (Hogan), 一键诊断 plan, step 2.
 | `runtime.version` | string | That runtime's version. |
 | `sqlite` | `node:sqlite` \| `sqlite3-cli` \| `none` | The SQLite implementation the parsers would use. `none` breaks Cursor, OpenCode, Kiro and the other SQLite-backed tools; an old Node with the `sqlite3` command is fine. |
 | `account.configured` | boolean | An API key is configured. |
-| `account.server` | `default` \| `custom` | `apiUrl` is `https://vibecafe.ai` or something else (the URL itself is not reported). |
+| `account.server` | `default` \| `custom` | `apiUrl` is `https://vibefriends.com` or something else (the URL itself is not reported). |
 | `account.uploadState` | `match` \| `mismatch` \| `unrecorded` \| `none` | Whether `state.json` belongs to the current key: `mismatch` = the next sync re-uploads the full local history; `unrecorded` = written by a CLI older than 0.11.1 (adopted on the next save); `none` = no upload state yet (or not configured). |
 | `account.lastSyncRejected` | boolean \| null | Read from the **newest** sync record only: `false` when it succeeded (「最近一次同步未被服务器拒绝」), `true` when it failed with `unauthorized` (「最近一次同步被服务器拒绝（Key 无效）」), `null` for anything else — no end recorded, a timeout, a network or server failure (e.g. 502), any other failure (「无法判断 Key 是否被拒」), or no record at all (then say nothing, or 「暂无同步记录」). The desktop apps use the same rule. |
 | `account.deviceTag` | string \| null | First 4 hex chars of `sha256(hostname)`, where hostname is the upload hostname saved in `config.json` (`hostname`), or `os.hostname()` without a trailing `.local` before the first sync. Distinguishes one person's machines; reveals nothing. |
