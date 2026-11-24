@@ -7,7 +7,9 @@ import { mkdtempSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import {
+  chosenProxies,
   envProxyBlock,
+  mergedNoProxy,
   nodeHonoursEnvProxyFlag,
   proxyVariables,
   resetEnvProxyForTests,
@@ -22,21 +24,23 @@ function fakeHttp({ throws = false } = {}) {
   const calls = [];
   return {
     calls,
-    setGlobalProxyFromEnv() {
-      calls.push('set');
+    setGlobalProxyFromEnv(proxyEnv) {
+      calls.push(proxyEnv);
       if (throws) throw Object.assign(new Error('invalid'), { code: 'ERR_PROXY_INVALID_CONFIG' });
       return () => {};
     },
   };
 }
 
+const NODE_24 = { node: '24.22.3' };
+const LOOP = 'localhost,127.0.0.1,::1,[::1]';
+
 test.afterEach(() => resetEnvProxyForTests());
 
-test('no proxy variable: nothing to follow, environment untouched', () => {
+test('no proxy variable: nothing to follow', () => {
   const env = { PATH: '/bin', HTTPS_PROXY: '  ' };
   const httpModule = fakeHttp();
-  assert.deepEqual(setupEnvProxy({ env, versions: { node: '24.22.3' }, execArgv: [], httpModule }), { state: 'none' });
-  assert.equal(env.NO_PROXY, undefined);
+  assert.deepEqual(setupEnvProxy({ env, versions: NODE_24, execArgv: [], httpModule }), { state: 'none' });
   assert.deepEqual(httpModule.calls, []);
   assert.equal(envProxyBlock(), null);
 });
@@ -48,67 +52,67 @@ test('reads all four spellings in Node/Claude Code order', () => {
   );
 });
 
-test('an http proxy is turned on in-process where the runtime allows it', () => {
+test('the runtime gets the chosen proxies directly; the environment is never changed', () => {
   const env = { HTTPS_PROXY: 'http://127.0.0.1:7890' };
+  const before = { ...env };
   const httpModule = fakeHttp();
-  assert.equal(setupEnvProxy({ env, versions: { node: '24.22.3' }, execArgv: [], httpModule }).state, 'active');
-  assert.deepEqual(httpModule.calls, ['set']);
-  assert.equal(env.NO_PROXY, 'localhost,127.0.0.1,::1');
+  assert.equal(setupEnvProxy({ env, versions: NODE_24, execArgv: [], httpModule }).state, 'active');
+  assert.deepEqual(httpModule.calls, [{ HTTPS_PROXY: 'http://127.0.0.1:7890', HTTP_PROXY: undefined, NO_PROXY: LOOP }]);
+  assert.deepEqual(env, before);
   assert.equal(envProxyBlock(), null);
 });
 
 test('a value without a scheme is read as http://, as curl does', () => {
   const env = { https_proxy: '127.0.0.1:7890', NO_PROXY: 'corp.example' };
-  setupEnvProxy({ env, versions: { node: '24.22.3' }, execArgv: [], httpModule: fakeHttp() });
-  assert.equal(env.https_proxy, 'http://127.0.0.1:7890');
-  assert.equal(env.NO_PROXY, 'corp.example,localhost,127.0.0.1,::1');
-});
-
-test('both NO_PROXY spellings end up with every entry the user wrote, plus loopback', () => {
-  // Only lowercase (common in shells): the uppercase copy must not lose it.
-  const lower = { HTTPS_PROXY: 'http://p:1', no_proxy: 'corp.invalid' };
-  setupEnvProxy({ env: lower, versions: { node: '24.22.3' }, execArgv: [], httpModule: fakeHttp() });
-  assert.equal(lower.no_proxy, 'corp.invalid,localhost,127.0.0.1,::1');
-  assert.equal(lower.NO_PROXY, 'corp.invalid,localhost,127.0.0.1,::1');
-  // Uppercase set, lowercase defined but empty (Node prefers the empty one).
-  const mixed = { HTTPS_PROXY: 'http://p:1', NO_PROXY: 'corp.invalid', no_proxy: '' };
-  setupEnvProxy({ env: mixed, versions: { node: '24.22.3' }, execArgv: [], httpModule: fakeHttp() });
-  assert.equal(mixed.no_proxy, 'corp.invalid,localhost,127.0.0.1,::1');
-  assert.equal(mixed.NO_PROXY, 'corp.invalid,localhost,127.0.0.1,::1');
-  // `*` in either spelling already bypasses everything: left alone.
-  const star = { HTTPS_PROXY: 'http://p:1', no_proxy: 'a.example', NO_PROXY: '*' };
-  setupEnvProxy({ env: star, versions: { node: '24.22.3' }, execArgv: [], httpModule: fakeHttp() });
-  assert.equal(star.no_proxy, 'a.example');
-  assert.equal(star.NO_PROXY, '*');
-});
-
-test('ALL_PROXY alone stands for every scheme, as curl reads it', () => {
-  const socks = { all_proxy: 'socks5://127.0.0.1:7891' };
-  assert.equal(setupEnvProxy({ env: socks, versions: { node: '24.22.3' }, execArgv: [], httpModule: fakeHttp() }).state, 'socks');
-  assert.equal(envProxyBlock().reason, 'socks');
-  const http = { ALL_PROXY: 'http://127.0.0.1:7890' };
   const httpModule = fakeHttp();
-  assert.equal(setupEnvProxy({ env: http, versions: { node: '24.22.3' }, execArgv: [], httpModule }).state, 'active');
-  assert.equal(http.HTTPS_PROXY, 'http://127.0.0.1:7890');
-  assert.equal(http.HTTP_PROXY, 'http://127.0.0.1:7890');
-  assert.deepEqual(httpModule.calls, ['set']);
-  // With an HTTP(S) proxy present, ALL_PROXY is not consulted.
-  const both = { HTTPS_PROXY: 'http://p:1', ALL_PROXY: 'http://q:2' };
-  setupEnvProxy({ env: both, versions: { node: '24.22.3' }, execArgv: [], httpModule: fakeHttp() });
-  assert.equal(both.HTTPS_PROXY, 'http://p:1');
+  setupEnvProxy({ env, versions: NODE_24, execArgv: [], httpModule });
+  assert.equal(httpModule.calls[0].HTTPS_PROXY, 'http://127.0.0.1:7890');
+  assert.equal(httpModule.calls[0].NO_PROXY, `corp.example,${LOOP}`);
+  assert.equal(env.https_proxy, '127.0.0.1:7890');
 });
 
-test('HTTP_PROXY alone also covers https, so fetch and https agree', () => {
-  const env = { http_proxy: 'http://127.0.0.1:7890' };
-  setupEnvProxy({ env, versions: { node: '24.22.3' }, execArgv: [], httpModule: fakeHttp() });
-  assert.equal(env.HTTPS_PROXY, 'http://127.0.0.1:7890');
+test('both NO_PROXY spellings are merged with loopback; * anywhere bypasses all', () => {
+  assert.equal(mergedNoProxy({ no_proxy: 'corp.invalid' }), `corp.invalid,${LOOP}`);
+  assert.equal(mergedNoProxy({ NO_PROXY: 'upper.invalid', no_proxy: '' }), `upper.invalid,${LOOP}`);
+  assert.equal(mergedNoProxy({ NO_PROXY: 'a', no_proxy: 'b,a' }), `b,a,${LOOP}`);
+  assert.equal(mergedNoProxy({ NO_PROXY: '*', no_proxy: 'corp.invalid' }), '*');
+  assert.equal(mergedNoProxy({}), LOOP);
+});
+
+test('each scheme takes its own variable, then ALL_PROXY, as curl does', () => {
+  assert.deepEqual(chosenProxies({ http_proxy: 'http://a:1', ALL_PROXY: 'socks5h://b:2' }), {
+    https: { name: 'ALL_PROXY', value: 'socks5h://b:2' },
+    http: { name: 'http_proxy', value: 'http://a:1' },
+  });
+  // An HTTP_PROXY alone also covers https (Node's fetch already does that).
+  assert.deepEqual(chosenProxies({ HTTP_PROXY: 'http://a:1' }).https, { name: 'HTTP_PROXY', value: 'http://a:1' });
+});
+
+test('http_proxy plus a SOCKS ALL_PROXY: https would go through SOCKS, so blocked', () => {
+  const env = { http_proxy: 'http://a:1', ALL_PROXY: 'socks5h://b:2' };
+  assert.equal(setupEnvProxy({ env, versions: NODE_24, execArgv: [], httpModule: fakeHttp() }).state, 'socks');
+});
+
+test('ALL_PROXY alone: SOCKS blocks; HTTP is followed only where the runtime can be told', () => {
+  assert.equal(setupEnvProxy({
+    env: { all_proxy: 'socks5://127.0.0.1:7891' }, versions: NODE_24, execArgv: [], httpModule: fakeHttp(),
+  }).state, 'socks');
+  const httpModule = fakeHttp();
+  assert.equal(setupEnvProxy({
+    env: { ALL_PROXY: 'http://127.0.0.1:7890' }, versions: NODE_24, execArgv: [], httpModule,
+  }).state, 'active');
+  assert.deepEqual(httpModule.calls[0], { HTTPS_PROXY: 'http://127.0.0.1:7890', HTTP_PROXY: 'http://127.0.0.1:7890', NO_PROXY: LOOP });
+  // Startup switch only: Node never read ALL_PROXY, so it is not followed.
+  assert.equal(setupEnvProxy({
+    env: { ALL_PROXY: 'http://127.0.0.1:7890', NODE_USE_ENV_PROXY: '1' }, versions: { node: '22.23.1' }, execArgv: [], httpModule: {},
+  }).state, 'unsupported');
 });
 
 test('SOCKS cannot be followed by Node https, so vendor requests are blocked', () => {
   for (const value of ['socks5://127.0.0.1:7891', 'SOCKS5H://127.0.0.1:7891', 'socks://h:1']) {
-    const env = { HTTPS_PROXY: 'http://p:1', ALL_PROXY: value, http_proxy: value };
+    const env = { HTTPS_PROXY: value };
     const httpModule = fakeHttp();
-    assert.equal(setupEnvProxy({ env, versions: { node: '24.22.3' }, execArgv: [], httpModule }).state, 'socks');
+    assert.equal(setupEnvProxy({ env, versions: NODE_24, execArgv: [], httpModule }).state, 'socks');
     assert.deepEqual(httpModule.calls, []);
     const block = envProxyBlock();
     assert.equal(block.reason, 'socks');
@@ -118,13 +122,13 @@ test('SOCKS cannot be followed by Node https, so vendor requests are blocked', (
 
 test('an invalid value that the runtime rejects blocks instead of going direct', () => {
   const env = { HTTPS_PROXY: 'http://[bad' };
-  assert.equal(setupEnvProxy({ env, versions: { node: '24.22.3' }, execArgv: [], httpModule: fakeHttp({ throws: true }) }).state, 'unsupported');
+  assert.equal(setupEnvProxy({ env, versions: NODE_24, execArgv: [], httpModule: fakeHttp({ throws: true }) }).state, 'unsupported');
   assert.equal(envProxyBlock().reason, 'unsupported');
 });
 
 test('without setGlobalProxyFromEnv the startup switch decides, by Node version', () => {
-  const run = (node, { flag = '1', execArgv = [], NODE_OPTIONS } = {}) => setupEnvProxy({
-    env: { HTTPS_PROXY: 'http://p:1', ...(flag ? { NODE_USE_ENV_PROXY: flag } : {}), ...(NODE_OPTIONS ? { NODE_OPTIONS } : {}) },
+  const run = (node, { flag = '1', execArgv = [], NODE_OPTIONS, value = 'http://p:1' } = {}) => setupEnvProxy({
+    env: { HTTPS_PROXY: value, ...(flag ? { NODE_USE_ENV_PROXY: flag } : {}), ...(NODE_OPTIONS ? { NODE_OPTIONS } : {}) },
     versions: { node }, execArgv, httpModule: {},
   }).state;
   assert.equal(run('22.23.1'), 'active');               // the Windows app's bundled Node
@@ -135,14 +139,15 @@ test('without setGlobalProxyFromEnv the startup switch decides, by Node version'
   assert.equal(run('22.23.1', { flag: null }), 'unsupported');
   assert.equal(run('22.23.1', { flag: null, execArgv: ['--use-env-proxy'] }), 'active');
   assert.equal(run('22.23.1', { flag: null, NODE_OPTIONS: '--max-old-space-size=1 --use-env-proxy' }), 'active');
+  assert.equal(run('22.23.1', { value: '127.0.0.1:7890' }), 'unsupported'); // Node read it without a scheme
   assert.equal(nodeHonoursEnvProxyFlag('26.0.0'), true);
   assert.equal(nodeHonoursEnvProxyFlag('23.11.0'), false);
 });
 
-test('Bun follows http proxies on its own', () => {
-  assert.equal(setupEnvProxy({
-    env: { HTTPS_PROXY: 'http://p:1' }, versions: { bun: '1.3.14', node: '24.3.0' }, execArgv: [], httpModule: {},
-  }).state, 'active');
+test('Bun follows the proxy variables it read itself', () => {
+  const bun = { bun: '1.3.14', node: '24.3.0' };
+  assert.equal(setupEnvProxy({ env: { HTTPS_PROXY: 'http://p:1' }, versions: bun, execArgv: [], httpModule: {} }).state, 'active');
+  assert.equal(setupEnvProxy({ env: { ALL_PROXY: 'http://p:1' }, versions: bun, execArgv: [], httpModule: {} }).state, 'unsupported');
 });
 
 // The real runtime running this suite (CI: Node 20 / 22 / 24): with a proxy
@@ -205,6 +210,11 @@ const canSetAtRuntime = typeof http.setGlobalProxyFromEnv === 'function';
 
 test('on this runtime: a terminal-style proxy variable (no switch, no scheme)', async (t) => {
   assertFollowedOrBlocked(await runChild(t, port => ({ HTTPS_PROXY: `127.0.0.1:${port}` })), canSetAtRuntime);
+});
+
+test('on this runtime: only ALL_PROXY plus the switch (Node never reads ALL_PROXY)', async (t) => {
+  const result = await runChild(t, port => ({ ALL_PROXY: `http://127.0.0.1:${port}`, NODE_USE_ENV_PROXY: '1' }));
+  assertFollowedOrBlocked(result, canSetAtRuntime);
 });
 
 test('on this runtime: the Windows app style (full URL plus NODE_USE_ENV_PROXY=1)', async (t) => {

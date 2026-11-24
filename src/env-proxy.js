@@ -23,14 +23,14 @@
 // refuse to send (`envProxyBlock()`). Requests without a vendor account (our
 // server, npm) are not blocked here; they follow the proxy whenever it is on.
 //
-// Loopback is always added to NO_PROXY: the Antigravity quota and parser talk
-// to a language server on 127.0.0.1, which must never be sent to a proxy.
+// Loopback is always bypassed where this module configures the runtime: the
+// Antigravity quota and parser talk to a language server on 127.0.0.1, which
+// must never be sent to a proxy.
 
 import http from 'node:http';
 
 const PROXY_VARIABLES = ['HTTPS_PROXY', 'https_proxy', 'HTTP_PROXY', 'http_proxy'];
-const ALL_PROXY_VARIABLES = ['ALL_PROXY', 'all_proxy'];
-const LOOPBACK = ['localhost', '127.0.0.1', '::1'];
+const LOOPBACK = ['localhost', '127.0.0.1', '::1', '[::1]'];
 
 let current = { state: 'none' };
 
@@ -41,8 +41,32 @@ export function proxyVariables(env = process.env) {
     .map(name => ({ name, value: env[name].trim() }));
 }
 
+function first(env, names) {
+  for (const name of names) {
+    const value = typeof env[name] === 'string' ? env[name].trim() : '';
+    if (value) return { name, value };
+  }
+  return null;
+}
+
+/**
+ * The proxy for each scheme, read as curl reads the variables: the scheme's
+ * own variable (lowercase first), then ALL_PROXY. For https an HTTP_PROXY
+ * alone is the last resort, as Node's fetch already uses it.
+ */
+export function chosenProxies(env = process.env) {
+  return {
+    https: first(env, ['https_proxy', 'HTTPS_PROXY', 'all_proxy', 'ALL_PROXY', 'http_proxy', 'HTTP_PROXY']),
+    http: first(env, ['http_proxy', 'HTTP_PROXY', 'all_proxy', 'ALL_PROXY']),
+  };
+}
+
 function isSocks(value) {
   return /^socks[0-9a-z]*:\/\//i.test(value);
+}
+
+function withScheme(value) {
+  return value.includes('://') ? value : `http://${value}`;
 }
 
 /** `--use-env-proxy` or NODE_USE_ENV_PROXY=1, the startup switches Node reads. */
@@ -66,48 +90,18 @@ export function nodeHonoursEnvProxyFlag(version) {
 }
 
 /**
- * One bypass list from both spellings (Node prefers lowercase, other programs
- * uppercase), plus loopback, written back to `NO_PROXY` and to `no_proxy`
- * when that exists, so no reader loses an entry the user wrote in either.
+ * Both bypass spellings merged with loopback (`[::1]` too: Node's fetch
+ * matches the bracketed host). `*` in either means bypass everything.
  */
-function addLoopbackToNoProxy(env) {
+export function mergedNoProxy(env = process.env) {
   const entries = [];
   for (const name of ['no_proxy', 'NO_PROXY']) {
     for (const entry of (env[name] || '').split(/[,\s]+/).filter(Boolean)) {
       if (!entries.includes(entry)) entries.push(entry);
     }
   }
-  if (entries.includes('*')) return;
-  const merged = [...entries, ...LOOPBACK.filter(host => !entries.includes(host))].join(',');
-  env.NO_PROXY = merged;
-  if (env.no_proxy !== undefined) env.no_proxy = merged;
-}
-
-/**
- * curl's reading of the variables Node ignores: `ALL_PROXY` stands for every
- * scheme, and an `HTTP_PROXY` alone also covers https (Node's fetch already
- * does that, its https agent does not). Copied in this process only, so both
- * request paths and every child see the same proxy. Returns the variables.
- */
-function fillFromCurlConventions(env) {
-  let variables = proxyVariables(env);
-  if (variables.length === 0) {
-    const all = ALL_PROXY_VARIABLES
-      .map(name => (typeof env[name] === 'string' ? env[name].trim() : ''))
-      .find(Boolean);
-    if (all) {
-      env.HTTPS_PROXY = all;
-      env.HTTP_PROXY = all;
-      variables = proxyVariables(env);
-    }
-  }
-  const https = env.https_proxy?.trim() || env.HTTPS_PROXY?.trim();
-  const http = env.http_proxy?.trim() || env.HTTP_PROXY?.trim();
-  if (!https && http) {
-    env.HTTPS_PROXY = http;
-    variables = proxyVariables(env);
-  }
-  return variables;
+  if (entries.includes('*')) return '*';
+  return [...entries, ...LOOPBACK.filter(host => !entries.includes(host))].join(',');
 }
 
 /**
@@ -117,10 +111,14 @@ function fillFromCurlConventions(env) {
  *   - `active`: requests go through the proxy;
  *   - `socks`: a SOCKS proxy, which Node's https cannot follow;
  *   - `unsupported`: a proxy is set but this runtime cannot be made to follow it.
- * Mutates only this process's environment, the way curl reads the same
- * variables: `ALL_PROXY` alone stands for every scheme, `HTTP_PROXY` alone
- * also covers https, a value without a scheme is `http://…`, and loopback
- * joins NO_PROXY.
+ * The environment itself is never changed (children such as `agy` see what
+ * the user or the app set). Where the runtime can be configured at run time
+ * (`http.setGlobalProxyFromEnv`, Node 24.14+ / 25.4+), it gets the chosen
+ * proxies directly, a value without a scheme read as `http://`. Where only
+ * the startup switch exists, Node already decided from the environment as it
+ * was, so only an `HTTPS_PROXY` / `HTTP_PROXY` that was there with a scheme
+ * counts; anything this function would have had to add (ALL_PROXY, a
+ * missing scheme) means the proxy is not followed.
  */
 export function setupEnvProxy({
   env = process.env,
@@ -128,26 +126,30 @@ export function setupEnvProxy({
   execArgv = process.execArgv,
   httpModule = http,
 } = {}) {
-  const variables = fillFromCurlConventions(env);
-  if (variables.length === 0) {
+  const { https, http: plain } = chosenProxies(env);
+  if (!https && !plain) {
     current = { state: 'none' };
     return current;
   }
-  addLoopbackToNoProxy(env);
-  if (variables.some(({ value }) => isSocks(value))) {
+  if ([https, plain].some(choice => choice && isSocks(choice.value))) {
     current = { state: 'socks' };
     return current;
   }
-  for (const { name, value } of variables) {
-    if (!value.includes('://')) env[name] = `http://${value}`;
-  }
+  // Bun and the startup switch read only these variables, as they were.
+  const readAtStartup = proxyVariables(env).every(({ value }) => value.includes('://'))
+    && Boolean(first(env, PROXY_VARIABLES))
+    && [https, plain].every(choice => !choice || PROXY_VARIABLES.includes(choice.name));
   if (versions.bun) {
-    current = { state: 'active' };
+    current = { state: readAtStartup ? 'active' : 'unsupported' };
     return current;
   }
   if (typeof httpModule.setGlobalProxyFromEnv === 'function') {
     try {
-      httpModule.setGlobalProxyFromEnv();
+      httpModule.setGlobalProxyFromEnv({
+        HTTPS_PROXY: https ? withScheme(https.value) : undefined,
+        HTTP_PROXY: plain ? withScheme(plain.value) : undefined,
+        NO_PROXY: mergedNoProxy(env),
+      });
       current = { state: 'active' };
     } catch {
       current = { state: 'unsupported' };
@@ -155,7 +157,9 @@ export function setupEnvProxy({
     return current;
   }
   current = {
-    state: envProxyFlagOn(env, execArgv) && nodeHonoursEnvProxyFlag(versions.node) ? 'active' : 'unsupported',
+    state: readAtStartup && envProxyFlagOn(env, execArgv) && nodeHonoursEnvProxyFlag(versions.node)
+      ? 'active'
+      : 'unsupported',
   };
   return current;
 }
