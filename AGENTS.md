@@ -118,10 +118,15 @@ about most is a vendor seeing their real IP together with their vendor account.
 5. **Only necessary requests; documented and switchable.** Every kind of
    network activity is described in the privacy notes, and every product can be
    switched off on its own.
-6. **Every change answers to it.** Any change that adds or alters network
-   behavior states, point by point, how it meets 1–5. This is a required part of
-   the approval request (see Architecture Approval Gate), and cross-review
-   checks against it.
+6. **Every change answers to it, without a worse experience.** Any change that
+   adds or alters network behavior states, point by point, how it meets 1–5,
+   and whether the user experience gets worse. Compliance must not come at the
+   cost of a worse experience: exhaust the alternatives first, and only when
+   every path has been tried and none keeps both, bring the tried paths and the
+   trade-offs to the maintainer for a decision. "Stop reading it" or "stop
+   offering it" is not a proposal on its own. This is a required part of the
+   approval request (see Architecture Approval Gate), and cross-review checks
+   against it.
 
 Scope of the promise: on our side we never route around the user's network
 settings, and when unsure we do not send. Sites that the user's own proxy rules
