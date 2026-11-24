@@ -27,6 +27,12 @@ function credential(environment) {
   return null;
 }
 
+/** The URL a quota read requests (none without a key), chosen like the read. */
+export function zaiNetworkURLs({ environment = process.env, usageURL } = {}) {
+  const selected = credential(environment);
+  return selected ? [usageURL || selected.usageURL] : [];
+}
+
 function integer(value) {
   return Number.isInteger(value) ? value : null;
 }

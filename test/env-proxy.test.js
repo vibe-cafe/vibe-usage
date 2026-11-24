@@ -240,7 +240,7 @@ test('quota providers that carry a vendor credential are not run while blocked',
     envProxyBlock: block,
     fetchImpl: () => { throw new Error('must not reach the network'); },
     home,
-    environment: { HOME: home, VIBE_USAGE_QUOTA_CACHE_DIR: join(home, 'quota-cache') },
+    environment: { HOME: home, VIBE_USAGE_QUOTA_CACHE_DIR: join(home, 'quota-cache'), Z_AI_API_KEY: 'test-key' },
   });
   for (const product of envelope.products) {
     assert.equal(product.status, 'unsupported', product.id);
@@ -248,19 +248,62 @@ test('quota providers that carry a vendor credential are not run while blocked',
   }
 });
 
-test('a host on the bypass list is the user\'s own direct rule', () => {
-  const env = { no_proxy: 'api.kimi.com,.bigmodel.cn,*.example.com,corp.example:8080' };
-  assert.equal(noProxyMatches('api.kimi.com', env), true);
-  assert.equal(noProxyMatches('open.bigmodel.cn', env), true);
-  assert.equal(noProxyMatches('bigmodel.cn', env), false);
-  assert.equal(noProxyMatches('a.example.com', env), true);
-  assert.equal(noProxyMatches('example.com', env), false);
-  assert.equal(noProxyMatches('corp.example', env), true);
-  assert.equal(noProxyMatches('cursor.com', env), false);
-  assert.equal(noProxyMatches('anything', { NO_PROXY: '*' }), true);
-  assert.equal(envProxyBlockFor(['api.kimi.com'], { env, state: 'socks' }), null);
-  assert.equal(envProxyBlockFor(['api.kimi.com', 'cursor.com'], { env, state: 'socks' }).reason, 'socks');
-  assert.equal(envProxyBlockFor(['cursor.com'], { env, state: 'active' }), null);
+test('a request on the bypass list is the user\'s own direct rule', () => {
+  const env = { no_proxy: 'api.kimi.com,.bigmodel.cn,*.example.com,corp.example:8080,[::1]:9000,10.0.0.1' };
+  assert.equal(noProxyMatches('https://api.kimi.com/coding/v1/usages', env), true);
+  assert.equal(noProxyMatches('https://open.bigmodel.cn/api', env), true);
+  assert.equal(noProxyMatches('https://bigmodel.cn/', env), false);
+  assert.equal(noProxyMatches('https://a.example.com/', env), true);
+  assert.equal(noProxyMatches('https://example.com/', env), false);
+  assert.equal(noProxyMatches('http://corp.example:8080/', env), true);
+  assert.equal(noProxyMatches('https://cursor.com/', env), false);
+  assert.equal(noProxyMatches('http://[::1]:9000/', env), true);
+  assert.equal(noProxyMatches('http://[::1]:9001/', env), false);
+  assert.equal(noProxyMatches('https://10.0.0.1/', env), true);
+  assert.equal(noProxyMatches('https://anything/', { NO_PROXY: '*' }), true);
+  assert.equal(envProxyBlockFor(['https://api.kimi.com/'], { env, state: 'socks' }), null);
+  assert.equal(envProxyBlockFor(['https://api.kimi.com/', 'https://cursor.com/'], { env, state: 'socks' }).reason, 'socks');
+  assert.equal(envProxyBlockFor(['https://cursor.com/'], { env, state: 'active' }), null);
+});
+
+test('a bypass entry with a port covers that port only', () => {
+  const env = { NO_PROXY: 'api.z.ai:8080' };
+  assert.equal(noProxyMatches('https://api.z.ai/api/monitor/usage/quota/limit', env), false);
+  assert.equal(noProxyMatches('https://api.z.ai:8080/', env), true);
+  assert.equal(envProxyBlockFor(['https://api.z.ai/'], { env, state: 'socks' }).reason, 'socks');
+});
+
+test('a bare domain on the bypass list covers itself, not its subdomains', () => {
+  // The fetch in Node 22 reads `kimi.com` as that host only; reading it wider
+  // would let a request go direct that the user did not exempt.
+  const env = { NO_PROXY: 'kimi.com' };
+  assert.equal(noProxyMatches('https://kimi.com/', env), true);
+  assert.equal(noProxyMatches('https://api.kimi.com/', env), false);
+});
+
+test('the guard checks the addresses the provider will actually use', async (t) => {
+  const { fetchQuotaProducts } = await import('../src/quotas/registry.js');
+  const home = mkdtempSync(join(tmpdir(), 'vibe-usage-env-proxy-'));
+  t.after(() => rmSync(home, { recursive: true, force: true }));
+  setupEnvProxy({ env: { HTTPS_PROXY: 'socks5://127.0.0.1:7891' }, versions: NODE_24, execArgv: [], httpModule: fakeHttp() });
+  const base = { HOME: home, VIBE_USAGE_QUOTA_CACHE_DIR: join(home, 'quota-cache') };
+  const run = async (ids, environment) => Object.fromEntries((await fetchQuotaProducts(ids, {
+    fetchImpl: () => { throw new Error('no network in tests'); }, home, environment: { ...base, ...environment },
+  })).products.map(product => [product.id, product.status]));
+  // Kimi with its login server moved elsewhere: exempting the default hosts
+  // is not enough.
+  assert.equal((await run(['kimi-code'], {
+    KIMI_CODE_OAUTH_HOST: 'https://login.example.net', NO_PROXY: 'api.kimi.com,auth.kimi.com',
+  }))['kimi-code'], 'unsupported');
+  // A whitespace-only BigModel key falls back to Z.ai, like the read itself.
+  assert.equal((await run(['zcode'], {
+    BIGMODEL_API_KEY: '  ', Z_AI_API_KEY: 'test-key', NO_PROXY: 'open.bigmodel.cn',
+  })).zcode, 'unsupported');
+  assert.notEqual((await run(['zcode'], {
+    BIGMODEL_API_KEY: '  ', Z_AI_API_KEY: 'test-key', NO_PROXY: 'api.z.ai',
+  })).zcode, 'unsupported');
+  // No key: nothing is requested, so nothing is blocked.
+  assert.equal((await run(['zcode'], {})).zcode, 'missing_credentials');
 });
 
 // A PAC that sends domestic hosts direct and the rest through SOCKS (the

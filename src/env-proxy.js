@@ -184,33 +184,59 @@ export function envProxyBlock(state = current.state) {
   return { reason: state, message: BLOCK_MESSAGES[state], notice: BLOCK_NOTICES[state] };
 }
 
+const DEFAULT_PORTS = { 'https:': '443', 'http:': '80' };
+
+function requestTarget(url) {
+  try {
+    const parsed = new URL(String(url).includes('://') ? url : `https://${url}`);
+    return {
+      host: parsed.hostname.toLowerCase().replace(/^\[|\]$/g, ''),
+      port: parsed.port || DEFAULT_PORTS[parsed.protocol] || '',
+    };
+  } catch {
+    return null;
+  }
+}
+
+function bypassEntry(raw) {
+  const entry = raw.toLowerCase();
+  const bracketed = entry.match(/^\[([^\]]+)\](?::(\d+))?$/);
+  if (bracketed) return { host: bracketed[1], port: bracketed[2] || '' };
+  const withPort = entry.match(/^([^:]+):(\d+)$/);
+  if (withPort) return { host: withPort[1], port: withPort[2] };
+  return { host: entry, port: '' };
+}
+
 /**
- * Whether `host` is bypassed by the bypass list Node would use (curl-style:
- * `*`, an exact host, `.example.com` / `*.example.com` for subdomains, a bare
- * `example.com` for itself and its subdomains).
+ * Whether a request to `url` is bypassed by the bypass list Node would use.
+ * Read the way every runtime agrees on, so a match is never wider than the
+ * user's rule: `*`; an exact host (a bare `example.com` is itself only — the
+ * fetch in Node 22 does not extend it to subdomains); `.example.com` /
+ * `*.example.com` for subdomains; an entry with a port only for that port.
  */
-export function noProxyMatches(host, env = process.env) {
+export function noProxyMatches(url, env = process.env) {
+  const target = requestTarget(url);
+  if (!target) return false;
   const list = first(env, ['no_proxy', 'NO_PROXY'])?.value || '';
-  const target = String(host || '').toLowerCase().replace(/^\[|\]$/g, '');
   return list.split(/[,\s]+/).filter(Boolean).some(raw => {
-    const entry = raw.toLowerCase().replace(/:\d+$/, '');
-    if (entry === '*') return true;
-    const sub = entry.startsWith('*.') ? entry.slice(2) : entry.startsWith('.') ? entry.slice(1) : null;
-    if (sub) return target.endsWith(`.${sub}`);
-    return target === entry || target.endsWith(`.${entry}`);
+    if (raw === '*') return true;
+    const { host, port } = bypassEntry(raw);
+    if (port && port !== target.port) return false;
+    const suffix = host.startsWith('*.') ? host.slice(1) : host.startsWith('.') ? host : null;
+    return suffix ? target.host.endsWith(suffix) : target.host === host;
   });
 }
 
 /**
- * `envProxyBlock()` for a request to these hosts: none when every host is on
+ * `envProxyBlock()` for requests to these URLs: none when every one is on
  * the user's bypass list (a direct route is the user's own rule — the desktop
  * apps put the hosts a PAC sends direct there), so a domestic provider keeps
  * working when only foreign hosts would need the SOCKS proxy.
  */
-export function envProxyBlockFor(hosts, { env = process.env, state = current.state } = {}) {
+export function envProxyBlockFor(urls, { env = process.env, state = current.state } = {}) {
   const block = envProxyBlock(state);
   if (!block) return null;
-  return hosts.length > 0 && hosts.every(host => noProxyMatches(host, env)) ? null : block;
+  return urls.length > 0 && urls.every(url => noProxyMatches(url, env)) ? null : block;
 }
 
 /** Test hook: forget the decision made by the last `setupEnvProxy()`. */

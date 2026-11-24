@@ -794,7 +794,7 @@ function exportSkipped(err) {
 
 export async function parse({
   previousInfo,
-  envProxyBlock: block = envProxyBlockFor([new URL(cursorWebBase()).hostname]),
+  envProxyBlock: block = envProxyBlockFor([cursorWebBase()]),
 } = {}) {
   const dbPath = getCursorStateDbPath();
   let token = null;
