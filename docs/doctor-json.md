@@ -15,9 +15,9 @@ maintainer (Hogan), 一键诊断 plan, step 2.
   10 s: `<apiUrl>/api/usage/settings` (no `Authorization` header; any HTTP
   answer, including 401, means reachable) and `<registry>/-/ping`. They use the
   same Node `https` module and default global agent as uploads, so they take
-  the same route: through the environment proxy when `NODE_USE_ENV_PROXY=1`
-  is set (Node 22.21+ / 24.5+; the Windows app sets it with `HTTPS_PROXY`
-  when the system has a proxy), directly otherwise. A machine whose sync
+  the same route (`src/env-proxy.js`): the environment proxy where the
+  runtime follows it, the CLI's own tunnel (`src/proxy-tunnel.js`) where it
+  cannot, directly when no proxy is set or the host is on the bypass list. A machine whose sync
   cannot get out fails here too, and one whose sync works through the proxy
   is reported reachable. Budget about 12 s; the apps should give the whole
   command 30 s.

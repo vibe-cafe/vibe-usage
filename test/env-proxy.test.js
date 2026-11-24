@@ -607,3 +607,44 @@ test('plain HTTP through an HTTP proxy uses the absolute-form request, not CONNE
     `GET http://doctor-registry.invalid:8080/-/ping auth=${auth} host=doctor-registry.invalid:8080`,
   ]);
 });
+
+test('a proxy that never answers is closed, not left holding a socket', async (t) => {
+  const closed = [];
+  const proxy = net.createServer(socket => {
+    socket.on('data', () => {}); // never answers
+    socket.on('close', () => closed.push('closed'));
+  });
+  await new Promise(resolve => proxy.listen(0, '127.0.0.1', resolve));
+  t.after(() => proxy.close());
+  const { installProxyTunnel } = await import('../src/proxy-tunnel.js');
+  const uninstall = installProxyTunnel({ proxies: { https: `http://127.0.0.1:${proxy.address().port}` },
+    bypass: () => false, handshakeTimeoutMs: 200 });
+  t.after(() => uninstall());
+  await assert.rejects(fetch('https://api.vibe-usage-proxy-test.invalid/'), error => {
+    const code = error.code || error.cause?.code;
+    return code === 'ETIMEDOUT' || /timed out/.test(String(error.cause?.message || error.message));
+  });
+  await new Promise(resolve => setTimeout(resolve, 100));
+  assert.deepEqual(closed, ['closed']);
+});
+
+test('a hop from a bypassed site to another goes back through the proxy', async (t) => {
+  const seen = [];
+  const { proxyURL, asked } = await connectHarness(t, (req, res) => {
+    seen.push(req.url);
+    res.end('landed');
+  });
+  const direct = http.createServer((req, res) => {
+    res.writeHead(302, { location: 'http://api.vibe-usage-proxy-test.invalid/landed' });
+    res.end();
+  });
+  await new Promise(resolve => direct.listen(0, '127.0.0.1', resolve));
+  t.after(() => { direct.closeAllConnections(); direct.close(); });
+  const { installProxyTunnel } = await import('../src/proxy-tunnel.js');
+  const uninstall = installProxyTunnel({ proxies: { http: proxyURL }, bypass: host => host === '127.0.0.1' });
+  t.after(() => uninstall());
+  const text = await (await fetch(`http://127.0.0.1:${direct.address().port}/start`)).text();
+  assert.equal(text, 'landed');
+  assert.deepEqual(asked, ['GET http://api.vibe-usage-proxy-test.invalid/landed']);
+  assert.deepEqual(seen, ['/landed']);
+});

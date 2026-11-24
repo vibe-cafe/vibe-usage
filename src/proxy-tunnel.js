@@ -158,9 +158,10 @@ function ipv6Bytes(host) {
   return out;
 }
 
-/** A raw socket to `host:port` through `proxy`. */
-export async function connectThroughProxy(proxy, host, port) {
+/** A raw socket to `host:port` through `proxy`; `onSocket` sees it first. */
+export async function connectThroughProxy(proxy, host, port, onSocket = () => {}) {
   const socket = await openProxySocket(proxy);
+  onSocket(socket);
   try {
     if (proxy.kind === 'socks5') await socks5Connect(socket, proxy, host, port);
     else await httpConnect(socket, proxy, host, port);
@@ -190,8 +191,14 @@ function openTunnel(proxy, host, port, secure, options, timeoutMs) {
         resolve(socket);
       }
     };
-    const timer = setTimeout(() => finish(new Error('proxy tunnel timed out')), timeoutMs);
-    connectThroughProxy(proxy, host, port).then(raw => {
+    const timer = setTimeout(() => {
+      finish(Object.assign(new Error('proxy tunnel timed out'), { code: 'ETIMEDOUT' }));
+    }, timeoutMs);
+    // Held from the first byte, so a proxy that never answers is closed too.
+    connectThroughProxy(proxy, host, port, socket => {
+      if (settled) socket.destroy();
+      else current = socket;
+    }).then(raw => {
       if (settled) { raw.destroy(); return; }
       current = raw;
       if (!secure) { finish(null, raw); return; }
@@ -291,7 +298,7 @@ const CREDENTIAL_HEADERS = ['authorization', 'cookie', 'proxy-authorization'];
  * string / URLSearchParams / bytes body, signal, redirects), answered with a
  * real `Response`. Compressed bodies are decoded, as `fetch` does.
  */
-function tunnelFetch(agents, routeOf, nativeFetch) {
+function tunnelFetch(agents) {
   return async function fetchThroughProxy(input, init = {}) {
     let url = new URL(typeof input === 'string' || input instanceof URL ? input : input.url);
     let method = String(init.method || (input instanceof Request ? input.method : 'GET')).toUpperCase();
@@ -330,12 +337,9 @@ function tunnelFetch(agents, routeOf, nativeFetch) {
           if (body) throw new TypeError('fetch failed: cross-origin redirect with a body');
           for (const name of CREDENTIAL_HEADERS) headers.delete(name);
         }
+        // Routed again on the next turn: the agents connect a bypassed host
+        // directly and send the rest through the proxy.
         url = next;
-        if (routeOf(url) !== 'tunnel') {
-          // This hop goes direct (bypass list, loopback, no proxy for its
-          // scheme): the native stack takes it from here.
-          return nativeFetch(url, { method, headers, body: body ? body.bytes : undefined, signal, redirect: init.redirect });
-        }
         continue;
       }
       const responseHeaders = new Headers();
@@ -372,15 +376,7 @@ export function installProxyTunnel({ proxies, bypass, nativeFetch = globalThis.f
     https: tunnelAgent(httpsModule.Agent, true, chosen.https, bypass, handshakeTimeoutMs),
     http: tunnelAgent(httpModule.Agent, false, chosen.http, bypass, handshakeTimeoutMs),
   };
-  const routeOf = url => {
-    if (!['http:', 'https:'].includes(url.protocol)) return 'native';
-    const secure = url.protocol === 'https:';
-    const proxy = secure ? chosen.https : chosen.http;
-    const port = Number(url.port) || (secure ? 443 : 80);
-    const host = url.hostname.replace(/^\[|\]$/g, '');
-    return proxy && !bypass(host, port) ? 'tunnel' : 'native';
-  };
-  const throughProxy = tunnelFetch(agents, routeOf, nativeFetch);
+  const throughProxy = tunnelFetch(agents);
   const previous = { fetch: globalThis.fetch, https: httpsModule.globalAgent, http: httpModule.globalAgent };
   httpsModule.globalAgent = agents.https;
   httpModule.globalAgent = agents.http;
@@ -391,7 +387,11 @@ export function installProxyTunnel({ proxies, bypass, nativeFetch = globalThis.f
     } catch {
       return nativeFetch(input, init);
     }
-    return routeOf(url) === 'tunnel' ? throughProxy(input, init) : nativeFetch(input, init);
+    // Every http(s) request takes the agents, which pick each hop's route:
+    // bypassed and loopback hosts directly (not through a runtime proxy the
+    // startup switch may have set on the native stack), the rest through
+    // the proxy.
+    return ['http:', 'https:'].includes(url.protocol) ? throughProxy(input, init) : nativeFetch(input, init);
   };
   return function uninstall() {
     globalThis.fetch = previous.fetch;

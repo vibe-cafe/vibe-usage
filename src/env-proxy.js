@@ -69,7 +69,10 @@ function isSocks(value) {
 }
 
 function withScheme(value) {
-  return value.includes('://') ? value : `http://${value}`;
+  // A scheme written in capitals (`HTTP://`) is not recognised by Node's agent.
+  return value.includes('://')
+    ? value.replace(/^([A-Za-z][A-Za-z0-9+.-]*):\/\//, (_, scheme) => `${scheme.toLowerCase()}://`)
+    : `http://${value}`;
 }
 
 /** `--use-env-proxy` or NODE_USE_ENV_PROXY=1, the startup switches Node reads. */
