@@ -113,7 +113,7 @@ test('OpenCode Go fetch reports missing logins without reaching the network', as
   assert.equal(missingDatabase.status, 'missing_credentials');
   assert.deepEqual(missingDatabase.meters, []);
 
-  credentialFixture(dataRoot, [{ integrationId: 'opencode', value: { type: 'key', key: 'sk-other' } }]);
+  credentialFixture(dataRoot, [{ integrationId: 'anthropic', value: { type: 'key', key: 'sk-other' } }]);
   const unrelatedCredential = await fetchOpenCodeGoQuota({
     environment: { VIBE_USAGE_OPENCODE_DIRS: dataRoot },
     home: '/definitely/missing-home',
@@ -277,4 +277,204 @@ test('quota results reject an unknown emptyReason', async () => withFixture(asyn
     () => quotaResult({ id: 'opencode-go', status: 'no_data', emptyReason: 'made-up' }),
     /invalid quota emptyReason/,
   );
+}));
+
+// ---------------------------------------------------------------------------
+// Every place OpenCode keeps a Go login (2026-11-24). Fixture values are fake;
+// every request goes to a stub that records it and never reaches the network.
+
+const NOW = new Date('2026-11-24T12:00:00Z');
+const LATER = NOW.getTime() + 60 * 60 * 1000;
+const currentPayload = {
+  usage: {
+    rolling: { status: 'ok', percent: 12, resetsAt: '2026-11-24T15:00:00.000Z' },
+    weekly: { status: 'ok', percent: 30, resetsAt: '2026-11-30T00:00:00.000Z' },
+    monthly: { status: 'ok', percent: 8, resetsAt: '2026-12-20T00:00:00.000Z' },
+  },
+};
+
+function accountLogin({ access = 'acc-fake-1', orgID = 'wrk_fake', expires = LATER, server } = {}) {
+  const metadata = {};
+  if (orgID !== null) metadata.orgID = orgID;
+  if (server !== undefined) metadata.server = server;
+  return { type: 'oauth', methodID: 'device', refresh: 'ref-must-not-leave', access, expires, metadata };
+}
+
+async function fetchWith(dataRoot, extra = {}) {
+  const requests = [];
+  const result = await fetchOpenCodeGoQuota({
+    environment: { VIBE_USAGE_OPENCODE_DIRS: dataRoot },
+    home: '/definitely/missing-home',
+    now: NOW,
+    fetchImpl: async (url, options) => {
+      requests.push({ url, headers: options.headers });
+      return jsonResponse(usagePayload);
+    },
+    ...extra,
+  });
+  return { result, requests };
+}
+
+test('OpenCode Go reads a 1.x login made through "OpenCode Go" (auth.json opencode-go)', async () => withFixture(async dataRoot => {
+  mkdirSync(dataRoot, { recursive: true });
+  writeFileSync(join(dataRoot, 'auth.json'), JSON.stringify({
+    anthropic: { type: 'oauth', access: 'must-not-be-read' },
+    'opencode-go': { type: 'api', key: 'sk-go-file-key' },
+  }));
+  const { result, requests } = await fetchWith(dataRoot);
+  assert.equal(result.status, 'ok');
+  assert.equal(requests.length, 1);
+  assert.equal(requests[0].url, 'https://opencode.ai/zen/go/v1/usage');
+  assert.equal(requests[0].headers.Authorization, 'Bearer sk-go-file-key');
+  assert.equal('x-opencode-org-id' in requests[0].headers, false);
+}));
+
+test('OpenCode Go prefers auth.json opencode-go over auth.json opencode', async () => withFixture(async dataRoot => {
+  mkdirSync(dataRoot, { recursive: true });
+  writeFileSync(join(dataRoot, 'auth.json'), JSON.stringify({
+    opencode: { type: 'api', key: 'sk-zen-file-key' },
+    'opencode-go': { type: 'api', key: 'sk-go-file-key' },
+  }));
+  const { requests } = await fetchWith(dataRoot);
+  assert.equal(requests[0].headers.Authorization, 'Bearer sk-go-file-key');
+}));
+
+test('OpenCode Go reads a 2.x OpenCode account sign-in with its workspace', async () => withFixture(async dataRoot => {
+  credentialFixture(dataRoot, [{ integrationId: 'opencode', value: accountLogin() }]);
+  const { result, requests } = await fetchWith(dataRoot);
+  assert.equal(result.status, 'ok');
+  assert.equal(requests.length, 1);
+  assert.equal(requests[0].url, 'https://opencode.ai/zen/go/v1/usage');
+  assert.equal(requests[0].headers.Authorization, 'Bearer acc-fake-1');
+  assert.equal(requests[0].headers['x-opencode-org-id'], 'wrk_fake');
+  const serialized = JSON.stringify(result);
+  assert.equal(serialized.includes('acc-fake-1'), false);
+  assert.equal(serialized.includes('ref-must-not-leave'), false);
+  assert.equal(serialized.includes('wrk_fake'), false);
+}));
+
+test('OpenCode Go reads a 2.x OpenCode service-account key', async () => withFixture(async dataRoot => {
+  credentialFixture(dataRoot, [{
+    integrationId: 'opencode',
+    value: { type: 'key', key: 'sk-service-key', metadata: { orgID: 'wrk_service' } },
+  }]);
+  const { result, requests } = await fetchWith(dataRoot);
+  assert.equal(result.status, 'ok');
+  assert.equal(requests[0].headers.Authorization, 'Bearer sk-service-key');
+  assert.equal(requests[0].headers['x-opencode-org-id'], 'wrk_service');
+}));
+
+test('OpenCode Go sends nothing for an expired account sign-in and never renews it', async () => withFixture(async dataRoot => {
+  credentialFixture(dataRoot, [{ integrationId: 'opencode', value: accountLogin({ expires: NOW.getTime() - 1000 }) }]);
+  const { result, requests } = await fetchWith(dataRoot);
+  assert.equal(result.status, 'expired_credentials');
+  assert.equal(requests.length, 0);
+
+  // Inside the renewal margin counts as expired too: OpenCode renews it when it runs.
+  credentialFixture(join(dataRoot, 'margin'), [{
+    integrationId: 'opencode', value: accountLogin({ expires: NOW.getTime() + 30_000 }),
+  }]);
+  const margin = await fetchWith(join(dataRoot, 'margin'));
+  assert.equal(margin.result.status, 'expired_credentials');
+  assert.equal(margin.requests.length, 0);
+
+  // `expires: 0` means the issuer gave no lifetime.
+  credentialFixture(join(dataRoot, 'forever'), [{ integrationId: 'opencode', value: accountLogin({ expires: 0 }) }]);
+  assert.equal((await fetchWith(join(dataRoot, 'forever'))).result.status, 'ok');
+}));
+
+test('OpenCode Go skips an account sign-in without a workspace or for another Console', async () => withFixture(async dataRoot => {
+  credentialFixture(dataRoot, [{ integrationId: 'opencode', value: accountLogin({ orgID: null }) }]);
+  const noWorkspace = await fetchWith(dataRoot);
+  assert.equal(noWorkspace.result.status, 'missing_credentials');
+  assert.equal(noWorkspace.requests.length, 0);
+
+  const custom = join(dataRoot, 'custom');
+  credentialFixture(custom, [{
+    integrationId: 'opencode', value: accountLogin({ server: 'https://console.example.com' }),
+  }]);
+  const customConsole = await fetchWith(custom);
+  assert.equal(customConsole.result.status, 'missing_credentials');
+  assert.equal(customConsole.requests.length, 0);
+
+  // The retired Console host is the default Console, as OpenCode rewrites it.
+  const retired = join(dataRoot, 'retired');
+  credentialFixture(retired, [{
+    integrationId: 'opencode', value: accountLogin({ server: 'https://console.opencode.ai' }),
+  }]);
+  assert.equal((await fetchWith(retired)).result.status, 'ok');
+}));
+
+test('OpenCode Go prefers a Go key over an account sign-in when both are stored', async () => withFixture(async dataRoot => {
+  credentialFixture(dataRoot, [
+    { integrationId: 'opencode', value: accountLogin() },
+    { integrationId: 'opencode-go', value: { type: 'key', key: 'sk-go-row-key' } },
+  ]);
+  const { requests } = await fetchWith(dataRoot);
+  assert.equal(requests.length, 1);
+  assert.equal(requests[0].headers.Authorization, 'Bearer sk-go-row-key');
+  assert.equal('x-opencode-org-id' in requests[0].headers, false);
+}));
+
+test('OpenCode Go uses an older usable login when the account sign-in has expired', async () => withFixture(async dataRoot => {
+  credentialFixture(dataRoot, [{ integrationId: 'opencode', value: accountLogin({ expires: NOW.getTime() - 1 }) }]);
+  writeFileSync(join(dataRoot, 'auth.json'), JSON.stringify({ 'opencode-go': { type: 'api', key: 'sk-go-file-key' } }));
+  const { result, requests } = await fetchWith(dataRoot);
+  assert.equal(result.status, 'ok');
+  assert.equal(requests[0].headers.Authorization, 'Bearer sk-go-file-key');
+}));
+
+test('OpenCode Go uses the active account row and the newest among equals', async () => withFixture(async dataRoot => {
+  credentialFixture(dataRoot, [
+    { integrationId: 'opencode', value: accountLogin({ access: 'acc-active' }), active: 1 },
+    { integrationId: 'opencode', value: accountLogin({ access: 'acc-inactive' }), active: 0 },
+  ]);
+  const { requests } = await fetchWith(dataRoot);
+  assert.equal(requests[0].headers.Authorization, 'Bearer acc-active');
+}));
+
+test('OpenCode Go honors XDG_DATA_HOME like OpenCode does', async () => withFixture(async dataRoot => {
+  const xdg = join(dataRoot, 'xdg-data');
+  assert.deepEqual(openCodeDataRoots({ XDG_DATA_HOME: xdg }, '/Users/example'), [join(xdg, 'opencode')]);
+
+  credentialFixture(join(xdg, 'opencode'), [{ integrationId: 'opencode', value: accountLogin() }]);
+  const requests = [];
+  const result = await fetchOpenCodeGoQuota({
+    environment: { XDG_DATA_HOME: xdg },
+    home: '/definitely/missing-home',
+    now: NOW,
+    fetchImpl: async (url, options) => {
+      requests.push(options.headers);
+      return jsonResponse(usagePayload);
+    },
+  });
+  assert.equal(result.status, 'ok');
+  assert.equal(requests[0].Authorization, 'Bearer acc-fake-1');
+}));
+
+test('OpenCode Go scopes an account sign-in cache by workspace, not by its rotating token', async () => withFixture(async dataRoot => {
+  const { fetchQuotaProducts } = await import('../src/quotas/registry.js');
+  const cacheDir = join(dataRoot, 'quota-cache');
+  credentialFixture(join(dataRoot, 'a'), [{ integrationId: 'opencode', value: accountLogin({ access: 'acc-before' }) }]);
+  credentialFixture(join(dataRoot, 'b'), [{ integrationId: 'opencode', value: accountLogin({ access: 'acc-after' }) }]);
+  credentialFixture(join(dataRoot, 'c'), [{
+    integrationId: 'opencode', value: accountLogin({ access: 'acc-after', orgID: 'wrk_other' }),
+  }]);
+  const run = (root, fetchImpl) => fetchQuotaProducts(['opencode-go'], {
+    environment: { VIBE_USAGE_OPENCODE_DIRS: join(dataRoot, root), VIBE_USAGE_QUOTA_CACHE_DIR: cacheDir },
+    home: '/definitely/missing-home',
+    now: NOW,
+    fetchImpl,
+    envProxyBlock: null,
+  });
+
+  const fresh = await run('a', async () => jsonResponse(currentPayload));
+  assert.equal(fresh.products[0].status, 'ok');
+  // OpenCode renewed the token; the live read then fails transiently.
+  const renewed = await run('b', async () => jsonResponse({}, 502));
+  assert.equal(renewed.products[0].status, 'ok');
+  assert.equal(renewed.products[0].source, 'cache');
+  // Another workspace never sees the first one's numbers.
+  const otherWorkspace = await run('c', async () => jsonResponse({}, 502));
+  assert.equal(otherWorkspace.products[0].status, 'retryable_error');
 }));

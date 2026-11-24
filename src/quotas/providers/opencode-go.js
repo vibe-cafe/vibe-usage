@@ -6,8 +6,24 @@ import { quotaResult } from '../schema.js';
 import { isSqliteUnavailableError, queryDbJson, sqliteUnavailableError } from '../../parsers/sqlite.js';
 
 const PRODUCT_ID = 'opencode-go';
-const INTEGRATION_ID = 'opencode-go';
+// OpenCode's two integrations that can carry a Go login. `opencode-go` is the
+// Go-only API key (1.x `/connect` → OpenCode Go, 2.0–2.3, or imported from
+// 1.x). `opencode` is the OpenCode account: since OpenCode 2.4.0 the only
+// connect option new users see ("OpenCode account" sign-in or "API key
+// (service account)"), and Go models come through it.
+const GO_INTEGRATION_ID = 'opencode-go';
+const OPENCODE_INTEGRATION_ID = 'opencode';
 const DEFAULT_USAGE_URL = 'https://opencode.ai/zen/go/v1/usage';
+// An account sign-in is accepted only for the default OpenCode Console. The
+// retired host maps onto it path for path, as OpenCode itself rewrites it
+// (`packages/core/src/console-access.ts`); a custom Console's token belongs to
+// another server and is never sent to opencode.ai.
+const DEFAULT_CONSOLE_ORIGIN = 'https://opencode.ai';
+const RETIRED_CONSOLE_ORIGIN = 'https://console.opencode.ai';
+// OpenCode renews an account token five minutes before it lapses whenever it
+// runs. We never renew it (that would rewrite OpenCode's credential and rotate
+// its refresh token), so a token this close to expiry is treated as expired.
+const EXPIRY_MARGIN_MS = 60_000;
 
 // The endpoint reports the three windows OpenCode Go enforces (rolling /
 // weekly / monthly). It does not return the rolling window length, but the
@@ -20,13 +36,18 @@ const METER_ORDER = [
   ['monthly', 'Monthly'],
 ];
 
-/** Data roots scanned for the OpenCode credential store, in order. */
+/**
+ * Data roots scanned for the OpenCode credential store, in order. OpenCode
+ * keeps its data in `$XDG_DATA_HOME/opencode`, else `~/.local/share/opencode`,
+ * on every platform (`%USERPROFILE%\.local\share\opencode` on Windows).
+ */
 export function openCodeDataRoots(environment = process.env, home = homedir()) {
   const override = environment.VIBE_USAGE_OPENCODE_DIRS?.trim();
   if (override) {
     return override.split(delimiter).map(value => value.trim()).filter(Boolean);
   }
-  return [join(home, '.local', 'share', 'opencode')];
+  const xdgData = environment.XDG_DATA_HOME;
+  return [join(xdgData || join(home, '.local', 'share'), 'opencode')];
 }
 
 export function openCodeDbPath(root) {
@@ -39,70 +60,140 @@ function date(value) {
   return Number.isNaN(parsed.getTime()) ? null : parsed;
 }
 
-/**
- * Reads only the `opencode-go` integration key from OpenCode's credential
- * table. The value is the client's own JSON blob (`{ type: 'key', key }`);
- * nothing else in the row or database is selected, logged, cached, or
- * uploaded.
- */
-function readCredentialTable(root) {
-  const dbPath = openCodeDbPath(root);
-  if (!existsSync(dbPath)) return { status: 'missing' };
+function isRecord(value) {
+  return value !== null && typeof value === 'object' && !Array.isArray(value);
+}
+
+function text(value) {
+  return typeof value === 'string' ? value.trim() : '';
+}
+
+function consoleOrigin(metadata) {
+  const server = typeof metadata?.server === 'string' && metadata.server.trim()
+    ? metadata.server.trim()
+    : `${DEFAULT_CONSOLE_ORIGIN}/console`;
   try {
-    const rows = queryDbJson(dbPath, `SELECT value FROM credential
-      WHERE integration_id = '${INTEGRATION_ID}'
-      ORDER BY coalesce(active, 1) DESC, time_updated DESC
-      LIMIT 1`);
-    const raw = rows[0]?.value;
-    if (typeof raw !== 'string' || !raw.trim()) return { status: 'missing' };
-    let key = '';
-    try {
-      const parsed = JSON.parse(raw);
-      key = typeof parsed?.key === 'string' ? parsed.key.trim() : '';
-    } catch {
-      key = '';
-    }
-    return key ? { status: 'ok', key } : { status: 'missing' };
-  } catch (error) {
-    if (isSqliteUnavailableError(error)) return { status: 'unavailable' };
-    // An older/newer schema without the credential table simply has no login.
-    if (/no such table|no such column/i.test(error?.message || '')) return { status: 'missing' };
-    return { status: 'error' };
+    const origin = new URL(server).origin;
+    return origin === RETIRED_CONSOLE_ORIGIN ? DEFAULT_CONSOLE_ORIGIN : origin;
+  } catch {
+    return null;
   }
 }
 
 /**
- * Fallback for the pre-2.x layout, which keeps the same key as plain JSON in
- * `auth.json` (`{"opencode": {"type": "api", "key": "sk-..."}}`). Only that one
- * entry is read; sibling provider credentials in the file are never inspected,
- * and the key is returned to the caller without ever being logged or cached.
- * The credential table stays authoritative when it has a Go row — it is the
- * Go-specific record, while `auth.json` also holds non-Go keys.
+ * Turns one stored credential value into what the usage request needs, or a
+ * reason it cannot be used. Only the fields named here are read: the key, or
+ * an account sign-in's access token, expiry, Console and workspace ID. The
+ * refresh token and anything else in the value are never touched.
  */
-function readAuthFile(root) {
+function credentialFromValue(value, integrationId, now) {
+  if (!isRecord(value)) return { status: 'missing' };
+  // Only an OpenCode-account credential names a workspace for the request; a
+  // Go key is already scoped to one and is sent exactly as before.
+  const orgId = integrationId === OPENCODE_INTEGRATION_ID ? text(value.metadata?.orgID) || undefined : undefined;
+  if (value.type === 'key' || value.type === 'api') {
+    const key = text(value.key);
+    if (!key) return { status: 'missing' };
+    return { status: 'ok', token: key, orgId, scope: key };
+  }
+  if (value.type === 'oauth' && integrationId === OPENCODE_INTEGRATION_ID) {
+    const access = text(value.access);
+    // OpenCode reads the workspace from the sign-in itself
+    // (`packages/core/src/usage-limits.ts`) and shows no Go usage without it.
+    if (!access || !orgId) return { status: 'missing' };
+    if (consoleOrigin(value.metadata) !== DEFAULT_CONSOLE_ORIGIN) return { status: 'missing' };
+    const expires = Number(value.expires);
+    if (Number.isFinite(expires) && expires !== 0 && expires <= now.getTime() + EXPIRY_MARGIN_MS) {
+      return { status: 'expired' };
+    }
+    // The access token rotates on every renewal; the workspace does not.
+    return { status: 'ok', token: access, orgId, scope: `${OPENCODE_INTEGRATION_ID}\0${orgId}` };
+  }
+  return { status: 'missing' };
+}
+
+function parseStoredValue(raw) {
+  if (isRecord(raw)) return raw;
+  if (typeof raw !== 'string' || !raw.trim()) return null;
+  try {
+    return JSON.parse(raw);
+  } catch {
+    return null;
+  }
+}
+
+/**
+ * Reads the current `opencode-go` and `opencode` rows from OpenCode's
+ * credential table (2.x). Nothing else in the database is selected, logged,
+ * cached, or uploaded. Returns the candidates in the order they are tried.
+ */
+function readCredentialTable(root, now) {
+  const dbPath = openCodeDbPath(root);
+  if (!existsSync(dbPath)) return { status: 'missing', candidates: [] };
+  let rows;
+  try {
+    rows = queryDbJson(dbPath, `SELECT integration_id, value FROM credential
+      WHERE integration_id IN ('${GO_INTEGRATION_ID}', '${OPENCODE_INTEGRATION_ID}')
+      ORDER BY coalesce(active, 1) DESC, time_updated DESC`);
+  } catch (error) {
+    if (isSqliteUnavailableError(error)) return { status: 'unavailable', candidates: [] };
+    // An older/newer schema without the credential table simply has no login.
+    if (/no such table|no such column/i.test(error?.message || '')) return { status: 'missing', candidates: [] };
+    return { status: 'error', candidates: [] };
+  }
+  const current = new Map();
+  for (const row of Array.isArray(rows) ? rows : []) {
+    if (!current.has(row?.integration_id)) current.set(row.integration_id, row.value);
+  }
+  const candidates = [GO_INTEGRATION_ID, OPENCODE_INTEGRATION_ID]
+    .filter(id => current.has(id))
+    .map(id => credentialFromValue(parseStoredValue(current.get(id)), id, now));
+  return { status: 'missing', candidates };
+}
+
+/**
+ * The 1.x layout keeps logins as plain JSON in `auth.json`, keyed by provider:
+ * `opencode-go` when the user connected "OpenCode Go" (what the official Go
+ * docs describe), `opencode` when they connected "OpenCode" with the same
+ * workspace key. Only those two entries are read; sibling provider
+ * credentials in the file are never inspected.
+ */
+function readAuthFile(root, now) {
   let parsed = null;
   try {
     parsed = JSON.parse(readFileSync(join(root, 'auth.json'), 'utf8'));
   } catch {
-    return { status: 'missing' };
+    return [];
   }
-  const key = parsed?.opencode?.key;
-  const trimmed = typeof key === 'string' ? key.trim() : '';
-  return trimmed ? { status: 'ok', key: trimmed } : { status: 'missing' };
+  if (!isRecord(parsed)) return [];
+  return [GO_INTEGRATION_ID, OPENCODE_INTEGRATION_ID]
+    .filter(id => parsed[id] !== undefined)
+    .map(id => {
+      const entry = parsed[id];
+      // 1.x stores API keys as `{ type: "api", key }`; an OAuth entry there
+      // carries no workspace and is not a Go login.
+      return isRecord(entry) && entry.type === 'api'
+        ? credentialFromValue(entry, id, now)
+        : { status: 'missing' };
+    });
 }
 
 /**
- * The Go key for one data root, or a failure to report. The credential table
- * wins; `auth.json` covers stores that never migrated. A concrete table read
- * failure is preserved only when the fallback has no key either, so an
- * unreadable database cannot hide a perfectly good login.
+ * The Go login for one data root, or a failure to report. The credential
+ * table (2.x) is authoritative: `opencode-go` first, then the `opencode`
+ * account or service-account key. `auth.json` (1.x) follows: `opencode-go`,
+ * then `opencode`. The first usable login wins. Otherwise an expired account
+ * sign-in is reported before a table read failure, and a read failure only
+ * when nothing else was found, so an unreadable database cannot hide a good
+ * login.
  */
-function readCredential(root) {
-  const table = readCredentialTable(root);
-  if (table.status === 'ok') return table;
-  const authFile = readAuthFile(root);
-  if (authFile.status === 'ok') return authFile;
-  return table;
+function readCredential(root, now) {
+  const table = readCredentialTable(root, now);
+  const candidates = [...table.candidates, ...readAuthFile(root, now)];
+  const usable = candidates.find(candidate => candidate.status === 'ok');
+  if (usable) return usable;
+  if (candidates.some(candidate => candidate.status === 'expired')) return { status: 'expired' };
+  return { status: table.status };
 }
 
 export function parseOpenCodeGoUsage(payload) {
@@ -139,13 +230,13 @@ export async function fetchOpenCodeGoQuota({
 } = {}) {
   let credential = { status: 'missing' };
   for (const root of openCodeDataRoots(environment, home)) {
-    const found = readCredential(root);
+    const found = readCredential(root, now);
     if (found.status === 'ok') {
       credential = found;
       break;
     }
-    // Keep the first concrete read failure; a missing database just means the
-    // next configured root may hold the login.
+    // Keep the first concrete reason; a missing database just means the next
+    // configured root may hold the login.
     if (found.status !== 'missing' && credential.status === 'missing') credential = found;
   }
   if (credential.status === 'unavailable') {
@@ -164,6 +255,15 @@ export async function fetchOpenCodeGoQuota({
       fetchedAt: now,
     });
   }
+  if (credential.status === 'expired') {
+    // OpenCode renews the sign-in the next time it runs; nothing is sent.
+    return quotaResult({
+      id: PRODUCT_ID,
+      status: 'expired_credentials',
+      message: 'OpenCode account sign-in has expired; open OpenCode to renew it',
+      fetchedAt: now,
+    });
+  }
   if (credential.status !== 'ok') {
     return quotaResult({
       id: PRODUCT_ID,
@@ -173,23 +273,27 @@ export async function fetchOpenCodeGoQuota({
     });
   }
 
-  const token = credential.key;
+  const { token, orgId, scope } = credential;
+  const headers = { Authorization: `Bearer ${token}`, Accept: 'application/json' };
+  // The workspace an account sign-in chose, as OpenCode sends it for the same
+  // request (`packages/core/src/usage-limits.ts`).
+  if (orgId) headers['x-opencode-org-id'] = orgId;
   try {
     const response = await fetchImpl(usageURL, {
       method: 'GET',
-      headers: { Authorization: `Bearer ${token}`, Accept: 'application/json' },
+      headers,
       signal: AbortSignal.timeout(timeoutMs),
     });
     if (response.status === 401) {
       return attachCacheScope(quotaResult({
         id: PRODUCT_ID,
         status: 'unauthorized',
-        message: 'OpenCode Go rejected the saved API key',
+        message: 'OpenCode Go rejected the saved login',
         fetchedAt: now,
-      }), token);
+      }), scope);
     }
     if (response.status === 403) {
-      // A valid OpenCode key without an active Go subscription. The reason
+      // A valid OpenCode login without an active Go subscription. The reason
       // travels machine-readably so a client can say "not subscribed" instead
       // of showing a neutral empty state.
       return attachCacheScope(quotaResult({
@@ -198,7 +302,7 @@ export async function fetchOpenCodeGoQuota({
         emptyReason: 'notEntitled',
         message: 'OpenCode Go subscription is not active',
         fetchedAt: now,
-      }), token);
+      }), scope);
     }
     if (!response.ok) {
       return attachCacheScope(quotaResult({
@@ -206,7 +310,7 @@ export async function fetchOpenCodeGoQuota({
         status: 'retryable_error',
         message: `OpenCode usage API returned HTTP ${response.status}`,
         fetchedAt: now,
-      }), token);
+      }), scope);
     }
     const meters = parseOpenCodeGoUsage(await response.json());
     return attachCacheScope(quotaResult({
@@ -216,7 +320,7 @@ export async function fetchOpenCodeGoQuota({
       message: meters.length ? undefined : 'OpenCode usage API returned no window',
       fetchedAt: now,
       dataAsOf: now,
-    }), token);
+    }), scope);
   } catch (error) {
     return attachCacheScope(quotaResult({
       id: PRODUCT_ID,
@@ -225,6 +329,6 @@ export async function fetchOpenCodeGoQuota({
         ? 'OpenCode usage request timed out'
         : 'OpenCode usage request failed',
       fetchedAt: now,
-    }), token);
+    }), scope);
   }
 }
