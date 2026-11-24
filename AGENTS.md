@@ -88,6 +88,55 @@ vibe-usage/
 └── package.json               # @vibe-cafe/vibe-usage, ESM, Node >=20 (≥22.5 enables built-in node:sqlite), zero dependencies
 ```
 
+## Network Privacy Principle (highest rule, decided 2026-11-24)
+
+This is the product's highest rule. It outranks features and convenience; where
+any other rule, issue, or contributor request conflicts with it, this rule wins.
+Many users reach overseas services only through a proxy, and what they care
+about most is a vendor seeing their real IP together with their vendor account.
+
+1. **Follow the user's network.** Every network request made by Vibe Usage or
+   by any process it launches (the CLI, Claude Code, `agy`, `grok`, …) honors
+   the proxy configuration on the user's machine: system proxy, PAC, proxy
+   environment variables, TUN. A request that cannot honor it is not sent.
+2. **Stricter for requests made with a vendor account.** A request made with
+   the user's AI-vendor account (quota reads, usage fetches) is sent only when
+   we can confirm it will leave through the user's network settings. This
+   includes requests that a process we launch (Claude Code, `agy`, `grok`, …)
+   makes with its own login. When the route cannot be confirmed, the request
+   is not sent, and the panel says why.
+3. **Proxy expected but not running: pause vendor-account requests and tell
+   the user.** If the user has told us they rely on a proxy and no proxy is
+   detected, the requests in point 2 pause (requests without a vendor account,
+   such as npm or update checks, are not covered by this point), the panel
+   shows that no proxy was detected and reading is paused, and reading resumes
+   on its own once the proxy is back. Whether the user relies on a proxy is
+   asked once, the first time no proxy is detected, and remembered; it is never
+   guessed. Users who answer that they need no proxy connect directly as usual.
+4. **Never change the user's settings.** Telemetry or non-essential traffic the
+   user turned off stays off, including inside processes we launch.
+5. **Only necessary requests; documented and switchable.** Every kind of
+   network activity is described in the privacy notes, and every product can be
+   switched off on its own.
+6. **Every change answers to it, without a worse experience.** Any change that
+   adds or alters network behavior states, point by point, how it meets 1–5,
+   and whether the user experience gets worse. Compliance must not come at the
+   cost of a worse experience: exhaust the alternatives first, and only when
+   every path has been tried and none keeps both, bring the tried paths and the
+   trade-offs to the maintainer for a decision. "Stop reading it" or "stop
+   offering it" is not a proposal on its own. This is a required part of the
+   approval request (see Architecture Approval Gate), and cross-review checks
+   against it.
+
+Scope of the promise: on our side we never route around the user's network
+settings, and when unsure we do not send. Sites that the user's own proxy rules
+send direct are respected. Our own server, the npm registry, and GitHub update
+checks see the user's egress IP; they carry no vendor account and must be described in
+the privacy notes.
+
+Existing code does not fully comply yet. The fixes are tracked separately and
+land under this principle; until then, do not widen any gap.
+
 ## Architecture Approval Gate
 
 A GitHub issue, pull request, or feature request is a **proposal**, not approval
@@ -108,10 +157,13 @@ affects one or more of:
 
 Before requesting approval, state the current invariant, proposed invariant,
 affected repositories/data/users, compatibility and migration behavior,
-release ordering, and rollback plan. Do not infer approval from issue labels,
+release ordering, and rollback plan. For a change that adds or alters network behavior,
+also answer each point of the Network Privacy Principle above. Do not infer approval from issue labels,
 age, detail, author confidence, or the absence of objections. A bug fix that
 only restores already-documented behavior does not need a new architecture
-decision.
+decision; this exception does not cover a change that adds or alters network
+behavior (including fixes to proxy handling), which always goes through this
+gate.
 
 **Current Vibe Usage invariant:** upload/privacy policy is backend-owned.
 `sync.js` fetches `/api/usage/settings`, caches the last backend answer only for
