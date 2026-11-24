@@ -90,16 +90,14 @@ export function nodeHonoursEnvProxyFlag(version) {
 }
 
 /**
- * Both bypass spellings merged with loopback (`[::1]` too: Node's fetch
- * matches the bracketed host). `*` in either means bypass everything.
+ * The bypass list Node itself would use (lowercase `no_proxy` wins over
+ * `NO_PROXY`, as Node reads them; an empty value counts as unset), plus
+ * loopback (`[::1]` too: Node's fetch matches the bracketed host). A `*`
+ * stays exactly `*`.
  */
 export function mergedNoProxy(env = process.env) {
-  const entries = [];
-  for (const name of ['no_proxy', 'NO_PROXY']) {
-    for (const entry of (env[name] || '').split(/[,\s]+/).filter(Boolean)) {
-      if (!entries.includes(entry)) entries.push(entry);
-    }
-  }
+  const effective = first(env, ['no_proxy', 'NO_PROXY'])?.value || '';
+  const entries = effective.split(/[,\s]+/).filter(Boolean);
   if (entries.includes('*')) return '*';
   return [...entries, ...LOOPBACK.filter(host => !entries.includes(host))].join(',');
 }
@@ -140,7 +138,9 @@ export function setupEnvProxy({
     && Boolean(first(env, PROXY_VARIABLES))
     && [https, plain].every(choice => !choice || PROXY_VARIABLES.includes(choice.name));
   if (versions.bun) {
-    current = { state: readAtStartup ? 'active' : 'unsupported' };
+    // Bun's https requests read only HTTPS_PROXY / https_proxy.
+    const httpsOwn = https && ['https_proxy', 'HTTPS_PROXY'].includes(https.name);
+    current = { state: readAtStartup && httpsOwn ? 'active' : 'unsupported' };
     return current;
   }
   if (typeof httpModule.setGlobalProxyFromEnv === 'function') {
@@ -166,12 +166,12 @@ export function setupEnvProxy({
 
 const BLOCK_MESSAGES = {
   socks: 'The configured proxy is SOCKS, which this runtime cannot follow; not sent, to avoid a direct connection.',
-  unsupported: 'A proxy is configured but this runtime does not follow it (set NODE_USE_ENV_PROXY=1 on Node.js 22.21+ / 24.5+, or use Node.js 24.14+); not sent, to avoid a direct connection.',
+  unsupported: 'A proxy is configured but this runtime does not follow it (write it as a full HTTPS_PROXY=http://… and, on Node.js 22.21+ / 24.5+, set NODE_USE_ENV_PROXY=1; or use Node.js 24.14+); not sent, to avoid a direct connection.',
 };
 
 const BLOCK_NOTICES = {
   socks: '设置的代理是 SOCKS，当前运行环境无法照着走，为避免直连已跳过',
-  unsupported: '设置了代理，但当前 Node.js 没有照着走（Node.js 22.21 / 24.5 以上请设置 NODE_USE_ENV_PROXY=1，或改用 24.14 以上），为避免直连已跳过',
+  unsupported: '设置了代理，但当前运行环境没有照着走（请把代理写成完整的 HTTPS_PROXY=http://…，Node.js 22.21 / 24.5 以上同时设置 NODE_USE_ENV_PROXY=1，或改用 Node.js 24.14 以上），为避免直连已跳过',
 };
 
 /**

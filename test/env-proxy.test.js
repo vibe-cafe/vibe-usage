@@ -71,11 +71,14 @@ test('a value without a scheme is read as http://, as curl does', () => {
   assert.equal(env.https_proxy, '127.0.0.1:7890');
 });
 
-test('both NO_PROXY spellings are merged with loopback; * anywhere bypasses all', () => {
+test('the bypass list Node would use (lowercase wins), plus loopback; * stays *', () => {
   assert.equal(mergedNoProxy({ no_proxy: 'corp.invalid' }), `corp.invalid,${LOOP}`);
   assert.equal(mergedNoProxy({ NO_PROXY: 'upper.invalid', no_proxy: '' }), `upper.invalid,${LOOP}`);
-  assert.equal(mergedNoProxy({ NO_PROXY: 'a', no_proxy: 'b,a' }), `b,a,${LOOP}`);
-  assert.equal(mergedNoProxy({ NO_PROXY: '*', no_proxy: 'corp.invalid' }), '*');
+  assert.equal(mergedNoProxy({ NO_PROXY: 'a', no_proxy: 'b' }), `b,${LOOP}`);
+  // A lowercase list overriding an inherited uppercase `*`: Node follows the
+  // lowercase one, so vendor hosts keep going through the proxy.
+  assert.equal(mergedNoProxy({ NO_PROXY: '*', no_proxy: 'localhost' }), `localhost,127.0.0.1,::1,[::1]`);
+  assert.equal(mergedNoProxy({ no_proxy: '*' }), '*');
   assert.equal(mergedNoProxy({}), LOOP);
 });
 
@@ -148,6 +151,8 @@ test('Bun follows the proxy variables it read itself', () => {
   const bun = { bun: '1.3.14', node: '24.3.0' };
   assert.equal(setupEnvProxy({ env: { HTTPS_PROXY: 'http://p:1' }, versions: bun, execArgv: [], httpModule: {} }).state, 'active');
   assert.equal(setupEnvProxy({ env: { ALL_PROXY: 'http://p:1' }, versions: bun, execArgv: [], httpModule: {} }).state, 'unsupported');
+  // Bun's https requests read only HTTPS_PROXY.
+  assert.equal(setupEnvProxy({ env: { HTTP_PROXY: 'http://p:1' }, versions: bun, execArgv: [], httpModule: {} }).state, 'unsupported');
 });
 
 // The real runtime running this suite (CI: Node 20 / 22 / 24): with a proxy
