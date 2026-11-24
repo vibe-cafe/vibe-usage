@@ -6,7 +6,7 @@ import { createServer } from 'node:http';
 import { tmpdir } from 'node:os';
 import { delimiter, dirname, join } from 'node:path';
 import {
-  DEVICE_VERIFICATION_ORIGINS, browserCommand, planLoginPage, printableLink, runBrowserCommand, trustedLoginUrl,
+  DEVICE_VERIFICATION_ORIGINS, browserCommand, planLoginPage, printableText, runBrowserCommand, trustedLoginUrl,
 } from '../src/login-page.js';
 
 const PROD = 'https://vibefriends.com';
@@ -123,9 +123,9 @@ test('a malicious reply opens nothing on any platform; a genuine one opens every
   }
 });
 
-test('an untrusted link is printed without control characters', () => {
-  assert.equal(printableLink(`https://evil.example/\u001b]8;;x\u0007y\r\n\u009b31m`), 'https://evil.example/]8;;xy31m');
-  assert.equal(printableLink(undefined), '');
+test('untrusted text from the reply is printed without control characters', () => {
+  assert.equal(printableText(`https://evil.example/\u001b]8;;x\u0007y\r\n\u009b31m`), 'https://evil.example/]8;;xy31m');
+  assert.equal(printableText(undefined), '');
 });
 
 test('runBrowserCommand passes file, args and options to execFile', () => {
@@ -168,11 +168,12 @@ test('init opens only a trusted login link', { skip: process.platform === 'win32
   }
 
   let link = '';
+  let userCode = 'ABCD-EFGH';
   let polls = 0;
   const server = createServer((req, res) => {
     res.setHeader('Content-Type', 'application/json');
     if (req.url === '/api/usage/device/code') {
-      res.end(JSON.stringify({ deviceCode: 'dev', userCode: 'ABCD-EFGH', verificationUriComplete: link, expiresIn: 60, interval: 0.02 }));
+      res.end(JSON.stringify({ deviceCode: 'dev', userCode, verificationUriComplete: link, expiresIn: 60, interval: 0.02 }));
       return;
     }
     if (req.url === '/api/usage/device/poll') {
@@ -230,13 +231,15 @@ test('init opens only a trusted login link', { skip: process.platform === 'win32
   ];
   for (const bad of malicious) {
     link = bad;
+    // The user code comes from the same reply and is printed too.
+    userCode = 'ABCD-EFGH\u001b[2J\u0007';
     const result = await init();
     assert.equal(result.code, 1, result.stderr);
     assert.equal(existsSync(openLog), false, `opened ${JSON.stringify(bad)}`);
     assert.equal(polls >= 25, true, 'the flow stayed open long enough for a launcher to have run');
     assert.match(result.stdout, /没有自动打开浏览器/);
     assert.doesNotMatch(result.stdout, /浏览器会自动打开/);
-    assert.ok(result.stdout.includes(printableLink(bad)), 'the link is still printed for the user to copy');
+    assert.ok(result.stdout.includes(printableText(bad)), 'the link is still printed for the user to copy');
     assert.doesNotMatch(result.stdout, /\u001b|\u0007/);
   }
 });

@@ -70,9 +70,9 @@ export function planLoginPage(raw, apiUrl, os = osPlatform()) {
   return { url, command: url ? browserCommand(url, os) : null };
 }
 
-/** An untrusted link as printable text: no control characters, so it cannot
- * carry terminal escape sequences. */
-export function printableLink(raw) {
+/** Untrusted text from the reply (a rejected link, the user code) without
+ * control characters, so it cannot carry terminal escape sequences. */
+export function printableText(raw) {
   return String(raw ?? '').replace(/[\u0000-\u001f\u007f-\u009f]/g, '');
 }
 

@@ -3,7 +3,7 @@ import { DEFAULT_API_URL, isPlaintextRemoteApiUrl } from './api-url.js';
 import { hostname as osHostname } from 'node:os';
 import { loadConfig, saveConfig } from './config.js';
 import { fetchAccount, ingest, requestDeviceCode, pollDeviceCode } from './api.js';
-import { planLoginPage, printableLink, runBrowserCommand } from './login-page.js';
+import { planLoginPage, printableText, runBrowserCommand } from './login-page.js';
 import { runSync } from './sync.js';
 import { detectInstalledTools } from './tools.js';
 import { bigHeader, success, failure, warn, arrow, link, dim, divider } from './output.js';
@@ -135,9 +135,9 @@ async function runDeviceFlow(apiUrl, hostname) {
   // The link comes from the server's reply: see login-page.js for what is
   // checked before a browser is opened.
   const loginPage = planLoginPage(device.verificationUriComplete, apiUrl);
-  const shown = loginPage.url ? link(loginPage.url) : printableLink(device.verificationUriComplete);
+  const shown = loginPage.url ? link(loginPage.url) : printableText(device.verificationUriComplete);
   console.log(`${arrow('登录确认')} ${shown}`);
-  console.log(`  验证码: ${device.userCode}`);
+  console.log(`  验证码: ${printableText(device.userCode)}`);
   if (loginPage.command) {
     console.log(dim('  浏览器会自动打开；如果没反应，请手动复制上方链接。'));
   } else {
