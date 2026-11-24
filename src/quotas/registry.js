@@ -2,13 +2,28 @@ import { accessSync, constants, existsSync } from 'node:fs';
 import { homedir } from 'node:os';
 import { delimiter, join } from 'node:path';
 import { loadCachedQuota, saveCachedQuota } from './cache.js';
-import { fetchCursorQuota } from './providers/cursor.js';
+import { cursorQuotaNetworkURLs, fetchCursorQuota } from './providers/cursor.js';
 import { antigravityDesktopPaths, antigravityInstallPaths, fetchAntigravityQuota } from './providers/antigravity.js';
 import { fetchGrokQuota } from './providers/grok.js';
-import { fetchKimiCodeQuota } from './providers/kimi-code.js';
-import { fetchOpenCodeGoQuota } from './providers/opencode-go.js';
-import { fetchZaiQuota } from './providers/zai.js';
+import { fetchKimiCodeQuota, kimiCodeNetworkURLs } from './providers/kimi-code.js';
+import { fetchOpenCodeGoQuota, openCodeGoNetworkURLs } from './providers/opencode-go.js';
+import { fetchZaiQuota, zaiNetworkURLs } from './providers/zai.js';
 import { FETCHABLE_QUOTA_PRODUCT_IDS, quotaEnvelope, quotaResult } from './schema.js';
+import { envProxyBlockFor } from '../env-proxy.js';
+
+// Providers whose own request carries the user's vendor credential. When the
+// environment names a proxy this process cannot follow, they are not run
+// (network-privacy principle). Grok reads a local log; Antigravity talks to a
+// local language server and the official program makes its own requests.
+// The URLs each read requests, resolved by the provider itself: a URL on the
+// user's bypass list is the user's own direct rule, so it is not blocked; a
+// read that requests nothing (no key) is not blocked either.
+const VENDOR_NETWORK_URLS = {
+  'kimi-code': kimiCodeNetworkURLs,
+  zcode: zaiNetworkURLs,
+  'opencode-go': openCodeGoNetworkURLs,
+  cursor: cursorQuotaNetworkURLs,
+};
 
 const providers = new Map([
   ['kimi-code', fetchKimiCodeQuota],
@@ -110,7 +125,17 @@ export async function fetchQuotaProducts(ids, options = {}) {
   const invalid = unique.filter(id => !FETCHABLE_QUOTA_PRODUCT_IDS.includes(id));
   if (invalid.length) throw new Error(`Unsupported quota product: ${invalid.join(', ')}`);
 
+  const environment = options.environment || process.env;
   const fetched = await Promise.all(unique.map(async id => {
+    const urls = VENDOR_NETWORK_URLS[id]?.({ ...options, environment });
+    const block = !urls?.length ? null
+      : options.envProxyBlock !== undefined ? options.envProxyBlock
+      : envProxyBlockFor(urls, { env: environment });
+    if (block) {
+      // Not a failure: nothing was sent. `unsupported` keeps the desktop apps
+      // from offering a retry and the cache from answering in its place.
+      return quotaResult({ id, status: 'unsupported', message: block.message });
+    }
     try {
       return await providers.get(id)(options);
     } catch {

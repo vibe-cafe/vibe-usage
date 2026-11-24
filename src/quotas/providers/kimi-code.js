@@ -349,6 +349,8 @@ async function requestTokenRefresh({
     try {
       const response = await fetchImpl(oauthURL, {
         method: 'POST',
+        // A refresh token is never handed on to wherever a redirect points.
+        redirect: 'error',
         headers: {
           Accept: 'application/json',
           'Content-Type': 'application/x-www-form-urlencoded',
@@ -438,13 +440,26 @@ async function ensureFreshCredentials({
   }
 }
 
+export function kimiOAuthURL(environment = process.env) {
+  return `${(environment.KIMI_CODE_OAUTH_HOST || environment.KIMI_OAUTH_HOST
+    || DEFAULT_OAUTH_HOST).replace(/\/$/, '')}/api/oauth/token`;
+}
+
+/** The URLs a quota read may request, resolved the same way the read does. */
+export function kimiCodeNetworkURLs({
+  environment = process.env,
+  usageURL = DEFAULT_USAGE_URL,
+  oauthURL = kimiOAuthURL(environment),
+} = {}) {
+  return [usageURL, oauthURL];
+}
+
 export async function fetchKimiCodeQuota({
   environment = process.env,
   home = homedir(),
   fetchImpl = globalThis.fetch,
   usageURL = DEFAULT_USAGE_URL,
-  oauthURL = `${(environment.KIMI_CODE_OAUTH_HOST || environment.KIMI_OAUTH_HOST
-    || DEFAULT_OAUTH_HOST).replace(/\/$/, '')}/api/oauth/token`,
+  oauthURL = kimiOAuthURL(environment),
   now = new Date(),
   timeoutMs = 10_000,
   sleepImpl = sleep,

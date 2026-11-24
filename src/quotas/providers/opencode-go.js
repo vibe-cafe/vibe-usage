@@ -124,6 +124,11 @@ export function parseOpenCodeGoUsage(payload) {
   return meters;
 }
 
+/** The URL a quota read requests. */
+export function openCodeGoNetworkURLs({ usageURL = DEFAULT_USAGE_URL } = {}) {
+  return [usageURL];
+}
+
 export async function fetchOpenCodeGoQuota({
   environment = process.env,
   home = homedir(),

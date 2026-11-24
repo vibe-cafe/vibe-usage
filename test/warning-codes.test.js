@@ -7,7 +7,8 @@ import {
   countWarningCodes,
   isWarningCode,
 } from '../src/warning-codes.js';
-import { ENCRYPTED_TOKEN_NOTICE } from '../src/parsers/cursor.js';
+import { ENCRYPTED_TOKEN_NOTICE, PROXY_SKIP_NOTICE_PREFIX } from '../src/parsers/cursor.js';
+import { envProxyBlock } from '../src/env-proxy.js';
 import { CODEX_ULTRAFAST_HOLD_WARNING } from '../src/codex-ultrafast.js';
 import { sqliteUnavailableError } from '../src/parsers/sqlite.js';
 
@@ -100,6 +101,9 @@ const CASES = [
   ['dsh: skipping p/s1/session.v1.jsonl.zstd (invalid Zstandard frame magic at byte 0)', 'unsupported_format'],
   // Cursor
   [`cursor: ${ENCRYPTED_TOKEN_NOTICE}`, 'cursor_token_encrypted'],
+  // env-proxy.js: a proxy this process cannot follow (both reasons).
+  [`cursor: ${PROXY_SKIP_NOTICE_PREFIX}${envProxyBlock('socks').notice}，其他工具照常同步。`, 'proxy_unsupported'],
+  [`cursor: ${PROXY_SKIP_NOTICE_PREFIX}${envProxyBlock('unsupported').notice}，其他工具照常同步。`, 'proxy_unsupported'],
   ['cursor: Cursor usage export skipped (timeout after 120000ms). Cursor 用量导出超时，请稍后重试；可通过 VIBE_USAGE_CURSOR_FETCH_TIMEOUT_MS 增大导出等待时间。', 'network_timeout'],
   ['cursor: Cursor usage export skipped (network: ETIMEDOUT, ENETUNREACH). 请检查终端网络和代理配置；浏览器能访问 Cursor 不代表 Node.js 使用了相同代理。', 'network_failed'],
   ['cursor: Cursor usage export skipped (HTTP 503 Service Unavailable)', 'remote_http_error'],

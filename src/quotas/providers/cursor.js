@@ -82,6 +82,11 @@ export function parseCursorQuota(payload) {
   return meters;
 }
 
+/** The URL a quota read requests. */
+export function cursorQuotaNetworkURLs() {
+  return [USAGE_URL];
+}
+
 export async function fetchCursorQuota({
   environment = process.env, home = homedir(), platform = process.platform,
   fetchImpl = globalThis.fetch, now = new Date(), timeoutMs = 10000,

@@ -3,6 +3,7 @@ import { join, resolve } from 'node:path';
 import { homedir } from 'node:os';
 import { aggregateToBuckets, roundToHalfHour } from './aggregate.js';
 import { queryDbJsonSnapshotOnLock, sqliteUnavailableError, isSqliteUnavailableError } from './sqlite.js';
+import { envProxyBlockFor } from '../env-proxy.js';
 
 const STATE_DB_RELATIVE = join('User', 'globalStorage', 'state.vscdb');
 const ACCESS_TOKEN_KEY = 'cursorAuth/accessToken';
@@ -46,6 +47,11 @@ export const ENCRYPTED_TOKEN_NOTICE =
   '新版 Cursor 已加密保存登录凭证，vibe-usage 暂不支持读取，Cursor 用量暂停同步，其他工具照常同步。'
   + '重新登录 Cursor 无法解决，进展见 https://github.com/vibe-cafe/vibe-usage/issues/144';
 const ENCRYPTED_TOKEN_WARNING = `cursor: ${ENCRYPTED_TOKEN_NOTICE}`;
+
+// A proxy this process cannot follow (`env-proxy.js`): skip like the encrypted
+// token above, with no request and no info, so state and recorded progress
+// survive and the next run that can follow the proxy fills the gap.
+export const PROXY_SKIP_NOTICE_PREFIX = 'Cursor 本次未同步：';
 
 export function isEncryptedCursorToken(token) {
   return typeof token === 'string' && token.startsWith(ENCRYPTED_TOKEN_PREFIX);
@@ -786,7 +792,10 @@ function exportSkipped(err) {
   return { buckets: [], sessions: [], skipped: true, warnings: [`cursor: ${err.message}`] };
 }
 
-export async function parse({ previousInfo } = {}) {
+export async function parse({
+  previousInfo,
+  envProxyBlock: block = envProxyBlockFor([cursorWebBase()]),
+} = {}) {
   const dbPath = getCursorStateDbPath();
   let token = null;
   let sqliteUnavailable = false;
@@ -810,6 +819,12 @@ export async function parse({ previousInfo } = {}) {
     // on every run (parser warnings are never filtered); nothing from the
     // token itself goes into the message.
     return { buckets: [], sessions: [], skipped: true, warnings: [ENCRYPTED_TOKEN_WARNING] };
+  }
+  if (block) {
+    return {
+      buckets: [], sessions: [], skipped: true,
+      warnings: [`cursor: ${PROXY_SKIP_NOTICE_PREFIX}${block.notice}，其他工具照常同步。`],
+    };
   }
 
   const sub = decodeJwtSub(token);

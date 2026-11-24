@@ -15,9 +15,9 @@ maintainer (Hogan), 一键诊断 plan, step 2.
   10 s: `<apiUrl>/api/usage/settings` (no `Authorization` header; any HTTP
   answer, including 401, means reachable) and `<registry>/-/ping`. They use the
   same Node `https` module and default global agent as uploads, so they take
-  the same route: through the environment proxy when `NODE_USE_ENV_PROXY=1`
-  is set (Node 22.21+ / 24.5+; the Windows app sets it with `HTTPS_PROXY`
-  when the system has a proxy), directly otherwise. A machine whose sync
+  the same route (`src/env-proxy.js`): the environment proxy where the
+  runtime follows it, the CLI's own tunnel (`src/proxy-tunnel.js`) where it
+  cannot, directly when no proxy is set or the host is on the bypass list. A machine whose sync
   cannot get out fails here too, and one whose sync works through the proxy
   is reported reachable. Budget about 12 s; the apps should give the whole
   command 30 s.
@@ -133,6 +133,7 @@ maintainer (Hogan), 一键诊断 plan, step 2.
 | `sqlite_unavailable` | 没有可用的 SQLite |
 | `decoder_unavailable` | 缺少解压组件（zstd） |
 | `cursor_token_encrypted` | 本地登录令牌已加密（Cursor 3.27+，#144） |
+| `proxy_unsupported` | 设置了代理但无法照着走（SOCKS，或运行环境不支持），带厂商账号的请求已跳过，避免直连 |
 | `auth_rejected` | 登录凭证被拒绝，需要在该工具里重新登录 |
 | `network_timeout` | 网络请求超时 |
 | `network_failed` | 网络请求失败 |

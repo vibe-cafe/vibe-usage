@@ -16,6 +16,7 @@ import { COLLECTOR_VERSION } from './client-meta.js';
 import { kikiStartTime } from './kiki-migration.js';
 import { magpieStartTime } from './magpie-migration.js';
 import { ENCRYPTED_TOKEN_NOTICE, localCursorTokenEncrypted } from './parsers/cursor.js';
+import { setupEnvProxy } from './env-proxy.js';
 
 function printSmallHeader() {
   console.log();
@@ -384,6 +385,9 @@ const FULL_HELP = `
 `;
 
 export async function run(rawArgs) {
+  // Before anything can reach the network: follow the environment's proxy,
+  // or remember why requests carrying a vendor account must not be sent.
+  setupEnvProxy();
   // --key and --manual-key both mean "skip device flow, take this vbu_ key".
   // --manual-key is the documented name; --key is kept as a legacy alias so
   // existing scripts/docs don't break when device flow becomes the default.
