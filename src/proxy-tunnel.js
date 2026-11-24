@@ -23,10 +23,13 @@ import https from 'node:https';
 import net from 'node:net';
 import tls from 'node:tls';
 import zlib from 'node:zlib';
-import { Readable } from 'node:stream';
+import { Readable, pipeline } from 'node:stream';
 
 const DEFAULT_PORTS = { 'http:': 80, 'https:': 443, 'socks5:': 1080, 'socks5h:': 1080 };
 const CONNECT_TIMEOUT_MS = 10_000;
+// From the first byte to the proxy until the target's TLS is up: a proxy that
+// accepts but whose upstream is gone must fail the request, not hang it.
+const HANDSHAKE_TIMEOUT_MS = 15_000;
 const MAX_REDIRECTS = 20;
 
 /**
@@ -168,6 +171,45 @@ export async function connectThroughProxy(proxy, host, port) {
   }
 }
 
+/**
+ * `connectThroughProxy`, then TLS to the target when `secure`, all within
+ * `timeoutMs`: past it every socket is destroyed and the request fails.
+ */
+function openTunnel(proxy, host, port, secure, options, timeoutMs) {
+  return new Promise((resolve, reject) => {
+    let current = null;
+    let settled = false;
+    const finish = (error, socket) => {
+      if (settled) return;
+      settled = true;
+      clearTimeout(timer);
+      if (error) {
+        current?.destroy();
+        reject(error);
+      } else {
+        resolve(socket);
+      }
+    };
+    const timer = setTimeout(() => finish(new Error('proxy tunnel timed out')), timeoutMs);
+    connectThroughProxy(proxy, host, port).then(raw => {
+      if (settled) { raw.destroy(); return; }
+      current = raw;
+      if (!secure) { finish(null, raw); return; }
+      const socket = tls.connect({
+        ...tlsOptions(options),
+        socket: raw,
+        // The name the certificate must match; SNI only for a host name.
+        host,
+        servername: options.servername ?? (net.isIP(host) ? undefined : host),
+        ALPNProtocols: ['http/1.1'],
+      });
+      current = socket;
+      socket.once('secureConnect', () => finish(null, socket));
+      socket.once('error', error => finish(error));
+    }, error => finish(error));
+  });
+}
+
 function tlsOptions(options) {
   const picked = {};
   for (const key of ['ca', 'cert', 'key', 'pfx', 'passphrase', 'rejectUnauthorized', 'checkServerIdentity',
@@ -181,23 +223,13 @@ function tlsOptions(options) {
  * Agent whose connections go through the proxy chosen for its scheme;
  * `bypass(host)` true means a direct connection.
  */
-function tunnelAgent(Base, secure, proxy, bypass) {
+function tunnelAgent(Base, secure, proxy, bypass, timeoutMs) {
   return new (class extends Base {
     createConnection(options, callback) {
       const host = String(options.host || options.hostname || 'localhost').replace(/^\[|\]$/g, '');
       const port = Number(options.port) || (secure ? 443 : 80);
       if (!proxy || bypass(host, port)) return super.createConnection(options, callback);
-      connectThroughProxy(proxy, host, port).then(raw => {
-        if (!secure) return callback(null, raw);
-        const socket = tls.connect({
-          ...tlsOptions(options),
-          socket: raw,
-          servername: options.servername ?? (net.isIP(host) ? undefined : host),
-          ALPNProtocols: ['http/1.1'],
-        });
-        socket.once('secureConnect', () => callback(null, socket));
-        socket.once('error', error => callback(error));
-      }, error => callback(error));
+      openTunnel(proxy, host, port, secure, options, timeoutMs).then(socket => callback(null, socket), callback);
       return undefined;
     }
   })({ keepAlive: false });
@@ -219,20 +251,26 @@ async function bodyBytes(body) {
   return { bytes: Buffer.from(await new Response(body).arrayBuffer()), type: null };
 }
 
+/** The body, decoded as `fetch` does; a broken source errors the result. */
 function decoded(response) {
   const encoding = String(response.headers['content-encoding'] || '').trim().toLowerCase();
-  if (encoding === 'gzip' || encoding === 'x-gzip') return response.pipe(zlib.createGunzip());
-  if (encoding === 'deflate') return response.pipe(zlib.createInflate());
-  if (encoding === 'br') return response.pipe(zlib.createBrotliDecompress());
-  return response;
+  const decoder = encoding === 'gzip' || encoding === 'x-gzip' ? zlib.createGunzip()
+    : encoding === 'deflate' ? zlib.createInflate()
+      : encoding === 'br' ? zlib.createBrotliDecompress()
+        : null;
+  if (!decoder) return response;
+  pipeline(response, decoder, () => {});
+  return decoder;
 }
+
+const CREDENTIAL_HEADERS = ['authorization', 'cookie', 'proxy-authorization'];
 
 /**
  * `fetch` over the tunnel agents: the subset the CLI uses (method, headers,
  * string / URLSearchParams / bytes body, signal, redirects), answered with a
  * real `Response`. Compressed bodies are decoded, as `fetch` does.
  */
-function tunnelFetch(agents) {
+function tunnelFetch(agents, routeOf, nativeFetch) {
   return async function fetchThroughProxy(input, init = {}) {
     let url = new URL(typeof input === 'string' || input instanceof URL ? input : input.url);
     let method = String(init.method || (input instanceof Request ? input.method : 'GET')).toUpperCase();
@@ -264,7 +302,19 @@ function tunnelFetch(agents) {
           body = null;
           headers.delete('content-type');
         }
-        url = new URL(location, url);
+        const next = new URL(location, url);
+        if (next.origin !== url.origin) {
+          // Never hand a credential, or a body that may carry one, to
+          // another site (as `fetch` does for Authorization).
+          if (body) throw new TypeError('fetch failed: cross-origin redirect with a body');
+          for (const name of CREDENTIAL_HEADERS) headers.delete(name);
+        }
+        url = next;
+        if (routeOf(url) !== 'tunnel') {
+          // This hop goes direct (bypass list, loopback, no proxy for its
+          // scheme): the native stack takes it from here.
+          return nativeFetch(url, { method, headers, body: body ? body.bytes : undefined, signal, redirect: init.redirect });
+        }
         continue;
       }
       const responseHeaders = new Headers();
@@ -294,14 +344,22 @@ function tunnelFetch(agents) {
  * is not a proxy this tunnel can speak.
  */
 export function installProxyTunnel({ proxies, bypass, nativeFetch = globalThis.fetch,
-  httpModule = http, httpsModule = https } = {}) {
+  httpModule = http, httpsModule = https, handshakeTimeoutMs = HANDSHAKE_TIMEOUT_MS } = {}) {
   const chosen = { https: proxies.https ? parseProxy(proxies.https) : null, http: proxies.http ? parseProxy(proxies.http) : null };
   if ((proxies.https && !chosen.https) || (proxies.http && !chosen.http)) return false;
   const agents = {
-    https: tunnelAgent(httpsModule.Agent, true, chosen.https, bypass),
-    http: tunnelAgent(httpModule.Agent, false, chosen.http, bypass),
+    https: tunnelAgent(httpsModule.Agent, true, chosen.https, bypass, handshakeTimeoutMs),
+    http: tunnelAgent(httpModule.Agent, false, chosen.http, bypass, handshakeTimeoutMs),
   };
-  const throughProxy = tunnelFetch(agents);
+  const routeOf = url => {
+    if (!['http:', 'https:'].includes(url.protocol)) return 'native';
+    const secure = url.protocol === 'https:';
+    const proxy = secure ? chosen.https : chosen.http;
+    const port = Number(url.port) || (secure ? 443 : 80);
+    const host = url.hostname.replace(/^\[|\]$/g, '');
+    return proxy && !bypass(host, port) ? 'tunnel' : 'native';
+  };
+  const throughProxy = tunnelFetch(agents, routeOf, nativeFetch);
   const previous = { fetch: globalThis.fetch, https: httpsModule.globalAgent, http: httpModule.globalAgent };
   httpsModule.globalAgent = agents.https;
   httpModule.globalAgent = agents.http;
@@ -312,12 +370,7 @@ export function installProxyTunnel({ proxies, bypass, nativeFetch = globalThis.f
     } catch {
       return nativeFetch(input, init);
     }
-    const secure = url.protocol === 'https:';
-    const proxy = secure ? chosen.https : chosen.http;
-    const port = Number(url.port) || (secure ? 443 : 80);
-    const host = url.hostname.replace(/^\[|\]$/g, '');
-    if (!proxy || !['http:', 'https:'].includes(url.protocol) || bypass(host, port)) return nativeFetch(input, init);
-    return throughProxy(input, init);
+    return routeOf(url) === 'tunnel' ? throughProxy(input, init) : nativeFetch(input, init);
   };
   return function uninstall() {
     globalThis.fetch = previous.fetch;

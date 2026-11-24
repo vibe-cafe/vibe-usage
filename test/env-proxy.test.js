@@ -460,3 +460,109 @@ test('on this runtime: an HTTP proxy the runtime cannot follow goes through the 
   assert.equal(out.https, '200 ok GET /https', JSON.stringify(out));
   assert.equal(seen.length, 2);
 });
+
+test('the startup switch alone counts only with HTTPS_PROXY (https uploads read nothing else)', () => {
+  const node = { node: '22.21.0' };
+  assert.equal(setup({ env: { HTTP_PROXY: 'http://p:1', NODE_USE_ENV_PROXY: '1' }, versions: node, execArgv: [],
+    httpModule: {} }).state, 'unsupported');
+  assert.equal(setup({ env: { HTTPS_PROXY: 'http://p:1', NODE_USE_ENV_PROXY: '1' }, versions: node, execArgv: [],
+    httpModule: {} }).state, 'active');
+  let installed;
+  setupEnvProxy({ env: { HTTPS_PROXY: 'socks5://127.0.0.1:1' }, versions: NODE_24, execArgv: [], httpModule: fakeHttp(),
+    installTunnel: options => { installed = options; return () => {}; } });
+  assert.equal(installed.bypass('127.0.0.9', 80), true);
+  assert.equal(installed.bypass('127.service.example', 443), false);
+});
+
+// In-process tunnel checks over plain HTTP targets: a stand-in CONNECT proxy
+// forwards every tunnel to one local server, whatever host was asked for.
+async function connectHarness(t, handler, { answer = true } = {}) {
+  const target = http.createServer(handler);
+  await new Promise(resolve => target.listen(0, '127.0.0.1', resolve));
+  t.after(() => { target.closeAllConnections(); target.close(); });
+  const asked = [];
+  const open = new Set();
+  const proxy = net.createServer(socket => {
+    open.add(socket);
+    socket.on('close', () => open.delete(socket));
+    socket.once('data', data => {
+      asked.push(data.toString().split('\r\n')[0]);
+      if (!answer) return; // accepts, never replies
+      const upstream = net.connect(target.address().port, '127.0.0.1', () => {
+        socket.write('HTTP/1.1 200 Connection Established\r\n\r\n');
+        upstream.pipe(socket);
+        socket.pipe(upstream);
+      });
+      upstream.on('error', () => socket.destroy());
+      socket.on('error', () => upstream.destroy());
+    });
+  });
+  await new Promise(resolve => proxy.listen(0, '127.0.0.1', resolve));
+  t.after(() => { for (const socket of open) socket.destroy(); proxy.close(); });
+  return { proxyURL: `http://127.0.0.1:${proxy.address().port}`, asked };
+}
+
+async function withTunnel(t, proxyURL, options = {}) {
+  const { installProxyTunnel } = await import('../src/proxy-tunnel.js');
+  const uninstall = installProxyTunnel({ proxies: { http: proxyURL, https: proxyURL }, bypass: () => false, ...options });
+  t.after(() => uninstall());
+}
+
+test('a redirect to another site drops the credential; a body is never replayed there', async (t) => {
+  const seen = [];
+  const { proxyURL } = await connectHarness(t, (req, res) => {
+    seen.push(`${req.headers.host} ${req.url} auth=${req.headers.authorization || '-'}`);
+    if (req.url === '/same') { res.writeHead(302, { location: '/landed' }); res.end(); return; }
+    if (req.url === '/away') { res.writeHead(302, { location: 'http://other.vibe-usage-proxy-test.invalid/landed' }); res.end(); return; }
+    if (req.url === '/away-307') { res.writeHead(307, { location: 'http://other.vibe-usage-proxy-test.invalid/landed' }); res.end(); return; }
+    res.end('ok');
+  });
+  await withTunnel(t, proxyURL);
+  const headers = { authorization: 'Bearer test-token' };
+  assert.equal(await (await fetch('http://api.vibe-usage-proxy-test.invalid/same', { headers })).text(), 'ok');
+  assert.equal(await (await fetch('http://api.vibe-usage-proxy-test.invalid/away', { headers })).text(), 'ok');
+  assert.deepEqual(seen, [
+    'api.vibe-usage-proxy-test.invalid /same auth=Bearer test-token',
+    'api.vibe-usage-proxy-test.invalid /landed auth=Bearer test-token',
+    'api.vibe-usage-proxy-test.invalid /away auth=Bearer test-token',
+    'other.vibe-usage-proxy-test.invalid /landed auth=-',
+  ]);
+  await assert.rejects(fetch('http://api.vibe-usage-proxy-test.invalid/away-307',
+    { method: 'POST', headers, body: new URLSearchParams({ refresh_token: 'x' }) }), /cross-origin redirect/);
+});
+
+test('a proxy that accepts but never answers fails the request instead of hanging it', async (t) => {
+  const { proxyURL, asked } = await connectHarness(t, (req, res) => res.end('never'), { answer: false });
+  await withTunnel(t, proxyURL, { handshakeTimeoutMs: 300 });
+  const started = Date.now();
+  await assert.rejects(fetch('http://api.vibe-usage-proxy-test.invalid/'));
+  assert.ok(Date.now() - started < 5000);
+  assert.equal(asked.length, 1);
+});
+
+test('a compressed body cut off mid-way errors instead of never ending', async (t) => {
+  const { gzipSync } = await import('node:zlib');
+  const { randomBytes } = await import('node:crypto');
+  const whole = gzipSync(randomBytes(64 * 1024));
+  const { proxyURL } = await connectHarness(t, (req, res) => {
+    res.writeHead(200, { 'content-encoding': 'gzip', 'content-length': String(whole.length) });
+    res.write(whole.subarray(0, 1000));
+    setTimeout(() => res.socket.destroy(), 50);
+  });
+  await withTunnel(t, proxyURL);
+  const response = await fetch('http://api.vibe-usage-proxy-test.invalid/');
+  await assert.rejects(response.text());
+});
+
+test('a form body arrives intact through the tunnel', async (t) => {
+  const { proxyURL } = await connectHarness(t, (req, res) => {
+    let body = '';
+    req.on('data', chunk => { body += chunk; });
+    req.on('end', () => res.end(`${req.headers['content-type']}|${body}`));
+  });
+  await withTunnel(t, proxyURL);
+  const text = await (await fetch('http://api.vibe-usage-proxy-test.invalid/token', {
+    method: 'POST', body: new URLSearchParams({ grant_type: 'refresh_token', a: 'b c' }),
+  })).text();
+  assert.equal(text, 'application/x-www-form-urlencoded;charset=UTF-8|grant_type=refresh_token&a=b+c');
+});

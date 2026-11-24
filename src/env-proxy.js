@@ -149,7 +149,8 @@ export function setupEnvProxy({
 
 function isLoopback(host) {
   const name = String(host).toLowerCase().replace(/^\[|\]$/g, '');
-  return name === 'localhost' || name.endsWith('.localhost') || /^127\./.test(name) || name === '::1';
+  return name === 'localhost' || name.endsWith('.localhost') || name === '::1'
+    || (net.isIPv4(name) && name.startsWith('127.'));
 }
 
 function runtimeProxyState({ env, versions, execArgv, httpModule }) {
@@ -171,18 +172,21 @@ function runtimeProxyState({ env, versions, execArgv, httpModule }) {
   }
   if (typeof httpModule.setGlobalProxyFromEnv === 'function') {
     try {
-      httpModule.setGlobalProxyFromEnv({
+      const restore = httpModule.setGlobalProxyFromEnv({
         HTTPS_PROXY: https ? withScheme(https.value) : undefined,
         HTTP_PROXY: plain ? withScheme(plain.value) : undefined,
         NO_PROXY: mergedNoProxy(env),
       });
-      return { state: 'active' };
+      return { state: 'active', uninstall: typeof restore === 'function' ? restore : undefined };
     } catch {
       return { state: 'unsupported' };
     }
   }
+  // Node's https agent reads only HTTPS_PROXY / https_proxy at start (fetch
+  // also falls back to HTTP_PROXY): without one, uploads would go direct.
+  const httpsOwn = !https || ['https_proxy', 'HTTPS_PROXY'].includes(https.name);
   return {
-    state: readAtStartup && envProxyFlagOn(env, execArgv) && nodeHonoursEnvProxyFlag(versions.node)
+    state: readAtStartup && httpsOwn && envProxyFlagOn(env, execArgv) && nodeHonoursEnvProxyFlag(versions.node)
       ? 'active'
       : 'unsupported',
   };
