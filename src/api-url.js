@@ -23,6 +23,19 @@ export function currentApiUrl(url) {
   return isLegacyApiUrl(url) ? DEFAULT_API_URL : url;
 }
 
+/** A server reached over plain http on another machine: the API key and the
+ * usage data cross the network unencrypted. Loopback (local development) is
+ * exempt. */
+export function isPlaintextRemoteApiUrl(url) {
+  let parsed;
+  try {
+    parsed = new URL(url);
+  } catch {
+    return false;
+  }
+  return parsed.protocol === 'http:' && !['localhost', '127.0.0.1', '[::1]'].includes(parsed.hostname);
+}
+
 /** Compare two recorded server URLs, treating the old and new production names
  * as one server. */
 export function sameApiServer(a, b) {
