@@ -68,9 +68,9 @@ function text(value) {
   return typeof value === 'string' ? value.trim() : '';
 }
 
-function consoleOrigin(metadata) {
-  const server = typeof metadata?.server === 'string' && metadata.server.trim()
-    ? metadata.server.trim()
+function consoleOrigin(fields) {
+  const server = typeof fields?.server === 'string' && fields.server.trim()
+    ? fields.server.trim()
     : `${DEFAULT_CONSOLE_ORIGIN}/console`;
   try {
     const origin = new URL(server).origin;
@@ -81,28 +81,32 @@ function consoleOrigin(metadata) {
 }
 
 /**
- * Turns one stored credential value into what the usage request needs, or a
- * reason it cannot be used. Only the fields named here are read: the key, or
- * an account sign-in's access token, expiry, Console and workspace ID. The
- * refresh token and anything else in the value are never touched.
+ * Turns one stored credential into what the usage request needs, or a reason
+ * it cannot be used. `fields` holds only what the request needs: the type, the
+ * key, or an account sign-in's access token, expiry, Console and workspace ID.
  */
-function credentialFromValue(value, integrationId, now) {
-  if (!isRecord(value)) return { status: 'missing' };
+function credentialFromFields(fields, integrationId, now) {
+  if (!isRecord(fields)) return { status: 'missing' };
+  const isOpenCode = integrationId === OPENCODE_INTEGRATION_ID;
   // Only an OpenCode-account credential names a workspace for the request; a
   // Go key is already scoped to one and is sent exactly as before.
-  const orgId = integrationId === OPENCODE_INTEGRATION_ID ? text(value.metadata?.orgID) || undefined : undefined;
-  if (value.type === 'key' || value.type === 'api') {
-    const key = text(value.key);
+  const orgId = isOpenCode ? text(fields.orgId) || undefined : undefined;
+  // An OpenCode credential belongs to the Console it signed in to; one for a
+  // custom Console is never sent to opencode.ai. (Go keys carry no Console.)
+  if (isOpenCode && consoleOrigin(fields) !== DEFAULT_CONSOLE_ORIGIN) return { status: 'missing' };
+  if (fields.type === 'key' || fields.type === 'api') {
+    const key = text(fields.key);
     if (!key) return { status: 'missing' };
+    // No workspace is required here: a 1.x "OpenCode" key imported by 2.x has
+    // none, and the endpoint accepts it as it did in 1.x.
     return { status: 'ok', token: key, orgId, scope: key };
   }
-  if (value.type === 'oauth' && integrationId === OPENCODE_INTEGRATION_ID) {
-    const access = text(value.access);
+  if (fields.type === 'oauth' && isOpenCode) {
+    const access = text(fields.access);
     // OpenCode reads the workspace from the sign-in itself
     // (`packages/core/src/usage-limits.ts`) and shows no Go usage without it.
     if (!access || !orgId) return { status: 'missing' };
-    if (consoleOrigin(value.metadata) !== DEFAULT_CONSOLE_ORIGIN) return { status: 'missing' };
-    const expires = Number(value.expires);
+    const expires = Number(fields.expires);
     if (Number.isFinite(expires) && expires !== 0 && expires <= now.getTime() + EXPIRY_MARGIN_MS) {
       return { status: 'expired' };
     }
@@ -112,43 +116,58 @@ function credentialFromValue(value, integrationId, now) {
   return { status: 'missing' };
 }
 
-function parseStoredValue(raw) {
-  if (isRecord(raw)) return raw;
-  if (typeof raw !== 'string' || !raw.trim()) return null;
+// Only the fields the request needs are extracted, inside SQLite, so the rest
+// of a stored value — the refresh token above all — never reaches this
+// process. A malformed value yields nulls instead of failing the query.
+const CREDENTIAL_FIELDS = [
+  ['type', '$.type'], ['key', '$.key'], ['access', '$.access'], ['expires', '$.expires'],
+  ['orgId', '$.metadata.orgID'], ['server', '$.metadata.server'],
+].map(([name, path]) => `CASE WHEN json_valid(value) THEN json_extract(value, '${path}') END AS ${name}`).join(', ');
+
+// 2.x imports `auth.json` into the credential table once and leaves the file
+// behind (`20260805200742_import_legacy_credentials`).
+const LEGACY_IMPORT_MIGRATION = '20260805200742_import_legacy_credentials';
+
+function legacyLoginsImported(dbPath) {
   try {
-    return JSON.parse(raw);
+    const rows = queryDbJson(dbPath, `SELECT 1 AS imported FROM migration
+      WHERE id = '${LEGACY_IMPORT_MIGRATION}' LIMIT 1`);
+    return rows.length > 0;
   } catch {
-    return null;
+    return false;
   }
 }
 
 /**
  * Reads the current `opencode-go` and `opencode` rows from OpenCode's
- * credential table (2.x). Nothing else in the database is selected, logged,
- * cached, or uploaded. Returns the candidates in the order they are tried.
+ * credential table (2.x): one row per integration, active first, then newest,
+ * as OpenCode picks it. Nothing else in the database is selected, logged,
+ * cached, or uploaded. `authoritative` says the table, not `auth.json`, holds
+ * this OpenCode's logins: it has a row for either integration, or 2.x has
+ * imported `auth.json`, whose copy is then a stale leftover.
  */
 function readCredentialTable(root, now) {
   const dbPath = openCodeDbPath(root);
-  if (!existsSync(dbPath)) return { status: 'missing', candidates: [] };
-  let rows;
+  if (!existsSync(dbPath)) return { status: 'missing', candidates: [], authoritative: false };
+  const candidates = [];
   try {
-    rows = queryDbJson(dbPath, `SELECT integration_id, value FROM credential
-      WHERE integration_id IN ('${GO_INTEGRATION_ID}', '${OPENCODE_INTEGRATION_ID}')
-      ORDER BY coalesce(active, 1) DESC, time_updated DESC`);
+    for (const id of [GO_INTEGRATION_ID, OPENCODE_INTEGRATION_ID]) {
+      const [row] = queryDbJson(dbPath, `SELECT ${CREDENTIAL_FIELDS} FROM credential
+        WHERE integration_id = '${id}'
+        ORDER BY coalesce(active, 1) DESC, time_updated DESC
+        LIMIT 1`);
+      if (row) candidates.push(credentialFromFields(row, id, now));
+    }
   } catch (error) {
-    if (isSqliteUnavailableError(error)) return { status: 'unavailable', candidates: [] };
+    if (isSqliteUnavailableError(error)) return { status: 'unavailable', candidates: [], authoritative: false };
     // An older/newer schema without the credential table simply has no login.
-    if (/no such table|no such column/i.test(error?.message || '')) return { status: 'missing', candidates: [] };
-    return { status: 'error', candidates: [] };
+    if (/no such table|no such column/i.test(error?.message || '')) {
+      return { status: 'missing', candidates: [], authoritative: false };
+    }
+    return { status: 'error', candidates: [], authoritative: false };
   }
-  const current = new Map();
-  for (const row of Array.isArray(rows) ? rows : []) {
-    if (!current.has(row?.integration_id)) current.set(row.integration_id, row.value);
-  }
-  const candidates = [GO_INTEGRATION_ID, OPENCODE_INTEGRATION_ID]
-    .filter(id => current.has(id))
-    .map(id => credentialFromValue(parseStoredValue(current.get(id)), id, now));
-  return { status: 'missing', candidates };
+  const authoritative = candidates.length > 0 || legacyLoginsImported(dbPath);
+  return { status: 'missing', candidates, authoritative };
 }
 
 /**
@@ -173,26 +192,30 @@ function readAuthFile(root, now) {
       // 1.x stores API keys as `{ type: "api", key }`; an OAuth entry there
       // carries no workspace and is not a Go login.
       return isRecord(entry) && entry.type === 'api'
-        ? credentialFromValue(entry, id, now)
+        ? credentialFromFields({ type: 'api', key: entry.key }, id, now)
         : { status: 'missing' };
     });
 }
 
 /**
  * The Go login for one data root, or a failure to report. The credential
- * table (2.x) is authoritative: `opencode-go` first, then the `opencode`
- * account or service-account key. `auth.json` (1.x) follows: `opencode-go`,
- * then `opencode`. The first usable login wins. Otherwise an expired account
- * sign-in is reported before a table read failure, and a read failure only
- * when nothing else was found, so an unreadable database cannot hide a good
- * login.
+ * table (2.x) comes first: `opencode-go`, then the `opencode` account or
+ * service-account key. `auth.json` (1.x: `opencode-go`, then `opencode`) is
+ * read only when the table holds no OpenCode login and 2.x has not imported
+ * the file. The first usable login wins. Otherwise an expired account sign-in
+ * is reported — nothing is sent with an older login then — and a table read
+ * failure only when `auth.json` had nothing either, so an unreadable database
+ * cannot hide a good 1.x login.
  */
 function readCredential(root, now) {
   const table = readCredentialTable(root, now);
-  const candidates = [...table.candidates, ...readAuthFile(root, now)];
-  const usable = candidates.find(candidate => candidate.status === 'ok');
+  const usable = table.candidates.find(candidate => candidate.status === 'ok');
   if (usable) return usable;
-  if (candidates.some(candidate => candidate.status === 'expired')) return { status: 'expired' };
+  if (!table.authoritative) {
+    const fromFile = readAuthFile(root, now).find(candidate => candidate.status === 'ok');
+    if (fromFile) return fromFile;
+  }
+  if (table.candidates.some(candidate => candidate.status === 'expired')) return { status: 'expired' };
   return { status: table.status };
 }
 

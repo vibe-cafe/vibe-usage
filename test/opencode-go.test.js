@@ -23,12 +23,14 @@ function quote(value) {
 }
 
 /** Writes an OpenCode-shaped credential database at `<root>/opencode.db`. */
-function credentialFixture(root, rows = [{ integrationId: 'opencode-go', value: { type: 'key', key: 'sk-test-key' } }]) {
+function credentialFixture(root, rows = [{ integrationId: 'opencode-go', value: { type: 'key', key: 'sk-test-key' } }], { migrations } = {}) {
   mkdirSync(root, { recursive: true });
   const path = openCodeDbPath(root);
   const sql = 'CREATE TABLE credential (id TEXT PRIMARY KEY, integration_id TEXT, value TEXT, active INTEGER, time_updated INTEGER);'
     + rows.map((row, index) => `INSERT INTO credential VALUES (${quote(`cred-${index}`)},${quote(row.integrationId)},`
-      + `${quote(JSON.stringify(row.value))},${row.active ?? 1},${index});`).join('');
+      + `${quote(typeof row.value === 'string' ? row.value : JSON.stringify(row.value))},${row.active ?? 1},${index});`).join('')
+    + (migrations ? 'CREATE TABLE migration (id TEXT PRIMARY KEY, time_completed INTEGER NOT NULL);'
+      + migrations.map(id => `INSERT INTO migration VALUES (${quote(id)}, 1);`).join('') : '');
   let DatabaseSync;
   try { ({ DatabaseSync } = require('node:sqlite')); } catch { /* Node 20 uses the CLI. */ }
   if (DatabaseSync) {
@@ -416,12 +418,50 @@ test('OpenCode Go prefers a Go key over an account sign-in when both are stored'
   assert.equal('x-opencode-org-id' in requests[0].headers, false);
 }));
 
-test('OpenCode Go uses an older usable login when the account sign-in has expired', async () => withFixture(async dataRoot => {
+test('OpenCode Go sends nothing when the account sign-in has expired, even with a leftover auth.json', async () => withFixture(async dataRoot => {
+  // 2.x leaves the 1.x auth.json behind after importing it; once the table
+  // holds an OpenCode login, that file is stale and never used.
   credentialFixture(dataRoot, [{ integrationId: 'opencode', value: accountLogin({ expires: NOW.getTime() - 1 }) }]);
   writeFileSync(join(dataRoot, 'auth.json'), JSON.stringify({ 'opencode-go': { type: 'api', key: 'sk-go-file-key' } }));
   const { result, requests } = await fetchWith(dataRoot);
-  assert.equal(result.status, 'ok');
-  assert.equal(requests[0].headers.Authorization, 'Bearer sk-go-file-key');
+  assert.equal(result.status, 'expired_credentials');
+  assert.equal(requests.length, 0);
+}));
+
+test('OpenCode Go ignores auth.json once OpenCode 2.x has imported it', async () => withFixture(async dataRoot => {
+  // The user removed every OpenCode login in 2.x; the imported file stays.
+  credentialFixture(dataRoot, [{ integrationId: 'anthropic', value: { type: 'key', key: 'sk-other' } }],
+    { migrations: ['20260805200742_import_legacy_credentials'] });
+  writeFileSync(join(dataRoot, 'auth.json'), JSON.stringify({ 'opencode-go': { type: 'api', key: 'sk-go-file-key' } }));
+  const imported = await fetchWith(dataRoot);
+  assert.equal(imported.result.status, 'missing_credentials');
+  assert.equal(imported.requests.length, 0);
+
+  // 1.x keeps the table empty and never runs that migration: auth.json counts.
+  const legacy = join(dataRoot, 'legacy');
+  credentialFixture(legacy, [], { migrations: ['20260622202450_simplify_session_input'] });
+  writeFileSync(join(legacy, 'auth.json'), JSON.stringify({ 'opencode-go': { type: 'api', key: 'sk-go-file-key' } }));
+  const fromFile = await fetchWith(legacy);
+  assert.equal(fromFile.result.status, 'ok');
+  assert.equal(fromFile.requests[0].headers.Authorization, 'Bearer sk-go-file-key');
+}));
+
+test('OpenCode Go sends an OpenCode key only to its own Console', async () => withFixture(async dataRoot => {
+  credentialFixture(dataRoot, [{
+    integrationId: 'opencode',
+    value: { type: 'key', key: 'sk-custom', metadata: { orgID: 'wrk_x', server: 'https://console.example.com' } },
+  }]);
+  const custom = await fetchWith(dataRoot);
+  assert.equal(custom.result.status, 'missing_credentials');
+  assert.equal(custom.requests.length, 0);
+
+  // A 1.x "OpenCode" key imported by 2.x has no workspace and still works.
+  const imported = join(dataRoot, 'imported');
+  credentialFixture(imported, [{ integrationId: 'opencode', value: { type: 'key', key: 'sk-imported' } }]);
+  const result = await fetchWith(imported);
+  assert.equal(result.result.status, 'ok');
+  assert.equal(result.requests[0].headers.Authorization, 'Bearer sk-imported');
+  assert.equal('x-opencode-org-id' in result.requests[0].headers, false);
 }));
 
 test('OpenCode Go uses the active account row and the newest among equals', async () => withFixture(async dataRoot => {
@@ -431,6 +471,14 @@ test('OpenCode Go uses the active account row and the newest among equals', asyn
   ]);
   const { requests } = await fetchWith(dataRoot);
   assert.equal(requests[0].headers.Authorization, 'Bearer acc-active');
+
+  // Rows later in the fixture are newer (larger time_updated).
+  const equals = join(dataRoot, 'equals');
+  credentialFixture(equals, [
+    { integrationId: 'opencode', value: accountLogin({ access: 'acc-older' }), active: 1 },
+    { integrationId: 'opencode', value: accountLogin({ access: 'acc-newer' }), active: 1 },
+  ]);
+  assert.equal((await fetchWith(equals)).requests[0].headers.Authorization, 'Bearer acc-newer');
 }));
 
 test('OpenCode Go honors XDG_DATA_HOME like OpenCode does', async () => withFixture(async dataRoot => {
