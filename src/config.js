@@ -3,7 +3,8 @@ import { randomBytes } from 'node:crypto';
 import { join } from 'node:path';
 import { homedir } from 'node:os';
 import { moveDirectoryOutOfFilePath } from './path-repair.js';
-import { migrateConfigApiUrl } from './api-url.js';
+import { migrateConfigApiUrl, sameApiServer, DEFAULT_API_URL } from './api-url.js';
+import { migrateStateIdentityApiUrl } from './state.js';
 
 // VIBE_USAGE_CONFIG_DIR overrides the dir (test hook).
 const CONFIG_DIR = process.env.VIBE_USAGE_CONFIG_DIR?.trim() || join(homedir(), '.vibe-usage');
@@ -72,5 +73,11 @@ export function saveConfig(config) {
     // Windows permission models vary; on POSIX, do not silently leave an API
     // key file broader than owner-only if hardening a pre-existing file fails.
     if (process.platform !== 'win32') throw err;
+  }
+  // Any save of the new production URL (e.g. `config set` before the first
+  // sync on this version) renames state.json's server too, keeping the pair
+  // consistent for an older CLI that compares them as plain strings.
+  if (!isDev && sameApiServer(config?.apiUrl, DEFAULT_API_URL)) {
+    try { migrateStateIdentityApiUrl(); } catch { /* sync retries this */ }
   }
 }

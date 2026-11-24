@@ -107,6 +107,33 @@ test('state.json identity is renamed in place, keeping every hash (old CLIs comp
   }
 });
 
+test('saving the new URL (config set) renames the state identity too', () => {
+  const dir = mkdtempSync(join(tmpdir(), 'vibe-usage-api-url-save-'));
+  try {
+    const out = probe(`
+      import { saveState, stateIdentity } from './src/state.js';
+      import { loadConfig, saveConfig } from './src/config.js';
+      import { readFileSync, writeFileSync } from 'node:fs';
+      import { join } from 'node:path';
+      const dir = process.env.VIBE_USAGE_STATE_DIR;
+      writeFileSync(join(dir, 'config.json'), JSON.stringify({ apiKey: 'vbu_k', apiUrl: 'https://vibecafe.ai', hostname: 'h' }));
+      saveState({ buckets: { a: 'h1' }, sessions: {} }, stateIdentity({ apiUrl: 'https://vibecafe.ai', apiKey: 'vbu_k' }));
+      const config = loadConfig();
+      config.hostname = 'h2';
+      saveConfig(config);
+      const state = JSON.parse(readFileSync(join(dir, 'state.json'), 'utf8'));
+      const saved = JSON.parse(readFileSync(join(dir, 'config.json'), 'utf8'));
+      console.log(JSON.stringify({ stateUrl: state.identity.apiUrl, buckets: state.buckets, configUrl: saved.apiUrl }));`,
+      { VIBE_USAGE_STATE_DIR: dir, VIBE_USAGE_CONFIG_DIR: dir, VIBE_USAGE_DEV: '0' });
+    const r = JSON.parse(out);
+    assert.equal(r.configUrl, DEFAULT_API_URL);
+    assert.equal(r.stateUrl, DEFAULT_API_URL);
+    assert.deepEqual(r.buckets, { a: 'h1' });
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
 test('upload state recorded against the old name survives the switch (no full re-upload)', () => {
   const dir = mkdtempSync(join(tmpdir(), 'vibe-usage-api-url-state-'));
   try {
