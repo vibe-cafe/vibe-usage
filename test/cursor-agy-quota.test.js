@@ -6,7 +6,7 @@ import net from 'node:net';
 import { dirname, join } from 'node:path';
 import { execFileSync, spawn } from 'node:child_process';
 import { fetchCursorQuota, parseCursorQuota, readCursorQuotaToken, cursorQuotaDbPath } from '../src/quotas/providers/cursor.js';
-import { antigravityBinary, fetchAntigravityQuota, parseAntigravityQuota, withAntigravitySession } from '../src/quotas/providers/antigravity.js';
+import { antigravityBinary, fetchAntigravityQuota, parseAntigravityQuota, readAntigravityQuota, withAntigravitySession } from '../src/quotas/providers/antigravity.js';
 import { fetchQuotaProducts, discoverQuotaProducts } from '../src/quotas/registry.js';
 
 const token = `header.${Buffer.from(JSON.stringify({ sub: 'fixture-account' })).toString('base64url')}.fixture-signature`;
@@ -145,21 +145,17 @@ test('AGY shows only the Gemini family as 5h/7d; other families are validated bu
 
 test('AGY never reads credentials during discovery or falls back to another account cache', async () => {
   const environment = { ANTIGRAVITY_CLI_PATH: process.execPath, PATH: '' };
-  const legacy = { environment, home: '/missing', platform: 'linux',
-    commandImpl: async () => ({ code: 0, stdout: '1.1.10', stderr: '' }) };
   assert.equal(discoverQuotaProducts({ environment, home: '/missing' }).products.find(p => p.id === 'antigravity').detected,true);
-  const result = await fetchAntigravityQuota({ ...legacy,
-    sessionImpl: async (binary, callback) => callback({ port: 1234, token: 'private-csrf' }),
-    requestImpl: async () => ({ status:200, payload: agyPayload }),
-  });
+  const read = { environment, platform: 'linux', binary: process.execPath,
+    commandImpl: async () => ({ code: 0, stdout: '1.1.10', stderr: '' }),
+    discoverImpl: async () => [{ pid: '9', token: 'private-csrf', ports: [1234] }] };
+  const { result } = await readAntigravityQuota({ ...read, requestImpl: async () => ({ status:200, payload: agyPayload }) });
   assert.equal(result.status,'ok');
   assert.equal(result.cacheScope,undefined);
   assert.ok(!JSON.stringify(result).includes('private-csrf'));
-  const rejected = await fetchAntigravityQuota({ ...legacy,
-    sessionImpl: async (binary, callback) => callback({}), requestImpl: async () => ({status:401}),
-  });
-  assert.equal(rejected.status,'unauthorized');
-  const missing = await fetchAntigravityQuota({ ...legacy, environment: {PATH:''} });
+  const rejected = await readAntigravityQuota({ ...read, requestImpl: async () => ({status:401}) });
+  assert.equal(rejected.result.status,'unauthorized');
+  const missing = await fetchAntigravityQuota({ environment: {PATH:''}, home: '/missing', platform: 'linux' });
   assert.equal(missing.status,'missing_credentials');
   assert.match(missing.message, /agy.*Antigravity Desktop/);
 });
@@ -208,6 +204,8 @@ test('AGY quota request goes straight to 127.0.0.1 even with an environment prox
         rejectUnauthorized: false }); r.on('error', done); r.on('response', done); r.end('{}'); });`,
     agy: `import { requestAntigravityQuota } from ${JSON.stringify(module)};
       await requestAntigravityQuota({ port: ${port}, token: 'private-csrf', timeoutMs: 1000 }).catch(() => {});`,
+    agyHttp: `import { requestAntigravityQuota } from ${JSON.stringify(module)};
+      await requestAntigravityQuota({ port: ${port}, token: 'private-csrf', timeoutMs: 1000, scheme: 'http' }).catch(() => {});`,
   };
   const run = script => new Promise((resolve, reject) => {
     hits.proxy = 0; hits.target = 0;
@@ -219,20 +217,19 @@ test('AGY quota request goes straight to 127.0.0.1 even with an environment prox
   const global = await run(scripts.global);
   if (global.proxy === 0) t.diagnostic(`${process.version} has no NODE_USE_ENV_PROXY; only the direct path is checked`);
   assert.deepEqual(await run(scripts.agy), { proxy: 0, target: 1 });
+  assert.deepEqual(await run(scripts.agyHttp), { proxy: 0, target: 1 });
 });
 
-test('AGY owns and cleans its prompt-free child on success and timeout', async t => {
+test('AGY owns and cleans its desktop engine on success and timeout', async t => {
   const root = mkdtempSync(join(tmpdir(),'vbu-agy-lifecycle-'));
   t.after(() => rmSync(root,{recursive:true,force:true}));
   const fake = join(root,'fake.cjs');
-  writeFileSync(fake, `const fs=require('fs'); const a=process.argv.slice(2);
-    fs.writeFileSync(a[a.indexOf('--log-file')+1], 'Language server listening on random port at 12345 for HTTPS (gRPC)');
+  writeFileSync(fake, `process.stdout.write('Language server listening on random port at 12345 for HTTPS (gRPC)\\n');
     process.stdin.on('data', () => process.exit(99)); setInterval(()=>{},1000);`);
   for (const mode of ['success','timeout','exception']) {
     let child, workingDirectory;
-    const options = { timeoutMs: mode === 'timeout' ? 300 : 3000, spawnImpl: (binary,args,opts) => {
-      assert.equal(args[args.indexOf('--print')+1],'');
-      assert.equal(args[args.indexOf('--input-format')+1],'stream-json');
+    const options = { desktopVersion: '2.40.1', timeoutMs: mode === 'timeout' ? 300 : 3000, spawnImpl: (binary,args,opts) => {
+      assert.equal(args[args.indexOf('--override_ide_version')+1],'2.40.1');
       workingDirectory=opts.cwd;
       child=spawn(process.execPath,[fake,...args],opts);return child;
     } };

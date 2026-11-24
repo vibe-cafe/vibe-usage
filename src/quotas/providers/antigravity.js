@@ -1,15 +1,22 @@
-import { accessSync, constants, readFileSync, statSync } from 'node:fs';
+import { accessSync, closeSync, constants, openSync, readFileSync, readSync, statSync } from 'node:fs';
 import { homedir } from 'node:os';
 import { delimiter, join, isAbsolute, resolve } from 'node:path';
+import http from 'node:http';
 import https from 'node:https';
 import { quotaResult } from '../schema.js';
-import { agyRequiresLogin, cleanupAllowanceMs, Interrupted, LoginRequired, runAntigravityCommand, TimedOut, withAntigravitySession } from './antigravity-process.js';
+import {
+  agyRequiresLogin, cleanupAllowanceMs, findRunningAntigravityServers, Interrupted, LoginRequired,
+  runAntigravityCommand, TimedOut, withAntigravitySession,
+} from './antigravity-process.js';
+import {
+  antigravityActivity, antigravityStatePath, backoffMs, loadAntigravityState, saveAntigravityState, settledReading,
+} from './antigravity-state.js';
 
 export { withAntigravitySession };
 
 const QUOTA_PATH = '/exa.language_server_pb.LanguageServerService/RetrieveUserQuotaSummary';
 const MIN_PATH_MS = 3000;
-const VERSION_AND_USAGE_MS = 6000;
+const RUNNING_READ_MS = 4000;
 const DESKTOP_READ_MS = 5000;
 
 /** Fixed places to look for agy besides PATH. On Windows the official
@@ -61,15 +68,59 @@ export function antigravityDesktopPaths(environment = process.env, home = homedi
     ? [join(local, 'Programs', 'antigravity', 'resources', 'bin', 'language_server.exe')] : [];
 }
 
-function desktopVersion(binary, platform) {
+function readVersion(text) {
+  const version = typeof text === 'string' ? text.trim() : '';
+  return /^\d+\.\d+\.\d+(?:[-+][0-9A-Za-z.-]{1,40})?$/.test(version) ? version : undefined;
+}
+
+/** `package.json`'s version from an Electron `app.asar` (Chromium pickle header, then the files). */
+export function asarPackageVersion(path) {
+  let fd;
+  try {
+    fd = openSync(path, 'r');
+    const prefix = Buffer.alloc(16);
+    if (readSync(fd, prefix, 0, 16, 0) !== 16 || prefix.readUInt32LE(0) !== 4) return undefined;
+    const headerSize = prefix.readUInt32LE(4);
+    const jsonSize = prefix.readUInt32LE(12);
+    if (jsonSize > 16 * 1024 * 1024 || jsonSize > headerSize) return undefined;
+    const json = Buffer.alloc(jsonSize);
+    if (readSync(fd, json, 0, jsonSize, 16) !== jsonSize) return undefined;
+    const entry = JSON.parse(json.toString('utf8'))?.files?.['package.json'];
+    const offset = Number(entry?.offset);
+    if (!Number.isSafeInteger(offset) || offset < 0 || !Number.isInteger(entry.size)
+      || entry.size <= 0 || entry.size > 1024 * 1024 || entry.unpacked) return undefined;
+    const body = Buffer.alloc(entry.size);
+    if (readSync(fd, body, 0, entry.size, 8 + headerSize + offset) !== entry.size) return undefined;
+    return readVersion(JSON.parse(body.toString('utf8'))?.version);
+  } catch {
+    return undefined;
+  } finally {
+    if (fd !== undefined) try { closeSync(fd); } catch {}
+  }
+}
+
+/**
+ * The installed desktop's real version, reported to Google when we start its
+ * engine. Unknown means the engine is not started: no version is made up.
+ */
+export function desktopVersion(binary, platform = process.platform) {
   if (platform === 'darwin') {
     try {
       const plist = readFileSync(resolve(binary, '../../../Info.plist'), 'utf8');
-      const match = /<key>CFBundleShortVersionString<\/key>\s*<string>\s*(\d+\.\d+\.\d+(?:\.\d+)?)\s*<\/string>/.exec(plist);
-      if (match) return match[1];
-    } catch { /* Some packages omit readable version metadata. */ }
+      const match = /<key>CFBundleShortVersionString<\/key>\s*<string>\s*([^<]*?)\s*<\/string>/.exec(plist);
+      return readVersion(match?.[1]);
+    } catch { return undefined; }
   }
-  return '2.33.0'; // Quota protocol verified with this desktop version.
+  if (platform === 'win32') {
+    const resources = resolve(binary, '..', '..');
+    try {
+      return readVersion(JSON.parse(readFileSync(join(resources, 'app', 'package.json'), 'utf8'))?.version)
+        ?? asarPackageVersion(join(resources, 'app.asar'));
+    } catch {
+      return asarPackageVersion(join(resources, 'app.asar'));
+    }
+  }
+  return undefined;
 }
 
 // Older releases treat "/usage" as a billable prompt. Accept only an
@@ -150,16 +201,17 @@ function parseUsage({ code, stdout, stderr }) {
   return meters;
 }
 
-export function requestAntigravityQuota({ port, token, timeoutMs = 2000 }) {
+export function requestAntigravityQuota({ port, token, timeoutMs = 2000, scheme = 'https' }) {
   if (!Number.isInteger(port) || port < 1 || port > 65535) throw new Error('Invalid local port');
+  const transport = scheme === 'http' ? http : https;
   return new Promise((resolve, reject) => {
-    // The self-signed exception is hard-coded to loopback. No remote URL or
+    // Hard-coded to loopback (the self-signed exception too). No remote URL or
     // redirect can receive this process-scoped CSRF token. A fresh agent, not
     // the global one: under NODE_USE_ENV_PROXY (which the Windows app sets)
     // Node 22.21+/24 sends even 127.0.0.1 through HTTPS_PROXY unless NO_PROXY
-    // lists it, and a remote proxy cannot reach agy's loopback port.
-    const request = https.request({ hostname: '127.0.0.1', port, path: QUOTA_PATH,
-      method: 'POST', rejectUnauthorized: false, agent: new https.Agent(),
+    // lists it, and the CLI's own tunnel replaces the global agents.
+    const request = transport.request({ hostname: '127.0.0.1', port, path: QUOTA_PATH, method: 'POST',
+      ...(scheme === 'http' ? { agent: new http.Agent() } : { rejectUnauthorized: false, agent: new https.Agent() }),
       headers: { 'Content-Type': 'application/json', 'Connect-Protocol-Version': '1',
         'X-Codeium-Csrf-Token': token } }, response => {
       const chunks = [];
@@ -189,25 +241,105 @@ export function requestAntigravityQuota({ port, token, timeoutMs = 2000 }) {
   });
 }
 
-export async function fetchAntigravityQuota({
-  environment = process.env, home = homedir(), platform = process.platform,
-  now = new Date(), timeoutMs = 20000, sessionImpl = withAntigravitySession,
-  requestImpl = requestAntigravityQuota, commandImpl = runAntigravityCommand,
+function binaryKey(binary) {
+  try {
+    const stat = statSync(binary);
+    return `${binary}\0${stat.size}\0${stat.mtimeMs}`;
+  } catch { return undefined; }
+}
+
+const quota = (status, now, extra = {}) => quotaResult({ id: 'antigravity', status, fetchedAt: now, ...extra });
+const UNAUTHORIZED = { message: 'Sign in to Antigravity and retry' };
+const RETRY = { message: 'Check the Antigravity connection and retry' };
+
+/**
+ * One read, in the order the maintainer set on 2026-11-24: the official
+ * `agy -p /usage`, then a running desktop's own language server, and only
+ * then a short-lived desktop engine of our own. Returns the result plus what
+ * the caller should remember (agy's version check, an agy sign-in failure).
+ */
+export async function readAntigravityQuota({
+  environment = process.env, platform = process.platform, now = new Date(), timeoutMs = 20000,
+  binary, desktop, skipAgy = false, agyVersion = null,
+  sessionImpl = withAntigravitySession, requestImpl = requestAntigravityQuota,
+  commandImpl = runAntigravityCommand, discoverImpl = findRunningAntigravityServers,
 } = {}) {
-  const result = (status, extra = {}) => quotaResult({ id: 'antigravity', status, fetchedAt: now, ...extra });
-  const ok = meters => result('ok', { meters });
-  const unauthorized = () => result('unauthorized', { message: 'Sign in to Antigravity and retry' });
-  const retry = () => result('retryable_error', { message: 'Check the Antigravity connection and retry' });
+  const outcome = { agyVersion, agyLoginRequired: false };
+  const done = (status, extra) => ({ ...outcome, result: quota(status, now, extra) });
   // Both clients allow 30s, including up to 10s for the Windows launcher.
   // Earlier attempts' cleanup consumes this same clock. Keep the final cleanup
   // allowance even on a desktop-only installation.
   const cleanupMs = cleanupAllowanceMs(platform);
   const deadline = performance.now() + Math.min(timeoutMs, 20000) - cleanupMs;
+  const remaining = () => Math.floor(deadline - performance.now());
   function optionsFor({ reserve = 0, minimum = MIN_PATH_MS, cap = Infinity } = {}) {
-    const available = Math.floor(deadline - performance.now()) - reserve;
+    const available = remaining() - reserve;
     if (available < minimum) throw new TimedOut();
-    return { environment, timeoutMs: Math.min(cap, available) };
+    return { environment, platform, timeoutMs: Math.min(cap, available) };
   }
+  // Only local process and socket tables; nothing is sent until step 2.
+  const running = Promise.resolve().then(() => discoverImpl({ platform })).catch(() => []);
+  const version = desktop ? desktopVersion(desktop, platform) : undefined;
+  let loginRequired = skipAgy;
+
+  // 1. The official, documented command.
+  if (binary && !skipAgy) {
+    // The later steps, if this installation has them, plus this step's own cleanup.
+    const reserve = desktop ? RUNNING_READ_MS + (version ? DESKTOP_READ_MS : 0) + cleanupMs : 0;
+    try {
+      const key = binaryKey(binary);
+      let supported = key && agyVersion?.binary === key ? agyVersion.supported : undefined;
+      if (supported === undefined) {
+        // Older releases treat "/usage" as a billable prompt.
+        const version = await commandImpl(binary, ['--version'], optionsFor({ reserve, cap: 2000 }));
+        supported = version.code === 0 && supportsAntigravityUsage(version.stdout.trim() || version.stderr);
+        if (version.code === 0 && key) outcome.agyVersion = { binary: key, supported };
+      }
+      if (supported) {
+        const usage = await commandImpl(binary, ['-p', '/usage', '--output-format', 'json'],
+          optionsFor({ reserve }));
+        return done('ok', { meters: parseUsage(usage) });
+      }
+    } catch (error) {
+      if (error instanceof LoginRequired) { loginRequired = true; outcome.agyLoginRequired = true; }
+      else if (error instanceof Interrupted) return done('retryable_error', RETRY);
+    }
+  }
+
+  // 2. A desktop the user already has open: its own loopback service, no new process.
+  for (const server of await running) {
+    for (const port of server.ports) {
+      for (const scheme of ['https', 'http']) {
+        const limit = Math.min(RUNNING_READ_MS, remaining() - (version ? DESKTOP_READ_MS : 0));
+        if (limit < 1000) break;
+        let response;
+        try {
+          response = await requestImpl({ port, token: server.token, scheme, timeoutMs: limit });
+        } catch { continue; } // Not this protocol on this port.
+        if ([401, 403].includes(response.status) || response.payload?.code === 'unauthenticated') {
+          return done('unauthorized', UNAUTHORIZED);
+        }
+        if (response.status === 200) {
+          try {
+            const meters = parseAntigravityQuota(response.payload);
+            if (meters.length) return done('ok', { meters });
+          } catch { /* Not a quota summary. */ }
+        }
+        break; // This port answered; it is not the quota service.
+      }
+    }
+  }
+
+  // 3. Only when neither worked: the installed desktop engine, under its real version.
+  if (version) {
+    try {
+      return done('ok', { meters: await sessionImpl(desktop, readMeters, { ...optionsFor(), desktopVersion: version }) });
+    } catch (error) {
+      if (error instanceof LoginRequired) loginRequired = true;
+      else if (error instanceof Interrupted) return done('retryable_error', RETRY);
+    }
+  }
+  return loginRequired ? done('unauthorized', UNAUTHORIZED) : done('retryable_error', RETRY);
 
   async function readMeters(endpoint) {
     let response;
@@ -226,43 +358,82 @@ export async function fetchAntigravityQuota({
     if (meters.length) return meters;
     // The service can listen before its account and quota are ready.
   }
+}
 
+/** What to show without asking Google: the remembered outcome. */
+function rememberedResult(state, now) {
+  if (state.failure === 'unauthorized') return quota('unauthorized', now, UNAUTHORIZED);
+  if (!state.reading) return quota('retryable_error', now, RETRY);
+  const { meters, dataAsOf } = settledReading(state.reading, now);
+  // After a failed read the numbers are the last good ones: the clients mark
+  // `source: "cache"` as "live read failed".
+  return quota('ok', now, { meters, dataAsOf, source: state.failure ? 'cache' : 'live' });
+}
+
+/**
+ * Asks Google only when Antigravity was used since the last read (or there is
+ * no good reading yet), at most once per 5 minutes, backing off after
+ * failures; otherwise answers from the last reading. Approved 2026-11-24.
+ */
+export async function fetchAntigravityQuota(options = {}) {
+  const {
+    environment = process.env, home = homedir(), platform = process.platform, now = new Date(),
+    readImpl = readAntigravityQuota, activityImpl = antigravityActivity,
+    statePath = antigravityStatePath(environment, home), egressGate = async () => null,
+  } = options;
   const binary = antigravityBinary(environment, home, platform);
   const desktop = firstExecutable(antigravityDesktopPaths(environment, home, platform), platform);
-  if (!binary && !desktop) return result('missing_credentials', { message: 'Install agy or Antigravity Desktop and sign in' });
-  if (binary) {
-    try {
-      const meters = await sessionImpl(binary, readMeters, optionsFor());
-      if (meters?.length) return ok(meters);
-    } catch (error) {
-      if (error instanceof LoginRequired) return unauthorized();
-      if (error instanceof Interrupted) return retry();
-    }
+  if (!binary && !desktop) return quota('missing_credentials', now, { message: 'Install agy or Antigravity Desktop and sign in' });
 
-    try {
-      // If /usage times out, its process must be gone before desktop can start.
-      const reserve = desktop ? DESKTOP_READ_MS + cleanupMs : 0;
-      const version = await commandImpl(binary, ['--version'], optionsFor({
-        reserve, minimum: desktop ? VERSION_AND_USAGE_MS : MIN_PATH_MS, cap: 2000,
-      }));
-      if (version.code === 0 && supportsAntigravityUsage(version.stdout.trim() || version.stderr)) {
-        const usage = await commandImpl(binary, ['-p', '/usage', '--output-format', 'json'],
-          optionsFor({ reserve }));
-        return ok(parseUsage(usage));
-      }
-    } catch (error) {
-      if (error instanceof LoginRequired) return unauthorized();
-      if (error instanceof Interrupted) return retry();
-    }
+  const state = loadAntigravityState(statePath);
+  const before = activityImpl(home);
+  const last = state.attemptAt ? Date.parse(state.attemptAt) : NaN;
+  // A clock set back past the last attempt does not lock reading out.
+  const waited = last <= now.getTime() ? now.getTime() - last : Infinity;
+  const used = before.all !== state.seen;
+  const wanted = state.failure === 'unauthorized' ? used
+    : state.failure === 'retryable' || !state.reading || used;
+  if (!wanted || waited < backoffMs(state.failures)) return rememberedResult(state, now);
+
+  // Every step below makes Google see the account. The egress check (the
+  // network-privacy work, handed in by the registry) goes here: after every
+  // rule that decides not to ask, so an answer from the record checks nothing.
+  const paused = await egressGate();
+  if (paused) {
+    return quota('unsupported', now, {
+      message: paused.message, pauseReason: paused.pauseReason, egressRegion: paused.region,
+    });
   }
 
-  if (desktop) {
-    try {
-      const version = desktopVersion(desktop, platform);
-      return ok(await sessionImpl(desktop, readMeters, { ...optionsFor(), desktopVersion: version }));
-    } catch (error) {
-      if (error instanceof LoginRequired) return unauthorized();
-    }
+  // The check can take seconds: another process may have started a read meanwhile.
+  const current = loadAntigravityState(statePath);
+  if (current.attemptAt !== state.attemptAt) return rememberedResult(current, now);
+  // Recorded first, so a second process in the same minute sees this attempt.
+  state.attemptAt = now.toISOString();
+  if (!saveAntigravityState(statePath, state)) return rememberedResult(state, now);
+
+  const key = binary && binaryKey(binary);
+  const blocked = state.agyLoginBlocked;
+  const skipAgy = Boolean(blocked && blocked.cli === before.cli && blocked.binary === key);
+  const { result, agyVersion, agyLoginRequired } = await readImpl({
+    ...options, environment, platform, now, binary, desktop, skipAgy, agyVersion: state.agyVersion,
+  });
+
+  // Taken after the read, so a read that touched a store cannot look like use.
+  const after = activityImpl(home);
+  state.seen = after.all;
+  state.agyVersion = agyVersion ?? state.agyVersion;
+  if (agyLoginRequired && key) state.agyLoginBlocked = { cli: after.cli, binary: key };
+  else if (!skipAgy) state.agyLoginBlocked = null;
+  if (result.status === 'ok') {
+    state.reading = { readAt: now.toISOString(), meters: result.meters };
+    state.failures = 0;
+    state.failure = null;
+  } else {
+    state.failures += 1;
+    state.failure = result.status === 'unauthorized' ? 'unauthorized' : 'retryable';
   }
-  return retry();
+  saveAntigravityState(statePath, state);
+  if (result.status === 'ok' || state.failure === 'unauthorized' || !state.reading) return result;
+  return rememberedResult(state, now);
 }
