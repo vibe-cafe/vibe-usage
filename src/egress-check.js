@@ -29,7 +29,7 @@ import { mkdirSync, readFileSync, renameSync, writeFileSync } from 'node:fs';
 import https from 'node:https';
 import { homedir, networkInterfaces } from 'node:os';
 import { dirname, join } from 'node:path';
-import { chosenProxies } from './env-proxy.js';
+import { chosenProxies, noProxyMatches } from './env-proxy.js';
 
 /** Regions the paused vendors do not serve and our users may be in. */
 export const UNSUPPORTED_EGRESS_REGIONS = Object.freeze(['CN', 'HK', 'MO']);
@@ -102,12 +102,24 @@ export function bypassedBroadly(url, environment = process.env) {
 }
 
 /**
- * `proxy` when a request to `url` would go through the environment's proxy,
- * `direct` otherwise (no proxy variable, or the URL on the bypass list as
- * any runtime might read it).
+ * The route a gated product's own program takes to `url` (`agy`, a Go
+ * program: for https only `HTTPS_PROXY` / `https_proxy`, not `HTTP_PROXY` or
+ * `ALL_PROXY`, and the bypass list read broadly). `direct` whenever it might
+ * go direct: reading it as direct costs one check, as proxied would skip one.
  */
 export function routeFor(url, environment = process.env) {
-  return chosenProxies(environment).https && !bypassedBroadly(url, environment) ? 'proxy' : 'direct';
+  const httpsProxy = ['https_proxy', 'HTTPS_PROXY'].some(name => String(environment[name] ?? '').trim());
+  return httpsProxy && !bypassedBroadly(url, environment) ? 'proxy' : 'direct';
+}
+
+/**
+ * The route the CLI's own request to `url` takes (`env-proxy.js`: the proxy
+ * chosen per scheme, the bypass list read narrowly). A stand-in host is used
+ * only when this is direct, so the anonymous check never leaves direct where
+ * the user's settings send it through a proxy (rule 1).
+ */
+export function ownRouteFor(url, environment = process.env) {
+  return chosenProxies(environment).https && !noProxyMatches(url, environment) ? 'proxy' : 'direct';
 }
 
 /** The two-letter country in a trace body, or null (unknown, Tor, absent). */
@@ -170,9 +182,10 @@ export function fetchTraceRegion(host, { timeoutMs = TRACE_TIMEOUT_MS, httpsModu
         response.setEncoding('utf8');
         response.on('data', chunk => {
           body += chunk;
-          if (body.length > TRACE_MAX_BYTES) {
+          if (Buffer.byteLength(body) > TRACE_MAX_BYTES) {
+            // Not a trace page: no answer, as in the desktop apps.
             request.destroy();
-            done(traceRegion(body.slice(0, TRACE_MAX_BYTES)));
+            done(null);
           }
         });
         response.on('end', () => done(traceRegion(body)));
@@ -265,7 +278,7 @@ export async function egressPauseFor(productId, {
   if (proxyRequired(environment)) return pause('proxyNotDetected');
   if (!egressCheckEnabled(environment)) return null;
   const candidates = [...product.traceHosts, ...SUBSTITUTE_TRACE_HOSTS];
-  const host = candidates.find(candidate => routeFor(`https://${candidate}/`, environment) === 'direct');
+  const host = candidates.find(candidate => ownRouteFor(`https://${candidate}/`, environment) === 'direct');
   if (!host) return pause('egressUnconfirmed');
   const region = await regionThrough(host, {
     environment, now, fingerprint: typeof fingerprint === 'function' ? fingerprint() : fingerprint, trace,

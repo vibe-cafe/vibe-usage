@@ -5,7 +5,7 @@ import { existsSync, mkdtempSync, readFileSync, rmSync, statSync } from 'node:fs
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import {
-  egressPauseFor, fetchTraceRegion, networkFingerprint, routeFor, traceRegion,
+  egressPauseFor, fetchTraceRegion, networkFingerprint, ownRouteFor, routeFor, traceRegion,
 } from '../src/egress-check.js';
 import { fetchQuotaProducts } from '../src/quotas/registry.js';
 import { quotaResult } from '../src/quotas/schema.js';
@@ -38,10 +38,18 @@ test('traceRegion reads only a two-letter loc= line', () => {
   assert.equal(traceRegion(''), null);
 });
 
-test('routeFor follows the environment proxy and its bypass list', () => {
+test('routeFor reads the proxy as agy does, ownRouteFor as the CLI does', () => {
   assert.equal(routeFor('https://chatgpt.com/', {}), 'direct');
   assert.equal(routeFor('https://chatgpt.com/', { HTTPS_PROXY: 'http://127.0.0.1:7890' }), 'proxy');
-  assert.equal(routeFor('https://chatgpt.com/', { ALL_PROXY: 'socks5h://127.0.0.1:7891' }), 'proxy');
+  // agy takes neither for https: it would go direct, so it is checked.
+  assert.equal(routeFor('https://chatgpt.com/', { ALL_PROXY: 'socks5h://127.0.0.1:7891' }), 'direct');
+  assert.equal(routeFor('https://chatgpt.com/', { HTTP_PROXY: 'http://127.0.0.1:7890' }), 'direct');
+  // The CLI's own requests follow both, and read a bare bypass entry narrowly.
+  assert.equal(ownRouteFor('https://chatgpt.com/', { ALL_PROXY: 'socks5h://127.0.0.1:7891' }), 'proxy');
+  assert.equal(ownRouteFor('https://chatgpt.com/', { HTTP_PROXY: 'http://127.0.0.1:7890' }), 'proxy');
+  assert.equal(ownRouteFor('https://api.anthropic.com/', {
+    HTTPS_PROXY: 'http://127.0.0.1:7890', NO_PROXY: 'anthropic.com',
+  }), 'proxy');
   assert.equal(routeFor('https://daily-cloudcode-pa.googleapis.com/', {
     HTTPS_PROXY: 'http://127.0.0.1:7890', NO_PROXY: '.googleapis.com',
   }), 'direct');
@@ -105,6 +113,29 @@ test('a bare bypass entry for Google with a proxy set still checks (and the manu
     environment: { ...base, VIBE_USAGE_REQUIRE_PROXY: '1' }, now: NOW, trace, fingerprint: 'a',
   });
   assert.equal(manual.pauseReason, 'proxyNotDetected');
+});
+
+test('a proxy agy cannot use is no proxy; a stand-in the CLI would proxy is never sent direct', async t => {
+  for (const variable of ['ALL_PROXY', 'HTTP_PROXY']) {
+    const { trace, calls } = tracer('US');
+    const environment = { [variable]: 'http://127.0.0.1:7890', VIBE_USAGE_QUOTA_CACHE_DIR: cacheDir(t) };
+    // agy would go direct; both stand-ins go through the CLI's proxy.
+    assert.equal((await egressPauseFor('antigravity', { environment, now: NOW, trace, fingerprint: 'a' })).pauseReason,
+      'egressUnconfirmed', variable);
+    assert.deepEqual(calls, []);
+    assert.equal((await egressPauseFor('antigravity', {
+      environment: { ...environment, VIBE_USAGE_REQUIRE_PROXY: '1' }, now: NOW, trace, fingerprint: 'a',
+    })).pauseReason, 'proxyNotDetected', variable);
+  }
+  // Google direct by a broad entry; `anthropic.com` alone does not send the
+  // CLI's own request to api.anthropic.com direct.
+  const { trace, calls } = tracer('US');
+  const result = await egressPauseFor('antigravity', {
+    environment: { HTTPS_PROXY: 'http://127.0.0.1:7890', NO_PROXY: '.googleapis.com,anthropic.com', VIBE_USAGE_QUOTA_CACHE_DIR: cacheDir(t) },
+    now: NOW, trace, fingerprint: 'a',
+  });
+  assert.equal(result.pauseReason, 'egressUnconfirmed');
+  assert.deepEqual(calls, []);
 });
 
 test('the manual "relies on a local proxy" setting pauses a direct read without a check', async t => {
@@ -260,6 +291,8 @@ test('the trace request is anonymous, direct and bounded', async () => {
   assert.equal(await fetchTraceRegion('chatgpt.com', { httpsModule: silent.module, timeoutMs: 20 }), null);
   const huge = fakeHttps((request, onResponse) => onResponse(response(200, ['x'.repeat(5000), '\nloc=US\n'])));
   assert.equal(await fetchTraceRegion('chatgpt.com', { httpsModule: huge.module }), null);
+  const early = fakeHttps((request, onResponse) => onResponse(response(200, ['loc=US\n', 'x'.repeat(5000)])));
+  assert.equal(await fetchTraceRegion('chatgpt.com', { httpsModule: early.module }), null);
 });
 
 test('quota fetch reports a pause as unsupported with its reason and starts nothing', async t => {
