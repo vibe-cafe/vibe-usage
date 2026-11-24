@@ -224,10 +224,31 @@ function tlsOptions(options) {
  * `bypass(host)` true means a direct connection.
  */
 function tunnelAgent(Base, secure, proxy, bypass, timeoutMs) {
+  const target = options => ({
+    host: String(options.host || options.hostname || 'localhost').replace(/^\[|\]$/g, ''),
+    port: Number(options.port) || (secure ? 443 : 80),
+  });
   return new (class extends Base {
+    addRequest(request, options) {
+      const { host, port } = target(options);
+      if (!secure && proxy?.kind === 'http' && !bypass(host, port)) {
+        // Plain HTTP through an HTTP proxy: the standard absolute-form
+        // request to the proxy (many proxies allow CONNECT to 443 only).
+        const name = net.isIPv6(host) ? `[${host}]` : host;
+        request.path = `http://${name}${port === 80 ? '' : `:${port}`}${request.path}`;
+        if (proxy.auth) {
+          request.setHeader('proxy-authorization',
+            `Basic ${Buffer.from(`${proxy.auth.user}:${proxy.auth.pass}`).toString('base64')}`);
+        }
+        return super.addRequest(request, { ...options, host: proxy.host, hostname: proxy.host, port: proxy.port,
+          vibeUsageForward: true });
+      }
+      return super.addRequest(request, options);
+    }
+
     createConnection(options, callback) {
-      const host = String(options.host || options.hostname || 'localhost').replace(/^\[|\]$/g, '');
-      const port = Number(options.port) || (secure ? 443 : 80);
+      if (options.vibeUsageForward) return super.createConnection(options, callback);
+      const { host, port } = target(options);
       if (!proxy || bypass(host, port)) return super.createConnection(options, callback);
       openTunnel(proxy, host, port, secure, options, timeoutMs).then(socket => callback(null, socket), callback);
       return undefined;

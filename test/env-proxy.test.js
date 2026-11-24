@@ -474,31 +474,45 @@ test('the startup switch alone counts only with HTTPS_PROXY (https uploads read 
   assert.equal(installed.bypass('127.service.example', 443), false);
 });
 
-// In-process tunnel checks over plain HTTP targets: a stand-in CONNECT proxy
-// forwards every tunnel to one local server, whatever host was asked for.
+// In-process tunnel checks: a stand-in HTTP proxy that forwards absolute-form
+// requests (plain HTTP targets) and CONNECT tunnels (https targets) to one
+// local server, whatever host was asked for.
 async function connectHarness(t, handler, { answer = true } = {}) {
   const target = http.createServer(handler);
   await new Promise(resolve => target.listen(0, '127.0.0.1', resolve));
   t.after(() => { target.closeAllConnections(); target.close(); });
   const asked = [];
   const open = new Set();
-  const proxy = net.createServer(socket => {
-    open.add(socket);
-    socket.on('close', () => open.delete(socket));
-    socket.once('data', data => {
-      asked.push(data.toString().split('\r\n')[0]);
-      if (!answer) return; // accepts, never replies
-      const upstream = net.connect(target.address().port, '127.0.0.1', () => {
-        socket.write('HTTP/1.1 200 Connection Established\r\n\r\n');
-        upstream.pipe(socket);
-        socket.pipe(upstream);
-      });
-      upstream.on('error', () => socket.destroy());
-      socket.on('error', () => upstream.destroy());
+  const proxy = http.createServer((req, res) => {
+    asked.push(`${req.method} ${req.url}`);
+    if (!answer) return; // accepts, never replies
+    const url = new URL(req.url);
+    // Its own agent: the global agent (and `agent: false`, a new one of its
+    // class) is the tunnel under test.
+    const upstream = http.request({ host: '127.0.0.1', port: target.address().port, method: req.method,
+      path: url.pathname + url.search, headers: req.headers, agent: new http.Agent() }, response => {
+      res.writeHead(response.statusCode, response.headers);
+      response.pipe(res);
+      response.on('aborted', () => res.destroy());
+      response.on('error', () => res.destroy());
     });
+    upstream.on('error', () => res.destroy());
+    req.pipe(upstream);
+  });
+  proxy.on('connection', socket => { open.add(socket); socket.on('close', () => open.delete(socket)); });
+  proxy.on('connect', (req, socket) => {
+    asked.push(`CONNECT ${req.url}`);
+    if (!answer) return;
+    const upstream = net.connect(target.address().port, '127.0.0.1', () => {
+      socket.write('HTTP/1.1 200 Connection Established\r\n\r\n');
+      upstream.pipe(socket);
+      socket.pipe(upstream);
+    });
+    upstream.on('error', () => socket.destroy());
+    socket.on('error', () => upstream.destroy());
   });
   await new Promise(resolve => proxy.listen(0, '127.0.0.1', resolve));
-  t.after(() => { for (const socket of open) socket.destroy(); proxy.close(); });
+  t.after(() => { for (const socket of open) socket.destroy(); proxy.closeAllConnections(); proxy.close(); });
   return { proxyURL: `http://127.0.0.1:${proxy.address().port}`, asked };
 }
 
@@ -535,7 +549,7 @@ test('a proxy that accepts but never answers fails the request instead of hangin
   const { proxyURL, asked } = await connectHarness(t, (req, res) => res.end('never'), { answer: false });
   await withTunnel(t, proxyURL, { handshakeTimeoutMs: 300 });
   const started = Date.now();
-  await assert.rejects(fetch('http://api.vibe-usage-proxy-test.invalid/'));
+  await assert.rejects(fetch('https://api.vibe-usage-proxy-test.invalid/'));
   assert.ok(Date.now() - started < 5000);
   assert.equal(asked.length, 1);
 });
@@ -565,4 +579,31 @@ test('a form body arrives intact through the tunnel', async (t) => {
     method: 'POST', body: new URLSearchParams({ grant_type: 'refresh_token', a: 'b c' }),
   })).text();
   assert.equal(text, 'application/x-www-form-urlencoded;charset=UTF-8|grant_type=refresh_token&a=b+c');
+});
+
+test('plain HTTP through an HTTP proxy uses the absolute-form request, not CONNECT', async (t) => {
+  const seen = [];
+  const proxy = http.createServer((req, res) => {
+    seen.push(`${req.method} ${req.url} auth=${req.headers['proxy-authorization'] || '-'} host=${req.headers.host}`);
+    req.resume();
+    res.end('via proxy');
+  });
+  proxy.on('connect', (req, socket) => { seen.push(`CONNECT ${req.url}`); socket.destroy(); });
+  await new Promise(resolve => proxy.listen(0, '127.0.0.1', resolve));
+  t.after(() => { proxy.closeAllConnections(); proxy.close(); });
+  const { installProxyTunnel } = await import('../src/proxy-tunnel.js');
+  const port = proxy.address().port;
+  const uninstall = installProxyTunnel({ proxies: { http: `http://u:p@127.0.0.1:${port}` }, bypass: () => false });
+  t.after(() => uninstall());
+  assert.equal(await (await fetch('http://doctor-target.invalid/api/usage/settings')).text(), 'via proxy');
+  const viaRequest = await new Promise((resolve, reject) => {
+    http.get('http://doctor-registry.invalid:8080/-/ping', r => { let d = ''; r.on('data', c => { d += c; }); r.on('end', () => resolve(d)); })
+      .on('error', reject);
+  });
+  assert.equal(viaRequest, 'via proxy');
+  const auth = `Basic ${Buffer.from('u:p').toString('base64')}`;
+  assert.deepEqual(seen, [
+    `GET http://doctor-target.invalid/api/usage/settings auth=${auth} host=doctor-target.invalid`,
+    `GET http://doctor-registry.invalid:8080/-/ping auth=${auth} host=doctor-registry.invalid:8080`,
+  ]);
 });
