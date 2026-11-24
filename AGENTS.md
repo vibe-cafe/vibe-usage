@@ -99,12 +99,16 @@ about most is a vendor seeing their real IP together with their vendor account.
    by any process it launches (the CLI, Claude Code, `agy`, `grok`, …) honors
    the proxy configuration on the user's machine: system proxy, PAC, proxy
    environment variables, TUN. A request that cannot honor it is not sent.
-2. **Stricter for requests that carry a vendor account.** A request that
-   carries the user's AI-vendor credentials (quota reads, usage fetches) is sent
-   only when we can confirm it will leave through the user's network settings.
-   When that cannot be confirmed it is not sent, and the panel says why.
-3. **No proxy, no request — and tell the user.** If the user has told us they
-   rely on a proxy and no proxy is detected, such requests pause, the panel
+2. **Stricter for requests made with a vendor account.** A request made with
+   the user's AI-vendor account (quota reads, usage fetches) is sent only when
+   we can confirm it will leave through the user's network settings. This
+   includes requests that a process we launch (Claude Code, `agy`, `grok`, …)
+   makes with its own login. When the route cannot be confirmed, the request
+   is not sent, and the panel says why.
+3. **Proxy expected but not running: pause vendor-account requests and tell
+   the user.** If the user has told us they rely on a proxy and no proxy is
+   detected, the requests in point 2 pause (requests without a vendor account,
+   such as npm or update checks, are not covered by this point), the panel
    shows that no proxy was detected and reading is paused, and reading resumes
    on its own once the proxy is back. Whether the user relies on a proxy is
    asked once, the first time no proxy is detected, and remembered; it is never
@@ -121,8 +125,8 @@ about most is a vendor seeing their real IP together with their vendor account.
 
 Scope of the promise: on our side we never route around the user's network
 settings, and when unsure we do not send. Sites that the user's own proxy rules
-send direct are respected. Our own server, the npm registry, and update checks
-see the user's egress IP; they carry no vendor account and must be described in
+send direct are respected. Our own server, the npm registry, and GitHub update
+checks see the user's egress IP; they carry no vendor account and must be described in
 the privacy notes.
 
 Existing code does not fully comply yet. The fixes are tracked separately and
@@ -152,7 +156,9 @@ release ordering, and rollback plan. For a change that adds or alters network be
 also answer each point of the Network Privacy Principle above. Do not infer approval from issue labels,
 age, detail, author confidence, or the absence of objections. A bug fix that
 only restores already-documented behavior does not need a new architecture
-decision.
+decision; this exception does not cover a change that adds or alters network
+behavior (including fixes to proxy handling), which always goes through this
+gate.
 
 **Current Vibe Usage invariant:** upload/privacy policy is backend-owned.
 `sync.js` fetches `/api/usage/settings`, caches the last backend answer only for
