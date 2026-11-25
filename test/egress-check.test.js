@@ -1,7 +1,7 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import { EventEmitter } from 'node:events';
-import { existsSync, mkdtempSync, readFileSync, rmSync, statSync } from 'node:fs';
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, statSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import {
@@ -297,10 +297,14 @@ test('the trace request is anonymous, direct and bounded', async () => {
 
 test('quota fetch reports a pause as unsupported with its reason and starts nothing', async t => {
   const environment = { VIBE_USAGE_QUOTA_CACHE_DIR: cacheDir(t), ANTIGRAVITY_CLI_PATH: process.execPath };
+  // Antigravity used here before, so a read is due and only the egress check stands in its way.
+  const home = cacheDir(t);
+  mkdirSync(join(home, '.gemini', 'antigravity-cli', 'conversations'), { recursive: true });
+  writeFileSync(join(home, '.gemini', 'antigravity-cli', 'conversations', 'earlier.db'), 'used before');
   const started = [];
   const never = async () => { started.push('agy'); throw new Error('must not start'); };
   const { products: [region] } = await fetchQuotaProducts(['antigravity'], {
-    environment, platform: 'linux', commandImpl: never, sessionImpl: never,
+    environment, home, platform: 'linux', commandImpl: never, sessionImpl: never,
     egressPause: async id => (id === 'antigravity'
       ? { pauseReason: 'egressRegionUnsupported', region: 'CN', message: 'Paused: CN' } : null),
   });
@@ -311,7 +315,7 @@ test('quota fetch reports a pause as unsupported with its reason and starts noth
 
   // The built-in gate, through the environment the apps pass: nothing is sent.
   const { products: [manual] } = await fetchQuotaProducts(['antigravity'], {
-    environment: { ...environment, VIBE_USAGE_REQUIRE_PROXY: '1' }, platform: 'linux',
+    environment: { ...environment, VIBE_USAGE_REQUIRE_PROXY: '1' }, home, platform: 'linux',
     commandImpl: never, sessionImpl: never,
   });
   assert.equal(manual.status, 'unsupported');

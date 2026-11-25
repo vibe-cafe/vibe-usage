@@ -1,8 +1,8 @@
 import { execFile, spawn } from 'node:child_process';
 import { randomBytes } from 'node:crypto';
-import { mkdtempSync, readFileSync, rmSync, statSync } from 'node:fs';
+import { chmodSync, existsSync, mkdirSync, mkdtempSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
-import { join } from 'node:path';
+import { delimiter, join } from 'node:path';
 import { setTimeout as delay } from 'node:timers/promises';
 
 const OUTPUT_LIMIT = 1024 * 1024;
@@ -11,8 +11,9 @@ const LOGIN_URL = /ANTIGRAVITY_OPEN_URL:|https:\/\/accounts\.google\.com\/o\/oau
 // agy also logs "not authenticated, trying silent auth" before a successful login.
 export const agyRequiresLogin = text => LOGIN_URL.test(text)
   || /Print mode: not logged in\b|cannot complete interactive login/i.test(text);
-const RETRYABLE_LOG_ERRORS = new Set(['ENOENT', 'EBUSY', 'EPERM', 'EACCES']);
 const unavailable = () => new Error('Antigravity quota service unavailable');
+// Our own desktop engines carry this in their --gemini_dir; never treat one as the user's desktop.
+const OWN_DIRECTORY = 'vibe-usage-agy-quota-';
 export class LoginRequired extends Error {}
 export class Interrupted extends Error {}
 export class TimedOut extends Error {}
@@ -36,9 +37,52 @@ async function stopTree(child, closed) {
   await Promise.race([closed, delay(500, undefined, { ref: false })]);
 }
 
+/** Windows environment names are case-insensitive: drop every spelling before setting one. */
+function setVariable(env, name, value) {
+  for (const key of Object.keys(env)) if (key.toUpperCase() === name.toUpperCase()) delete env[key];
+  env[name] = value;
+}
+
+/**
+ * When silent sign-in fails (usually a network or keychain timeout while the
+ * login is still valid), `agy -p` falls back to interactive OAuth and runs the
+ * browser launcher it finds on PATH (CodexBar #4441, verified with agy 1.3.3).
+ * Stubs that only leave a mark go first on PATH for our child, and BROWSER
+ * points at one; the caller stops agy as soon as the mark appears. A launcher
+ * agy reaches without PATH is not covered; the provider's persisted sign-in
+ * block keeps that to at most one browser tab.
+ */
+function installBrowserStubs(directory, env, platform) {
+  const bin = join(directory, 'browser-stubs');
+  const mark = join(directory, 'browser-blocked');
+  mkdirSync(bin, { mode: 0o700 });
+  if (platform === 'win32') {
+    // Inside double quotes cmd keeps & | < > ^ literal; only % and " would change the command.
+    if (/["%\r\n]/.test(mark)) throw unavailable();
+    const stub = `@echo off\r\ntype nul > "${mark}"\r\nexit /b 1\r\n`;
+    writeFileSync(join(bin, 'rundll32.bat'), stub);
+    writeFileSync(join(bin, 'browser.bat'), stub);
+    setVariable(env, 'BROWSER', join(bin, 'browser.bat'));
+  } else {
+    if (/['\n]/.test(mark)) throw unavailable();
+    for (const name of ['open', 'xdg-open', 'browser']) {
+      const path = join(bin, name);
+      writeFileSync(path, `#!/bin/sh\n: > '${mark}'\nexit 1\n`, { mode: 0o700 });
+      chmodSync(path, 0o700);
+    }
+    setVariable(env, 'BROWSER', join(bin, 'browser'));
+  }
+  const pathKey = Object.keys(env).find(key => key.toUpperCase() === 'PATH') ?? 'PATH';
+  const rest = env[pathKey];
+  setVariable(env, pathKey, rest ? `${bin}${platform === 'win32' ? ';' : delimiter}${rest}` : bin);
+  return mark;
+}
+
 // Every entry point owns its cwd, streams, time limit and process tree.
-async function withProcess(binary, argsFor, { environment = process.env, timeoutMs, spawnImpl = spawn, desktopVersion }, read) {
-  const directory = mkdtempSync(join(tmpdir(), 'vibe-usage-agy-quota-'));
+async function withProcess(binary, argsFor, {
+  environment = process.env, timeoutMs, spawnImpl = spawn, desktopVersion, agy = false, platform = process.platform,
+}, read) {
+  const directory = mkdtempSync(join(tmpdir(), OWN_DIRECTORY));
   const controller = new AbortController();
   const abort = error => controller.abort(error);
   const onSignal = () => abort(new Interrupted());
@@ -48,6 +92,13 @@ async function withProcess(binary, argsFor, { environment = process.env, timeout
     // Desktop apps can fetch ZCode in this same CLI invocation. Windows env names are case-insensitive.
     const env = Object.fromEntries(Object.entries(environment)
       .filter(([key]) => !/^(BIGMODEL_API_KEY|Z_AI_API_KEY)$/i.test(key)));
+    let browserMark;
+    if (agy) {
+      // Only in this child: the user's own agy keeps updating itself as configured.
+      // The literal lowercase "true" is what agy honors (CodexBar #4739).
+      setVariable(env, 'AGY_CLI_DISABLE_AUTO_UPDATE', 'true');
+      browserMark = installBrowserStubs(directory, env, platform);
+    }
     if (desktopVersion) {
       // Match --gemini_dir even when the caller set a login directory, so desktop migrations stay in our cwd.
       env.ANTIGRAVITY_GEMINI_DIR = directory;
@@ -64,7 +115,15 @@ async function withProcess(binary, argsFor, { environment = process.env, timeout
     process.once('SIGINT', onSignal);
     const interrupted = new Promise((_, reject) =>
       controller.signal.addEventListener('abort', () => reject(controller.signal.reason), { once: true }));
-    return await Promise.race([interrupted, read({ child, directory, closed, abort, signal: controller.signal })]);
+    if (browserMark) {
+      void (async () => {
+        while (!controller.signal.aborted) {
+          if (existsSync(browserMark)) return abort(new LoginRequired());
+          await delay(100, undefined, { signal: controller.signal, ref: false }).catch(() => {});
+        }
+      })();
+    }
+    return await Promise.race([interrupted, read({ child, directory, closed, abort, signal: controller.signal, browserMark })]);
   } finally {
     clearTimeout(timer);
     controller.abort();
@@ -81,8 +140,9 @@ async function withProcess(binary, argsFor, { environment = process.env, timeout
   }
 }
 
+/** Runs one official `agy` command (`--version`, `-p /usage`) to completion. */
 export function runAntigravityCommand(binary, args, options) {
-  return withProcess(binary, () => args, options, async ({ child, closed, abort }) => {
+  return withProcess(binary, () => args, { ...options, agy: true }, async ({ child, closed, abort, browserMark }) => {
     child.stdin.end();
     let bytes = 0;
     function capture(stream) {
@@ -104,58 +164,45 @@ export function runAntigravityCommand(binary, args, options) {
     const stdout = capture(child.stdout);
     const stderr = capture(child.stderr);
     const code = await closed;
+    // agy can reach its launcher and exit before the next poll.
+    if (existsSync(browserMark)) throw new LoginRequired();
     return { code, stdout: Buffer.concat(stdout).toString(), stderr: Buffer.concat(stderr).toString() };
   });
 }
 
+/**
+ * Starts the installed desktop `language_server` as our own short-lived engine,
+ * reporting the desktop's real version, and reads its quota summary.
+ */
 export function withAntigravitySession(binary, callback, {
   environment = process.env, timeoutMs = 20000, spawnImpl, desktopVersion,
 } = {}) {
+  if (!desktopVersion) return Promise.reject(unavailable());
   const token = randomBytes(32).toString('hex');
-  const argsFor = directory => desktopVersion ? [
+  const argsFor = directory => [
     '--standalone', '--override_ide_name', 'antigravity', '--subclient_type', 'hub',
     '--override_ide_version', desktopVersion, '--override_user_agent_name', 'antigravity',
     '--https_server_port', '0', '--csrf_token', token, '--app_data_dir', 'antigravity',
     '--api_server_url', 'https://generativelanguage.googleapis.com',
     '--cloud_code_endpoint', 'https://daily-cloudcode-pa.googleapis.com', '--gemini_dir', directory,
-  ] : [
-    '--print', '', '--input-format', 'stream-json', '--output-format', 'stream-json',
-    '--csrf_token', token, '--log-file', join(directory, 'cli.log'),
   ];
   return withProcess(binary, argsFor, { environment, timeoutMs, spawnImpl, desktopVersion },
-    async ({ child, directory, closed, abort, signal }) => {
+    async ({ child, closed, abort, signal }) => {
       let port;
-      const inspect = (text, reportsPort) => {
-        if (desktopVersion ? LOGIN_URL.test(text) : agyRequiresLogin(text)) abort(new LoginRequired());
-        if (reportsPort) port ||= Number(PORT.exec(text)?.[1]);
-      };
       for (const stream of [child.stdout, child.stderr]) {
-        // Both services can print login diagnostics. Only the desktop prints its port.
+        // Only the Google OAuth URL or the desktop's open-URL marker is a login signal.
         let tail = '';
         stream.on('data', chunk => {
           const text = tail + chunk.toString();
-          inspect(text, Boolean(desktopVersion));
+          if (LOGIN_URL.test(text)) abort(new LoginRequired());
+          port ||= Number(PORT.exec(text)?.[1]);
           tail = text.slice(-128);
         });
       }
-      if (desktopVersion) child.stdin.end(); // The legacy CLI waits on an empty, open stdin.
-      const logPath = join(directory, 'cli.log');
-      function inspectLog() {
-        try {
-          if (statSync(logPath).size > OUTPUT_LIMIT) throw unavailable();
-          inspect(readFileSync(logPath, 'utf8'), true);
-        } catch (error) { if (!RETRYABLE_LOG_ERRORS.has(error.code)) throw error; }
-      }
-      closed.then(() => {
-        // A headless agy can log its final login diagnostic and exit between polls.
-        if (!desktopVersion && !signal.aborted) {
-          try { inspectLog(); } catch (error) { return abort(error); }
-        }
-        abort(unavailable());
-      });
+      child.stdin.end();
+      closed.then(() => abort(unavailable()));
       const deadline = Date.now() + timeoutMs;
       while (!signal.aborted) {
-        if (!desktopVersion && !port) inspectLog();
         if (port && !signal.aborted) {
           const value = await callback({ port, token, timeoutMs: Math.min(2000, Math.max(1, deadline - Date.now())) });
           if (value !== undefined) return value;
@@ -164,4 +211,98 @@ export function withAntigravitySession(binary, callback, {
       }
       throw signal.reason;
     });
+}
+
+function execFileText(file, args, options) {
+  return new Promise((resolve, reject) => {
+    execFile(file, args, { encoding: 'utf8', windowsHide: true, maxBuffer: 8 * 1024 * 1024, ...options },
+      (error, stdout) => (error ? reject(error) : resolve(stdout)));
+  });
+}
+
+const CSRF = /--csrf_token[= ]+([0-9a-f-]{8,128})(?=\s|$)/i;
+
+function serverFrom(pid, command) {
+  if (!/antigravity/i.test(command) || !/language_server/i.test(command) || command.includes(OWN_DIRECTORY)) return null;
+  const token = CSRF.exec(command)?.[1];
+  return token && /^\d+$/.test(pid) ? { pid, token } : null;
+}
+
+/** `ps -axww -o pid=,uid=,command=` lines → the current user's desktop language servers. */
+export function parseUnixProcessList(output, uid) {
+  const servers = [];
+  for (const line of output.split('\n')) {
+    const match = /^\s*(\d+)\s+(\d+)\s+(.+)$/.exec(line);
+    if (!match || (uid !== undefined && Number(match[2]) !== uid)) continue;
+    const server = serverFrom(match[1], match[3]);
+    if (server) servers.push(server);
+  }
+  return servers;
+}
+
+/** `lsof -Fn` output → listening TCP ports. */
+export function parseLsofPorts(output) {
+  const ports = new Set();
+  for (const line of output.split('\n')) {
+    const port = Number(/^n.*:(\d+)$/.exec(line.trim())?.[1]);
+    if (Number.isInteger(port) && port > 0 && port < 65536) ports.add(port);
+  }
+  return [...ports];
+}
+
+const WINDOWS_SCRIPT = [
+  '$s = (Get-Process -Id $PID).SessionId',
+  'Get-CimInstance Win32_Process -Filter "Name LIKE \'language_server%\'" | Where-Object { $_.SessionId -eq $s } | ForEach-Object {',
+  '  $ports = @(Get-NetTCPConnection -State Listen -OwningProcess $_.ProcessId -ErrorAction SilentlyContinue | ForEach-Object { $_.LocalPort }) -join ","',
+  '  "---"; "ProcessId=" + $_.ProcessId; "Ports=" + $ports; "CommandLine=" + $_.CommandLine',
+  '}',
+].join('\n');
+
+/** The PowerShell records above → this session's desktop language servers with their listening ports. */
+export function parseWindowsServers(output) {
+  const servers = [];
+  for (const record of output.split(/^---\s*$/m)) {
+    const field = name => new RegExp(`^${name}=(.*)$`, 'm').exec(record)?.[1]?.trim() ?? '';
+    const server = serverFrom(field('ProcessId'), field('CommandLine'));
+    if (!server) continue;
+    server.ports = [...new Set(field('Ports').split(',').map(Number)
+      .filter(port => Number.isInteger(port) && port > 0 && port < 65536))];
+    if (server.ports.length) servers.push(server);
+  }
+  return servers;
+}
+
+/**
+ * Finds a running Antigravity desktop's own language servers: only local
+ * process and socket tables, never the network. Each result is the process's
+ * own loopback CSRF token (not an OAuth credential) and the ports that same
+ * process listens on; the token is sent nowhere else.
+ */
+export async function findRunningAntigravityServers({
+  platform = process.platform, execImpl = execFileText, uid = process.getuid?.(), timeoutMs = 5000,
+} = {}) {
+  try {
+    if (platform === 'win32') {
+      for (const shell of ['powershell.exe', 'pwsh.exe']) {
+        try {
+          return parseWindowsServers(await execImpl(shell, ['-NoProfile', '-NonInteractive', '-Command', WINDOWS_SCRIPT],
+            { timeout: timeoutMs }));
+        } catch { /* Try the next shell. */ }
+      }
+      return [];
+    }
+    if (platform !== 'darwin') return [];
+    const servers = parseUnixProcessList(await execImpl('/bin/ps', ['-axww', '-o', 'pid=,uid=,command='],
+      { timeout: 2000 }), uid);
+    const lsof = existsSync('/usr/sbin/lsof') ? '/usr/sbin/lsof' : 'lsof';
+    for (const server of servers) {
+      try {
+        server.ports = parseLsofPorts(await execImpl(lsof,
+          ['-nP', '-a', '-p', server.pid, '-iTCP', '-sTCP:LISTEN', '-Fn'], { timeout: 2000 }));
+      } catch { server.ports = []; }
+    }
+    return servers.filter(server => server.ports.length);
+  } catch {
+    return [];
+  }
 }
