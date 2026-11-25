@@ -457,6 +457,21 @@ test('DSH replies are timed with their own output tokens', async () => {
   });
 });
 
+test('a DSH reply whose usage is all zeros counts no model time', async () => {
+  // A usage block of zeros is a known output of 0; a missing one is unknown.
+  await withDshSessions(async (sessions) => {
+    writeSession(sessions, 'proj-z', 'session-z', withSeq([
+      sessionRecord('session-z', '/home/me/proj-z'),
+      userRecord(1700000000000),
+      assistantRecord(1700000150000, 'model-a', { inputTokens: 0, outputTokens: 0, cacheReadTokens: 0, reasoningTokens: 0 }),
+    ]), true);
+
+    const result = await parse();
+    assert.equal(result.sessions.length, 1);
+    assert.equal(result.sessions[0].activeSeconds, 0);
+  });
+});
+
 test('DSH reads plain .jsonl session logs as well', async () => {
   await withDshSessions(async (sessions) => {
     writeSession(sessions, 'proj-e', 'session-5', [

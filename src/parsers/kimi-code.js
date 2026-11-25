@@ -288,7 +288,7 @@ export function parseCurrentKimiRoots(roots, {
 
       // Each usage.record marks an assistant step completing — use it as an
       // assistant timing event so active-time math has both sides of a turn.
-      sessionEvents.push({ sessionId: sessionDir, source, project, timestamp: ts, role: 'assistant' });
+      sessionEvents.push({ sessionId: sessionDir, source, project, timestamp: ts, role: 'assistant', outputTokens });
     }
   }
 

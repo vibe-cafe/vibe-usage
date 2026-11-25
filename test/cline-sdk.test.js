@@ -52,6 +52,13 @@ test('Cline 3 SDK artifacts are detected and split inclusive input/cache exactly
   assert.equal(JSON.stringify(result).includes('cost'), false);
 }));
 
+test('Cline SDK replies are timed with their own output tokens', async () => fixture(async root => {
+  // 100 s after the prompt with 20 output tokens: at most 30 s + 20 / 20 per second.
+  writeSession(root, 'timed', [user('u'), assistant('a', start + 100_000)]);
+  const result = await parse();
+  assert.equal(result.sessions[0].activeSeconds, 31);
+}));
+
 test('resumed Cline sessions keep old usage and count new equal-sized calls and model switches', async () => fixture(async root => {
   writeSession(root, 'one', [user('u'), assistant('a')]);
   const first = await parse();

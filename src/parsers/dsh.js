@@ -18,11 +18,10 @@ import {
 
 const SOURCE = 'dsh';
 // 2: cached models carry `project` instead of the session's full `cwd`.
-const DSH_CACHE_ALGO = 2;
-// The whole-source snapshot holds sessions, so it moves with how they are
-// computed: 3 is model time (2026-11-25). An earlier release keeps reading its
-// own version and never sees sessions carrying 5-minute cells.
-const DSH_SNAPSHOT_ALGO = 3;
+// 3: model time (2026-11-25) -- file entries keep each reply's output tokens,
+// zero included, and the whole-source snapshot holds sessions with 5-minute
+// cells. An earlier release keeps reading its own version.
+const DSH_CACHE_ALGO = 3;
 
 // Verified against deepseek-ai/deepseek-harness, released formats V0-V4:
 // packages/session/session-format/src/filename.ts, session-format-v0-to-v1,
@@ -291,6 +290,9 @@ function buildSessionModel(text, fileVersion) {
       role: 'assistant',
       timeMs,
       usage: parseUsage(rec.data.usage),
+      // Model time: the reply's output, reasoning included; a usage block of
+      // zeros is a known 0, a missing one unknown (aggregate.js replySpan()).
+      outputTokens: rec.data.usage && typeof rec.data.usage === 'object' ? toCount(rec.data.usage.outputTokens) : undefined,
       model:
         typeof rec.data.message?.source?.model === 'string' && rec.data.message.source.model
           ? rec.data.message.source.model
@@ -441,9 +443,7 @@ function modelToResult(model, skipCount) {
     const timestamp = new Date(msg.timeMs);
     // Model time: a reply's output (reasoning included) sets its cap; a reply
     // without usage is unknown (aggregate.js replySpan()).
-    const outputTokens = msg.role === 'assistant' && msg.usage
-      ? msg.usage.outputTokens + msg.usage.reasoningOutputTokens
-      : undefined;
+    const outputTokens = msg.role === 'assistant' ? msg.outputTokens : undefined;
     events.push({ sessionId, source: SOURCE, project, timestamp, role: msg.role,
       ...(outputTokens !== undefined ? { outputTokens } : {}) });
     if (msg.usage) {
@@ -584,7 +584,7 @@ export async function parse() {
     ? hashManifest([`tz|${localTimeZoneToken()}`, `dir|${sessionsDir}`, ...fileStats.map((f) => `${f.file}|${f.sig}`)])
     : null;
   if (manifest) {
-    const snap = loadSourceSnapshot(snapshotKey, DSH_SNAPSHOT_ALGO, manifest);
+    const snap = loadSourceSnapshot(snapshotKey, DSH_CACHE_ALGO, manifest);
     if (snap
       && Array.isArray(snap.buckets) && Array.isArray(snap.sessions)) {
       return snap;
@@ -695,7 +695,7 @@ export async function parse() {
     result.skipped = anyFailure;
     result.warnings = warnings;
   } else if (manifest) {
-    saveSourceSnapshot(snapshotKey, DSH_SNAPSHOT_ALGO, manifest, result);
+    saveSourceSnapshot(snapshotKey, DSH_CACHE_ALGO, manifest, result);
   }
   return result;
 }

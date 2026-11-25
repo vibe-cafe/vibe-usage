@@ -227,11 +227,13 @@ export function restoreModelTime(saved) {
  * chronological. `extractSessions()` below keeps the sorting fallback for
  * parsers that emit mixed or out-of-order sessions.
  *
- * Events are { timestamp: Date, role: 'user' | 'assistant', outputTokens? }.
- * How replies are read from them (`replyMode`):
+ * Events are { timestamp: Date, role: 'user' | 'assistant', outputTokens?,
+ * requestAt? }. How replies are read from them (`replyMode`):
  *
  *   - 'events' (default): every assistant event ends a reply that started at
- *     the previous event of either role. This is what every parser gets until
+ *     the previous event of either role -- or at its own `requestAt` (a Date),
+ *     when the parser records when the request went out (OpenCode: a reply's
+ *     created and completed times). This is what every parser gets until
  *     its own log is mapped to replies: a parser that records one event per
  *     reply and per tool result is then measured exactly; one that folds tool
  *     results into assistant events, or drops them, counts at most 2 minutes
@@ -305,8 +307,11 @@ export function accumulateSessionEvent(accumulator, event) {
     }
     return;
   }
-  // The first event of a session has nothing before it to start from.
-  if (previousMs !== null) countReply(accumulator, previousMs, timestampMs, event.outputTokens);
+  // The first event of a session has nothing before it to start from, unless
+  // it records its own request time.
+  const requestMs = event.requestAt instanceof Date ? event.requestAt.getTime() : NaN;
+  const startMs = Number.isFinite(requestMs) && requestMs <= timestampMs ? requestMs : previousMs;
+  if (startMs !== null) countReply(accumulator, startMs, timestampMs, event.outputTokens);
 }
 
 export function sessionAccumulatorIsOrdered(accumulator) {

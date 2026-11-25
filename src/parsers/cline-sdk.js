@@ -120,7 +120,12 @@ export function readClineSdk(sessionDirs, { onWarning = () => {}, onFatal = () =
         outputTokens: message.outputTokens, cachedInputTokens: message.cachedInputTokens,
         reasoningOutputTokens: 0 });
     }
-    events.push({ ...base, sessionId: message.sessionId, role: message.role });
+    // Model time: an assistant message with metrics has its output tokens; one
+    // without (all zero) is timed as unknown.
+    const measured = message.role === 'assistant'
+      && message.inputTokens + message.outputTokens + message.cachedInputTokens > 0;
+    events.push({ ...base, sessionId: message.sessionId, role: message.role,
+      ...(measured ? { outputTokens: message.outputTokens } : {}) });
   }
   return { entries, events };
 }

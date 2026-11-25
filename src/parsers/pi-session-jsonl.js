@@ -130,8 +130,9 @@ export async function parsePiSessionJsonl({
           }
         }
 
+        let event = null;
         if (message.role === 'user' || message.role === 'assistant' || message.role === 'toolResult') {
-          const event = {
+          event = {
             sessionId,
             source,
             project,
@@ -144,6 +145,8 @@ export async function parsePiSessionJsonl({
 
         if (message.role !== 'assistant' || !message.usage) continue;
         const usage = message.usage;
+        // Model time: the reply's output (reasoning included) sets its cap.
+        if (event) event.outputTokens = toCount(usage.output);
         const inputTokens = toCount(usage.input) + toCount(usage.cacheWrite);
         // Pi's Usage type names this field `reasoning` (a documented subset of
         // `output`); older/adjacent stores wrote `reasoningTokens`. Reading only

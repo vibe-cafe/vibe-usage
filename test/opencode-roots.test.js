@@ -81,6 +81,21 @@ test('OpenCode replies are timed with their own output tokens', async () => fixt
   assert.equal(result.sessions[0].activeSeconds, 31);
 }));
 
+test('OpenCode replies run from their creation to their completion', async () => fixture(async (root, primary) => {
+  // Created 1 s after the prompt, written over the next 30 s: the 30 s of
+  // generation are model time (within 30 s + 1000 / 20 per second).
+  json(primary, [
+    { id: 'u1', sessionID: 'ses_done', role: 'user', time: { created: start }, path: { root: '/work/project' } },
+    { id: 'a1', sessionID: 'ses_done', role: 'assistant', time: { created: start + 1_000, completed: start + 31_000 },
+      modelID: 'test-model', tokens: { input: 10, output: 1000 }, path: { root: '/work/project' } },
+  ]);
+  const result = await parse();
+  assert.equal(result.sessions[0].activeSeconds, 30);
+  assert.equal(result.sessions[0].lastMessageAt, new Date(start + 31_000).toISOString());
+  // Buckets keep the creation time.
+  assert.equal(result.buckets[0].bucketStart, new Date(start).toISOString());
+}));
+
 test('OpenCode validates SQLite and legacy layouts without throwing on absent paths', async () => fixture(async root => {
   const db = join(root, 'db'), old = join(root, 'json');
   sqlite(db, []); json(old, []);

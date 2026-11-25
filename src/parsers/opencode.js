@@ -195,7 +195,13 @@ export async function parse({ extraRoots = [], magpie } = {}) {
     // Model time: a reply's output (reasoning included) sets its cap; a row
     // without token counts is unknown (aggregate.js replySpan()).
     const outputTokens = role === 'assistant' && tokens ? (tokens.output || 0) + (tokens.reasoning || 0) : undefined;
-    events.push({ ...base, sessionId: row.sessionId, role, ...(outputTokens !== undefined ? { outputTokens } : {}) });
+    // A reply runs from its creation (the request) to its completion; buckets
+    // keep the creation time they always had. A reply still streaming has no
+    // completion yet and is timed from the event before it.
+    const completed = role === 'assistant' && row.completed != null ? new Date(row.completed) : null;
+    const timing = completed && Number.isFinite(completed.getTime()) && completed >= row.timestamp
+      ? { timestamp: completed, requestAt: row.timestamp } : {};
+    events.push({ ...base, ...timing, sessionId: row.sessionId, role, ...(outputTokens !== undefined ? { outputTokens } : {}) });
     if (!row.modelID || !tokens || (!tokens.input && !tokens.output)) continue;
     entries.push({ ...base, model: row.modelID,
       ...(magpie && row.providerID === 'magpie' ? { magpie: {
