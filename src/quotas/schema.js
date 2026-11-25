@@ -41,9 +41,11 @@ export const QUOTA_FAILURE_REASONS = Object.freeze([
 
 /**
  * Why a read was not sent on purpose (network-privacy principle), additive
- * within schema v1 and only with status `unsupported`. Shared with the desktop
- * clients, which show a fixed line for each and offer no retry: the next read
- * checks again. `egressRegion` (two letters) comes with
+ * within schema v1. A pause returns unsupported or, when answered from a
+ * valid local record, ok/local. Shared with the desktop clients, which show a
+ * fixed line for each and offer no retry: the next read checks again. Mac
+ * 0.8.0 and Windows 0.7.9 read this field only with unsupported and keep
+ * showing the local numbers otherwise. `egressRegion` (two letters) comes with
  * `egressRegionUnsupported`. `proxyUnsupported` comes from the environment proxy guard.
  */
 export const QUOTA_PAUSE_REASONS = Object.freeze([
@@ -209,7 +211,8 @@ export function quotaResult({
     result.emptyReason = emptyReason;
   }
   if (pauseReason !== undefined && pauseReason !== null) {
-    if (!QUOTA_PAUSE_REASONS.includes(pauseReason) || status !== 'unsupported') {
+    const localReading = status === 'ok' && source === 'local';
+    if (!QUOTA_PAUSE_REASONS.includes(pauseReason) || (status !== 'unsupported' && !localReading)) {
       throw new TypeError(`invalid quota pauseReason: ${pauseReason}`);
     }
     result.pauseReason = pauseReason;

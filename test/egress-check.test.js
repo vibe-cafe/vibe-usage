@@ -5,7 +5,7 @@ import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, statSync, wri
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import {
-  egressPauseFor, fetchTraceRegion, networkFingerprint, ownRouteFor, routeFor, traceRegion,
+  EGRESS_GATED_PRODUCTS, egressPauseFor, fetchTraceRegion, networkFingerprint, ownRouteFor, routeFor, traceRegion,
 } from '../src/egress-check.js';
 import { fetchQuotaProducts } from '../src/quotas/registry.js';
 import { quotaResult } from '../src/quotas/schema.js';
@@ -74,7 +74,7 @@ test('a product whose hosts all go through a proxy is never checked', async t =>
 test('products that do not pause are never checked', async t => {
   const { trace, calls } = tracer('CN');
   const environment = { VIBE_USAGE_QUOTA_CACHE_DIR: cacheDir(t) };
-  for (const id of ['cursor', 'kimi-code', 'zcode', 'opencode-go', 'grok']) {
+  for (const id of ['cursor', 'kimi-code', 'zcode', 'opencode-go']) {
     assert.equal(await egressPauseFor(id, { environment, now: NOW, trace, fingerprint: 'a' }), null);
   }
   assert.deepEqual(calls, []);
@@ -334,11 +334,63 @@ test('quota fetch reports a pause as unsupported with its reason and starts noth
   assert.equal(checked, 0);
 });
 
-test('pauseReason is a closed vocabulary and only travels with unsupported', () => {
+test('Grok checks every xAI account route, preferring its own direct trace hosts', async t => {
+  assert.deepEqual(EGRESS_GATED_PRODUCTS.grok, {
+    urls: ['https://cli-chat-proxy.grok.com/', 'https://auth.x.ai/', 'https://api.x.ai/'],
+    traceHosts: ['cli-chat-proxy.grok.com', 'api.x.ai'],
+  });
+  const HTTPS_PROXY = 'socks5://127.0.0.1:1080';
+  for (const [env, expectedHost, reason] of [
+    [{}, 'cli-chat-proxy.grok.com', 'egressRegionUnsupported'],
+    [{ HTTPS_PROXY }, null, undefined],
+    [{ HTTPS_PROXY, NO_PROXY: 'api.x.ai' }, 'api.x.ai', 'egressRegionUnsupported'],
+    [{ HTTPS_PROXY, NO_PROXY: 'auth.x.ai,chatgpt.com' }, 'chatgpt.com', 'egressRegionUnsupported'],
+    [{ ALL_PROXY: HTTPS_PROXY }, null, 'egressUnconfirmed'],
+  ]) {
+    const { trace, calls } = tracer('CN');
+    const pause = await egressPauseFor('grok', {
+      environment: { ...env, VIBE_USAGE_QUOTA_CACHE_DIR: cacheDir(t) }, trace, now: NOW, fingerprint: 'net',
+    });
+    assert.equal(pause?.pauseReason, reason);
+    assert.deepEqual(calls, expectedHost ? [expectedHost] : []);
+  }
+});
+
+test('Grok registry checks only an installed binary and a pause starts nothing', async t => {
+  const home = cacheDir(t);
+  const checks = [], spawns = [];
+  const options = {
+    home, environment: { HOME: home, PATH: home, VIBE_USAGE_QUOTA_CACHE_DIR: home }, now: NOW,
+    spawnImpl: (...args) => { spawns.push(args); throw new Error('unexpected spawn'); },
+    egressPause: async id => {
+      checks.push(id);
+      return { pauseReason: 'egressRegionUnsupported', region: 'HK', message: 'Paused in HK.' };
+    },
+  };
+  const fetch = async () => (await fetchQuotaProducts(['grok'], options)).products[0];
+  assert.equal((await fetch()).status, 'no_data');
+  assert.deepEqual(checks, []);
+  writeFileSync(join(home, process.platform === 'win32' ? 'grok.exe' : 'grok'), '', { mode: 0o700 });
+  const paused = await fetch();
+  assert.equal(paused.status, 'unsupported');
+  assert.equal(paused.pauseReason, 'egressRegionUnsupported');
+  assert.equal(paused.egressRegion, 'HK');
+  assert.equal(paused.message, 'Paused in HK.');
+  assert.deepEqual(checks, ['grok']);
+  assert.deepEqual(spawns, []);
+});
+
+test('pauseReason is a closed vocabulary on unsupported and successful local reads', () => {
   const ok = quotaResult({ id: 'antigravity', status: 'unsupported', pauseReason: 'egressUnconfirmed', egressRegion: 'CN' });
   assert.equal(ok.pauseReason, 'egressUnconfirmed');
   assert.throws(() => quotaResult({ id: 'antigravity', status: 'unsupported', pauseReason: 'proxyChoicePending' }), /pauseReason/);
   assert.throws(() => quotaResult({ id: 'antigravity', status: 'no_data', pauseReason: 'egressUnconfirmed' }), /pauseReason/);
+  const local = { id: 'grok', status: 'ok', source: 'local', pauseReason: 'egressRegionUnsupported', egressRegion: 'CN' };
+  assert.equal(quotaResult(local).egressRegion, 'CN');
+  assert.equal(quotaResult(local).pauseReason, local.pauseReason);
+  for (const source of ['live', 'cache']) assert.throws(() => quotaResult({ ...local, source }), /pauseReason/);
+  assert.throws(() => quotaResult({ ...local, status: 'retryable_error' }), /pauseReason/);
+  assert.throws(() => quotaResult({ ...local, pauseReason: 'unknown' }), /pauseReason/);
   const odd = quotaResult({ id: 'antigravity', status: 'unsupported', pauseReason: 'egressRegionUnsupported', egressRegion: 'cn-x' });
   assert.equal(odd.egressRegion, undefined);
 });

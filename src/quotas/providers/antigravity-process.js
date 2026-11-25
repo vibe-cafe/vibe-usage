@@ -1,9 +1,11 @@
-import { execFile, spawn } from 'node:child_process';
+import { execFile } from 'node:child_process';
 import { randomBytes } from 'node:crypto';
-import { chmodSync, existsSync, mkdirSync, mkdtempSync, rmSync, writeFileSync } from 'node:fs';
-import { tmpdir } from 'node:os';
+import { chmodSync, existsSync, mkdirSync, writeFileSync } from 'node:fs';
 import { delimiter, join } from 'node:path';
 import { setTimeout as delay } from 'node:timers/promises';
+import { setVariable, withProcess } from './child-process.js';
+
+export { cleanupAllowanceMs, Interrupted, TimedOut } from './child-process.js';
 
 const OUTPUT_LIMIT = 1024 * 1024;
 const PORT = /listening on \w+ port at (\d+) for HTTPS\b/i;
@@ -15,33 +17,6 @@ const unavailable = () => new Error('Antigravity quota service unavailable');
 // Our own desktop engines carry this in their --gemini_dir; never treat one as the user's desktop.
 const OWN_DIRECTORY = 'vibe-usage-agy-quota-';
 export class LoginRequired extends Error {}
-export class Interrupted extends Error {}
-export class TimedOut extends Error {}
-
-// Leave room for stopTree's two waits and rmSync's 100 + 200 + 300 ms retry delays.
-export const cleanupAllowanceMs = platform => (platform === 'win32' ? 2000 : 750) + 500 + 600;
-
-async function stopTree(child, closed) {
-  if (!child.pid) return;
-  if (process.platform === 'win32') {
-    if (child.exitCode === null && child.signalCode === null) {
-      await new Promise(resolve => execFile('taskkill.exe', ['/PID', String(child.pid), '/T', '/F'],
-        { windowsHide: true, timeout: 2000 }, resolve));
-    }
-  } else {
-    // The group can still have helpers even after its leader has exited.
-    try { process.kill(-child.pid, 'SIGTERM'); } catch { return; }
-    await Promise.race([closed, delay(750, undefined, { ref: false })]);
-    try { process.kill(-child.pid, 'SIGKILL'); } catch { /* Group already gone. */ }
-  }
-  await Promise.race([closed, delay(500, undefined, { ref: false })]);
-}
-
-/** Windows environment names are case-insensitive: drop every spelling before setting one. */
-function setVariable(env, name, value) {
-  for (const key of Object.keys(env)) if (key.toUpperCase() === name.toUpperCase()) delete env[key];
-  env[name] = value;
-}
 
 /**
  * When silent sign-in fails (usually a network or keychain timeout while the
@@ -78,21 +53,11 @@ function installBrowserStubs(directory, env, platform) {
   return mark;
 }
 
-// Every entry point owns its cwd, streams, time limit and process tree.
-async function withProcess(binary, argsFor, {
-  environment = process.env, timeoutMs, spawnImpl = spawn, desktopVersion, agy = false, platform = process.platform,
+function withAntigravityProcess(binary, argsFor, {
+  environment, timeoutMs, spawnImpl, desktopVersion, agy = false, platform = process.platform,
 }, read) {
-  const directory = mkdtempSync(join(tmpdir(), OWN_DIRECTORY));
-  const controller = new AbortController();
-  const abort = error => controller.abort(error);
-  const onSignal = () => abort(new Interrupted());
-  const timer = setTimeout(() => abort(new TimedOut('Antigravity quota service unavailable')), timeoutMs);
-  let child, closed;
-  try {
-    // Desktop apps can fetch ZCode in this same CLI invocation. Windows env names are case-insensitive.
-    const env = Object.fromEntries(Object.entries(environment)
-      .filter(([key]) => !/^(BIGMODEL_API_KEY|Z_AI_API_KEY)$/i.test(key)));
-    let browserMark;
+  let browserMark;
+  function configureEnv(env, directory) {
     if (agy) {
       // Only in this child: the user's own agy keeps updating itself as configured.
       // The literal lowercase "true" is what agy honors (CodexBar #4739).
@@ -104,45 +69,27 @@ async function withProcess(binary, argsFor, {
       env.ANTIGRAVITY_GEMINI_DIR = directory;
       env.ANTIGRAVITY_VSCODE_HOST = '1';
     }
-    child = spawnImpl(binary, argsFor(directory), {
-      cwd: directory, detached: process.platform !== 'win32', windowsHide: true,
-      stdio: ['pipe', 'pipe', 'pipe'], env,
-    });
-    child.stdin.on('error', () => {});
-    child.once('error', () => abort(unavailable()));
-    closed = new Promise(resolve => child.once('close', resolve));
-    process.once('SIGTERM', onSignal);
-    process.once('SIGINT', onSignal);
-    const interrupted = new Promise((_, reject) =>
-      controller.signal.addEventListener('abort', () => reject(controller.signal.reason), { once: true }));
+  }
+  return withProcess(binary, argsFor, {
+    prefix: OWN_DIRECTORY, configureEnv, environment, timeoutMs, spawnImpl,
+    failureMessage: 'Antigravity quota service unavailable',
+  }, context => {
     if (browserMark) {
+      const { abort, signal } = context;
       void (async () => {
-        while (!controller.signal.aborted) {
+        while (!signal.aborted) {
           if (existsSync(browserMark)) return abort(new LoginRequired());
-          await delay(100, undefined, { signal: controller.signal, ref: false }).catch(() => {});
+          await delay(100, undefined, { signal, ref: false }).catch(() => {});
         }
       })();
     }
-    return await Promise.race([interrupted, read({ child, directory, closed, abort, signal: controller.signal, browserMark })]);
-  } finally {
-    clearTimeout(timer);
-    controller.abort();
-    try {
-      if (child) {
-        await stopTree(child, closed);
-        child.stdin.destroy();
-      }
-    } finally {
-      process.removeListener('SIGTERM', onSignal);
-      process.removeListener('SIGINT', onSignal);
-      try { rmSync(directory, { recursive: true, force: true, maxRetries: 3, retryDelay: 100 }); } catch {}
-    }
-  }
+    return read({ ...context, browserMark });
+  });
 }
 
 /** Runs one official `agy` command (`--version`, `-p /usage`) to completion. */
 export function runAntigravityCommand(binary, args, options) {
-  return withProcess(binary, () => args, { ...options, agy: true }, async ({ child, closed, abort, browserMark }) => {
+  return withAntigravityProcess(binary, () => args, { ...options, agy: true }, async ({ child, closed, abort, browserMark }) => {
     child.stdin.end();
     let bytes = 0;
     function capture(stream) {
@@ -186,7 +133,7 @@ export function withAntigravitySession(binary, callback, {
     '--api_server_url', 'https://generativelanguage.googleapis.com',
     '--cloud_code_endpoint', 'https://daily-cloudcode-pa.googleapis.com', '--gemini_dir', directory,
   ];
-  return withProcess(binary, argsFor, { environment, timeoutMs, spawnImpl, desktopVersion },
+  return withAntigravityProcess(binary, argsFor, { environment, timeoutMs, spawnImpl, desktopVersion },
     async ({ child, closed, abort, signal }) => {
       let port;
       for (const stream of [child.stdout, child.stderr]) {
