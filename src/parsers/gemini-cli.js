@@ -164,16 +164,18 @@ export async function parse() {
       const ts = new Date(stamp);
       if (isNaN(ts.getTime())) continue;
 
+      const tokens = role === 'assistant' ? extractTokens(msg) : null;
       sessionEvents.push({
         sessionId: filePath,
         source: 'gemini-cli',
         project,
         timestamp: ts,
         role,
+        // Model time: the reply's output, thoughts included, sets its cap.
+        ...(tokens ? { outputTokens: tokens.outputTokens + tokens.reasoningOutputTokens } : {}),
       });
 
       if (role !== 'assistant') continue;
-      const tokens = extractTokens(msg);
       if (!tokens) continue;
 
       entries.push({

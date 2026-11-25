@@ -304,6 +304,10 @@ export async function parse() {
           project,
           timestamp: candidate.timestamp,
           role: candidate.role,
+          // Model time: a reply takes the output of the copy of its record whose
+          // usage is kept, whichever copy is read last (set below, once every
+          // file is read); without usage in any copy it is unknown.
+          ...(candidate.role === 'assistant' && candidate.id ? { usageId: candidate.id } : {}),
         };
         const key = candidate.id
           ? `id:${candidate.sessionId}:${candidate.id}:${candidate.role}`
@@ -313,6 +317,10 @@ export async function parse() {
     }
   }
 
+  for (const event of eventsByKey.values()) {
+    const kept = event.usageId ? entriesById.get(event.usageId) : null;
+    if (kept) event.outputTokens = kept.entry.outputTokens + kept.entry.reasoningOutputTokens;
+  }
   return {
     buckets: aggregateToBuckets([...entriesById.values()].map(({ entry }) => entry)),
     sessions: extractSessions(sessionEventsWithPrompts([...eventsByKey.values()])),

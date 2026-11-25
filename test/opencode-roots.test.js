@@ -73,8 +73,11 @@ test('OpenCode replies are timed with their own output tokens', async () => fixt
   // Model time: at most 30 s + output (reasoning included) / 20 per second.
   json(primary, [
     { id: 'u1', sessionID: 'ses_timed', role: 'user', time: { created: start }, path: { root: '/work/project' } },
-    { id: 'a1', sessionID: 'ses_timed', role: 'assistant', time: { created: start + 300_000 },
+    { id: 'a1', sessionID: 'ses_timed', role: 'assistant', time: { created: start, completed: start + 300_000 },
       modelID: 'test-model', tokens: { input: 10, output: 15, reasoning: 5 }, path: { root: '/work/project' } },
+    // Not completed yet: nothing until it is.
+    { id: 'a2', sessionID: 'ses_timed', role: 'assistant', time: { created: start + 400_000 },
+      modelID: 'test-model', tokens: { input: 10, output: 15 }, path: { root: '/work/project' } },
   ]);
   const result = await parse();
   assert.equal(result.sessions.length, 1);

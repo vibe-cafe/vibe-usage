@@ -57,6 +57,14 @@ test('Cline SDK replies are timed with their own output tokens', async () => fix
   writeSession(root, 'timed', [user('u'), assistant('a', start + 100_000)]);
   const result = await parse();
   assert.equal(result.sessions[0].activeSeconds, 31);
+  // A recorded output of 0 counts nothing; a message without an output count
+  // is unknown (at most 2 minutes).
+  const zero = { ...assistant('z', start + 100_000), metrics: { inputTokens: 0, outputTokens: 0 } };
+  const unknown = { ...assistant('n', start + 100_000), metrics: { inputTokens: 10 } };
+  writeSession(root, 'timed', [user('u'), zero]);
+  assert.equal((await parse()).sessions[0].activeSeconds, 0);
+  writeSession(root, 'timed', [user('u'), unknown]);
+  assert.equal((await parse()).sessions[0].activeSeconds, 100);
 }));
 
 test('resumed Cline sessions keep old usage and count new equal-sized calls and model switches', async () => fixture(async root => {

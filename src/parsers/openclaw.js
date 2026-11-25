@@ -28,6 +28,8 @@ function getPossibleRoots() {
   return roots;
 }
 
+const OUTPUT_KEYS = ['output', 'outputTokens', 'output_tokens', 'completionTokens', 'completion_tokens'];
+
 /** Normalize usage fields — OpenClaw supports multiple naming conventions */
 function getTokens(usage, ...keys) {
   for (const key of keys) {
@@ -95,6 +97,10 @@ export async function parse() {
               project,
               timestamp: ts,
               role: msg.role === 'user' ? 'user' : 'assistant',
+              // Model time: a reply whose usage records an output count has it.
+              ...(msg.role === 'assistant' && msg.usage && OUTPUT_KEYS.some(key => msg.usage[key] != null) ? {
+                outputTokens: getTokens(msg.usage, ...OUTPUT_KEYS),
+              } : {}),
             });
 
             if (msg.role !== 'assistant') continue;
@@ -126,7 +132,7 @@ export async function parse() {
               project,
               timestamp: ts,
               inputTokens: inputTokens + cacheWriteTokens,
-              outputTokens: getTokens(usage, 'output', 'outputTokens', 'output_tokens', 'completionTokens', 'completion_tokens'),
+              outputTokens: getTokens(usage, ...OUTPUT_KEYS),
               cachedInputTokens: getTokens(usage, 'cacheRead', 'cache_read', 'cache_read_input_tokens'),
               reasoningOutputTokens: 0,
             });

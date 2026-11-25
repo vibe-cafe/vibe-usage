@@ -444,6 +444,8 @@ function parseLegacyKimi() {
             project,
             timestamp: evTs,
             role: LEGACY_USER_EVENT_TYPES.has(type) ? 'user' : 'assistant',
+            // Model time: a StatusUpdate carries the step's output tokens.
+            ...(type === 'StatusUpdate' && payload.token_usage ? { outputTokens: payload.token_usage.output || 0 } : {}),
           });
         }
       }
