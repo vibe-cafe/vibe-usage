@@ -208,17 +208,23 @@ for (const [name, error, status] of [
     assert.equal(result.status, status);
     assert.equal(result.source, 'live');
     assert.deepEqual(result.meters, []);
-    if (status === 'unauthorized') assert.match(result.message, /grok login.*terminal/i);
-    else assert.equal(result.emptyReason, 'sessionWithoutPlanLimits');
+    if (status === 'unauthorized') {
+      assert.match(result.message, /grok login.*terminal/i);
+      assert.equal(result.failureReason, 'credentialsMissing');
+    } else {
+      assert.equal(result.emptyReason, 'sessionWithoutPlanLimits');
+      assert.equal(result.failureReason, undefined);
+    }
   });
 }
 
-for (const [scenario, answer] of [
+for (const [scenario, answer, failureReason = 'programNoAnswer'] of [
   ['service error', { error: { code: -32603, message: 'private' } }],
-  ['unknown method', { error: { code: -32601, message: 'private' } }],
-  ['bad period', { result: { currentPeriod: { ...currentPeriod, start: 'invalid' } } }],
-  ['ended period', { result: { currentPeriod: { ...currentPeriod, end: now.toISOString() } } }],
-  ['future period', { result: { currentPeriod: { ...currentPeriod, start: '2026-11-26' } } }],
+  ['unknown method', { error: { code: -32601, message: 'private' } }, 'programOutdated'],
+  ['other sign-in error', { error: { code: -32000, message: 'private' } }],
+  ['bad period', { result: { currentPeriod: { ...currentPeriod, start: 'invalid' } } }, 'unrecognizedResponse'],
+  ['ended period', { result: { currentPeriod: { ...currentPeriod, end: now.toISOString() } } }, 'unrecognizedResponse'],
+  ['future period', { result: { currentPeriod: { ...currentPeriod, start: '2026-11-26' } } }, 'unrecognizedResponse'],
   ['initialize-error'], ['early-exit'], ['garbage'], ['over-cap'], ['spawn failure'],
 ]) {
   test(scenario + ' returns the dated local reading', async t => {
@@ -228,7 +234,7 @@ for (const [scenario, answer] of [
     f.environment.SCENARIO = scenario;
     const extra = scenario === 'spawn failure' ? { spawnImpl: () => { throw new Error('private'); } } : {};
     assert.deepEqual(await f.fetch(extra), { id: 'grok', status: 'ok', source: 'local', meters: [meter(81)],
-      planLabel: 'Local plan', fetchedAt: now.toISOString(), dataAsOf: eventTime });
+      planLabel: 'Local plan', fetchedAt: now.toISOString(), dataAsOf: eventTime, failureReason });
     if (scenario === 'initialize-error') assert.deepEqual(f.calls().slice(1).map(call => call.method), ['initialize']);
   });
 }
@@ -243,6 +249,7 @@ test('timeout includes stopping the process tree and removing the temporary cwd'
   assert.ok(performance.now() - started <= timeoutMs + 300);
   assert.equal(result.source, 'local');
   assert.deepEqual(result.meters, [meter(81)]);
+  assert.equal(result.failureReason, 'timedOut');
   const [child, ...calls] = f.calls();
   assert.equal(existsSync(child.cwd), false);
   assert.throws(() => process.kill(child.pid, 0), { code: 'ESRCH' });
@@ -262,6 +269,7 @@ test('a pause returns the local 0% reading or the pause message, without spawnin
   assert.equal(missing.message, pause.message);
   assert.equal(missing.pauseReason, pause.pauseReason);
   assert.equal(missing.egressRegion, 'CN');
+  assert.equal(missing.failureReason, undefined);
   f.writeLog(undefined);
   const local = await f.fetch(options);
   assert.deepEqual(local, { id: 'grok', status: 'ok', source: 'local', planLabel: 'Local plan', meters: [meter(0)],
@@ -270,6 +278,7 @@ test('a pause returns the local 0% reading or the pause message, without spawnin
   assert.equal(absent.source, 'local');
   assert.deepEqual(absent.meters, [meter(0)]);
   assert.equal(absent.pauseReason, undefined);
+  assert.equal(absent.failureReason, 'programNotFound');
   assert.equal(existsSync(f.trace), false);
 });
 
@@ -279,6 +288,8 @@ test('the 2 MiB log tail bounds fallback reads and live tier lookup', async t =>
   appendFileSync(f.environment.LOG_PATH, '\n' + 'x'.repeat(2 * 1024 * 1024) + '\n');
   const local = await f.fetch({ grokBinary: null });
   assert.equal(local.status, 'no_data');
+  assert.equal(local.emptyReason, 'noLocalRecord');
+  assert.equal(local.failureReason, 'programNotFound');
   const live = await f.fetch();
   assert.equal(live.source, 'live');
   assert.deepEqual(live.meters, [meter(0)]);

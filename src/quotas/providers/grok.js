@@ -3,7 +3,7 @@ import { homedir } from 'node:os';
 import { delimiter, join, resolve } from 'node:path';
 import { StringDecoder } from 'node:string_decoder';
 import { quotaResult } from '../schema.js';
-import { cleanupAllowanceMs, setVariable, withProcess } from './child-process.js';
+import { cleanupAllowanceMs, setVariable, TimedOut, withProcess } from './child-process.js';
 
 const PRODUCT_ID = 'grok';
 const DEFAULT_MAX_LOG_BYTES = 2 * 1024 * 1024;
@@ -148,7 +148,10 @@ export function parseGrokBillingLog(text, now = new Date()) {
   return null;
 }
 
-function logQuota(readLog, now) {
+// The local record, after the live read could not answer (`failureReason`,
+// #190): a reading or an empty state carries why live failed; a record that
+// cannot be read at all reports that instead.
+function logQuota(readLog, now, failureReason) {
   let parsed;
   try {
     parsed = parseGrokBillingLog(readLog(), now);
@@ -157,7 +160,9 @@ function logQuota(readLog, now) {
     return quotaResult({
       id: PRODUCT_ID,
       status,
-      ...(status === 'no_data' ? { emptyReason: 'noLocalRecord' } : { failureReason: 'localRecordUnreadable' }),
+      ...(status === 'no_data'
+        ? { emptyReason: 'noLocalRecord', failureReason }
+        : { failureReason: 'localRecordUnreadable' }),
       message: status === 'no_data'
         ? 'Grok billing status is not available yet'
         : 'Grok billing status could not be read',
@@ -170,6 +175,7 @@ function logQuota(readLog, now) {
       id: PRODUCT_ID,
       status: 'no_data',
       emptyReason: parsed ? 'periodEnded' : 'noLocalRecord',
+      failureReason,
       message: 'Grok billing status is not available yet',
       fetchedAt: now,
       dataAsOf: parsed?.dataAsOf,
@@ -184,6 +190,7 @@ function logQuota(readLog, now) {
     fetchedAt: now,
     dataAsOf: parsed.dataAsOf,
     source: 'local',
+    failureReason,
   });
 }
 
@@ -274,7 +281,7 @@ export async function fetchGrokQuota({
   maxLogBytes = DEFAULT_MAX_LOG_BYTES, spawnImpl, timeoutMs,
 } = {}) {
   const readLog = () => readLogTail(grokBillingLogPath(environment, home), maxLogBytes);
-  if (!grokBinary) return logQuota(readLog, now);
+  if (!grokBinary) return logQuota(readLog, now, 'programNotFound');
   const quota = fields => quotaResult({ id: PRODUCT_ID, fetchedAt: now, ...fields });
   const paused = await egressGate();
   if (paused) {
@@ -287,8 +294,8 @@ export async function fetchGrokQuota({
   let answer;
   try {
     answer = await requestGrokBilling(grokBinary, { environment, platform, timeoutMs, spawnImpl });
-  } catch {
-    return logQuota(readLog, now);
+  } catch (failure) {
+    return logQuota(readLog, now, failure instanceof TimedOut ? 'timedOut' : 'programNoAnswer');
   }
   const { error, result } = answer;
   if (error?.code === -32000) {
@@ -296,11 +303,17 @@ export async function fetchGrokQuota({
       return quota({ status: 'no_data', emptyReason: 'sessionWithoutPlanLimits' });
     }
     if (LOGIN_REQUIRED.test(error.message)) {
-      return quota({ status: 'unauthorized', message: 'Run grok login in a terminal to sign in.' });
+      return quota({
+        status: 'unauthorized', failureReason: 'credentialsMissing',
+        message: 'Run grok login in a terminal to sign in.',
+      });
     }
   }
+  // -32601: a Grok too old to know the billing method; anything else (the
+  // billing service's own error, -32603) is no answer.
+  if (error) return logQuota(readLog, now, error.code === -32601 ? 'programOutdated' : 'programNoAnswer');
   const parsed = parseGrokBillingConfig(result?.config ?? result, now);
-  if (!parsed?.active || !parsed.started) return logQuota(readLog, now);
+  if (!parsed?.active || !parsed.started) return logQuota(readLog, now, 'unrecognizedResponse');
   let planLabel = tier(result.subscription_tier, result.subscriptionTier, parsed.planLabel);
   if (!planLabel) {
     // Grok also writes this call's tier to its billing event.
