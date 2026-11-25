@@ -425,7 +425,7 @@ test('`login cursor` saves the sign-in; `status` names it; `logout cursor` remov
   const logout = await run(['logout', 'cursor']);
   assert.equal(logout.code, 0);
   assert.match(logout.stdout, /已退出 Cursor 登录/);
-  assert.match(logout.stdout, /Active Sessions/);
+  assert.match(logout.stdout, /Sessions 里撤销：它显示为「Desktop App」/);
   assert.equal(existsSync(path), false);
 });
 

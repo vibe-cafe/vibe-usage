@@ -652,7 +652,10 @@ export async function runCursorLogout(args, { env = process.env, sleep = ms => n
     release?.();
   }
   console.log(removed ? '已退出 Cursor 登录，本机保存的登录已删除。' : '本机没有保存 Cursor 登录。');
-  console.log('Cursor 官网上的这条登录可在 cursor.com 设置里的 Active Sessions 撤销。');
+  // Measured 2026-11-25 on the maintainer's account: Cursor lists this sign-in
+  // as "Desktop App", adds one more per renewal, and a revocation takes up to
+  // 10 minutes.
+  console.log('Cursor 官网上的这条登录可在 cursor.com 设置的 Sessions 里撤销：它显示为「Desktop App」（每续期一次多一条，按时间认，别撤正在用的 Cursor 编辑器那条），最多 10 分钟生效。');
 }
 
 /** One line for `status`, or null when there is no stored sign-in. Never prints a token. */
