@@ -208,6 +208,7 @@ export function loadOlderCodexFileCache(codexHome, filePath, signature, { magpie
   if (!older || !signatureMatches(older.signature, signature)) return null;
   const parts = partsAccepted(older.algorithmVersion);
   return {
+    signature: older.signature,
     entry: summaryAccepted(older.algorithmVersion) ? older : null,
     header: (parts && older.header) || null,
     index: (parts && older.index) || null,

@@ -645,7 +645,9 @@ function replayIndexDigest(index) {
 function fillFullIndex(index) {
   const source = index?.[SLIM_INDEX_SOURCE];
   if (!source) return true;
-  const { codexHome, filePath, signature, src, cacheOptions } = source;
+  const { codexHome, filePath, src, cacheOptions } = source;
+  // One key or several; for a group, computed only when a fill is needed.
+  const signature = typeof source.signature === 'function' ? source.signature() : source.signature;
   const sameIndex = full => !!full && HEAVY_INDEX_FIELDS.every(key => Array.isArray(full[key]))
     && full.sessionId === index.sessionId
     && full.parsedRecordCount === index.parsedRecordCount
@@ -831,37 +833,51 @@ const RECENT_WINDOW_MS = 3 * 24 * 60 * 60 * 1000;
 
 /**
  * The order in which a run reads sessions. `recent`: the keys of sessions with
- * a plain rollout modified since `since`. `needed`: those and every session
+ * a plain rollout modified since `since`. `needed(key)`: those and every session
  * one of them descends from (forks and sub-agents need their parent's replay
- * index). `rank(key)`: the newest plain mtime of the session, raised to that
- * of any fork or sub-agent of it, so a parent goes with the newest of them.
+ * index). `rank(key)`: the newest plain mtime of the session (a session with
+ * compressed rollouts only: when it started), raised to that of any fork or
+ * sub-agent of it, so a parent goes with the newest of them.
  */
 function sessionPriorities(files, sessionKey, since) {
-  const newest = new Map();
-  const parentOf = new Map();
+  const recent = new Set();
   for (const file of files) {
-    const key = sessionKey(file);
-    newest.set(key, Math.max(newest.get(key) ?? 0, file.compressed ? 0 : file.signature.mtimeMs));
-    const parentId = file.header?.forkedFromId || (file.header?.isSubagent ? file.header.parentThreadId : null);
-    if (parentId && parentId !== key) parentOf.set(key, parentId);
+    if (!file.compressed && file.signature.mtimeMs >= since) recent.add(sessionKey(file));
   }
-  const recent = new Set([...newest].filter(([, mtime]) => mtime >= since).map(([key]) => key));
-  const needed = new Set(recent);
-  for (let key of recent) {
-    while (parentOf.has(key) && !needed.has(parentOf.get(key))) needed.add(key = parentOf.get(key));
-  }
-  const ranks = new Map(newest);
-  // Chains are short; the bound only matters for a cycle in damaged headers.
-  for (let changed = true, round = 0; changed && round < 32; round++) {
-    changed = false;
-    for (const [key, parentId] of parentOf) {
-      if (ranks.has(parentId) && ranks.get(parentId) < ranks.get(key)) {
-        ranks.set(parentId, ranks.get(key));
-        changed = true;
+  // The rest only for a run that has to read beyond pass 1 (a warm sync does not).
+  let order = null;
+  const build = () => {
+    const ranks = new Map();
+    const parentOf = new Map();
+    for (const file of files) {
+      const key = sessionKey(file);
+      // A session known only from compressed rollouts ranks by when it started.
+      const mtime = file.compressed ? (file.header?.sessionStartedAtMs ?? 0) : file.signature.mtimeMs;
+      ranks.set(key, Math.max(ranks.get(key) ?? 0, mtime));
+      const parentId = file.header?.forkedFromId || (file.header?.isSubagent ? file.header.parentThreadId : null);
+      if (parentId && parentId !== key) parentOf.set(key, parentId);
+    }
+    const needed = new Set(recent);
+    for (let key of recent) {
+      while (parentOf.has(key) && !needed.has(parentOf.get(key))) needed.add(key = parentOf.get(key));
+    }
+    // Chains are short; the bound only matters for a cycle in damaged headers.
+    for (let changed = true, round = 0; changed && round < 32; round++) {
+      changed = false;
+      for (const [key, parentId] of parentOf) {
+        if (ranks.has(parentId) && ranks.get(parentId) < ranks.get(key)) {
+          ranks.set(parentId, ranks.get(key));
+          changed = true;
+        }
       }
     }
-  }
-  return { recent, needed, rank: key => ranks.get(key) ?? 0 };
+    return { ranks, needed };
+  };
+  return {
+    recent,
+    needed: key => (order ??= build()).needed.has(key),
+    rank: key => (order ??= build()).ranks.get(key) ?? 0,
+  };
 }
 
 function workBudgetMs() {
@@ -1275,6 +1291,7 @@ function olderEntryFor(codexHome, filePath, signature, cacheOptions, ultrafastSt
     summary: older.entry?.result && summaryMatchesCut(older.entry.result, ultrafastStartMs) ? older.entry : null,
     header: older.header,
     index: older.index,
+    signature: older.signature,
   };
 }
 
@@ -1350,6 +1367,8 @@ function startingCache(file, cacheOptions, ultrafastStartMs, manifest = null) {
   if (file.appendTail) return;
   const older = olderEntryFor(file.codexHome, file.filePath, file.signature, cacheOptions, ultrafastStartMs);
   if (!older) return;
+  // Its signature carries the device number it was written under (see storedDevs()).
+  file.olderEntry = { signature: older.signature };
   if (older.summary) {
     file.cache = older.summary;
     file.cacheSource = older.summary.algorithmVersion;
@@ -1732,39 +1751,77 @@ async function parseCodexHomes({ codexExtraHome, extraRoots = [], magpie, codexU
   const sessionKey = file => file.header?.sessionId || `\u0000${file.filePath}`;
   const involvesCompressed = file => file.compressed || !!file.members?.some(member => member.compressed);
   const { recent, needed, rank } = sessionPriorities(files, sessionKey, Date.now() - RECENT_WINDOW_MS);
+  // `limited`: compressed reads only within BACKLOG_SHARE. Not in pass 2:
+  // what it reads is for the conversations in use.
   const passes = [
-    item => recent.has(sessionKey(item)) && !involvesCompressed(item),
-    item => needed.has(sessionKey(item)),
-    () => true,
+    { mayRead: item => recent.has(sessionKey(item)) && !involvesCompressed(item), limited: false },
+    { mayRead: item => needed(sessionKey(item)), limited: false },
+    { mayRead: () => true, limited: true },
   ];
   const backlogBudget = budget * BACKLOG_SHARE;
   const physicalFiles = [...files];
-  const position = new Map(physicalFiles.map((file, i) => [file, i]));
-  const groupPosition = new Map([...duplicateIds].map((id, i) => [id, i]));
+  // Only for sorting after pass 1.
+  let positions = null;
+  const position = file => (positions ??= new Map(physicalFiles.map((f, i) => [f, i]))).get(file);
+  let groupPositions = null;
+  const groupPosition = id => (groupPositions ??= new Map([...duplicateIds].map((d, i) => [d, i]))).get(id);
   const byPriority = (key, place) => (a, b) => rank(key(b)) - rank(key(a))
     || involvesCompressed(a) - involvesCompressed(b) || place(a) - place(b);
-  // Plain rollouts of a session before its compressed ones, so a compressed
-  // copy of one can take its index.
-  const indexOrder = [...physicalFiles].sort(byPriority(sessionKey, file => position.get(file)));
+  // Pass 1 keeps the order a single pass always had: plain rollouts, then
+  // compressed ones (so a compressed copy can take a plain twin's index), each
+  // in directory order. It reads only recent plain rollouts, and a warm sync --
+  // nothing to read, so it ends after pass 1 -- would only pay for sorting.
+  // Passes 2 and 3 go newest first, plain before compressed within a session.
+  const plainFirst = [...physicalFiles.filter(file => !file.compressed), ...physicalFiles.filter(file => file.compressed)];
+  let newestFirst = null;
+  const indexOrder = first => (first ? plainFirst
+    : newestFirst ??= [...physicalFiles].sort(byPriority(sessionKey, position)));
 
   // Device numbers the stored signatures carry: a group entry or a parent
   // state written before 2026-11-25 can only be recomputed for the device
   // number its members had then (see legacyCodexSegmentSignature()). Mostly
   // one or two; bounded in any case.
-  const devCounts = new Map();
-  const noteDev = dev => {
-    if (typeof dev === 'string' && dev !== 'codex-segments') devCounts.set(dev, (devCounts.get(dev) || 0) + 1);
+  let knownDevs = null;
+  const storedDevs = () => {
+    if (knownDevs) return knownDevs;
+    const devCounts = new Map();
+    const noteDev = dev => {
+      if (typeof dev === 'string' && dev !== 'codex-segments') devCounts.set(dev, (devCounts.get(dev) || 0) + 1);
+    };
+    for (const records of manifests.values()) for (const record of records.values()) noteDev(record?.signature?.dev);
+    for (const file of files) {
+      for (const stored of [file.cache, file.priorCache, file.priorTail, file.olderEntry]) noteDev(stored?.signature?.dev);
+    }
+    return knownDevs = [...devCounts].sort((a, b) => b[1] - a[1]).slice(0, 16).map(([dev]) => dev);
   };
-  for (const records of manifests.values()) for (const record of records.values()) noteDev(record?.signature?.dev);
-  for (const file of files) noteDev(file.cache?.signature?.dev);
-  const knownDevs = [...devCounts].sort((a, b) => b[1] - a[1]).slice(0, 16).map(([dev]) => dev);
   // [0] under the members' current device number (what an earlier release
   // computes now), then under each earlier one.
   const legacyDevs = members => {
     const devs = new Set(members.map(member => member.signature.dev));
     if (devs.size !== 1) return [null];
     const [current] = devs;
-    return [current, ...knownDevs.filter(dev => dev !== current)];
+    return [current, ...storedDevs().filter(dev => dev !== current)];
+  };
+  // A group's earlier keys, each hashed only when asked for: a warm sync whose
+  // records are still in the earlier format matches the first one (the current
+  // device number) for almost every group, and hashing them all cost ~0.1 s.
+  // `match(stored)`: the index of the earlier key a stored signature is, or -1
+  // (no hashing at all when its size or mtime already differ).
+  const legacyKeys = (members, current) => {
+    let devs = null;
+    const candidates = () => devs ??= legacyDevs(members);
+    const keys = [];
+    const at = i => keys[i] ??= legacyCodexSegmentSignature(members, candidates()[i]);
+    return {
+      count: () => candidates().length,
+      at,
+      all: () => candidates().map((_, i) => at(i)),
+      match(stored) {
+        if (stored?.size !== current.size || stored?.mtimeMs !== current.mtimeMs) return -1;
+        for (let i = 0; i < candidates().length; i++) if (sameSignature(stored, at(i))) return i;
+        return -1;
+      },
+    };
   };
 
   const indexMeta = new Map(); // physical rollout -> its header, or its full replay index
@@ -1780,9 +1837,9 @@ async function parseCodexHomes({ codexExtraHome, extraRoots = [], magpie, codexU
   let pendingPhase = null;
 
   // A parent's state as a summary was checked against it: its file (a group:
-  // its key) and the index used. legacyParentStates() gives the same state as
-  // earlier releases wrote it -- with the device number, and a group's earlier
-  // key -- [0] under the current device number.
+  // its key) and the index used. legacyParentStateMatch() recognizes the same
+  // state as earlier releases wrote it -- with the device number, and a group's
+  // earlier key -- 0 under the current device number.
   const replayParentState = parent => {
     const signature = filesByPath.get(parent.filePath)?.signature;
     const digest = replayIndexDigest(parent);
@@ -1790,23 +1847,37 @@ async function parseCodexHomes({ codexExtraHome, extraRoots = [], magpie, codexU
       ? `${parent.filePath}\u0000${signature.size}:${signature.mtimeMs}:${signature.ino}\u0000${digest}`
       : null;
   };
-  const legacyParentStates = parent => {
+  // The index of the earlier form `recorded` is, or -1.
+  const legacyParentStateMatch = (parent, recorded) => {
     const parentFile = filesByPath.get(parent.filePath);
     const digest = replayIndexDigest(parent);
-    if (!parentFile || !digest) return [];
-    const signatures = parentFile.members
-      ? parentFile.legacySignatures()
-      : legacyDevs([parentFile]).map(dev => ({ ...parentFile.signature, dev: dev ?? parentFile.signature.dev }));
-    return signatures.map(s => `${parent.filePath}\u0000${s.size}:${s.mtimeMs}:${s.dev}:${s.ino}\u0000${digest}`);
+    const head = `${parent.filePath}\u0000`;
+    const tail = `\u0000${digest}`;
+    if (!parentFile || !digest || !recorded.startsWith(head) || !recorded.endsWith(tail)) return -1;
+    const devs = parentFile.members ? null : legacyDevs([parentFile]);
+    const count = parentFile.members ? parentFile.legacyKeys.count() : devs.length;
+    for (let i = 0; i < count; i++) {
+      const s = parentFile.members
+        ? parentFile.legacyKeys.at(i)
+        : { ...parentFile.signature, dev: devs[i] ?? parentFile.signature.dev };
+      if (recorded === `${head}${s.size}:${s.mtimeMs}:${s.dev}:${s.ino}${tail}`) return i;
+    }
+    return -1;
   };
 
-  for (const mayRead of passes) {
-    pendingPaths = new Set();
-    pendingIds = new Set();
-    pendingPhase = null;
+  for (const { mayRead, limited } of passes) {
+    const first = mayRead === passes[0].mayRead;
+    // A pass that left nothing for later is the last: a warm sync makes one.
+    if (pendingPhase !== null || pendingPaths.size > 0 || pendingIds.size > 0) {
+      pendingPaths = new Set();
+      pendingIds = new Set();
+      pendingPhase = null;
+    } else if (!first) {
+      break;
+    }
     // May this pass read these rollouts (or merge these groups) now?
     const canRead = (...items) => items.every(mayRead)
-      && Date.now() - startedAt < (items.some(involvesCompressed) ? backlogBudget : budget);
+      && Date.now() - startedAt < (limited && items.some(involvesCompressed) ? backlogBudget : budget);
     const leaveForNextRun = file => {
       pendingPaths.add(file.filePath);
       if (file.header?.sessionId) pendingIds.add(file.header.sessionId);
@@ -1814,7 +1885,7 @@ async function parseCodexHomes({ codexExtraHome, extraRoots = [], magpie, codexU
 
     // Only replay participants, their parents, corrupt-header files, and
     // duplicate physical copies need the full compact token index.
-    for (const file of indexOrder) {
+    for (const file of indexOrder(first)) {
       if (indexDone.has(file.filePath)) continue;
       const header = file.header;
       const required = !header
@@ -1897,19 +1968,19 @@ async function parseCodexHomes({ codexExtraHome, extraRoots = [], magpie, codexU
       // `identity` names the group's cache entry, `read` is what the merge reads.
       plans.push({ id, members, ...planCodexSegments(members) });
     }
-    // Newest first; within that, groups merged from plain files only (see
-    // BACKLOG_SHARE). The output keeps the order of duplicateIds.
-    plans.sort((a, b) => rank(b.id) - rank(a.id)
-      || a.read.some(file => file.compressed) - b.read.some(file => file.compressed)
-      || groupPosition.get(a.id) - groupPosition.get(b.id));
+    // Groups merged from plain files only first (see BACKLOG_SHARE); after
+    // pass 1, newest first before that. The output keeps the order of
+    // duplicateIds.
+    const plainOnly = plan => !plan.read.some(file => file.compressed);
+    // A stable sort: ties keep the order of duplicateIds.
+    plans.sort(first ? (a, b) => plainOnly(b) - plainOnly(a)
+      : (a, b) => rank(b.id) - rank(a.id) || plainOnly(b) - plainOnly(a));
     for (const { id, members, identity, read } of plans) {
       const selected = identity[0];
       const filePath = `${selected.codexHome}/.vibe-usage-session-${createHash('sha256').update(id).digest('hex')}`;
       const signature = codexSegmentSignature(identity);
       // The keys earlier releases gave this state (see legacyCodexSegmentSignature()).
-      let legacy = null;
-      const legacySignatures = () => legacy ??= legacyDevs(identity)
-        .map(dev => legacyCodexSegmentSignature(identity, dev));
+      const legacy = legacyKeys(identity, signature);
       // Same order as startingCache(), without step 2: a group has no append tail.
       // An older group entry is taken whole or not at all: when its summary is not
       // exact under the cut the members are merged again anyway, and indexing the
@@ -1923,17 +1994,26 @@ async function parseCodexHomes({ codexExtraHome, extraRoots = [], magpie, codexU
         lookup = { cache: null, cacheSource: null, manifestRecord: null, entrySignature: null, recordSignature: null };
         const record = manifests.get(selected.codexHome)?.get(filePath);
         const usable = keys => manifestRecordUsable(record, keys, cacheOptions, ultrafastStartMs, { group: true });
-        if (usable(signature) || usable(legacySignatures())) {
+        const current = usable(signature);
+        const earlier = current || !record ? -1 : legacy.match(record.signature);
+        if (current || (earlier >= 0 && usable(record.signature))) {
           lookup.cache = cacheFromManifestRecord(record, selected.codexHome, filePath, cacheOptions);
+          // Its full index is filled from the entry under the record's key, the
+          // one the record says the entry has, or an earlier one -- a 0.15.x
+          // collector running alongside rewrites the entry under the earlier key
+          // for the current device number.
+          const source = lookup.cache.index?.[SLIM_INDEX_SOURCE];
+          if (source) {
+            const recorded = [].concat(source.signature);
+            source.signature = () => [...recorded, ...legacy.all()];
+          }
           lookup.cacheSource = record.src;
           lookup.manifestRecord = record;
           lookup.entrySignature = record.entrySignature ?? record.signature;
-          if (!sameSignature(record.signature, signature) && sameSignature(record.signature, legacySignatures()[0])) {
-            lookup.recordSignature = record.signature;
-          }
+          if (earlier === 0) lookup.recordSignature = record.signature;
           cacheStats.manifestHits++;
         } else {
-          const keys = [signature, ...legacySignatures()];
+          const keys = [signature, ...legacy.all()];
           const own = loadCodexFileCache(selected.codexHome, filePath, keys);
           const older = own?.result ? null
             : olderEntryFor(selected.codexHome, filePath, keys, cacheOptions, ultrafastStartMs)?.summary;
@@ -1960,7 +2040,7 @@ async function parseCodexHomes({ codexExtraHome, extraRoots = [], magpie, codexU
       const group = { ...selected, filePath, signature, snapshotSize: signature.size,
         compressed: false, cache, members: read, lines: null, appendTail: null, priorTail: null,
         cacheSource, manifestRecord, cacheWritten: false,
-        legacySignatures, stateSignatures: () => [signature, ...legacySignatures()],
+        legacyKeys: legacy, stateSignatures: () => [signature, ...legacy.all()],
         entrySignature: cache ? lookup?.entrySignature ?? null : null,
         recordSignature: manifestRecord ? lookup?.recordSignature ?? null : null };
       delete group.boundaryParent;
@@ -2033,8 +2113,8 @@ async function parseCodexHomes({ codexExtraHome, extraRoots = [], magpie, codexU
       }
       pendingPhase ??= 'usage';
     };
-    const usagePlace = file => (file.members ? physicalFiles.length + groupPosition.get(file.header.sessionId) : position.get(file));
-    for (const file of [...usageFiles].sort(byPriority(sessionKey, usagePlace))) {
+    const usagePlace = file => (file.members ? physicalFiles.length + groupPosition(file.header.sessionId) : position(file));
+    for (const file of first ? usageFiles : [...usageFiles].sort(byPriority(sessionKey, usagePlace))) {
       if (resultByFile.has(file)) continue;
       const fm = metaOf(file);
       if (fm.sessionId && sessionById.get(fm.sessionId)?.filePath !== file.filePath) continue;
@@ -2066,7 +2146,7 @@ async function parseCodexHomes({ codexExtraHome, extraRoots = [], magpie, codexU
         if (recorded === parentState) {
           recordedState = parentState;
         } else {
-          const at = legacyParentStates(parent).indexOf(recorded);
+          const at = legacyParentStateMatch(parent, recorded);
           if (at === 0) recordedState = recorded;
           else if (at > 0) recordedState = parentState;
         }

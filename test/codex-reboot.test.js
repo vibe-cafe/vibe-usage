@@ -7,7 +7,7 @@ import { syncBuiltinESMExports } from 'node:module';
 import { join } from 'node:path';
 import { tmpdir } from 'node:os';
 import { parse } from '../src/parsers/codex.js';
-import { codexCacheDir, fileSignature } from '../src/parsers/codex-cache.js';
+import { codexCacheDir, fileSignature, olderCodexCacheDir } from '../src/parsers/codex-cache.js';
 import { codexSegmentSignature, legacyCodexSegmentSignature } from '../src/parsers/codex-segments.js';
 
 // A reboot gives a Mac's data volume a new device number (st_dev). On
@@ -84,7 +84,7 @@ const grow = jsonl([
 ]);
 const growMore = jsonl([tokenCount('2026-07-10T12:40:00.000Z', 40, 342)]);
 
-async function withHomes(fn) {
+async function withHomes(fn, { onlyGroup = false } = {}) {
   const root = mkdtempSync(join(tmpdir(), 'vibe-usage-codex-reboot-'));
   const homes = { codex: join(root, 'a-codex'), orca: join(root, 'b-orca') };
   for (const home of Object.values(homes)) mkdirSync(join(home, DAY_DIR), { recursive: true });
@@ -104,10 +104,12 @@ async function withHomes(fn) {
   };
   writeFileSync(file('orca', parentFile), parent);
   linkSync(file('orca', parentFile), file('codex', parentFile));
-  writeFileSync(file('orca', forkFile), jsonl(forkRecords));
-  writeFileSync(file('codex', soloFile), solo);
-  writeFileSync(file('codex', soloForkFile), soloFork);
-  writeFileSync(file('codex', growFile), grow);
+  if (!onlyGroup) {
+    writeFileSync(file('orca', forkFile), jsonl(forkRecords));
+    writeFileSync(file('codex', soloFile), solo);
+    writeFileSync(file('codex', soloForkFile), soloFork);
+    writeFileSync(file('codex', growFile), grow);
+  }
   try {
     return await fn({ homes, file, run, uncached });
   } finally {
@@ -173,7 +175,7 @@ const groupMembers = file => [file('codex', parentFile), file('orca', parentFile
  * hashed with the members' device numbers, and parent states that carry the
  * device number (a group parent's: its key of that format).
  */
-function toEarlierFormat(homes, file) {
+function toEarlierFormat(homes, file, { parentStates: expectedParentStates = 2 } = {}) {
   const members = groupMembers(file);
   const current = codexSegmentSignature(members);
   const legacy = legacyCodexSegmentSignature(members);
@@ -202,7 +204,7 @@ function toEarlierFormat(homes, file) {
     writeFileSync(manifestPath(home), `${JSON.stringify(manifest)}\n`);
   }
   assert.equal(groupEntries, 1, 'the group entry');
-  assert.equal(parentStates, 2, 'both forks recorded their parent state');
+  assert.equal(parentStates, expectedParentStates, 'every fork recorded its parent state');
   return { current, legacy };
 }
 
@@ -311,6 +313,80 @@ test('a cache an earlier release wrote is used after the upgrade, and after a re
       restore();
     }
   });
+});
+
+/** The group's entry rewritten under the earlier key for the device numbers stats report now. */
+function rewriteGroupEntryAsOlderCollector(homes, file) {
+  const legacy = legacyCodexSegmentSignature(groupMembers(file));
+  let rewritten = 0;
+  for (const home of Object.values(homes)) {
+    const dir = codexCacheDir(home);
+    for (const name of readdirSync(dir).filter(name => name.endsWith('.json'))) {
+      const entry = JSON.parse(readFileSync(join(dir, name), 'utf8'));
+      if (!entry.filePath.includes('.vibe-usage-session-')) continue;
+      entry.signature = legacy;
+      writeFileSync(join(dir, name), `${JSON.stringify(entry)}\n`);
+      rewritten++;
+    }
+  }
+  assert.equal(rewritten, 1);
+}
+
+test('after a reboot, a parent group whose entry a 0.15.x collector rewrote is not merged again', async () => {
+  // 0.15.x, still running next to this version after a reboot, misses the
+  // group and writes its entry back under the earlier key for the current
+  // device number. Filling the parent's index for a fork that grew must take
+  // that entry, or the two collectors re-merge the parent on every run.
+  await withHomes(async ({ homes, file, run, uncached }) => {
+    await run();
+    await run();
+    toEarlierFormat(homes, file);
+    const restore = shiftDeviceNumbers(1000);
+    try {
+      assert.deepEqual((await opened(run)).paths, []); // records the group under its current key
+      rewriteGroupEntryAsOlderCollector(homes, file);
+      appendFileSync(file('orca', forkFile), jsonl([tokenCount('2026-07-10T09:30:00.000Z', 6, 3015)]));
+      const { result, paths } = await opened(run);
+      assert.deepEqual([...new Set(paths)], [file('orca', forkFile)]);
+      assert.deepEqual(view(result), view(await uncached()));
+    } finally {
+      restore();
+    }
+  });
+});
+
+test('after a reboot, groups whose members kept only algorithm-6 entries are not merged again', async () => {
+  // Upgraded from 0.14 on a machine with several homes: the copies of a
+  // shared session took their header and index from the algorithm-6 entries
+  // and never wrote one of their own, so the manifest holds only the group.
+  // The device number the group's earlier key needs is in those entries.
+  await withHomes(async ({ homes, file, run, uncached }) => {
+    await run();
+    await run();
+    toEarlierFormat(homes, file, { parentStates: 0 });
+    for (const home of Object.values(homes)) {
+      const dir = codexCacheDir(home);
+      for (const name of readdirSync(dir).filter(name => name.endsWith('.json'))) {
+        const entry = JSON.parse(readFileSync(join(dir, name), 'utf8'));
+        if (entry.filePath.includes('.vibe-usage-session-')) continue;
+        writeFileSync(join(olderCodexCacheDir(home), name), `${JSON.stringify({ ...entry, algorithmVersion: 6, result: null })}\n`);
+        rmSync(join(dir, name));
+      }
+      const manifest = JSON.parse(readFileSync(manifestPath(home), 'utf8'));
+      for (const path of Object.keys(manifest.records)) {
+        if (!path.includes('.vibe-usage-session-')) delete manifest.records[path];
+      }
+      writeFileSync(manifestPath(home), `${JSON.stringify(manifest)}\n`);
+    }
+    const restore = shiftDeviceNumbers(1000);
+    try {
+      const { result, paths } = await opened(run);
+      assert.deepEqual(paths, []);
+      assert.deepEqual(view(result), view(await uncached()));
+    } finally {
+      restore();
+    }
+  }, { onlyGroup: true });
 });
 
 test('a hard link is still told apart from a copy on another device', async () => {

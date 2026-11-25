@@ -134,14 +134,17 @@ const input = (result, from = null) => result.buckets
 test('the first run uploads the conversations in use and leaves a fork of an unread compressed parent for later', needsZstd, async () => {
   const m = machine();
   writeFileSync(m.file('codex', 'rollout-a-active.jsonl'), active([tokenCount('2026-07-18T10:05:00.000Z', 40, 41)]));
+  // The fork is history too, a month old (one in use is read first, with its
+  // parent: the cold-start tests below).
   writeFileSync(m.file('codex', 'rollout-b-fork.jsonl'), fork);
+  const monthAgo = (clock.now - 30 * 24 * 3600e3) / 1000;
+  fs.utimesSync(m.file('codex', 'rollout-b-fork.jsonl'), monthAgo, monthAgo);
   writeFileSync(m.file('codex', 'rollout-c-parent.jsonl.zst'), zlib.zstdCompressSync(Buffer.from(parent)));
 
-  // Three headers (30 ms), the fork's index (40 ms). The compressed parent's
-  // index would start at the end of the backlog's 40 ms (of a 60 ms budget):
-  // left for the next run. The active conversation is still read (50 ms), and
-  // there would be time for the fork too, but without its parent the copied
-  // history cannot be told apart: it waits.
+  // Three headers (30 ms), the conversation in use (40 ms), the fork's index
+  // (50 ms). The compressed parent's index would start after the backlog's
+  // 40 ms (of a 60 ms budget): left for the next run, and without its parent
+  // the fork's copied history cannot be told apart: it waits.
   const first = await m.run(60);
   assert.equal(first.result.skipped, undefined, JSON.stringify(first.result));
   assert.equal(first.result.indexing.phase, 'replay-index');
@@ -155,7 +158,7 @@ test('the first run uploads the conversations in use and leaves a fork of an unr
     tokenCount('2026-07-18T10:05:00.000Z', 40, 41),
     tokenCount('2026-07-18T10:06:00.000Z', 60, 102),
   ]));
-  // The parent's index (10 ms), the active conversation's appended records
+  // The active conversation's appended records (10 ms), the parent's index
   // (20 ms), the fork (30 ms) and the parent's usage, started inside the
   // backlog's 40 ms of a 60 ms budget.
   const second = await m.run(60);
@@ -179,6 +182,9 @@ test('a group with a compressed copy not compared yet waits; the other sessions 
   linkSync(m.file('orca1', 'rollout-shared.jsonl'), m.file('orca2', 'rollout-shared.jsonl'));
   writeFileSync(m.file('orca1', 'rollout-other.jsonl'), other);
   linkSync(m.file('orca1', 'rollout-other.jsonl'), m.file('orca2', 'rollout-other.jsonl'));
+  // Codex compresses only what was not touched for a week: both are history.
+  const monthAgo = (clock.now - 30 * 24 * 3600e3) / 1000;
+  for (const name of ['rollout-shared.jsonl', 'rollout-other.jsonl']) fs.utimesSync(m.file('orca1', name), monthAgo, monthAgo);
   const before = await m.run(600000, { extraRoots: true });
   assert.equal(input(before.result), 3300);
 
@@ -257,4 +263,23 @@ test('a cold start reads the conversations in use first; history follows, and th
       assert.ok(bucket.totalTokens <= final.get(`${bucket.bucketStart}|${bucket.model}|${bucket.project}`), JSON.stringify(bucket));
     }
   }
+});
+
+test('what a conversation in use needs from compressed history is read with the whole budget', needsZstd, async () => {
+  const m = machine();
+  for (const n of [1, 2, 3]) {
+    writeFileSync(m.file('codex', `rollout-a-active-${n}.jsonl`),
+      active([tokenCount('2026-07-18T10:05:00.000Z', 10 * n, 10 * n + 1)]).replace('active-1', `active-${n}`));
+  }
+  writeFileSync(m.file('codex', 'rollout-b-fork.jsonl'), fork); // made today
+  writeFileSync(m.file('codex', 'rollout-c-parent.jsonl.zst'), zlib.zstdCompressSync(Buffer.from(parent)));
+
+  // Five headers (50 ms); the fork's index and the three conversations in use
+  // (90 ms) already pass the backlog's 80 ms (of 120 ms). The fork's
+  // compressed parent is still read -- it is what a conversation in use
+  // needs -- and so are the fork and the parent's usage: everything in one run.
+  const first = await m.run(120);
+  assert.equal(first.result.indexing, undefined, JSON.stringify(first.result.indexing));
+  assert.deepEqual(view(first.result), view(await m.uncached()));
+  assert.equal(input(first.result, FORK_WINDOW), 10 + 20 + 30 + 5);
 });
