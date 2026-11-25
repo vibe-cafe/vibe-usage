@@ -1,5 +1,5 @@
 import { createInterface } from 'node:readline';
-import { DEFAULT_API_URL, currentApiUrl, isPlaintextRemoteApiUrl } from './api-url.js';
+import { DEFAULT_API_URL, currentApiUrl, isPlaintextRemoteApiUrl, sameApiServer } from './api-url.js';
 import { hostname as osHostname } from 'node:os';
 import { loadConfig, saveConfig } from './config.js';
 import { fetchAccount, ingest, requestDeviceCode, pollDeviceCode } from './api.js';
@@ -21,9 +21,49 @@ function prompt(question) {
   });
 }
 
-export function resolveInitApiUrl(replyApiUrl, fallbackApiUrl = DEFAULT_API_URL) {
+/**
+ * The server URL in the device-flow reply, or null when it must not be used.
+ * Like the login link (login-page.js), it is untrusted input: the API key is
+ * sent to it right away and every later sync goes there. Accepted only when
+ * it parses, carries no user info, is https (http only when the login itself
+ * went to that same http origin: LAN self-hosting), and names the server the
+ * login went to — the same origin, or both production names (sameApiServer).
+ */
+export function trustedReplyApiUrl(replyApiUrl, requestedApiUrl) {
+  if (typeof replyApiUrl !== 'string') return null;
+  const raw = replyApiUrl.trim();
+  // The URL parser silently drops tabs/newlines; refuse instead of rewriting.
+  if (!raw || /[\s\u0000-\u001f\u007f-\u009f]/.test(raw)) return null;
+  let reply;
+  let requested;
+  try {
+    reply = new URL(raw);
+    requested = new URL(requestedApiUrl);
+  } catch {
+    return null;
+  }
+  if (reply.username || reply.password) return null;
+  if (reply.protocol === 'http:') {
+    if (requested.protocol !== 'http:' || reply.origin !== requested.origin) return null;
+  } else if (reply.protocol !== 'https:') {
+    return null;
+  }
+  if (!sameApiServer(reply.origin, requested.origin)) return null;
+  // Requests resolve '/api/...' against it, so the origin is all that is used.
+  return currentApiUrl(reply.origin);
+}
+
+/**
+ * Where init sends the new key: the reply's server when trusted, otherwise the
+ * one the login went to. `ignoredReply` is the reply that was refused (for the
+ * warning), null when there was none or it was taken.
+ */
+export function resolveInitApiUrl(replyApiUrl, requestedApiUrl = DEFAULT_API_URL) {
+  const requested = currentApiUrl(requestedApiUrl);
   const reply = typeof replyApiUrl === 'string' ? replyApiUrl.trim() : '';
-  return currentApiUrl(reply || fallbackApiUrl);
+  if (!reply) return { apiUrl: requested, ignoredReply: null };
+  const trusted = trustedReplyApiUrl(reply, requested);
+  return trusted ? { apiUrl: trusted, ignoredReply: null } : { apiUrl: requested, ignoredReply: reply };
 }
 
 export async function runInit(options = {}) {
@@ -65,9 +105,12 @@ export async function runInit(options = {}) {
     const auth = await runDeviceFlow(requestedApiUrl, host);
     if (!auth) process.exit(1);
     apiKey = auth.apiKey;
-    apiUrl = resolveInitApiUrl(auth.apiUrl, requestedApiUrl);
-    if (apiUrl !== requestedApiUrl && isPlaintextRemoteApiUrl(apiUrl)) {
-      console.log(warn(`服务器 ${apiUrl} 用的是明文 http，API Key 和用量数据会不加密传输；局域网自托管可以忽略，公网服务器请改用 https。`));
+    // Decided before the first request that carries the key (ingest below).
+    // An adopted http URL is the login's own origin, already warned about above.
+    const resolved = resolveInitApiUrl(auth.apiUrl, requestedApiUrl);
+    apiUrl = resolved.apiUrl;
+    if (resolved.ignoredReply) {
+      console.log(warn(`服务器返回的地址 ${printableText(resolved.ignoredReply)} 不是本次登录的服务器，已忽略，继续使用 ${apiUrl}。`));
     }
   }
 
