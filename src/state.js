@@ -66,7 +66,7 @@ export function loadState(identity) {
     const sessions = parsed.sessions ?? {};
     // Model-time rows (2026-11-25). Older CLIs neither read nor write the key,
     // so a file they saved simply has none and the rows are sent again (the
-    // server overwrites them with the same values).
+    // server keeps the larger value of each cell: nothing changes there).
     const activity = parsed.activity && typeof parsed.activity === 'object' && !Array.isArray(parsed.activity)
       && Object.keys(parsed.activity).length > 0 ? parsed.activity : null;
     // Local parser diagnostics (currently Cursor's account/newest event).

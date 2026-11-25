@@ -19,6 +19,10 @@ import {
 const SOURCE = 'dsh';
 // 2: cached models carry `project` instead of the session's full `cwd`.
 const DSH_CACHE_ALGO = 2;
+// The whole-source snapshot holds sessions, so it moves with how they are
+// computed: 3 is model time (2026-11-25). An earlier release keeps reading its
+// own version and never sees sessions carrying 5-minute cells.
+const DSH_SNAPSHOT_ALGO = 3;
 
 // Verified against deepseek-ai/deepseek-harness, released formats V0-V4:
 // packages/session/session-format/src/filename.ts, session-format-v0-to-v1,
@@ -435,7 +439,13 @@ function modelToResult(model, skipCount) {
   for (let i = skipCount; i < model.messages.length; i++) {
     const msg = model.messages[i];
     const timestamp = new Date(msg.timeMs);
-    events.push({ sessionId, source: SOURCE, project, timestamp, role: msg.role });
+    // Model time: a reply's output (reasoning included) sets its cap; a reply
+    // without usage is unknown (aggregate.js replySpan()).
+    const outputTokens = msg.role === 'assistant' && msg.usage
+      ? msg.usage.outputTokens + msg.usage.reasoningOutputTokens
+      : undefined;
+    events.push({ sessionId, source: SOURCE, project, timestamp, role: msg.role,
+      ...(outputTokens !== undefined ? { outputTokens } : {}) });
     if (msg.usage) {
       entries.push({
         source: SOURCE,
@@ -574,7 +584,7 @@ export async function parse() {
     ? hashManifest([`tz|${localTimeZoneToken()}`, `dir|${sessionsDir}`, ...fileStats.map((f) => `${f.file}|${f.sig}`)])
     : null;
   if (manifest) {
-    const snap = loadSourceSnapshot(snapshotKey, DSH_CACHE_ALGO, manifest);
+    const snap = loadSourceSnapshot(snapshotKey, DSH_SNAPSHOT_ALGO, manifest);
     if (snap
       && Array.isArray(snap.buckets) && Array.isArray(snap.sessions)) {
       return snap;
@@ -685,7 +695,7 @@ export async function parse() {
     result.skipped = anyFailure;
     result.warnings = warnings;
   } else if (manifest) {
-    saveSourceSnapshot(snapshotKey, DSH_CACHE_ALGO, manifest, result);
+    saveSourceSnapshot(snapshotKey, DSH_SNAPSHOT_ALGO, manifest, result);
   }
   return result;
 }

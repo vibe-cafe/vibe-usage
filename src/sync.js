@@ -33,8 +33,10 @@ const ACTIVITY_BATCH_SIZE = 500;
  * Model-time upload rows (2026-11-25): the `activity` of every session, added
  * up per tool, project, machine and half-hour. Only sources whose parser
  * returned a complete view this sync contribute -- a row is the whole local
- * picture of its key and the server overwrites it, so a skipped or still
- * indexing parser (Codex reading its history) must not send a partial sum.
+ * picture of its key, so a skipped or still indexing parser (Codex reading its
+ * history) does not send a partial sum. The server keeps the larger value of
+ * each cell, like the token buckets: a window whose older session log was
+ * deleted comes back smaller and does not erase what was uploaded.
  */
 export function buildActivityRows(sessions, completeSources) {
   const rows = new Map();
@@ -905,6 +907,9 @@ async function runSyncPasses({
         const batchSessions = allSessionsToSend.slice(batchIdx * SESSION_BATCH_SIZE, (batchIdx + 1) * SESSION_BATCH_SIZE);
         const batchActivity = activityUnacknowledged ? []
           : allActivityToSend.slice(batchIdx * ACTIVITY_BATCH_SIZE, (batchIdx + 1) * ACTIVITY_BATCH_SIZE);
+        // Batches that were there only for rows the server has stopped
+        // acknowledging carry nothing left to send.
+        if (batchIdx > 0 && batch.length === 0 && batchSessions.length === 0 && batchActivity.length === 0) continue;
         const batchNum = batchIdx + 1;
         const prefix = totalBatches > 1 ? `  ${dim(`[${batchNum}/${totalBatches}]`)} 上传中 ` : '  上传中 ';
 

@@ -176,6 +176,11 @@ test('a warm run serves unchanged transcripts from the cache without opening the
 
   assert.deepEqual(normalize(await f.run()), expected, 'cold run builds the cache');
   assert.equal(f.cacheEntries().length, 2);
+  // An earlier release reads `session` from these entries and uploads it as it
+  // is: the 5-minute cells stay beside it, outside what that release reads.
+  const entries = f.cacheEntries().map((name) => JSON.parse(readFileSync(join(f.cacheDir, 'claude-code', name), 'utf8')));
+  for (const entry of entries) assert.equal(Object.hasOwn(entry.session, 'activity'), false);
+  assert.deepEqual(entries.find((entry) => entry.session.project === 'app').activity, rich.activity);
 
   // Blank both transcripts in place, then put their mtime back: a warm run
   // that opened them would now find no usage at all.

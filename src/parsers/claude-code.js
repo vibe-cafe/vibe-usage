@@ -39,6 +39,16 @@ const CLAUDE_SNAPSHOT_ALGO = 2;
 // is not read again.
 const CLAUDE_SESSION_ALGO = 2;
 
+// An earlier release reads `session` from this shared entry and uploads it as
+// it is. The 5-minute cells go to the server only when its settings say
+// `activity: true`, and only as summed rows -- never inside a session -- so
+// they are kept beside the session, where an earlier release does not look.
+function cachedSessionFields(session) {
+  if (!session) return { session, sessionAlgo: CLAUDE_SESSION_ALGO };
+  const { activity, ...rest } = session;
+  return { session: rest, ...(activity ? { activity } : {}), sessionAlgo: CLAUDE_SESSION_ALGO };
+}
+
 const MAX_WARNINGS = 20;
 const READ_CHUNK_BYTES = 1024 * 1024;
 const GUARD_BYTES = 4096;
@@ -580,7 +590,8 @@ async function scanProjectCandidate(candidate, ctx) {
     && cache.sessionAlgo === CLAUDE_SESSION_ALGO
     && sameSignature(cache.signature, candidate.signature)
     && cache.state.fallbackProject === candidate.fallbackProject) {
-    return scanResult(cachedState, cache.session, ctx.collectMagpie);
+    const session = cache.session && cache.activity ? { ...cache.session, activity: cache.activity } : cache.session;
+    return scanResult(cachedState, session, ctx.collectMagpie);
   }
 
   const resume = !!cache && canResume(cache, candidate);
@@ -604,7 +615,7 @@ async function scanProjectCandidate(candidate, ctx) {
       guardHash,
       fullReadAt: resume ? cache.fullReadAt : Date.now(),
       state: serializeState(state),
-      ...(completed ? { session: completed.session, sessionAlgo: CLAUDE_SESSION_ALGO } : {}),
+      ...(completed ? cachedSessionFields(completed.session) : {}),
     });
     if (!saved) {
       // Stopping at the budget is only progress if the work is on disk. With

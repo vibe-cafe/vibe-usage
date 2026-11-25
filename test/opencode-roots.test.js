@@ -69,6 +69,18 @@ async function fixture(run) {
   }
 }
 
+test('OpenCode replies are timed with their own output tokens', async () => fixture(async (root, primary) => {
+  // Model time: at most 30 s + output (reasoning included) / 20 per second.
+  json(primary, [
+    { id: 'u1', sessionID: 'ses_timed', role: 'user', time: { created: start }, path: { root: '/work/project' } },
+    { id: 'a1', sessionID: 'ses_timed', role: 'assistant', time: { created: start + 300_000 },
+      modelID: 'test-model', tokens: { input: 10, output: 15, reasoning: 5 }, path: { root: '/work/project' } },
+  ]);
+  const result = await parse();
+  assert.equal(result.sessions.length, 1);
+  assert.equal(result.sessions[0].activeSeconds, 31);
+}));
+
 test('OpenCode validates SQLite and legacy layouts without throwing on absent paths', async () => fixture(async root => {
   const db = join(root, 'db'), old = join(root, 'json');
   sqlite(db, []); json(old, []);

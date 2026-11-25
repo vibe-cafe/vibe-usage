@@ -439,6 +439,24 @@ test('DSH ignores plugin-sourced user messages and assistant-only sessions', { s
   });
 });
 
+test('DSH replies are timed with their own output tokens', async () => {
+  // Model time: from the request to the reply, at most 30 s + output / 20
+  // per second (aggregate.js replySpan()). Output includes reasoning.
+  await withDshSessions(async (sessions) => {
+    writeSession(sessions, 'proj-t', 'session-t', withSeq([
+      sessionRecord('session-t', '/home/me/proj-t'),
+      userRecord(1700000000000),
+      assistantRecord(1700000300000, 'model-a', { inputTokens: 8, outputTokens: 20, cacheReadTokens: 0, reasoningTokens: 0 }),
+      userRecord(1700000600000),
+      assistantRecord(1700000900000, 'model-a', { inputTokens: 8, outputTokens: 4000, cacheReadTokens: 0, reasoningTokens: 3000 }),
+    ]), true);
+
+    const result = await parse();
+    assert.equal(result.sessions.length, 1);
+    assert.equal(result.sessions[0].activeSeconds, 31 + 230);
+  });
+});
+
 test('DSH reads plain .jsonl session logs as well', async () => {
   await withDshSessions(async (sessions) => {
     writeSession(sessions, 'proj-e', 'session-5', [

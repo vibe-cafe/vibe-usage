@@ -24,6 +24,10 @@ function accountingRecord(obj, context) {
     }
   } else if (obj.type === 'turn_context') {
     next.payload = pick(p, ['model', 'service_tier']);
+  } else if (obj.type === 'response_item' && p) {
+    // Model time: a user message or a tool's output starts the next reply
+    // (codex.js isReplyBoundary()); the kind and role are all it reads.
+    next.payload = pick(p, ['type', 'role']);
   } else if (obj.type === 'event_msg' && p) {
     next.payload = pick(p, ['type', 'started_at', 'model', 'usage_record', 'response_id']);
     if (p.type === 'token_count') {
