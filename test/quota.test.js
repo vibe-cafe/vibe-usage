@@ -260,11 +260,10 @@ test('Grok fetch reads its official bounded local log without credentials or net
     assert.equal(empty.status, 'no_data');
     assert.equal(empty.emptyReason, 'noLocalRecord');
     assert.ok(!JSON.stringify(empty).includes('private unrelated event'));
-    // A directory where the log should be fails with EISDIR on every platform
-    // (a file as GROK_HOME gives ENOTDIR on POSIX but ENOENT on Windows).
-    const brokenHome = join(root, 'broken-grok');
-    mkdirSync(join(brokenHome, 'logs', 'unified.jsonl'), { recursive: true });
-    const unreadable = fetchGrokQuota({ environment: { GROK_HOME: brokenHome }, home: root });
+    // Any read error other than a missing file. A NUL in the path is rejected
+    // on every platform (a file as GROK_HOME is ENOENT on Windows, and Windows
+    // opens a directory as an empty file).
+    const unreadable = fetchGrokQuota({ environment: { GROK_HOME: join(root, 'bad\0home') }, home: root });
     assert.equal(unreadable.status, 'retryable_error');
     assert.equal(unreadable.failureReason, 'localRecordUnreadable');
   } finally {
