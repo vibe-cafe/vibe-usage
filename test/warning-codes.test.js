@@ -7,7 +7,7 @@ import {
   countWarningCodes,
   isWarningCode,
 } from '../src/warning-codes.js';
-import { ENCRYPTED_TOKEN_NOTICE, PROXY_SKIP_NOTICE_PREFIX } from '../src/parsers/cursor.js';
+import { ENCRYPTED_TOKEN_NOTICE, LOGIN_EXPIRED_NOTICE, PROXY_SKIP_NOTICE_PREFIX } from '../src/parsers/cursor.js';
 import { envProxyBlock } from '../src/env-proxy.js';
 import { CODEX_ULTRAFAST_HOLD_WARNING } from '../src/codex-ultrafast.js';
 import { sqliteUnavailableError } from '../src/parsers/sqlite.js';
@@ -101,6 +101,10 @@ const CASES = [
   ['dsh: skipping p/s1/session.v1.jsonl.zstd (invalid Zstandard frame magic at byte 0)', 'unsupported_format'],
   // Cursor
   [`cursor: ${ENCRYPTED_TOKEN_NOTICE}`, 'cursor_token_encrypted'],
+  // The separate Vibe Usage sign-in (cursor-login.js): ended, or renewal not done this run.
+  [`cursor: ${LOGIN_EXPIRED_NOTICE}`, 'cursor_login_expired'],
+  ['cursor: Cursor 登录续期本次未完成，Cursor 本次未同步，下次重试 (network: fetch failed)', 'network_failed'],
+  ['cursor: Cursor 登录续期本次未完成，Cursor 本次未同步，下次重试 (skipped (HTTP 503))', 'remote_http_error'],
   // env-proxy.js: a proxy this process cannot follow (both reasons).
   [`cursor: ${PROXY_SKIP_NOTICE_PREFIX}${envProxyBlock('socks').notice}，其他工具照常同步。`, 'proxy_unsupported'],
   [`cursor: ${PROXY_SKIP_NOTICE_PREFIX}${envProxyBlock('unsupported').notice}，其他工具照常同步。`, 'proxy_unsupported'],

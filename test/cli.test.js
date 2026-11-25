@@ -334,8 +334,8 @@ test('status explains a stale Cursor by its encrypted token instead of the accou
     const encrypted = runWithEnv(['status'], env);
     assert.equal(encrypted.status, 0, encrypted.stderr);
     assert.match(encrypted.stdout, /Cursor {2}· {2}已上传 1 buckets/);
-    assert.match(encrypted.stdout, /新版 Cursor 已加密保存登录凭证，vibe-usage 暂不支持读取，Cursor 用量暂停同步/);
-    assert.match(encrypted.stdout, /重新登录 Cursor 无法解决，进展见 https:\/\/github\.com\/vibe-cafe\/vibe-usage\/issues\/144/);
+    assert.match(encrypted.stdout, /新版 Cursor 已加密保存登录凭证，Cursor 用量暂停同步/);
+    assert.match(encrypted.stdout, /运行 vibe-usage login cursor（或在 App 设置里登录 Cursor）即可恢复/);
     assert.doesNotMatch(encrypted.stdout, /请确认 Cursor 登录的是这个账号/);
     assert.ok(!`${encrypted.stdout}${encrypted.stderr}`.includes(cipher));
     assert.doesNotMatch(`${encrypted.stdout}${encrypted.stderr}`, /cursor-safe-storage/);

@@ -15,8 +15,9 @@ import { fetchAccount } from './api.js';
 import { COLLECTOR_VERSION } from './client-meta.js';
 import { kikiStartTime } from './kiki-migration.js';
 import { magpieStartTime } from './magpie-migration.js';
-import { ENCRYPTED_TOKEN_NOTICE, localCursorTokenEncrypted } from './parsers/cursor.js';
+import { ENCRYPTED_TOKEN_NOTICE, localCursorTokenEncrypted, recentAppRecord } from './parsers/cursor.js';
 import { setupEnvProxy } from './env-proxy.js';
+import { cursorLoginStatusLine, readStoredCursorLogin, setProvidedCursorLogin } from './cursor-login.js';
 
 function printSmallHeader() {
   console.log();
@@ -109,10 +110,21 @@ async function showStatus() {
           // An encrypted token (issue #144) also stops new events, and then
           // checking the account is the wrong advice. Read only here, through
           // the parser's own read; only a yes/no comes back.
-          console.log(dimText(localCursorTokenEncrypted()
-            ? `       ${ENCRYPTED_TOKEN_NOTICE}`
-            : '       已超过 48 小时没有新的 Cursor 事件；如最近用过 Cursor，请确认 Cursor 登录的是这个账号'));
+          // With a Vibe Usage sign-in (stored, or a desktop app's own) the
+          // local token is not used, so neither its encryption nor Cursor's
+          // account is the suspect.
+          const signedIn = Boolean(readStoredCursorLogin()?.credential || recentAppRecord(cursorInfo));
+          console.log(dimText(signedIn
+            ? '       已超过 48 小时没有新的 Cursor 事件；如最近用过 Cursor，请确认在 Vibe Usage 里登录的 Cursor 是这个账号'
+            : localCursorTokenEncrypted()
+              ? `       ${ENCRYPTED_TOKEN_NOTICE}`
+              : '       已超过 48 小时没有新的 Cursor 事件；如最近用过 Cursor，请确认 Cursor 登录的是这个账号'));
         }
+      }
+      if (tool.id === 'cursor') {
+        // The separate sign-in kept by the CLI (never the token itself).
+        const line = cursorLoginStatusLine();
+        if (line) console.log(dimText(`       ${line}`));
       }
     }
     console.log();
@@ -315,6 +327,18 @@ function extractOption(args, name) {
   return { args: [...args.slice(0, idx), ...args.slice(idx + 2)], value };
 }
 
+// `--cursor-login-stdin`: the whole of stdin, bounded.
+async function readStdin(limit) {
+  const chunks = [];
+  let size = 0;
+  for await (const chunk of process.stdin) {
+    size += chunk.length;
+    if (size > limit) throw new Error('stdin too large');
+    chunks.push(chunk);
+  }
+  return Buffer.concat(chunks).toString('utf8');
+}
+
 // Boolean global flag: present anywhere in argv → true, removed from args.
 function extractFlag(args, name) {
   const flag = `--${name}`;
@@ -372,6 +396,8 @@ const FULL_HELP = `
     ${BARE} doctor --json  Same report as versioned JSON (schemaVersion 1) for the desktop apps
     ${BARE} quota discover --json  Detect subscription-quota products locally
     ${BARE} quota fetch --product <id> --json  Fetch only selected subscription quotas
+    ${BARE} login cursor  Sign in to Cursor for Vibe Usage (as Cursor's CLI; used only to read usage)
+    ${BARE} logout cursor  Forget that Cursor sign-in
     ${BARE} config show  Show full config as JSON
     ${BARE} config get <key>   Get a config value
     ${BARE} config set <key> <value>  Set a config value
@@ -411,6 +437,24 @@ export async function run(rawArgs) {
     codexExtraHome = validation.path;
   }
 
+  // A desktop app hands over the Cursor sign-in it keeps (cursor-login.js):
+  // read from stdin, kept in memory for this run only.
+  let cursorLoginStdin;
+  ({ args: stripped, value: cursorLoginStdin } = extractFlag(stripped, 'cursor-login-stdin'));
+  if (cursorLoginStdin) {
+    if (process.stdin.isTTY) {
+      console.error(failure('--cursor-login-stdin 只给桌面 App 用：Cursor 登录要从标准输入传入。'));
+      process.exit(1);
+    }
+    let text = '';
+    try {
+      text = await readStdin(64 * 1024);
+    } catch {
+      // Remembered as unusable below: Cursor is skipped, other tools sync.
+    }
+    if (!setProvidedCursorLogin(text)) console.error(warn('App 传入的 Cursor 登录无法识别，本次不读 Cursor。'));
+  }
+
   const args = stripped;
   const command = args[0];
 
@@ -443,6 +487,26 @@ export async function run(rawArgs) {
       } catch (error) {
         console.error(error?.message || String(error));
         process.exitCode = 1;
+      }
+      break;
+    }
+    case 'login':
+    case 'logout': {
+      if (args[1] !== 'cursor') {
+        console.error(`Usage: ${BARE} ${command} cursor`);
+        process.exit(1);
+      }
+      const { runCursorLogin, runCursorLogout } = await import('./cursor-login.js');
+      if (command === 'logout') {
+        await runCursorLogout(args.slice(2));
+      } else {
+        const { browserCommand, runBrowserCommand } = await import('./login-page.js');
+        await runCursorLogin(args.slice(2), {
+          openBrowser: url => {
+            const launch = browserCommand(url);
+            if (launch) runBrowserCommand(launch);
+          },
+        });
       }
       break;
     }

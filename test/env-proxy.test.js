@@ -244,7 +244,7 @@ test('quota providers that carry a vendor credential are not run while blocked',
       envProxyBlock: block,
       fetchImpl: () => { throw new Error('must not reach the network'); },
       home,
-      environment: { HOME: home, VIBE_USAGE_QUOTA_CACHE_DIR: join(home, 'quota-cache'), Z_AI_API_KEY: 'test-key' },
+      environment: { HOME: home, VIBE_USAGE_QUOTA_CACHE_DIR: join(home, 'quota-cache'), VIBE_USAGE_CONFIG_DIR: home, Z_AI_API_KEY: 'test-key' },
     });
     for (const product of envelope.products) {
       assert.equal(product.status, 'unsupported', product.id);
@@ -325,7 +325,7 @@ test('SOCKS blocks only the providers whose hosts are not bypassed', async (t) =
     fetchImpl: () => { throw new Error('no network in tests'); },
     home,
     environment: {
-      HOME: home, VIBE_USAGE_QUOTA_CACHE_DIR: join(home, 'quota-cache'),
+      HOME: home, VIBE_USAGE_QUOTA_CACHE_DIR: join(home, 'quota-cache'), VIBE_USAGE_CONFIG_DIR: home,
       NO_PROXY: 'localhost,127.0.0.1,::1,api.kimi.com,auth.kimi.com',
     },
   });
