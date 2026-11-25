@@ -18,6 +18,7 @@ import { createServer } from 'node:http';
 import { pathToFileURL } from 'node:url';
 import { discoverQuotaProducts, fetchQuotaProducts } from '../src/quotas/registry.js';
 import { quotaResult } from '../src/quotas/schema.js';
+import { requestFailureReason } from '../src/quotas/response.js';
 import {
   fetchKimiCodeQuota,
   kimiCredentialPath,
@@ -1007,4 +1008,15 @@ test('fetch handles only requested products and uses sanitized cache on transien
   } finally {
     rmSync(root, { recursive: true, force: true });
   }
+});
+
+test('a timeout through the proxy tunnel is reported as timedOut, not unreachable', () => {
+  // Native fetch throws TimeoutError; http.request (the proxy tunnel) throws
+  // AbortError carrying the TimeoutError as its cause.
+  const timeout = new DOMException('timed out', 'TimeoutError');
+  const tunnelAbort = Object.assign(new Error('aborted'), { name: 'AbortError', cause: timeout });
+  assert.equal(requestFailureReason(timeout), 'timedOut');
+  assert.equal(requestFailureReason(tunnelAbort), 'timedOut');
+  assert.equal(requestFailureReason(new TypeError('fetch failed')), 'unreachable');
+  assert.equal(requestFailureReason(new SyntaxError('bad json')), 'unrecognizedResponse');
 });

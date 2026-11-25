@@ -8,7 +8,9 @@ export function parseQuotaPayload(parse, payload, now) {
 }
 
 export function requestFailureReason(error) {
-  if (error?.name === 'TimeoutError') return 'timedOut';
+  // Native fetch throws TimeoutError; the proxy tunnel's http.request throws
+  // AbortError with the TimeoutError as its cause.
+  if (error?.name === 'TimeoutError' || error?.cause?.name === 'TimeoutError') return 'timedOut';
   if (error instanceof SyntaxError || error instanceof InvalidQuotaResponse) return 'unrecognizedResponse';
   return 'unreachable';
 }
