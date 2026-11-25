@@ -760,7 +760,7 @@ test('a clock set back, a corrupt record or a missing installation do not block 
 test('the registry passes the reading through without its own cache', async t => {
   const m = machine(t);
   const options = { environment: m.environment, home: m.home, platform: 'linux', now: m.at(0),
-    readImpl: async ({ now }) => ({ result: m.reading(now) }) };
+    egressPause: async () => null, readImpl: async ({ now }) => ({ result: m.reading(now) }) };
   const { products: [result] } = await fetchQuotaProducts(['antigravity'], options);
   assert.equal(result.status, 'ok');
   assert.equal(result.cacheScope, undefined);
@@ -1027,7 +1027,7 @@ if (process.platform !== 'win32') {
       const run = () => JSON.parse(execFileSync(process.execPath,
         ['--import', isolate, cli, 'quota', 'fetch', '--product', 'antigravity', '--json'], {
           timeout: 8000, env: { HOME: home, PATH: `${dirname(process.execPath)}${delimiter}${system}`,
-            ANTIGRAVITY_CLI_PATH: binary, TMPDIR: tmpdir(), FIXTURE_USAGE: JSON.stringify(usage),
+            ANTIGRAVITY_CLI_PATH: binary, VIBE_USAGE_EGRESS_CHECK: '0', TMPDIR: tmpdir(), FIXTURE_USAGE: JSON.stringify(usage),
             FIXTURE_MODE: mode, FIXTURE_TRACE: trace },
         }));
       return { home, run, calls: () => readFileSync(trace, 'utf8'),

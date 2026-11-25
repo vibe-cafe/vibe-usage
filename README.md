@@ -192,6 +192,13 @@ HTTPS_PROXY=http://127.0.0.1:7890 npx @vibe-cafe/vibe-usage sync
 
 这些环境变量只影响当前命令；已经运行的桌面应用和后台服务有各自的进程环境（后台服务目前不带代理变量）。持续失败时，请提供完整的 Cursor 报错、操作系统、`node -v` 和 CLI 版本，以便区分具体原因。
 
+**出口检测**：读 Antigravity 的额度要用你的 Google 登录。没检测到代理时（环境变量里没有代理，或 Google 的地址写在 `NO_PROXY` 里；TUN、路由器上的代理这类本机看不到的情况也算），CLI 先用同一条线路、不带任何账号、Cookie 和令牌，访问一次 `https://chatgpt.com/cdn-cgi/trace`，只读其中的国家代码。Google 的地址没有这个页面，所以用 `chatgpt.com` 代替；它要走代理而 Google 直连时改用 `api.anthropic.com`，两个都走代理就算无法确认。出口在中国大陆、香港、澳门，或者确认不了，就不启动 `agy`、不请求 Antigravity 桌面版，额度结果是 `unsupported`，`pauseReason` 写明原因（`egressRegionUnsupported` 附 `egressRegion`，或 `egressUnconfirmed`），下次读取时重新检测。检测结果按当前网络缓存在 `~/.vibe-usage/egress-checks.json`：出口在支持地区缓存 10 分钟，其他结果 1 分钟，网卡地址变了就重新检测。Cloudflare（这些厂商的 CDN）会看到你的出网 IP，但看不到账号。Kimi、ZCode、OpenCode Go、Cursor 不做这个检测。两个环境变量可以改变做法，桌面应用也用它们把设置转给 CLI：
+
+- `VIBE_USAGE_EGRESS_CHECK=0`：不检测，没检测到代理时直接读取。
+- `VIBE_USAGE_REQUIRE_PROXY=1`：这台电脑靠本机代理软件上网。没检测到代理时一律暂停（`pauseReason: proxyNotDetected`），也不发检测请求。
+
+只开了系统代理、没设代理环境变量时，在终端里运行的 CLI 看不到系统代理，会按直连检测，而 Antigravity 桌面版自己走系统代理，所以可能误判而暂停。设上 `HTTPS_PROXY` 即可。
+
 ## Trust Model
 
 vibe-usage parses **local tool logs and local application state** on a machine the user fully controls. The reported data is self-reported telemetry — local logs, parsers, and upload requests can all be modified by the user.
