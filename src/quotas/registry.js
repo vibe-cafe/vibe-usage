@@ -135,7 +135,7 @@ export async function fetchQuotaProducts(ids, options = {}) {
     if (block) {
       // Not a failure: nothing was sent. `unsupported` keeps the desktop apps
       // from offering a retry and the cache from answering in its place.
-      return quotaResult({ id, status: 'unsupported', message: block.message });
+      return quotaResult({ id, status: 'unsupported', pauseReason: 'proxyUnsupported', message: block.message });
     }
     // A vendor that pauses when the egress is wrong: the provider calls this
     // right before it would make the vendor see the account
@@ -146,7 +146,7 @@ export async function fetchQuotaProducts(ids, options = {}) {
     try {
       return await providers.get(id)({ ...options, ...gated });
     } catch {
-      return quotaResult({ id, status: 'retryable_error', message: 'Provider failed unexpectedly' });
+      return quotaResult({ id, status: 'retryable_error', failureReason: 'internalError', message: 'Provider failed unexpectedly' });
     }
   }));
   const results = fetched.map(result => {
@@ -155,12 +155,17 @@ export async function fetchQuotaProducts(ids, options = {}) {
       return result;
     }
     if (result.status === 'retryable_error') {
-      return loadCachedQuota(
+      const cached = loadCachedQuota(
         result.id,
         result.cacheScope,
         options.environment,
         options.now || new Date()
-      ) || result;
+      );
+      if (cached) {
+        cached.failureReason = result.failureReason;
+        if (result.httpStatus !== undefined) cached.httpStatus = result.httpStatus;
+        return cached;
+      }
     }
     return result;
   });

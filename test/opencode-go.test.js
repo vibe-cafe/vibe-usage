@@ -133,9 +133,14 @@ test('OpenCode Go fetch maps authorization, entitlement, and transport failures'
     fetchImpl: async () => jsonResponse({ type: 'error' }, status),
   });
 
-  assert.equal((await fetch(401)).status, 'unauthorized');
+  const denied = await fetch(401);
+  assert.equal(denied.status, 'unauthorized');
+  assert.equal(denied.failureReason, undefined);
   assert.equal((await fetch(403)).status, 'no_data');
-  assert.equal((await fetch(500)).status, 'retryable_error');
+  const serverError = await fetch(500);
+  assert.equal(serverError.status, 'retryable_error');
+  assert.equal(serverError.failureReason, 'httpStatus');
+  assert.equal(serverError.httpStatus, 500);
 
   const timedOut = await fetchOpenCodeGoQuota({
     environment: { VIBE_USAGE_OPENCODE_DIRS: dataRoot },
@@ -143,6 +148,7 @@ test('OpenCode Go fetch maps authorization, entitlement, and transport failures'
     fetchImpl: async () => { throw Object.assign(new Error('aborted'), { name: 'TimeoutError' }); },
   });
   assert.equal(timedOut.status, 'retryable_error');
+  assert.equal(timedOut.failureReason, 'timedOut');
   assert.match(timedOut.message, /timed out/);
 
   const malformed = await fetchOpenCodeGoQuota({
@@ -151,6 +157,51 @@ test('OpenCode Go fetch maps authorization, entitlement, and transport failures'
     fetchImpl: async () => new Response('not json', { status: 200 }),
   });
   assert.equal(malformed.status, 'retryable_error');
+  assert.equal(malformed.failureReason, 'unrecognizedResponse');
+  assert.doesNotMatch(JSON.stringify(malformed), /not json|sk-test-key/);
+  const { result: offline } = await fetchWith(dataRoot, { fetchImpl: () => { throw new Error('private network error'); } });
+  assert.equal(offline.failureReason, 'unreachable');
+  assert.doesNotMatch(JSON.stringify(offline), /private network error|sk-test-key/);
+}));
+
+test('OpenCode Go reports noWindow only for a usage object without a known window', async () => withFixture(async dataRoot => {
+  credentialFixture(dataRoot);
+  for (const usage of [{}, { future: 12 }]) {
+    const { result } = await fetchWith(dataRoot, { fetchImpl: () => jsonResponse({ usage }) });
+    assert.equal(result.status, 'no_data');
+    assert.equal(result.emptyReason, 'noWindow');
+  }
+  for (const usage of [undefined, null, [], { rolling: null }, { weekly: {} }, { monthly: { percent: 'invalid' } }]) {
+    const { result } = await fetchWith(dataRoot, { fetchImpl: () => jsonResponse({ usage }) });
+    assert.equal(result.status, 'retryable_error');
+    assert.equal(result.failureReason, 'unrecognizedResponse');
+  }
+}));
+
+test('OpenCode Go reports credentialsUnreadable for a broken database or unavailable SQLite', async () => withFixture(async dataRoot => {
+  mkdirSync(dataRoot, { recursive: true });
+  const path = openCodeDbPath(dataRoot);
+  writeFileSync(path, 'private malformed data');
+  const broken = await fetchWith(dataRoot);
+  assert.equal(broken.result.status, 'retryable_error');
+  assert.equal(broken.result.failureReason, 'credentialsUnreadable');
+  assert.doesNotMatch(JSON.stringify(broken.result), /private malformed/);
+  assert.deepEqual(broken.requests, []);
+  // A directory cannot be opened as a read-only database. The fallback CLI
+  // is also unavailable on this fixture PATH.
+  rmSync(path);
+  mkdirSync(path);
+  const originalPath = process.env.PATH;
+  try {
+    process.env.PATH = dataRoot;
+    const missingSQLite = await fetchWith(dataRoot);
+    assert.equal(missingSQLite.result.status, 'retryable_error');
+    assert.equal(missingSQLite.result.failureReason, 'credentialsUnreadable');
+    assert.match(missingSQLite.result.message, /sqlite3 CLI not found/);
+    assert.deepEqual(missingSQLite.requests, []);
+  } finally {
+    process.env.PATH = originalPath;
+  }
 }));
 
 test('OpenCode Go data roots default to the OpenCode data directory and honor the override', () => {

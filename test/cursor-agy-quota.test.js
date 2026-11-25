@@ -97,6 +97,7 @@ test('Cursor isolates missing/rejected credentials and uses only same-account un
   const failing = async () => { throw new Error(`private proxy ${token}`); };
   const cached = await fetchQuotaProducts(['cursor'], { environment, now, fetchImpl: failing });
   assert.equal(cached.products[0].source, 'cache');
+  assert.equal(cached.products[0].failureReason, 'unreachable');
   const other = await fixture(t, 'utf8', 'different-account-token');
   const switched = await fetchQuotaProducts(['cursor'], { environment: {
     ...environment, CURSOR_STATE_DB_PATH: other.dbPath,
@@ -110,11 +111,13 @@ test('Cursor isolates missing/rejected credentials and uses only same-account un
   } });
   assert.equal(calls,2);
   assert.equal(rejected.products[0].status,'unauthorized');
+  assert.equal(rejected.products[0].failureReason, undefined);
   assert.equal(rejected.products[0].source,'live');
   const expired = await fetchQuotaProducts(['cursor'], { environment, now: new Date('2026-11-02'), fetchImpl: failing });
   assert.equal(expired.products[0].status,'retryable_error');
   const missing = await fetchCursorQuota({ environment: { CURSOR_STATE_DB_PATH: join(root,'absent') }, fetchImpl: () => assert.fail('unexpected network') });
   assert.equal(missing.status,'missing_credentials');
+  assert.equal(missing.failureReason, undefined);
 });
 
 // Issue #144: Cursor 3.27+ stores `cursor-safe-storage:<version>:<base64>`.
@@ -132,13 +135,18 @@ test('Cursor reports an encrypted login as unsupported: no request, no cache ent
     const encrypted = await fixture(t, encoding, login);
     // Same cache directory that holds the readable account's `ok` entry.
     const environment = { ...encrypted.environment, VIBE_USAGE_QUOTA_CACHE_DIR: readable.root };
-    const noNetwork = () => assert.fail('unexpected network');
+    let requests = 0;
+    const noNetwork = () => { requests += 1; throw new Error('unexpected network'); };
     const direct = await fetchCursorQuota({ environment, now, fetchImpl: noNetwork });
     assert.equal(direct.status, 'unsupported');
+    // #190: the card can say why (encrypted login), not just "nothing read".
+    assert.equal(direct.failureReason, 'credentialsEncrypted');
+    assert.equal(direct.pauseReason, undefined);
     assert.equal(direct.cacheScope, undefined);
     const envelope = await fetchQuotaProducts(['cursor'], { environment, now, fetchImpl: noNetwork });
     const [product] = envelope.products;
     assert.equal(product.status, 'unsupported');
+    assert.equal(product.failureReason, 'credentialsEncrypted');
     assert.equal(product.source, 'live');
     assert.deepEqual(product.meters, []);
     assert.match(product.message, /encrypted/);
@@ -151,7 +159,9 @@ test('Cursor reports an encrypted login as unsupported: no request, no cache ent
     // A fresh cache directory stays empty.
     const fresh = await fetchQuotaProducts(['cursor'], { environment: encrypted.environment, now, fetchImpl: noNetwork });
     assert.equal(fresh.products[0].status, 'unsupported');
+    assert.equal(fresh.products[0].failureReason, 'credentialsEncrypted');
     assert.equal(existsSync(join(encrypted.root, 'quota-cache.json')), false);
+    assert.equal(requests, 0);
   }
   // A readable login afterwards is fetched exactly as before.
   let calls = 0;
@@ -163,12 +173,30 @@ test('Cursor reports an encrypted login as unsupported: no request, no cache ent
 });
 
 test('Cursor malformed/oversized responses and network errors never echo secrets', async t => {
-  const { environment } = await fixture(t);
-  for (const body of ['<html>login</html>', JSON.stringify({ private: token }), ' '.repeat(1024*1024+1)]) {
+  const { environment, dbPath } = await fixture(t);
+  for (const body of [null, '<html>login</html>', JSON.stringify({ private: token }), ' '.repeat(1024*1024+1)]) {
     const result = await fetchCursorQuota({ environment, fetchImpl: async () => new Response(body) });
     assert.equal(result.status, 'retryable_error');
+    assert.equal(result.failureReason, 'unrecognizedResponse');
+    assert.doesNotMatch(JSON.stringify(result), /<html>/);
     assert.ok(!JSON.stringify(result).includes(token));
   }
+  for (const [fetchImpl, reason, httpStatus] of [
+    [() => new Response(token, { status: 502 }), 'httpStatus', 502],
+    [() => { throw new DOMException(token, 'TimeoutError'); }, 'timedOut'],
+    [() => { throw new TypeError(token); }, 'unreachable'],
+  ]) {
+    const result = await fetchCursorQuota({ environment, fetchImpl });
+    assert.equal(result.status, 'retryable_error');
+    assert.equal(result.failureReason, reason);
+    assert.equal(result.httpStatus, httpStatus);
+    assert.ok(!JSON.stringify(result).includes(token));
+  }
+  writeFileSync(dbPath, 'private malformed login');
+  const broken = await fetchCursorQuota({ environment, fetchImpl: () => assert.fail('unexpected request') });
+  assert.equal(broken.status, 'retryable_error');
+  assert.equal(broken.failureReason, 'credentialsUnreadable');
+  assert.doesNotMatch(JSON.stringify(broken), /private malformed login/);
 });
 
 test('AGY shows only the Gemini family as 5h/7d; other families are validated but not shown', () => {
@@ -202,6 +230,7 @@ test('AGY never reads credentials during discovery or falls back to another acco
   assert.equal(rejected.result.status,'unauthorized');
   const missing = await fetchAntigravityQuota({ environment: {PATH:''}, home: '/missing', platform: 'linux' });
   assert.equal(missing.status,'missing_credentials');
+  assert.equal(missing.failureReason, 'programNotFound');
   assert.match(missing.message, /agy.*Antigravity Desktop/);
 });
 

@@ -5,6 +5,7 @@ import { isEncryptedCursorToken } from '../../parsers/cursor.js';
 import { queryDbJsonSnapshotOnLock } from '../../parsers/sqlite.js';
 import { attachCacheScope } from '../cache.js';
 import { quotaResult } from '../schema.js';
+import { InvalidQuotaResponse, parseQuotaPayload, requestFailureReason } from '../response.js';
 
 const USAGE_URL = 'https://cursor.com/api/usage-summary';
 // Issue #144: same decision as the sync parser -- no local decryption, and
@@ -99,12 +100,14 @@ export async function fetchCursorQuota({
   const result = (status, extra = {}) => quotaResult({ id: 'cursor', status, fetchedAt: now, ...extra });
   let token;
   try { token = readCursorQuotaToken(cursorQuotaDbPath(environment, home, platform)); }
-  catch { return result('retryable_error', { message: 'Cursor login could not be read' }); }
+  catch { return result('retryable_error', { failureReason: 'credentialsUnreadable', message: 'Cursor login could not be read' }); }
   if (!token) return result('missing_credentials', { message: 'Open Cursor and sign in, then retry' });
   // Sent as a cookie the ciphertext is a certain 401 ("sign in again"). Like
   // missing_credentials this result carries no cache scope, so the registry
   // neither writes a cache entry for it nor falls back to an older one.
-  if (isEncryptedCursorToken(token)) return result('unsupported', { message: ENCRYPTED_TOKEN_MESSAGE });
+  if (isEncryptedCursorToken(token)) {
+    return result('unsupported', { failureReason: 'credentialsEncrypted', message: ENCRYPTED_TOKEN_MESSAGE });
+  }
   const scoped = (status, extra) => attachCacheScope(result(status, extra), token);
   try {
     const signal = AbortSignal.timeout(timeoutMs);
@@ -117,17 +120,18 @@ export async function fetchCursorQuota({
       if ([401, 403].includes(response.status)) { await response.body?.cancel(); continue; }
       if (!response.ok) {
         await response.body?.cancel();
-        return scoped('retryable_error', { message: `Cursor quota API returned HTTP ${response.status}` });
+        return scoped('retryable_error', { failureReason: 'httpStatus', httpStatus: response.status,
+          message: `Cursor quota API returned HTTP ${response.status}` });
       }
       const chunks = [];
       let size = 0;
-      for await (const chunk of response.body) {
+      for await (const chunk of response.body || []) {
         size += chunk.length;
-        if (size > 1024 * 1024) throw new Error('Oversized response');
+        if (size > 1024 * 1024) throw new InvalidQuotaResponse('Oversized response');
         chunks.push(chunk);
       }
       const payload = JSON.parse(Buffer.concat(chunks).toString('utf8'));
-      const meters = parseCursorQuota(payload);
+      const meters = parseQuotaPayload(parseCursorQuota, payload);
       const plans = { free: 'Free', pro: 'Pro', premium: 'Pro', pro_plus: 'Pro+', ultra: 'Ultra',
         enterprise: 'Enterprise', team: 'Team' };
       return scoped(meters.length ? 'ok' : 'no_data', { meters,
@@ -135,7 +139,8 @@ export async function fetchCursorQuota({
         ...(meters.length ? {} : { emptyReason: 'noWindow' }) });
     }
     return scoped('unauthorized', { message: 'Open Cursor and sign in again, then retry' });
-  } catch {
-    return scoped('retryable_error', { message: 'Cursor quota request failed; retry after checking the connection' });
+  } catch (error) {
+    return scoped('retryable_error', { failureReason: requestFailureReason(error),
+      message: 'Cursor quota request failed; retry after checking the connection' });
   }
 }
