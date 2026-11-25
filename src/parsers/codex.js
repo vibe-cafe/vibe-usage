@@ -1318,6 +1318,7 @@ function olderEntryFor(codexHome, filePath, signature, cacheOptions, ultrafastSt
     summary: older.entry?.result && summaryMatchesCut(older.entry.result, ultrafastStartMs) ? older.entry : null,
     header: older.header,
     index: older.index,
+    copyOf: older.copyOf,
     signature: older.signature,
   };
 }
@@ -1403,7 +1404,8 @@ function startingCache(file, cacheOptions, ultrafastStartMs, manifest = null) {
   }
   const header = own?.header ?? older.header;
   const index = own?.index ?? older.index;
-  if (header || index) file.cache = { ...own, header, index };
+  const copyOf = own?.copyOf ?? older.copyOf;
+  if (header || index) file.cache = { ...own, header, index, ...(copyOf ? { copyOf } : {}) };
 }
 
 function mergeFileResults(results, magpie, ultrafastStartMs = null) {

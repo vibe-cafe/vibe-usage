@@ -402,3 +402,43 @@ test('a warm sync looks up no older entry and no tail for the copies of a shared
     assert.equal(totalInput(second), 3005);
   });
 });
+
+// Upgrading from version 7 (algorithm 8, 2026-11-25): older summaries hold no
+// model time, so every group is merged again -- but a compressed copy that
+// version 7 proved byte-identical to a plain copy (`copyOf` in its entry) is
+// not decompressed and merged again: the proof is about the two files only.
+// Without it, on the maintainer's Mac Codex had not finished after 20 runs.
+test('the upgrade from version 7 keeps proven compressed copies out of the merge', needsZstd, async () => {
+  const readsAfterUpgrade = async (keepCopyOf) => withHomes(async ({ homes, file, run, uncached }) => {
+    writeFileSync(file('orca1', sharedFile), shared);
+    linkSync(file('orca1', sharedFile), file('orca2', sharedFile));
+    writeFileSync(file('codex', `${sharedFile}.zst`), zlib.zstdCompressSync(Buffer.from(shared)));
+    writeFileSync(file('orca1', otherFile), other);
+    await run();
+    let proven = 0;
+    // What version 7 leaves: its entries in its own `v7` folder, no version-8 folder.
+    for (const home of Object.values(homes)) {
+      const dir = codexCacheDir(home);
+      if (!existsSync(dir)) continue;
+      const v7 = join(olderCodexCacheDir(home), 'v7');
+      mkdirSync(v7, { recursive: true });
+      for (const name of groupEntries(dir)) {
+        const entry = JSON.parse(readFileSync(join(dir, name), 'utf8'));
+        if (entry.copyOf) proven++;
+        if (!keepCopyOf) delete entry.copyOf;
+        writeFileSync(join(v7, name), JSON.stringify({ ...entry, algorithmVersion: 7 }));
+      }
+      rmSync(dir, { recursive: true, force: true });
+    }
+    assert.equal(proven, 1, 'version 7 proved the compressed copy');
+    const upgraded = await run();
+    assert.equal(upgraded.skipped, undefined);
+    assert.equal(upgraded.cache.headerHits, 4);
+    assert.deepEqual(view(upgraded), view(await uncached()));
+    return upgraded.cache.filesRead;
+  });
+  const withProof = await readsAfterUpgrade(true);
+  const withoutProof = await readsAfterUpgrade(false);
+  // Without the proof the compressed copy is proven again (one decompression).
+  assert.equal(withoutProof - withProof, 1, JSON.stringify({ withProof, withoutProof }));
+});

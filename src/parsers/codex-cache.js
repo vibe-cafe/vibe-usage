@@ -225,11 +225,19 @@ export function loadOlderCodexFileCache(codexHome, filePath, signature, { magpie
     const entry = readSummary(path, filePath, version => summaryAccepted(version) || partsAccepted(version));
     if (!entry || !signatureMatches(entry.signature, signature)) continue;
     const parts = partsAccepted(entry.algorithmVersion);
-    found ??= { signature: entry.signature, entry: null, header: null, index: null };
+    found ??= { signature: entry.signature, entry: null, header: null, index: null, copyOf: null };
     if (!found.entry && summaryAccepted(entry.algorithmVersion)) found.entry = entry;
     if (parts) {
       found.header ??= entry.header || null;
       found.index ??= entry.index || null;
+      // The proof that this compressed file holds exactly a plain copy's bytes
+      // (codex.js indexFromCompressedCopy(); version 7 records it). It is about
+      // the two files only, and planCodexSegments() trusts it only while the
+      // plain copy still has the recorded signature. Without it every shared
+      // conversation's compressed copy was decompressed and merged again after
+      // the upgrade: on the maintainer's Mac Codex had not finished after 20
+      // runs.
+      found.copyOf ??= entry.copyOf || null;
     }
   }
   return found;
