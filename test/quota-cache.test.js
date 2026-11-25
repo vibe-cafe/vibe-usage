@@ -20,7 +20,7 @@ function fixture(t) {
     root,
     path: join(root, 'quota-cache.json'),
     environment: { BIGMODEL_API_KEY: dummyKey, VIBE_USAGE_QUOTA_CACHE_DIR: root,
-      GROK_HOME: join(root, 'absent-grok') },
+      HOME: root, PATH: root, GROK_HOME: join(root, 'absent-grok'), VIBE_USAGE_EGRESS_CHECK: '0' },
   };
 }
 

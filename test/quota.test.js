@@ -197,7 +197,7 @@ test('Grok parser selects the latest structured billing event and exposes only q
   assert.equal(JSON.stringify(parsed).includes('must-not-be-returned'), false);
 });
 
-test('Grok fetch reads its official bounded local log without credentials or network', () => {
+test('Grok fetch without a binary reads its bounded local billing log', async () => {
   const root = mkdtempSync(join(tmpdir(), 'vibe-usage-grok-quota-'));
   const grokHome = join(root, 'custom-grok');
   const logPath = join(grokHome, 'logs', 'unified.jsonl');
@@ -218,9 +218,9 @@ test('Grok fetch reads its official bounded local log without credentials or net
     },
   })}\n`);
   try {
-    const environment = { GROK_HOME: grokHome };
+    const environment = { HOME: root, PATH: root, GROK_HOME: grokHome };
     assert.equal(grokBillingLogPath(environment, root), logPath);
-    const result = fetchGrokQuota({
+    const result = await fetchGrokQuota({
       environment,
       home: root,
       now: new Date('2026-09-08T03:00:00Z'),
@@ -234,7 +234,7 @@ test('Grok fetch reads its official bounded local log without credentials or net
   }
 });
 
-test('Grok fetch drops an expired billing period and handles a missing log quietly', () => {
+test('Grok fetch drops an expired billing period and handles a missing log quietly', async t => {
   const expired = parseGrokBillingLog(JSON.stringify({
     ts: '2026-09-01T00:00:00Z',
     msg: 'billing: fetched credits config',
@@ -249,8 +249,10 @@ test('Grok fetch drops an expired billing period and handles a missing log quiet
   }), new Date('2026-09-08T00:00:00Z'));
   assert.equal(expired.active, false);
 
-  const missing = fetchGrokQuota({
-    environment: { GROK_HOME: '/definitely/missing/grok-home' },
+  const home = mkdtempSync(join(tmpdir(), 'vbu-grok-absent-'));
+  t.after(() => rmSync(home, { recursive: true, force: true }));
+  const missing = await fetchGrokQuota({
+    home, environment: { HOME: home, PATH: home },
     now: new Date('2026-09-08T00:00:00Z'),
   });
   assert.equal(missing.status, 'no_data');
