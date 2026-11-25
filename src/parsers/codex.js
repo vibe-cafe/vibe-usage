@@ -18,7 +18,14 @@ import {
 import {
   codexSegmentSignature, legacyCodexSegmentSignature, mergeCodexSegments, planCodexSegments,
 } from './codex-segments.js';
-import { aggregateToBuckets } from './aggregate.js';
+import {
+  addModelTimeSpan,
+  aggregateToBuckets,
+  modelTimeFields,
+  replySpan,
+  restoreModelTime,
+  serializeModelTime,
+} from './aggregate.js';
 import { mergeCindyHarnessUsage, readCindyHarnessUsage } from './cindy-ledger.js';
 import {
   codexSessionDirs,
@@ -323,6 +330,17 @@ function epochMs(value) {
   if (typeof value === 'string' && value.trim() !== '') value = Number(value);
   if (typeof value !== 'number' || !Number.isFinite(value)) return null;
   return value < 1e12 ? value * 1000 : value;
+}
+
+// Where a model call can start: a task start, the user's message, or a tool's
+// result (every response item whose type ends in `_output`), and the session's
+// own start.
+function isReplyBoundary(obj) {
+  const payload = obj.payload;
+  if (obj.type === 'session_meta') return true;
+  if (obj.type === 'event_msg') return isTaskStarted(payload) || payload?.type === 'user_message';
+  if (obj.type !== 'response_item' || typeof payload?.type !== 'string') return false;
+  return (payload.type === 'message' && payload.role === 'user') || payload.type.endsWith('_output');
 }
 
 function isTaskStarted(payload) {
@@ -919,7 +937,13 @@ function auditSize(file) {
   return file.cache?.result?.decodedBytes ?? Number.POSITIVE_INFINITY;
 }
 
-function applySessionEvent(acc, event) {
+// Model time (aggregate.js, approved 2026-11-25). A Codex reply is one model
+// call: it ends at the usage record counted for it (`replyOutputTokens`, its
+// output including reasoning) and starts at the latest boundary before it -- a
+// task start, a user message or a tool result. Tool runs, waits for a
+// sub-agent and the time between tasks lie between a boundary and the next
+// reply's start, so they are never counted.
+function applySessionEvent(acc, event, modelTime) {
   const timestampMsValue = event.timestamp.getTime();
   if (acc.lastTimestampMs != null && timestampMsValue < acc.lastTimestampMs) return false;
   acc.firstTimestampMs ??= timestampMsValue;
@@ -927,20 +951,16 @@ function applySessionEvent(acc, event) {
   acc.messageCount++;
 
   if (event.role === 'user') {
-    if (acc.turnStartMs != null && acc.turnEndMs != null && acc.turnEndMs > acc.turnStartMs) {
-      acc.completedActiveSeconds += Math.round((acc.turnEndMs - acc.turnStartMs) / 1000);
-    }
-    acc.turnStartMs = null;
-    acc.turnEndMs = null;
-    acc.waitingForFirstResponse = true;
     acc.userMessageCount++;
     acc.userPromptHours[event.timestamp.getUTCHours()]++;
-  } else if (acc.waitingForFirstResponse) {
-    acc.turnStartMs = timestampMsValue;
-    acc.turnEndMs = timestampMsValue;
-    acc.waitingForFirstResponse = false;
-  } else if (acc.turnStartMs != null) {
-    acc.turnEndMs = timestampMsValue;
+  }
+  if (event.boundary) acc.lastBoundaryMs = timestampMsValue;
+  if (event.replyOutputTokens !== undefined) {
+    const span = replySpan(acc.lastBoundaryMs, timestampMsValue, event.replyOutputTokens, acc.prevSpanEndMs);
+    if (span) {
+      addModelTimeSpan(modelTime, span[0], span[1]);
+      acc.prevSpanEndMs = span[1];
+    }
   }
   return true;
 }
@@ -959,26 +979,25 @@ function buildSessionAccumulator(events, previous = null) {
         project: first?.project || 'unknown',
         firstTimestampMs: null,
         lastTimestampMs: null,
-        completedActiveSeconds: 0,
-        turnStartMs: null,
-        turnEndMs: null,
-        waitingForFirstResponse: false,
+        lastBoundaryMs: null,
+        prevSpanEndMs: null,
+        modelTime: null,
         messageCount: 0,
         userMessageCount: 0,
         userPromptHours: new Array(24).fill(0),
       };
+  const modelTime = restoreModelTime(acc.modelTime);
   for (const event of sorted) {
-    if (!applySessionEvent(acc, event)) return null;
+    if (!applySessionEvent(acc, event, modelTime)) return null;
   }
+  // Kept in serializable form: an append tail stores the accumulator.
+  acc.modelTime = serializeModelTime(modelTime);
   return acc.sessionId ? acc : null;
 }
 
 function sessionFromAccumulator(acc) {
   if (!acc?.sessionId || acc.firstTimestampMs == null || acc.lastTimestampMs == null) return null;
-  let activeSeconds = acc.completedActiveSeconds;
-  if (acc.turnStartMs != null && acc.turnEndMs != null && acc.turnEndMs > acc.turnStartMs) {
-    activeSeconds += Math.round((acc.turnEndMs - acc.turnStartMs) / 1000);
-  }
+  const { activeSeconds, activity } = modelTimeFields(restoreModelTime(acc.modelTime));
   return {
     source: acc.source,
     project: acc.project || 'unknown',
@@ -990,6 +1009,7 @@ function sessionFromAccumulator(acc) {
     messageCount: acc.messageCount,
     userMessageCount: acc.userMessageCount,
     userPromptHours: acc.userPromptHours,
+    activity,
   };
 }
 
@@ -1055,6 +1075,9 @@ async function parseSessionFile(filePath, snapshotSize, fm, boundary, {
       // request, so the marker must not survive a turn boundary.
       if (obj.type === 'session_meta' || obj.type === 'turn_context' || obj.type === 'token_usage_record'
           || (obj.type === 'event_msg' && isTaskStarted(obj.payload))) pendingUsageMirror = null;
+      // This record's timing event, when it has one: the usage it may carry
+      // below ends a reply there.
+      let recordEvent = null;
 
         // A direct child task boundary covers every copied record, including
         // timing/meta events. The raw-token ordinal covers full-history and
@@ -1080,13 +1103,15 @@ async function parseSessionFile(filePath, snapshotSize, fm, boundary, {
             || (isOwnSessionMeta && !inReplayBlock);
           if (keepSessionMeta || (!isSessionMeta && !inReplayBlock)) {
             const isUserTurn = obj.type === 'turn_context' || obj.type === 'session_meta';
-            sessionEvents.push({
+            recordEvent = {
               sessionId: sessionKey,
               source: 'codex',
               project: sessionProject,
               timestamp: evTs,
               role: isUserTurn ? 'user' : 'assistant',
-            });
+              ...(isReplyBoundary(obj) ? { boundary: true } : {}),
+            };
+            sessionEvents.push(recordEvent);
           }
         }
       }
@@ -1206,6 +1231,7 @@ async function parseSessionFile(filePath, snapshotSize, fm, boundary, {
           counts: [usage.input_tokens || 0, usage.output_tokens || 0, cachedInput] } });
       } else if (isUltrafast && model !== 'unknown') ultrafastEntries.push(entry);
       else entries.push(entry);
+      if (recordEvent) recordEvent.replyOutputTokens = Number(usage.output_tokens) || 0;
     } catch {
       continue;
     }

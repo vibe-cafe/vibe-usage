@@ -389,9 +389,10 @@ test('a warm sync looks up no older entry and no tail for the copies of a shared
     }
     // Every copy of the shared session has its own header and index and never a
     // summary (the group's entry holds it); the fork has its own summary.
-    const older = Object.values(homes).map(olderCodexCacheDir);
-    const olderReads = reads.filter(path => older.some(dir => path.startsWith(dir + sep)
-      && !path.startsWith(join(dir, 'v7') + sep)));
+    // Older entries: anything under a home's cache directory outside this
+    // version's own folder (versions up to 6 at the top, version 7 in `v7`).
+    const olderReads = reads.filter(path => Object.values(homes).some(home =>
+      path.startsWith(olderCodexCacheDir(home) + sep) && !path.startsWith(codexCacheDir(home) + sep)));
     assert.deepEqual(olderReads, []);
     assert.deepEqual(reads.filter(path => path.endsWith('.tail.json')), []);
     assert.equal(second.cache.filesRead, 0);
