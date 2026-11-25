@@ -618,6 +618,27 @@ Manifest (2026-11-20, see "Codex parser cache"; copy taken 2026-11-20 07:49 +08:
 
 Run counts of the partial series move by one either way between repetitions, from where each 45 s run stops; a run past 45 s is one large rollout finishing past the budget check. The peak of the `~/.codex`-only first run (decompressing large rollouts) varies by ~200 MB between repetitions of either code (`cb0b520` 864-1010 MB, this change 872-1082 MB).
 
+Reboots and recent sessions first (2026-11-25, see "Reboots" under "Codex parser cache" and "Recent sessions first" under "Codex compressed rollouts"; copy of the maintainer's cache taken 2026-11-25 09:44 +08:00, 100 minutes into 0.15.8's rebuild after that morning's reboot, with device numbers 16777230 / 16777232 / 16777234 mixed in its records; `6c6276b` (0.15.8's Codex code) -> this change at `b431457`, every series run until complete, cut `2026-11-18T10:00:00.000Z`; first run, runs to complete, longest run, peak RSS). Two new starts: the cache `6c6276b` completed from the current one, read with every stat's device number shifted by 1000 (on Node 22 from its completed no-`v7` cache, as `6c6276b` never completes from the current one there), and an empty cache. The Node 24 rows that complete in run 1 were measured at `b2523fd`, which differs only in passes 2 and 3; a run that finishes in pass 1 never reaches them.
+
+| Start | Node | `6c6276b` | this change |
+|---|---|---|---|
+| current cache, all homes | 24 | 45.4 s partial, 3, 45.6 s, 2769 MB | 2.8 s complete, 1, 2.8 s, 536 MB |
+| current cache, all homes | 22 | 45.4 s partial, then fails every run (the cross-runtime index) | fails every run from run 1 (the same) |
+| current cache, `~/.codex` only | 24 | 37.1 s partial, 7, 37.1 s, 833 MB | 35.3 s partial, 7, 35.3 s, 887 MB |
+| current cache, `~/.codex` only | 22 | fails every run (the same) | fails every run (the same) |
+| `6c6276b`'s completed cache, device number shifted, all homes | 24 | 45.3 s partial (nothing to upload), 13, 56.7 s, 2446 MB | 1.3 s complete, 1, 1.3 s, 480 MB |
+| the same, `~/.codex` only | 24 | -- | 0.3 s complete, 1, 0.3 s, 175 MB |
+| `6c6276b`'s completed no-`v7` cache, device number shifted, all homes / `~/.codex` only | 22 | -- | 1.3 s complete, 1 / 0.2 s complete, 1 |
+| no `v7`, all homes | 24 | 45.4 s partial (nothing to upload), 14, 56.9 s, 1151 MB | 43.4 s partial, 6, 43.4 s, 1862 MB |
+| no `v7`, all homes | 22 | 45.8 s partial (nothing to upload), 16, 51.5 s, 1317 MB | 45.2 s partial, 6, 45.8 s, 2082 MB |
+| no `v7`, `~/.codex` only | 24 | 34.1 s partial, 11, 35.3 s, 820 MB | 31.4 s partial, 11, 43.5 s, 824 MB |
+| no `v7`, `~/.codex` only | 22 | 32.9 s partial, 13, 36.6 s, 832 MB | 31.2 s partial, 10, 44.4 s, 961 MB |
+| empty cache, all homes | 24 | 46.3 s partial (nothing to upload; first run only) | 45.1 s partial, 13, 54.1 s, 1784 MB |
+| empty cache, all homes | 22 | -- | 52.3 s partial, 16, 52.3 s, 1362 MB |
+| empty cache, `~/.codex` only | 24 / 22 | -- | 34.1 s partial, 11, 43.7 s / 30.9 s partial, 10, 44.3 s |
+
+No first run was `skipped`. "Nothing to upload": 0 of 26,300 rollouts done, no bucket. Every first run of this change carried the day's usage: in the four empty-cache series every half-hour window of the day that had closed before the run started was already complete in it (7 of 7 each); only windows still taking usage grew later (Codex was in use during the measurements). In no series of either code is a bucket of a partial run larger than the complete result's. Against a copy of `state.json` the only new keys (527 in all series) are conversations after the last Codex upload (07:52, before the reboot); everything else re-sends existing keys, lower while partial. The `~/.codex`-only rows are a configuration change, not a reboot: sessions that were groups across three homes become single files whose summaries were never computed, as in the 2026-11-20 table. Each completed cache was then read warm next to an uncached read of `6c6276b` started at the same moment: byte for byte the same output, in the same order, apart from the conversations active during that read (one or two items), on both Node versions -- except that Node 22 from no `v7` differs in the message count of 201 sessions and no bucket, the summaries computed by 0.14 under the Mac app's Node 24 (the U+2028 bullet; `6c6276b` only escaped it here because it rejected those entries for their device number). The two uncached reads of each version, run side by side, were identical (Node 24 all homes and `~/.codex` only, Node 22 all homes). Node 22 from the current cache fails with `Codex rollout changed while syncing` for both codes: an index cached under Node 24 counts a rollout's records differently (the U+2028 bullet), unchanged by this change. Warm, three homes, 7 runs each alternating: Node 24 803 -> 857 ms, Node 22 810 -> 856 ms (medians; +30 MB peak RSS), the three-pass bookkeeping and, while records keep the earlier key under the current device number, one hash per group.
+
 ## Development & Testing
 
 ```bash
