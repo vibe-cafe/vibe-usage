@@ -134,14 +134,17 @@ const input = (result, from = null) => result.buckets
 test('the first run uploads the conversations in use and leaves a fork of an unread compressed parent for later', needsZstd, async () => {
   const m = machine();
   writeFileSync(m.file('codex', 'rollout-a-active.jsonl'), active([tokenCount('2026-07-18T10:05:00.000Z', 40, 41)]));
+  // The fork is history too, a month old (one in use is read first, with its
+  // parent: the cold-start tests below).
   writeFileSync(m.file('codex', 'rollout-b-fork.jsonl'), fork);
+  const monthAgo = (clock.now - 30 * 24 * 3600e3) / 1000;
+  fs.utimesSync(m.file('codex', 'rollout-b-fork.jsonl'), monthAgo, monthAgo);
   writeFileSync(m.file('codex', 'rollout-c-parent.jsonl.zst'), zlib.zstdCompressSync(Buffer.from(parent)));
 
-  // Three headers (30 ms), the fork's index (40 ms). The compressed parent's
-  // index would start at the end of the backlog's 40 ms (of a 60 ms budget):
-  // left for the next run. The active conversation is still read (50 ms), and
-  // there would be time for the fork too, but without its parent the copied
-  // history cannot be told apart: it waits.
+  // Three headers (30 ms), the conversation in use (40 ms), the fork's index
+  // (50 ms). The compressed parent's index would start after the backlog's
+  // 40 ms (of a 60 ms budget): left for the next run, and without its parent
+  // the fork's copied history cannot be told apart: it waits.
   const first = await m.run(60);
   assert.equal(first.result.skipped, undefined, JSON.stringify(first.result));
   assert.equal(first.result.indexing.phase, 'replay-index');
@@ -155,7 +158,7 @@ test('the first run uploads the conversations in use and leaves a fork of an unr
     tokenCount('2026-07-18T10:05:00.000Z', 40, 41),
     tokenCount('2026-07-18T10:06:00.000Z', 60, 102),
   ]));
-  // The parent's index (10 ms), the active conversation's appended records
+  // The active conversation's appended records (10 ms), the parent's index
   // (20 ms), the fork (30 ms) and the parent's usage, started inside the
   // backlog's 40 ms of a 60 ms budget.
   const second = await m.run(60);
@@ -179,6 +182,9 @@ test('a group with a compressed copy not compared yet waits; the other sessions 
   linkSync(m.file('orca1', 'rollout-shared.jsonl'), m.file('orca2', 'rollout-shared.jsonl'));
   writeFileSync(m.file('orca1', 'rollout-other.jsonl'), other);
   linkSync(m.file('orca1', 'rollout-other.jsonl'), m.file('orca2', 'rollout-other.jsonl'));
+  // Codex compresses only what was not touched for a week: both are history.
+  const monthAgo = (clock.now - 30 * 24 * 3600e3) / 1000;
+  for (const name of ['rollout-shared.jsonl', 'rollout-other.jsonl']) fs.utimesSync(m.file('orca1', name), monthAgo, monthAgo);
   const before = await m.run(600000, { extraRoots: true });
   assert.equal(input(before.result), 3300);
 
@@ -208,4 +214,146 @@ test('a run that cannot read every header is still skipped', async () => {
   const first = await m.run(15);
   assert.equal(first.result.skipped, true);
   assert.equal(first.result.indexing.phase, 'discovery');
+});
+
+test('a cold start reads the conversations in use first; history follows, and the end equals one uninterrupted read', async () => {
+  const m = machine();
+  // A month of history, every conversation in two homes (Orca hard-links each
+  // rollout into every account's home), named so that a directory-order read
+  // reaches it first; an old conversation and a fork of it made today; and a
+  // conversation in use.
+  const monthAgo = (clock.now - 30 * 24 * 3600e3) / 1000;
+  for (let i = 1; i <= 6; i++) {
+    const name = `rollout-2026-07-0${i}T08-00-00-h${i}.jsonl`;
+    writeFileSync(m.file('codex', name), jsonl([
+      sessionMeta(`2026-07-0${i}T08:00:00.000Z`, `history-${i}`),
+      tokenCount(`2026-07-0${i}T08:05:00.000Z`, 100 * i, 100 * i + 1),
+    ]));
+    linkSync(m.file('codex', name), m.file('orca1', name));
+    fs.utimesSync(m.file('codex', name), monthAgo, monthAgo);
+  }
+  writeFileSync(m.file('codex', 'rollout-2026-07-10T08-00-00-parent.jsonl'), parent);
+  fs.utimesSync(m.file('codex', 'rollout-2026-07-10T08-00-00-parent.jsonl'), monthAgo, monthAgo);
+  writeFileSync(m.file('orca1', 'rollout-2026-07-17T09-00-00-fork.jsonl'), fork);
+  writeFileSync(m.file('orca1', 'rollout-2026-07-18T10-00-00-active.jsonl'), active([tokenCount('2026-07-18T10:05:00.000Z', 40, 41)]));
+
+  // 15 headers (150 ms). Pass 1, the conversations in use: the fork's index,
+  // the active conversation (170 ms). Pass 2, what they lack: the parent's
+  // index, then the fork's usage (190 ms). Pass 3, history, newest first --
+  // the parent's own usage is history too: indexes until the budget is gone.
+  const runs = [await m.run(205, { extraRoots: true })];
+  const first = runs[0].result;
+  assert.equal(first.skipped, undefined, JSON.stringify(first));
+  assert.ok(first.indexing, 'history is left for the next runs');
+  assert.equal(input(first), 40 + 5, 'the conversations in use: the fork without its parent\'s copied history');
+  assert.equal(input(first, FORK_WINDOW), 40 + 5, 'never the parent\'s history copied into the fork');
+
+  while (runs.at(-1).result.indexing && runs.length < 6) runs.push(await m.run(205, { extraRoots: true }));
+  const last = runs.at(-1).result;
+  assert.equal(last.indexing, undefined, `complete after ${runs.length} runs`);
+  const expected = await m.uncached({ extraRoots: true });
+  // Byte for byte, in the order one uninterrupted read emits them.
+  assert.equal(JSON.stringify({ buckets: last.buckets, sessions: last.sessions }),
+    JSON.stringify({ buckets: expected.buckets, sessions: expected.sessions }));
+  assert.equal(input(expected), 40 + 3000 + 5 + 2100);
+  // No run ever sent more for a window than the complete read has there.
+  const final = new Map(last.buckets.map(bucket => [`${bucket.bucketStart}|${bucket.model}|${bucket.project}`, bucket.totalTokens]));
+  for (const { result } of runs) {
+    for (const bucket of result.buckets) {
+      assert.ok(bucket.totalTokens <= final.get(`${bucket.bucketStart}|${bucket.model}|${bucket.project}`), JSON.stringify(bucket));
+    }
+  }
+});
+
+test('what a conversation in use needs from compressed history is read with the whole budget', needsZstd, async () => {
+  const m = machine();
+  for (const n of [1, 2, 3]) {
+    writeFileSync(m.file('codex', `rollout-a-active-${n}.jsonl`),
+      active([tokenCount('2026-07-18T10:05:00.000Z', 10 * n, 10 * n + 1)]).replace('active-1', `active-${n}`));
+  }
+  writeFileSync(m.file('codex', 'rollout-b-fork.jsonl'), fork); // made today
+  writeFileSync(m.file('codex', 'rollout-c-parent.jsonl.zst'), zlib.zstdCompressSync(Buffer.from(parent)));
+
+  // Five headers (50 ms); the fork's index and the three conversations in use
+  // (90 ms) already pass the backlog's 80 ms (of 120 ms). The fork's
+  // compressed parent's index is still read -- it is what a conversation in
+  // use needs (100 ms) -- and so is the fork (110 ms). The parent's own usage
+  // is history: a compressed read past the backlog's share, next run.
+  const first = await m.run(120);
+  assert.equal(first.result.indexing?.phase, 'usage', JSON.stringify(first.result.indexing));
+  assert.equal(input(first.result), 10 + 20 + 30 + 5);
+  const second = await m.run(120);
+  assert.equal(second.result.indexing, undefined, JSON.stringify(second.result.indexing));
+  assert.deepEqual(view(second.result), view(await m.uncached()));
+});
+
+test('a fork made today needs only its parent: an older ancestor waits for history', needsZstd, async () => {
+  const m = machine();
+  const grand = jsonl([
+    sessionMeta('2026-07-01T08:00:00.000Z', 'grand-1'),
+    tokenCount('2026-07-01T08:05:00.000Z', 1000, 1001),
+    tokenCount('2026-07-01T08:20:00.000Z', 2000, 3002),
+  ]);
+  const middle = jsonl([
+    sessionMeta('2026-07-05T08:00:00.000Z', 'middle-1', { forked_from_id: 'grand-1' }),
+    { ...tokenCount('2026-07-01T08:05:00.000Z', 1000, 1001), timestamp: '2026-07-05T08:00:00.000Z' },
+    { ...tokenCount('2026-07-01T08:20:00.000Z', 2000, 3002), timestamp: '2026-07-05T08:00:00.000Z' },
+    tokenCount('2026-07-05T08:01:00.000Z', 300, 3303),
+  ]);
+  const TODAY = '2026-07-18T09:00:00.000Z';
+  const today = jsonl([
+    sessionMeta(TODAY, 'today-1', { forked_from_id: 'middle-1' }),
+    { ...tokenCount('2026-07-01T08:05:00.000Z', 1000, 1001), timestamp: TODAY },
+    { ...tokenCount('2026-07-01T08:20:00.000Z', 2000, 3002), timestamp: TODAY },
+    { ...tokenCount('2026-07-05T08:01:00.000Z', 300, 3303), timestamp: TODAY },
+    tokenCount('2026-07-18T09:01:00.000Z', 7, 3311),
+  ]);
+  writeFileSync(m.file('codex', 'rollout-a-grand.jsonl.zst'), zlib.zstdCompressSync(Buffer.from(grand)));
+  writeFileSync(m.file('codex', 'rollout-b-middle.jsonl'), middle);
+  const monthAgo = (clock.now - 30 * 24 * 3600e3) / 1000;
+  fs.utimesSync(m.file('codex', 'rollout-b-middle.jsonl'), monthAgo, monthAgo);
+  writeFileSync(m.file('codex', 'rollout-c-today.jsonl'), today);
+
+  // Three headers (30 ms), today's fork's index (40 ms), its parent's index
+  // (50 ms), then the fork (60 ms) inside a 55 ms budget. The compressed
+  // grandparent is what the parent's own usage needs, not the fork's: it waits.
+  const first = await m.run(55);
+  assert.equal(first.result.skipped, undefined, JSON.stringify(first.result));
+  assert.ok(first.result.indexing, 'the parent and its parent wait');
+  assert.equal(input(first.result), 7, 'today\'s fork, without the history it copied');
+
+  let last = first;
+  for (let i = 0; i < 4 && last.result.indexing; i++) last = await m.run(55);
+  assert.equal(last.result.indexing, undefined);
+  assert.deepEqual(view(last.result), view(await m.uncached()));
+  assert.equal(input(last.result), 3000 + 300 + 7);
+});
+
+test('two forks made today of one compressed parent are both uploaded before the parent\'s own usage', needsZstd, async () => {
+  const m = machine();
+  const forkAt = (at, id, own, total) => jsonl([
+    sessionMeta(at, id, { forked_from_id: 'parent-1' }),
+    { ...tokenCount('2026-07-10T08:05:00.000Z', 1000, 1001), timestamp: at },
+    { ...tokenCount('2026-07-10T08:20:00.000Z', 2000, 3002), timestamp: at },
+    tokenCount(at.replace(':00:00.000Z', ':01:00.000Z'), own, total),
+  ]);
+  writeFileSync(m.file('codex', 'rollout-a-parent.jsonl.zst'), zlib.zstdCompressSync(Buffer.from(parent)));
+  writeFileSync(m.file('codex', 'rollout-b-fork1.jsonl'), forkAt('2026-07-17T09:00:00.000Z', 'fork-1', 5, 3008));
+  const hourAgo = (clock.now - 3600e3) / 1000;
+  fs.utimesSync(m.file('codex', 'rollout-b-fork1.jsonl'), hourAgo, hourAgo);
+  writeFileSync(m.file('codex', 'rollout-c-fork2.jsonl'), forkAt('2026-07-17T10:00:00.000Z', 'fork-2', 9, 3012));
+
+  // Three headers (30 ms), both forks' indexes (50 ms), the parent's index
+  // (60 ms), the newer fork (70 ms), the older one (80 ms) in a 75 ms budget.
+  // The parent's own usage -- a compressed read -- comes after them: it waits.
+  const first = await m.run(75);
+  assert.equal(first.result.skipped, undefined, JSON.stringify(first.result));
+  assert.ok(first.result.indexing, 'the parent\'s own usage waits');
+  assert.equal(input(first.result), 5 + 9, 'both forks, without the history they copied');
+
+  let last = first;
+  for (let i = 0; i < 3 && last.result.indexing; i++) last = await m.run(75);
+  assert.equal(last.result.indexing, undefined);
+  assert.deepEqual(view(last.result), view(await m.uncached()));
+  assert.equal(input(last.result), 3000 + 5 + 9);
 });

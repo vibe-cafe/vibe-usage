@@ -376,7 +376,11 @@ test('the rolling audit re-reads a transcript whose cache is older than the inte
   // change to the file: the cache is trusted until the audit comes round.
   const saved = JSON.parse(readFileSync(entryPath, 'utf8'));
   saved.state.keyed[0][3] = 999;
-  writeFileSync(entryPath, JSON.stringify(saved));
+  // With its trailing newline the entry grows by a byte. Written without it,
+  // in place (same inode), it kept its size, and when its mtime fell in the
+  // same timestamp tick as the first run's write (Windows CI), the whole-source
+  // snapshot, keyed by the cache directory's stats, still matched.
+  writeFileSync(entryPath, `${JSON.stringify(saved)}\n`);
   assert.equal((await f.run()).buckets[0].inputTokens, 999);
   const audited = await f.run({ VIBE_USAGE_CLAUDE_AUDIT_INTERVAL_MS: '0' });
   assert.equal(audited.buckets[0].inputTokens, 10);
@@ -432,4 +436,67 @@ test('a transcript appended between discovery and the snapshot is not frozen at 
   assert.equal(first.buckets.reduce((n, b) => n + b.inputTokens, 0), 10, 'first run reads the captured size');
   assert.equal((await f.run()).buckets.reduce((n, b) => n + b.inputTokens, 0), 30);
   assert.deepEqual(normalize(await f.run()), normalize(await f.uncached()));
+});
+
+/** Every stat reports its device number plus `offset`, as after a reboot. Returns the undo. */
+function shiftDeviceNumbers(offset) {
+  const real = { statSync: fs.statSync, lstatSync: fs.lstatSync, fstatSync: fs.fstatSync };
+  for (const [name, fn] of Object.entries(real)) {
+    fs[name] = (...args) => {
+      const stat = fn(...args);
+      if (stat && typeof stat.dev === 'number') stat.dev += offset;
+      return stat;
+    };
+  }
+  syncBuiltinESMExports();
+  return () => {
+    Object.assign(fs, real);
+    syncBuiltinESMExports();
+  };
+}
+
+test('after a reboot (a new device number) the cache is used as it is', async (t) => {
+  // macOS gives the data volume a new device number on many reboots; on
+  // 2026-11-25 comparing it made every entry a miss and the whole cache was
+  // rebuilt.
+  const f = fixture(t);
+  const mtimeSeconds = 1_790_000_000;
+  writeTranscript(f.path('rich'), richSession(), { mtimeSeconds });
+  const expected = normalize(await f.uncached());
+  assert.deepEqual(normalize(await f.run()), expected);
+  blankRange(f.path('rich'), 0, statSync(f.path('rich')).size);
+  utimesSync(f.path('rich'), mtimeSeconds, mtimeSeconds);
+
+  const restore = shiftDeviceNumbers(1000);
+  const parserCache = process.env.VIBE_USAGE_PARSER_CACHE;
+  try {
+    assert.deepEqual(normalize(await f.run()), expected, 'the whole-source snapshot');
+    process.env.VIBE_USAGE_PARSER_CACHE = '0';
+    assert.deepEqual(normalize(await f.run()), expected, 'the per-transcript entry');
+  } finally {
+    if (parserCache === undefined) delete process.env.VIBE_USAGE_PARSER_CACHE;
+    else process.env.VIBE_USAGE_PARSER_CACHE = parserCache;
+    restore();
+  }
+});
+
+test('a transcript appended after a reboot is read only from where the cache stopped', async (t) => {
+  const f = fixture(t);
+  const path = f.path('growing');
+  // A long first line puts the start of the file outside the 4 KiB guard.
+  writeTranscript(path, [user(0, { note: 'x'.repeat(10_000) }), assistant(1, { id: 'a1', input: 50, output: 5 })]);
+  await f.run();
+  const offset = statSync(path).size;
+  appendFileSync(path, lines([user(2), assistant(3, { id: 'a2', input: 7, output: 2 })]));
+  const expected = normalize(await f.uncached());
+  // Blank the start, short of the 4 KiB guard before the offset: a read from
+  // byte 0 would lose the first prompt.
+  blankRange(path, 0, offset - 4096 - 1);
+
+  const restore = shiftDeviceNumbers(1000);
+  try {
+    assert.deepEqual(normalize(await f.run()), expected);
+  } finally {
+    restore();
+  }
 });

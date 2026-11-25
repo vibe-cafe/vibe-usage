@@ -145,6 +145,22 @@ test('per-tool counts keep codes only and leave out tools with nothing to say', 
   for (const secret of SECRETS) assert.ok(!text.includes(secret), secret);
 });
 
+test('index progress keeps its phase, from a closed list', () => {
+  // A Codex count that falls from 9,650 to 0 between two syncs is the next
+  // phase starting; without the phase the history read like progress lost.
+  resetHistory();
+  const record = beginSyncRecord();
+  record.noteParser('codex', { indexing: { phase: 'replay-index', completed: 0, total: 26295 } });
+  record.noteParser('claude-code', { skipped: true, indexing: { phase: 'transcripts', completed: 2197, total: 2379 } });
+  record.noteParser('opencode', { skipped: true, indexing: { phase: 'free text /Users/张 三', completed: 1, total: 2 } });
+  record.flush();
+  const { tools } = rawEntries()[0];
+  assert.deepEqual(tools.codex.indexing, { phase: 'replay-index', completed: 0, total: 26295 });
+  assert.deepEqual(tools['claude-code'].indexing, { phase: 'transcripts', completed: 2197, total: 2379 });
+  assert.deepEqual(tools.opencode.indexing, { completed: 1, total: 2 });
+  assert.deepEqual(readSyncHistory().entries[0].tools.codex.indexing, { phase: 'replay-index', completed: 0, total: 26295 });
+});
+
 test('an entry says which parser passes finished and which deferred sources are pending', () => {
   resetHistory();
   const record = beginSyncRecord();

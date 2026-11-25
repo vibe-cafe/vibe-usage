@@ -1,7 +1,7 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import fs, {
-  appendFileSync, linkSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, rmSync, unlinkSync, writeFileSync,
+  appendFileSync, linkSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, rmSync, unlinkSync, utimesSync, writeFileSync,
 } from 'node:fs';
 import { syncBuiltinESMExports } from 'node:module';
 import { join, sep } from 'node:path';
@@ -177,6 +177,20 @@ function assertNoSlimIndexWritten(homes) {
       assert.ok(Array.isArray(entry.index[field]), `${name}: index without ${field}`);
     }
   }
+}
+
+/**
+ * The plain conversation, the parent and its fork in one home, modified in
+ * that order a second apart. A run summarizes the newest sessions first, a
+ * parent with its newest fork: parent, fork, plain -- the order the rolling
+ * audit then goes through them.
+ */
+function writeThree(file) {
+  const base = Date.parse('2026-07-10T10:00:00.000Z') / 1000;
+  [[plainFile, plain], [parentFile, parent], [forkFile, fork]].forEach(([name, text], i) => {
+    writeFileSync(file('codex', name), text);
+    utimesSync(file('codex', name), base + i, base + i);
+  });
 }
 
 function setUp(file) {
@@ -370,9 +384,7 @@ test('an entry written back when the run stops right after it still has its full
     // entry back with the index it held -- for the parent, an index the
     // manifest holds slim -- before the replay index is read again. A run that
     // stops in between leaves exactly that write behind.
-    writeFileSync(file('codex', plainFile), plain);
-    writeFileSync(file('codex', parentFile), parent);
-    writeFileSync(file('codex', forkFile), fork);
+    writeThree(file);
     const single = { extraRoots: [] };
     const clock = controlledClock();
     let stopped;
@@ -380,10 +392,10 @@ test('an entry written back when the run stops right after it still has its full
       await run(single);
       await run(single);
       process.env.VIBE_USAGE_CODEX_AUDIT_INTERVAL_MS = '0';
-      // Audit times follow the order the files were first summarized in.
-      assert.equal((await run(single)).cache.audited, 1); // the plain conversation
-      // The parent is next. With the clock moving only when a file is opened
-      // and a 1 ms budget, the run stops at the first check after its header.
+      // Audit times follow the order the files were first summarized in: the
+      // parent first (writeThree()). With the clock moving only when a file is
+      // opened and a 1 ms budget, the run stops at the first check after its
+      // header.
       process.env.VIBE_USAGE_CODEX_WORK_BUDGET_MS = '1';
       clock.onlyOnReads();
       stopped = await run(single);
@@ -402,9 +414,7 @@ test('an entry written back when the run stops right after it still has its full
 
 test('the rolling audit moves on to the next file instead of repeating one', async () => {
   await withHomes(async ({ file, run }) => {
-    writeFileSync(file('codex', plainFile), plain);
-    writeFileSync(file('codex', parentFile), parent);
-    writeFileSync(file('codex', forkFile), fork);
+    writeThree(file);
     const single = { extraRoots: [] };
     const clock = controlledClock();
     const realCreateReadStream = fs.createReadStream; // the clock's own wrapper
@@ -429,7 +439,7 @@ test('the rolling audit moves on to the next file instead of repeating one', asy
       fs.createReadStream = realCreateReadStream;
       clock.restore();
     }
-    assert.deepEqual(audited, [file('codex', plainFile), file('codex', parentFile), file('codex', forkFile)]);
+    assert.deepEqual(audited, [file('codex', parentFile), file('codex', forkFile), file('codex', plainFile)]);
   });
 });
 

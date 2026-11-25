@@ -1,5 +1,5 @@
 import { createHash } from 'node:crypto';
-import { sameSignature } from './codex-cache.js';
+import { sameFile, sameSignature } from './codex-cache.js';
 import { normalizeUsageRecord } from './codex-usage-record.js';
 
 const hash = value => createHash('sha256').update(JSON.stringify(value)).digest('base64url');
@@ -149,8 +149,11 @@ export function planCodexSegments(members) {
   const copies = new Set();
   for (let i = 0; i < members.length; i++) {
     for (let j = 0; j < i; j++) {
-      if (sameSignature(members[i].signature, members[j].signature)) parent[find(i)] = find(j);
+      // Both stats were taken in this run: one physical file only on one device.
+      if (sameFile(members[i].signature, members[j].signature)) parent[find(i)] = find(j);
     }
+    // `copyOf` was recorded by an earlier run, so the device number is not
+    // compared (see sameSignature()).
     const copyOf = members[i].compressed ? members[i].cache?.copyOf : null;
     const j = copyOf ? members.findIndex(other => !other.compressed
       && other.filePath === copyOf.filePath && sameSignature(other.signature, copyOf.signature)) : -1;
@@ -176,12 +179,36 @@ export function planCodexSegments(members) {
 
 // The disposable group cache is invalidated by ANY member of its identity (see
 // planCodexSegments()) changing, appearing, disappearing, or moving. It never
-// shares the selected physical file's cache.
+// shares the selected physical file's cache. Each member counts with its path,
+// size, mtime and inode -- not its device number, which macOS changes on many
+// reboots (see sameSignature() in codex-cache.js).
 export function codexSegmentSignature(members) {
   return {
     size: members.reduce((sum, file) => sum + file.snapshotSize, 0),
     mtimeMs: Math.max(...members.map(file => file.signature.mtimeMs)),
     dev: 'codex-segments',
-    ino: hash(members.map(file => [file.filePath, file.signature]).sort((a, b) => a[0].localeCompare(b[0]))),
+    ino: hash(members
+      .map(file => [file.filePath, file.signature.size, file.signature.mtimeMs, file.signature.ino])
+      .sort((a, b) => a[0].localeCompare(b[0]))),
+  };
+}
+
+/**
+ * The key a group had until 2026-11-25: every member's whole stat signature,
+ * device number included, hashed. Group entries and manifest records written
+ * by earlier releases (and by 0.15.x collectors still running next to this
+ * one) carry it. It can only be recomputed for a given device number: `dev`
+ * stands for every member's (all of a user's Codex homes normally share one
+ * volume); null takes each member's current one, as the earlier releases did.
+ */
+export function legacyCodexSegmentSignature(members, dev = null) {
+  return {
+    ...codexSegmentSignature(members),
+    ino: hash(members.map(file => [file.filePath, {
+      size: file.signature.size,
+      mtimeMs: file.signature.mtimeMs,
+      dev: dev ?? file.signature.dev,
+      ino: file.signature.ino,
+    }]).sort((a, b) => a[0].localeCompare(b[0]))),
   };
 }

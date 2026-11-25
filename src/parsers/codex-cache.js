@@ -90,12 +90,45 @@ export function fileSignature(stat) {
   };
 }
 
-/** Whether two stat signatures name one file state (and, with dev + ino, one file). */
+/**
+ * Whether a stat signature recorded by an earlier run names the same file
+ * state as one taken now: size, modification time and inode -- not the device
+ * number. Entries are keyed by path already, and macOS gives the data volume a
+ * new device number on many reboots: on the maintainer's Mac on 2026-11-25
+ * every one of 24,000 entries was rejected for that alone (size, mtime and
+ * inode all unchanged), and Codex stopped uploading for about twelve syncs
+ * while the cache was rebuilt. Only a different disk mounted at the same path,
+ * holding a file with the same inode, size and sub-millisecond mtime, would
+ * now be taken for the old one; that is not handled.
+ *
+ * Signatures still record `dev`: sameFile() needs it, and collectors of this
+ * algorithm version that predate this rule (0.15.x) share these entries and
+ * compare it.
+ */
 export function sameSignature(a, b) {
   return a?.size === b?.size
     && a?.mtimeMs === b?.mtimeMs
-    && a?.dev === b?.dev
     && a?.ino === b?.ino;
+}
+
+/**
+ * Whether two stats taken in the same run are one physical file (a hard link,
+ * as Orca keeps every rollout in each account's home): the device number too,
+ * since an inode number is unique only within one device.
+ */
+export function sameFile(a, b) {
+  return sameSignature(a, b) && a?.dev === b?.dev;
+}
+
+/**
+ * sameSignature() against one signature or any of several (a duplicate-session
+ * group is looked up under its current key and the keys of the earlier format,
+ * see codex-segments.js).
+ */
+export function signatureMatches(stored, wanted) {
+  return Array.isArray(wanted)
+    ? wanted.some(signature => sameSignature(stored, signature))
+    : sameSignature(stored, wanted);
 }
 
 /** Where versions up to 6 keep their entries. Read-only for this version. */
@@ -140,8 +173,9 @@ function readSummary(path, filePath, acceptsAlgorithm) {
 }
 
 /**
- * This version's own summary for a rollout. With a signature, only the entry
- * for exactly that file state; without one, whatever state was summarized last
+ * This version's own summary for a rollout. With a signature (or several, see
+ * signatureMatches()), only the entry for exactly that file state; without
+ * one, whatever state was summarized last
  * (the "what did we know before this file grew" lookup that pairs with
  * `loadCodexFileTail()`).
  */
@@ -149,7 +183,7 @@ export function loadCodexFileCache(codexHome, filePath, signature) {
   if (!codexCacheEnabled()) return null;
   const own = readSummary(entryPath(codexHome, filePath), filePath,
     version => version === CODEX_PARSER_ALGORITHM_VERSION);
-  return own && (!signature || sameSignature(own.signature, signature)) ? own : null;
+  return own && (!signature || signatureMatches(own.signature, signature)) ? own : null;
 }
 
 /**
@@ -171,9 +205,10 @@ export function loadOlderCodexFileCache(codexHome, filePath, signature, { magpie
   const partsAccepted = version => SAME_HEADER_AND_INDEX_ALGORITHM_VERSIONS.has(version);
   const older = readSummary(olderEntryPath(codexHome, filePath), filePath,
     version => summaryAccepted(version) || partsAccepted(version));
-  if (!older || !sameSignature(older.signature, signature)) return null;
+  if (!older || !signatureMatches(older.signature, signature)) return null;
   const parts = partsAccepted(older.algorithmVersion);
   return {
+    signature: older.signature,
     entry: summaryAccepted(older.algorithmVersion) ? older : null,
     header: (parts && older.header) || null,
     index: (parts && older.index) || null,

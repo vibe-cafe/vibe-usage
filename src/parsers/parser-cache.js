@@ -123,9 +123,14 @@ function withCacheDb(fn) {
   }
 }
 
-/** Build a deterministic stat signature token for a regular file. */
+/**
+ * Build a deterministic stat signature token for a regular file: size, mtime
+ * and inode. Not the device number: macOS gives the data volume a new one on
+ * many reboots, which turned every entry and snapshot into a miss (see
+ * sameSignature() in codex-cache.js).
+ */
 export function statToken(stat) {
-  return `${stat.size}:${stat.mtimeMs}:${stat.dev}:${stat.ino}`;
+  return `${stat.size}:${stat.mtimeMs}:${stat.ino}`;
 }
 
 export function fileStatToken(filePath) {
