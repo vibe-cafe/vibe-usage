@@ -541,6 +541,7 @@ test('a computer where Antigravity was never used asks nothing until a conversat
   rmSync(join(m.stores.desktop, 'earlier.db'));
   const never = await m.fetch(m.at(0));
   assert.equal(never.status, 'no_data');
+  assert.equal(never.emptyReason, 'noLocalRecord');
   assert.equal(m.reads.length, 0);
   assert.equal(existsSync(m.statePath), false);
   m.use('ide');
@@ -582,6 +583,7 @@ test('a failed read keeps the last numbers, marked as not from this read', async
     const result = await m.fetch(m.at(minutes));
     assert.equal(result.status, 'ok');
     assert.equal(result.source, 'cache');
+    assert.equal(result.failureReason, 'programNoAnswer');
     assert.equal(result.dataAsOf, m.at(0).toISOString());
     assert.deepEqual(result.meters, m.reading().meters);
   }
@@ -725,6 +727,19 @@ test('nothing is asked when the attempt cannot be recorded', async t => {
   const result = await m.fetch(m.at(0), { environment: { ...m.environment, VIBE_USAGE_QUOTA_CACHE_DIR: file } });
   assert.equal(m.reads.length, 0);
   assert.equal(result.status, 'retryable_error');
+  assert.equal(result.failureReason, 'programNoAnswer');
+});
+
+test('a window that ended after use is omitted while the next read is waiting', async t => {
+  const m = machine(t);
+  m.answer(({ now }) => ({ result: quotaResult({ id: 'antigravity', status: 'ok', fetchedAt: now,
+    meters: [{ id: 'short', label: '5h', utilization: 25, resetsAt: m.at(1).toISOString() }] }) }));
+  await m.fetch(m.at(0));
+  m.use();
+  const result = await m.fetch(m.at(2));
+  assert.equal(result.status, 'no_data');
+  assert.equal(result.emptyReason, 'periodEnded');
+  assert.equal(m.reads.length, 1);
 });
 
 test('two processes at the same moment ask only once', async t => {
@@ -733,6 +748,7 @@ test('two processes at the same moment ask only once', async t => {
   const [one, two] = await Promise.all([m.fetch(m.at(0)), m.fetch(m.at(0))]);
   assert.equal(m.reads.length, 1);
   assert.deepEqual([one.status, two.status].sort(), ['no_data', 'ok']);
+  assert.equal([one, two].find(result => result.status === 'no_data').emptyReason, 'noLocalRecord');
   // Also while the egress check keeps both waiting before the attempt is recorded.
   m.use();
   const egressGate = async () => { await delay(20); return null; };
@@ -766,6 +782,19 @@ test('the registry passes the reading through without its own cache', async t =>
   assert.equal(result.cacheScope, undefined);
   assert.equal(existsSync(join(m.home, 'quota', 'quota-cache.json')), false);
   assert.ok(existsSync(m.statePath));
+});
+
+test('the registry isolates a thrown provider error and returns only its fixed reason', async t => {
+  const m = machine(t);
+  const { products: [failed, grok] } = await fetchQuotaProducts(['antigravity', 'grok'], {
+    environment: m.environment, home: m.home, platform: 'linux', now: m.at(0),
+    activityImpl: () => { throw new Error('private vendor details'); },
+    egressPause: () => assert.fail('unexpected check'),
+  });
+  assert.equal(failed.status, 'retryable_error');
+  assert.equal(failed.failureReason, 'internalError');
+  assert.doesNotMatch(JSON.stringify(failed), /private vendor details/);
+  assert.equal(grok.emptyReason, 'noLocalRecord');
 });
 
 test('running desktop servers come only from this user\'s Antigravity language servers', async () => {
