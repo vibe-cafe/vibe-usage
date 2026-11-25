@@ -1,12 +1,17 @@
 import { existsSync } from 'node:fs';
 import { homedir } from 'node:os';
 import { join, resolve } from 'node:path';
+import { isEncryptedCursorToken } from '../../parsers/cursor.js';
 import { queryDbJsonSnapshotOnLock } from '../../parsers/sqlite.js';
 import { attachCacheScope } from '../cache.js';
 import { quotaResult } from '../schema.js';
 import { InvalidQuotaResponse, parseQuotaPayload, requestFailureReason } from '../response.js';
 
 const USAGE_URL = 'https://cursor.com/api/usage-summary';
+// Issue #144: same decision as the sync parser -- no local decryption, and
+// signing in again only writes the same ciphertext, so never say it helps.
+const ENCRYPTED_TOKEN_MESSAGE = 'Cursor now stores its login encrypted; vibe-usage cannot read Cursor quota yet. '
+  + 'Signing in again will not fix this. Progress: https://github.com/vibe-cafe/vibe-usage/issues/144';
 const finite = value => typeof value === 'number' && Number.isFinite(value) && value >= 0;
 
 export function cursorQuotaDbPath(environment = process.env, home = homedir(), platform = process.platform) {
@@ -97,6 +102,10 @@ export async function fetchCursorQuota({
   try { token = readCursorQuotaToken(cursorQuotaDbPath(environment, home, platform)); }
   catch { return result('retryable_error', { failureReason: 'credentialsUnreadable', message: 'Cursor login could not be read' }); }
   if (!token) return result('missing_credentials', { message: 'Open Cursor and sign in, then retry' });
+  // Sent as a cookie the ciphertext is a certain 401 ("sign in again"). Like
+  // missing_credentials this result carries no cache scope, so the registry
+  // neither writes a cache entry for it nor falls back to an older one.
+  if (isEncryptedCursorToken(token)) return result('unsupported', { message: ENCRYPTED_TOKEN_MESSAGE });
   const scoped = (status, extra) => attachCacheScope(result(status, extra), token);
   try {
     const signal = AbortSignal.timeout(timeoutMs);

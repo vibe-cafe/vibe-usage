@@ -120,6 +120,51 @@ test('Cursor isolates missing/rejected credentials and uses only same-account un
   assert.equal(missing.failureReason, undefined);
 });
 
+// Issue #144: Cursor 3.27+ stores `cursor-safe-storage:<version>:<base64>`.
+// Sent as a cookie that is a certain 401, which used to say "sign in again".
+test('Cursor reports an encrypted login as unsupported: no request, no cache entry, no stale cache', async t => {
+  const cipher = Buffer.from('synthetic ciphertext, not a real Cursor login').toString('base64');
+  const now = new Date('2026-10-23T00:00:00Z');
+  const readable = await fixture(t);
+  await fetchQuotaProducts(['cursor'], { environment: readable.environment, now,
+    fetchImpl: async () => new Response(JSON.stringify(cursorPayload)) });
+  const cachePath = join(readable.root, 'quota-cache.json');
+  const cacheBefore = readFileSync(cachePath);
+  for (const [login, encoding] of [[`cursor-safe-storage:v1:${cipher}`, 'utf8'],
+    [`cursor-safe-storage:v9:${cipher}`, 'utf16le']]) {
+    const encrypted = await fixture(t, encoding, login);
+    // Same cache directory that holds the readable account's `ok` entry.
+    const environment = { ...encrypted.environment, VIBE_USAGE_QUOTA_CACHE_DIR: readable.root };
+    const noNetwork = () => assert.fail('unexpected network');
+    const direct = await fetchCursorQuota({ environment, now, fetchImpl: noNetwork });
+    assert.equal(direct.status, 'unsupported');
+    assert.equal(direct.cacheScope, undefined);
+    const envelope = await fetchQuotaProducts(['cursor'], { environment, now, fetchImpl: noNetwork });
+    const [product] = envelope.products;
+    assert.equal(product.status, 'unsupported');
+    assert.equal(product.source, 'live');
+    assert.deepEqual(product.meters, []);
+    assert.match(product.message, /encrypted/);
+    assert.match(product.message, /will not fix/);
+    assert.match(product.message, /https:\/\/github\.com\/vibe-cafe\/vibe-usage\/issues\/144/);
+    assert.doesNotMatch(product.message, /sign in again, then retry/);
+    const output = JSON.stringify(envelope);
+    for (const secret of [cipher, 'cursor-safe-storage']) assert.ok(!output.includes(secret));
+    assert.deepEqual(readFileSync(cachePath), cacheBefore);
+    // A fresh cache directory stays empty.
+    const fresh = await fetchQuotaProducts(['cursor'], { environment: encrypted.environment, now, fetchImpl: noNetwork });
+    assert.equal(fresh.products[0].status, 'unsupported');
+    assert.equal(existsSync(join(encrypted.root, 'quota-cache.json')), false);
+  }
+  // A readable login afterwards is fetched exactly as before.
+  let calls = 0;
+  const back = await fetchQuotaProducts(['cursor'], { environment: readable.environment, now,
+    fetchImpl: async () => { calls++; return new Response(JSON.stringify(cursorPayload)); } });
+  assert.equal(calls, 1);
+  assert.equal(back.products[0].status, 'ok');
+  assert.equal(back.products[0].source, 'live');
+});
+
 test('Cursor malformed/oversized responses and network errors never echo secrets', async t => {
   const { environment, dbPath } = await fixture(t);
   for (const body of [null, '<html>login</html>', JSON.stringify({ private: token }), ' '.repeat(1024*1024+1)]) {
