@@ -157,6 +157,7 @@ function logQuota(readLog, now) {
     return quotaResult({
       id: PRODUCT_ID,
       status,
+      ...(status === 'no_data' ? { emptyReason: 'noLocalRecord' } : { failureReason: 'localRecordUnreadable' }),
       message: status === 'no_data'
         ? 'Grok billing status is not available yet'
         : 'Grok billing status could not be read',
@@ -168,6 +169,7 @@ function logQuota(readLog, now) {
     return quotaResult({
       id: PRODUCT_ID,
       status: 'no_data',
+      emptyReason: parsed ? 'periodEnded' : 'noLocalRecord',
       message: 'Grok billing status is not available yet',
       fetchedAt: now,
       dataAsOf: parsed?.dataAsOf,

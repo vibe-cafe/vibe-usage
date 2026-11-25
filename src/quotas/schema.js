@@ -29,20 +29,30 @@ export const QUOTA_EMPTY_REASONS = Object.freeze([
   'noWindow',
   'notEntitled',
   'sessionWithoutPlanLimits',
+  'periodEnded',
+  'noLocalRecord',
+]);
+
+export const QUOTA_FAILURE_REASONS = Object.freeze([
+  'credentialsMissing', 'credentialsRejected', 'credentialsUnreadable', 'credentialsEncrypted',
+  'loginRefreshFailed', 'programNotFound', 'programOutdated', 'programNoAnswer',
+  'timedOut', 'unreachable', 'httpStatus', 'unrecognizedResponse', 'localRecordUnreadable', 'internalError',
 ]);
 
 /**
  * Why a read was not sent on purpose (network-privacy principle), additive
  * within schema v1. A pause returns unsupported or, when answered from a
- * valid local record, ok/local. Mac 0.8.0 and Windows 0.7.9 read this field
- * only with unsupported and keep showing the local numbers otherwise.
- * `egressRegion` (two letters) comes with
- * `egressRegionUnsupported`. The reserved #190 vocabulary may add more.
+ * valid local record, ok/local. Shared with the desktop clients, which show a
+ * fixed line for each and offer no retry: the next read checks again. Mac
+ * 0.8.0 and Windows 0.7.9 read this field only with unsupported and keep
+ * showing the local numbers otherwise. `egressRegion` (two letters) comes with
+ * `egressRegionUnsupported`. `proxyUnsupported` comes from the environment proxy guard.
  */
 export const QUOTA_PAUSE_REASONS = Object.freeze([
   'egressRegionUnsupported',
   'egressUnconfirmed',
   'proxyNotDetected',
+  'proxyUnsupported',
 ]);
 
 const FETCH_STATUSES = new Set([
@@ -172,6 +182,8 @@ export function quotaResult({
   message,
   source = 'live',
   emptyReason,
+  failureReason,
+  httpStatus,
   pauseReason,
   egressRegion,
 }) {
@@ -205,6 +217,15 @@ export function quotaResult({
     }
     result.pauseReason = pauseReason;
     if (typeof egressRegion === 'string' && /^[A-Z]{2}$/.test(egressRegion)) result.egressRegion = egressRegion;
+  }
+  if (failureReason !== undefined && failureReason !== null) {
+    if (!QUOTA_FAILURE_REASONS.includes(failureReason) || result.pauseReason) {
+      throw new TypeError(`invalid quota failureReason: ${failureReason}`);
+    }
+    result.failureReason = failureReason;
+    if (failureReason === 'httpStatus' && Number.isInteger(httpStatus) && httpStatus >= 100 && httpStatus <= 599) {
+      result.httpStatus = httpStatus;
+    }
   }
   return result;
 }

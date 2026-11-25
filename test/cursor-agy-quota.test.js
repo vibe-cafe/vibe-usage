@@ -97,6 +97,7 @@ test('Cursor isolates missing/rejected credentials and uses only same-account un
   const failing = async () => { throw new Error(`private proxy ${token}`); };
   const cached = await fetchQuotaProducts(['cursor'], { environment, now, fetchImpl: failing });
   assert.equal(cached.products[0].source, 'cache');
+  assert.equal(cached.products[0].failureReason, 'unreachable');
   const other = await fixture(t, 'utf8', 'different-account-token');
   const switched = await fetchQuotaProducts(['cursor'], { environment: {
     ...environment, CURSOR_STATE_DB_PATH: other.dbPath,
@@ -110,20 +111,92 @@ test('Cursor isolates missing/rejected credentials and uses only same-account un
   } });
   assert.equal(calls,2);
   assert.equal(rejected.products[0].status,'unauthorized');
+  assert.equal(rejected.products[0].failureReason, undefined);
   assert.equal(rejected.products[0].source,'live');
   const expired = await fetchQuotaProducts(['cursor'], { environment, now: new Date('2026-11-02'), fetchImpl: failing });
   assert.equal(expired.products[0].status,'retryable_error');
   const missing = await fetchCursorQuota({ environment: { CURSOR_STATE_DB_PATH: join(root,'absent') }, fetchImpl: () => assert.fail('unexpected network') });
   assert.equal(missing.status,'missing_credentials');
+  assert.equal(missing.failureReason, undefined);
+});
+
+// Issue #144: Cursor 3.27+ stores `cursor-safe-storage:<version>:<base64>`.
+// Sent as a cookie that is a certain 401, which used to say "sign in again".
+test('Cursor reports an encrypted login as unsupported: no request, no cache entry, no stale cache', async t => {
+  const cipher = Buffer.from('synthetic ciphertext, not a real Cursor login').toString('base64');
+  const now = new Date('2026-10-23T00:00:00Z');
+  const readable = await fixture(t);
+  await fetchQuotaProducts(['cursor'], { environment: readable.environment, now,
+    fetchImpl: async () => new Response(JSON.stringify(cursorPayload)) });
+  const cachePath = join(readable.root, 'quota-cache.json');
+  const cacheBefore = readFileSync(cachePath);
+  for (const [login, encoding] of [[`cursor-safe-storage:v1:${cipher}`, 'utf8'],
+    [`cursor-safe-storage:v9:${cipher}`, 'utf16le']]) {
+    const encrypted = await fixture(t, encoding, login);
+    // Same cache directory that holds the readable account's `ok` entry.
+    const environment = { ...encrypted.environment, VIBE_USAGE_QUOTA_CACHE_DIR: readable.root };
+    let requests = 0;
+    const noNetwork = () => { requests += 1; throw new Error('unexpected network'); };
+    const direct = await fetchCursorQuota({ environment, now, fetchImpl: noNetwork });
+    assert.equal(direct.status, 'unsupported');
+    // #190: the card can say why (encrypted login), not just "nothing read".
+    assert.equal(direct.failureReason, 'credentialsEncrypted');
+    assert.equal(direct.pauseReason, undefined);
+    assert.equal(direct.cacheScope, undefined);
+    const envelope = await fetchQuotaProducts(['cursor'], { environment, now, fetchImpl: noNetwork });
+    const [product] = envelope.products;
+    assert.equal(product.status, 'unsupported');
+    assert.equal(product.failureReason, 'credentialsEncrypted');
+    assert.equal(product.source, 'live');
+    assert.deepEqual(product.meters, []);
+    assert.match(product.message, /encrypted/);
+    assert.match(product.message, /will not fix/);
+    assert.match(product.message, /https:\/\/github\.com\/vibe-cafe\/vibe-usage\/issues\/144/);
+    assert.doesNotMatch(product.message, /sign in again, then retry/);
+    const output = JSON.stringify(envelope);
+    for (const secret of [cipher, 'cursor-safe-storage']) assert.ok(!output.includes(secret));
+    assert.deepEqual(readFileSync(cachePath), cacheBefore);
+    // A fresh cache directory stays empty.
+    const fresh = await fetchQuotaProducts(['cursor'], { environment: encrypted.environment, now, fetchImpl: noNetwork });
+    assert.equal(fresh.products[0].status, 'unsupported');
+    assert.equal(fresh.products[0].failureReason, 'credentialsEncrypted');
+    assert.equal(existsSync(join(encrypted.root, 'quota-cache.json')), false);
+    assert.equal(requests, 0);
+  }
+  // A readable login afterwards is fetched exactly as before.
+  let calls = 0;
+  const back = await fetchQuotaProducts(['cursor'], { environment: readable.environment, now,
+    fetchImpl: async () => { calls++; return new Response(JSON.stringify(cursorPayload)); } });
+  assert.equal(calls, 1);
+  assert.equal(back.products[0].status, 'ok');
+  assert.equal(back.products[0].source, 'live');
 });
 
 test('Cursor malformed/oversized responses and network errors never echo secrets', async t => {
-  const { environment } = await fixture(t);
-  for (const body of ['<html>login</html>', JSON.stringify({ private: token }), ' '.repeat(1024*1024+1)]) {
+  const { environment, dbPath } = await fixture(t);
+  for (const body of [null, '<html>login</html>', JSON.stringify({ private: token }), ' '.repeat(1024*1024+1)]) {
     const result = await fetchCursorQuota({ environment, fetchImpl: async () => new Response(body) });
     assert.equal(result.status, 'retryable_error');
+    assert.equal(result.failureReason, 'unrecognizedResponse');
+    assert.doesNotMatch(JSON.stringify(result), /<html>/);
     assert.ok(!JSON.stringify(result).includes(token));
   }
+  for (const [fetchImpl, reason, httpStatus] of [
+    [() => new Response(token, { status: 502 }), 'httpStatus', 502],
+    [() => { throw new DOMException(token, 'TimeoutError'); }, 'timedOut'],
+    [() => { throw new TypeError(token); }, 'unreachable'],
+  ]) {
+    const result = await fetchCursorQuota({ environment, fetchImpl });
+    assert.equal(result.status, 'retryable_error');
+    assert.equal(result.failureReason, reason);
+    assert.equal(result.httpStatus, httpStatus);
+    assert.ok(!JSON.stringify(result).includes(token));
+  }
+  writeFileSync(dbPath, 'private malformed login');
+  const broken = await fetchCursorQuota({ environment, fetchImpl: () => assert.fail('unexpected request') });
+  assert.equal(broken.status, 'retryable_error');
+  assert.equal(broken.failureReason, 'credentialsUnreadable');
+  assert.doesNotMatch(JSON.stringify(broken), /private malformed login/);
 });
 
 test('AGY shows only the Gemini family as 5h/7d; other families are validated but not shown', () => {
@@ -157,6 +230,7 @@ test('AGY never reads credentials during discovery or falls back to another acco
   assert.equal(rejected.result.status,'unauthorized');
   const missing = await fetchAntigravityQuota({ environment: {PATH:''}, home: '/missing', platform: 'linux' });
   assert.equal(missing.status,'missing_credentials');
+  assert.equal(missing.failureReason, 'programNotFound');
   assert.match(missing.message, /agy.*Antigravity Desktop/);
 });
 
