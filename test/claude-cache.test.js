@@ -168,8 +168,11 @@ test('a warm run serves unchanged transcripts from the cache without opening the
   ]);
   const rich = expected.sessions.find((session) => session.project === 'app');
   // Out of order (the 10:35 line precedes 10:05): sorted, 10:00 → 10:35.
+  // Model time: two replies, each from its prompt to its last line, capped at
+  // 30 s + output / 20 per second: 45 output tokens (m1 40, m2 2, m3 3) give
+  // 32.25 s, 12 (m4 8, legacy 4) give 30.6 s.
   assert.deepEqual([rich.firstMessageAt, rich.lastMessageAt, rich.messageCount, rich.userMessageCount,
-    rich.activeSeconds], [ts(0), ts(35), 9, 2, 180 + 1740]);
+    rich.activeSeconds], [ts(0), ts(35), 9, 2, 63]);
 
   assert.deepEqual(normalize(await f.run()), expected, 'cold run builds the cache');
   assert.equal(f.cacheEntries().length, 2);

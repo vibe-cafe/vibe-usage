@@ -147,7 +147,9 @@ test('WorkBuddy maps routed models, exclusive usage, deduplicated requests, and 
     assert.equal(result.sessions[0].project, 'actual-project');
     assert.equal(result.sessions[0].messageCount, 3);
     assert.equal(result.sessions[0].userMessageCount, 1);
-    assert.equal(result.sessions[0].activeSeconds, 10);
+    // Model time: prompt → completed reply (10 s) and reply → usage-bearing
+    // function call (10 s).
+    assert.equal(result.sessions[0].activeSeconds, 20);
 
     const serialized = JSON.stringify(result);
     assert.equal(serialized.includes('PRIVATE_WORKBUDDY'), false);
