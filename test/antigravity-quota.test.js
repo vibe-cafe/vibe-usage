@@ -129,6 +129,7 @@ function install(t, { cli = true, desktop = true, platform = 'win32' } = {}) {
       onAttempt(name, options.timeoutMs);
     }
     const { products: [result], schemaVersion } = await fetchQuotaProducts(['antigravity'], {
+      egressPause: async () => null,
       environment, home, platform,
       commandImpl: async (binary, args, options) => {
         assert.equal(binary, agy);
@@ -171,6 +172,7 @@ test('agy waits for silent auth but stops when interactive login is impossible',
     for (const diagnostic of [silentAuth, noTerminal, 'Print mode: not logged in']) {
       await t.test(`${channel}: ${diagnostic}`, async () => {
         const { products: [result] } = await fetchQuotaProducts(['antigravity'], {
+      egressPause: async () => null,
           environment: { ANTIGRAVITY_CLI_PATH: process.execPath }, platform: 'linux',
           sessionImpl: (binary, callback, options) => withAntigravitySession(binary, callback, {
             ...options,
@@ -248,6 +250,7 @@ test('the running service waits for readiness and falls back immediately on an u
   ]) {
     const calls = [];
     const { products: [result] } = await fetchQuotaProducts(['antigravity'], {
+      egressPause: async () => null,
       home: '/fixture', platform: 'linux', environment: { ANTIGRAVITY_CLI_PATH: process.execPath },
       sessionImpl: (binary, callback, options) => withAntigravitySession(binary, callback, {
         ...options, spawnImpl(executable, args, opts) {
@@ -437,6 +440,7 @@ test('Mac desktop sessions use the bundle short version or the verified fallback
       '<key>CFBundleShortVersionString</key>\n  <string>2.45.1</string>']) {
       if (content !== null) writeFileSync(plist, content);
       const { products: [result] } = await fetchQuotaProducts(['antigravity'], {
+      egressPause: async () => null,
         environment, home, platform: 'darwin',
         sessionImpl: async (_, callback, options) => {
           versions.push(options.desktopVersion);
@@ -605,7 +609,7 @@ if (process.platform !== 'win32') {
       const trace = join(home, 'calls');
       writeFileSync(trace, '');
       const stdout = execFileSync(process.execPath, ['--import', isolate, cli, 'quota', 'fetch', '--product', 'antigravity', '--json'], {
-        timeout: 5000, env: { HOME: home, PATH: dirname(process.execPath), ANTIGRAVITY_CLI_PATH: binary,
+        timeout: 5000, env: { HOME: home, PATH: dirname(process.execPath), ANTIGRAVITY_CLI_PATH: binary, VIBE_USAGE_EGRESS_CHECK: "0",
           TMPDIR: tmpdir(), FIXTURE_USAGE: JSON.stringify(payload), FIXTURE_LOGIN: login, FIXTURE_TRACE: trace },
       });
       const { schemaVersion, products: [result] } = JSON.parse(stdout);
