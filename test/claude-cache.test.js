@@ -376,7 +376,11 @@ test('the rolling audit re-reads a transcript whose cache is older than the inte
   // change to the file: the cache is trusted until the audit comes round.
   const saved = JSON.parse(readFileSync(entryPath, 'utf8'));
   saved.state.keyed[0][3] = 999;
-  writeFileSync(entryPath, JSON.stringify(saved));
+  // With its trailing newline the entry grows by a byte. Written without it,
+  // in place (same inode), it kept its size, and when its mtime fell in the
+  // same timestamp tick as the first run's write (Windows CI), the whole-source
+  // snapshot, keyed by the cache directory's stats, still matched.
+  writeFileSync(entryPath, `${JSON.stringify(saved)}\n`);
   assert.equal((await f.run()).buckets[0].inputTokens, 999);
   const audited = await f.run({ VIBE_USAGE_CLAUDE_AUDIT_INTERVAL_MS: '0' });
   assert.equal(audited.buckets[0].inputTokens, 10);
