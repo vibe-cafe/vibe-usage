@@ -14,8 +14,8 @@ import { EGRESS_GATED_PRODUCTS, egressPauseFor } from '../egress-check.js';
 
 // Providers whose own request carries the user's vendor credential. When the
 // environment names a proxy this process cannot follow, they are not run
-// (network-privacy principle). Grok reads a local log; Antigravity talks to a
-// local language server and the official program makes its own requests.
+// (network-privacy principle). Grok and Antigravity delegate account requests
+// to the official programs and check their egress before starting a read.
 // The URLs each read requests, resolved by the provider itself: a URL on the
 // user's bypass list is the user's own direct rule, so it is not blocked; a
 // read that requests nothing (no key) is not blocked either.

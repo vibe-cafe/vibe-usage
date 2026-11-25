@@ -3,7 +3,7 @@
 // 「代理与地区风险-修复方案」§3.4, decided by the maintainer 2026-11-24).
 //
 // When the environment names a proxy for the vendor's hosts, the request goes
-// through it (`env-proxy.js`) and nothing here runs. When it goes out direct —
+// through it and nothing here runs. When it goes out direct —
 // no proxy at all, a host on the user's bypass list, or a proxy this machine
 // cannot see (TUN, a proxy on the router) — the CLI first asks a Cloudflare
 // edge on the same route which country it sees: an anonymous
@@ -12,10 +12,9 @@
 // serve, or no answer, pauses the read: nothing carrying the account is sent.
 //
 // Only the vendors the maintainer named pause (OpenAI, Anthropic, xAI,
-// Google). Of those the CLI reads Antigravity (Google, through `agy` or the
-// desktop language server, which make the request with their own login);
-// Grok reads a local log today and joins when it starts asking the official
-// program (#189). Google's hosts have no trace page, so a host of another
+// Google). The CLI reads Antigravity through agy or its desktop language
+// server, and Grok through its official CLI. Each uses its own login.
+// Grok's billing and API hosts have trace pages. For Google, a host of another
 // paused vendor on the same route stands in for them (`SUBSTITUTE_TRACE_HOSTS`).
 //
 // Settings, passed by the desktop apps or set by a terminal user:
@@ -41,8 +40,12 @@ export const UNSUPPORTED_EGRESS_REGIONS = Object.freeze(['CN', 'HK', 'MO']);
  */
 export const SUBSTITUTE_TRACE_HOSTS = Object.freeze(['chatgpt.com', 'api.anthropic.com']);
 
-/** Products the CLI gates, with the hosts their account requests reach. */
+/** Check every account route, including Grok's startup requests and token refresh. */
 export const EGRESS_GATED_PRODUCTS = Object.freeze({
+  grok: Object.freeze({
+    urls: ['https://cli-chat-proxy.grok.com/', 'https://auth.x.ai/', 'https://api.x.ai/'],
+    traceHosts: ['cli-chat-proxy.grok.com', 'api.x.ai'],
+  }),
   antigravity: Object.freeze({
     urls: ['https://daily-cloudcode-pa.googleapis.com/', 'https://generativelanguage.googleapis.com/'],
     traceHosts: [],
@@ -104,7 +107,8 @@ export function bypassedBroadly(url, environment = process.env) {
 /**
  * The route a gated product's own program takes to `url` (`agy`, a Go
  * program: for https only `HTTPS_PROXY` / `https_proxy`, not `HTTP_PROXY` or
- * `ALL_PROXY`, and the bypass list read broadly). `direct` whenever it might
+ * `ALL_PROXY`, and the bypass list read broadly). Grok may also use ALL_PROXY;
+ * that alone cannot exempt it from the check. `direct` whenever it might
  * go direct: reading it as direct costs one check, as proxied would skip one.
  */
 export function routeFor(url, environment = process.env) {
