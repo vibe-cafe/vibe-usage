@@ -236,18 +236,22 @@ test('on this runtime: the Windows app style (full URL plus NODE_USE_ENV_PROXY=1
 
 test('quota providers that carry a vendor credential are not run while blocked', async (t) => {
   const { fetchQuotaProducts } = await import('../src/quotas/registry.js');
-  const block = envProxyBlock('socks');
   const home = mkdtempSync(join(tmpdir(), 'vibe-usage-env-proxy-'));
   t.after(() => rmSync(home, { recursive: true, force: true }));
-  const envelope = await fetchQuotaProducts(['kimi-code', 'zcode', 'opencode-go', 'cursor'], {
-    envProxyBlock: block,
-    fetchImpl: () => { throw new Error('must not reach the network'); },
-    home,
-    environment: { HOME: home, VIBE_USAGE_QUOTA_CACHE_DIR: join(home, 'quota-cache'), VIBE_USAGE_CONFIG_DIR: home, Z_AI_API_KEY: 'test-key' },
-  });
-  for (const product of envelope.products) {
-    assert.equal(product.status, 'unsupported', product.id);
-    assert.equal(product.message, block.message);
+  for (const state of ['socks', 'unsupported']) {
+    const block = envProxyBlock(state);
+    const envelope = await fetchQuotaProducts(['kimi-code', 'zcode', 'opencode-go', 'cursor'], {
+      envProxyBlock: block,
+      fetchImpl: () => { throw new Error('must not reach the network'); },
+      home,
+      environment: { HOME: home, VIBE_USAGE_QUOTA_CACHE_DIR: join(home, 'quota-cache'), VIBE_USAGE_CONFIG_DIR: home, Z_AI_API_KEY: 'test-key' },
+    });
+    for (const product of envelope.products) {
+      assert.equal(product.status, 'unsupported', product.id);
+      assert.equal(product.pauseReason, 'proxyUnsupported');
+      assert.equal(product.failureReason, undefined);
+      assert.equal(product.message, block.message);
+    }
   }
 });
 

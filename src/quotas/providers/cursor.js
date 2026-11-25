@@ -6,6 +6,7 @@ import { cursorRefreshURL, cursorSignInBlock, cursorWebBase, endStoredCursorLogi
 import { queryDbJsonSnapshotOnLock } from '../../parsers/sqlite.js';
 import { attachCacheScope } from '../cache.js';
 import { quotaResult } from '../schema.js';
+import { InvalidQuotaResponse, parseQuotaPayload, requestFailureReason } from '../response.js';
 
 // `CURSOR_WEB_BASE_URL` is the test hook the sync parser already honors.
 const usageURL = environment => `${cursorWebBase(environment)}/api/usage-summary`;
@@ -107,7 +108,9 @@ export async function fetchCursorQuota({
   fetchImpl = globalThis.fetch, now = new Date(), timeoutMs = 10000, sleep,
 } = {}) {
   const result = (status, extra = {}) => quotaResult({ id: 'cursor', status, fetchedAt: now, ...extra });
-  const expired = () => result('unsupported', { message: LOGIN_EXPIRED_MESSAGE, signIn: 'expired' });
+  const expired = () => result('unsupported', { failureReason: 'credentialsRejected', message: LOGIN_EXPIRED_MESSAGE, signIn: 'expired' });
+  const renewalFailed = () => result('retryable_error', { failureReason: 'loginRefreshFailed',
+    message: 'Cursor sign-in renewal did not complete; retrying later' });
   // The separate Vibe Usage sign-in first (the app's, else the stored one).
   const login = resolveCursorLogin(environment);
   if (login?.unusable) return expired();
@@ -117,12 +120,12 @@ export async function fetchCursorQuota({
       // background run on a machine with a system proxy it was not told
       // about must not send the stored sign-in direct.
       const block = cursorSignInBlock([], { env: environment, blockFor: () => null });
-      if (block) return result('unsupported', { message: block.message });
+      if (block) return result('unsupported', { pauseReason: 'proxyUnsupported', message: block.message });
     }
     const options = { env: environment, fetchImpl, now, ...(sleep ? { sleep } : {}) };
     const fresh = await freshCursorLogin(login, options);
     if (fresh.expired) return expired();
-    if (fresh.retryable) return result('retryable_error', { message: 'Cursor sign-in renewal did not complete; retrying later' });
+    if (fresh.retryable) return renewalFailed();
     // The token changes on every renewal; the account does not.
     let answer = await readCursorQuota(fresh.credential.accessToken, `user:${fresh.credential.userId}`);
     if (answer.status !== 'unauthorized') return answer;
@@ -131,7 +134,7 @@ export async function fetchCursorQuota({
     if (!fresh.refreshed) {
       const renewed = await freshCursorLogin(login, { ...options, force: true });
       if (renewed.expired) return expired();
-      if (renewed.retryable) return result('retryable_error', { message: 'Cursor sign-in renewal did not complete; retrying later' });
+      if (renewed.retryable) return renewalFailed();
       answer = await readCursorQuota(renewed.credential.accessToken, `user:${renewed.credential.userId}`);
       if (answer.status !== 'unauthorized') return answer;
       rejected = renewed.credential;
@@ -142,12 +145,14 @@ export async function fetchCursorQuota({
 
   let token;
   try { token = readCursorQuotaToken(cursorQuotaDbPath(environment, home, platform)); }
-  catch { return result('retryable_error', { message: 'Cursor login could not be read' }); }
+  catch { return result('retryable_error', { failureReason: 'credentialsUnreadable', message: 'Cursor login could not be read' }); }
   if (!token) return result('missing_credentials', { message: 'Open Cursor and sign in, then retry' });
   // Sent as a cookie the ciphertext is a certain 401 ("sign in again"). Like
   // missing_credentials this result carries no cache scope, so the registry
   // neither writes a cache entry for it nor falls back to an older one.
-  if (isEncryptedCursorToken(token)) return result('unsupported', { message: ENCRYPTED_TOKEN_MESSAGE, signIn: 'required' });
+  if (isEncryptedCursorToken(token)) {
+    return result('unsupported', { failureReason: 'credentialsEncrypted', message: ENCRYPTED_TOKEN_MESSAGE, signIn: 'required' });
+  }
   return readCursorQuota(token, token);
 
   async function readCursorQuota(sessionToken, scope) {
@@ -163,17 +168,18 @@ export async function fetchCursorQuota({
         if ([401, 403].includes(response.status)) { await response.body?.cancel(); continue; }
         if (!response.ok) {
           await response.body?.cancel();
-          return scoped('retryable_error', { message: `Cursor quota API returned HTTP ${response.status}` });
+          return scoped('retryable_error', { failureReason: 'httpStatus', httpStatus: response.status,
+            message: `Cursor quota API returned HTTP ${response.status}` });
         }
         const chunks = [];
         let size = 0;
-        for await (const chunk of response.body) {
+        for await (const chunk of response.body || []) {
           size += chunk.length;
-          if (size > 1024 * 1024) throw new Error('Oversized response');
+          if (size > 1024 * 1024) throw new InvalidQuotaResponse('Oversized response');
           chunks.push(chunk);
         }
         const payload = JSON.parse(Buffer.concat(chunks).toString('utf8'));
-        const meters = parseCursorQuota(payload);
+        const meters = parseQuotaPayload(parseCursorQuota, payload);
         const plans = { free: 'Free', pro: 'Pro', premium: 'Pro', pro_plus: 'Pro+', ultra: 'Ultra',
           enterprise: 'Enterprise', team: 'Team' };
         return scoped(meters.length ? 'ok' : 'no_data', { meters,
@@ -181,8 +187,9 @@ export async function fetchCursorQuota({
           ...(meters.length ? {} : { emptyReason: 'noWindow' }) });
       }
       return scoped('unauthorized', { message: 'Open Cursor and sign in again, then retry' });
-    } catch {
-      return scoped('retryable_error', { message: 'Cursor quota request failed; retry after checking the connection' });
+    } catch (error) {
+      return scoped('retryable_error', { failureReason: requestFailureReason(error),
+        message: 'Cursor quota request failed; retry after checking the connection' });
     }
   }
 }

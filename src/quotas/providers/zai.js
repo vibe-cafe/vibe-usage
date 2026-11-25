@@ -1,5 +1,6 @@
 import { attachCacheScope } from '../cache.js';
 import { quotaResult } from '../schema.js';
+import { parseQuotaPayload, requestFailureReason } from '../response.js';
 
 const PRODUCT_ID = 'zcode';
 const BIGMODEL_USAGE_URL = 'https://open.bigmodel.cn/api/monitor/usage/quota/limit';
@@ -93,6 +94,7 @@ export function parseZaiQuota(payload, now = new Date()) {
     throw new Error('Invalid Z.ai quota response');
   }
   const parsed = payload.data.limits.map((raw, index) => parseLimit(raw, now, index)).filter(Boolean);
+  if (payload.data.limits.length && !parsed.length) throw new Error('Unrecognized Z.ai quota limits');
   const planLimits = parsed
     .filter(item => item.type === 'TOKENS_LIMIT' || item.type === 'CREDIT_LIMIT')
     .sort((a, b) => (a.windowMinutes || Number.MAX_SAFE_INTEGER)
@@ -133,14 +135,16 @@ export async function fetchZaiQuota({
     }
     if (!response.ok) {
       return attachCacheScope(quotaResult({ id: PRODUCT_ID, status: 'retryable_error',
+        failureReason: 'httpStatus', httpStatus: response.status,
         message: `${providerName} quota API returned HTTP ${response.status}`, fetchedAt: now }),
       cacheCredential);
     }
-    const { meters, planLabel } = parseZaiQuota(await response.json(), now);
+    const { meters, planLabel } = parseQuotaPayload(parseZaiQuota, await response.json(), now);
     return attachCacheScope(quotaResult({ id: PRODUCT_ID, status: meters.length ? 'ok' : 'no_data',
-      meters, planLabel, fetchedAt: now, dataAsOf: now }), cacheCredential);
+      emptyReason: meters.length ? undefined : 'noWindow', meters, planLabel, fetchedAt: now, dataAsOf: now }), cacheCredential);
   } catch (error) {
     return attachCacheScope(quotaResult({ id: PRODUCT_ID, status: 'retryable_error',
+      failureReason: requestFailureReason(error),
       message: error?.name === 'TimeoutError'
         ? `${providerName} quota request timed out`
         : `${providerName} quota request failed`,

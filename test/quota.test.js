@@ -18,6 +18,7 @@ import { createServer } from 'node:http';
 import { pathToFileURL } from 'node:url';
 import { discoverQuotaProducts, fetchQuotaProducts } from '../src/quotas/registry.js';
 import { quotaResult } from '../src/quotas/schema.js';
+import { requestFailureReason } from '../src/quotas/response.js';
 import {
   fetchKimiCodeQuota,
   kimiCredentialPath,
@@ -30,6 +31,26 @@ import {
   parseGrokBillingLog,
 } from '../src/quotas/providers/grok.js';
 import { fetchZaiQuota, parseZaiQuota } from '../src/quotas/providers/zai.js';
+
+test('quota failure reasons are closed, compatible with empty reasons and exclusive of pauses', () => {
+  const result = extra => quotaResult({ id: 'grok', status: 'unsupported', ...extra });
+  for (const failureReason of ['credentialsMissing', 'credentialsRejected', 'programOutdated', 'credentialsEncrypted']) {
+    assert.equal(result({ failureReason }).failureReason, failureReason);
+  }
+  assert.throws(() => result({ failureReason: 'server echoed something' }), TypeError);
+  assert.throws(() => result({ failureReason: 'unreachable', pauseReason: 'proxyUnsupported' }), TypeError);
+  const local = result({ status: 'no_data', source: 'local', failureReason: 'unreachable', emptyReason: 'periodEnded' });
+  assert.equal(local.emptyReason, 'periodEnded');
+  assert.equal(local.failureReason, 'unreachable');
+  for (const httpStatus of [99, 600, 502.5, '502', null]) {
+    assert.ok(!Object.hasOwn(result({ failureReason: 'httpStatus', httpStatus }), 'httpStatus'));
+  }
+  for (const httpStatus of [100, 502, 599]) {
+    assert.equal(result({ failureReason: 'httpStatus', httpStatus }).httpStatus, httpStatus);
+    assert.ok(!Object.hasOwn(result({ failureReason: 'unreachable', httpStatus }), 'httpStatus'));
+    assert.ok(!Object.hasOwn(result({ httpStatus }), 'httpStatus'));
+  }
+});
 
 function jsonResponse(payload, status = 200) {
   return new Response(JSON.stringify(payload), {
@@ -229,6 +250,22 @@ test('Grok fetch reads its official bounded local log without credentials or net
     assert.equal(result.source, 'local');
     assert.equal(result.planLabel, 'X Premium+');
     assert.equal(result.meters[0].utilization, 30);
+    assert.equal(result.failureReason, undefined);
+    const expired = fetchGrokQuota({ environment, home: root, now: new Date('2026-09-14T00:00:00Z') });
+    assert.equal(expired.status, 'no_data');
+    assert.equal(expired.emptyReason, 'periodEnded');
+    assert.equal(expired.dataAsOf, '2026-09-08T02:00:00.000Z');
+    writeFileSync(logPath, '{"msg":"private unrelated event"}\n');
+    const empty = fetchGrokQuota({ environment, home: root });
+    assert.equal(empty.status, 'no_data');
+    assert.equal(empty.emptyReason, 'noLocalRecord');
+    assert.ok(!JSON.stringify(empty).includes('private unrelated event'));
+    // Any read error other than a missing file. A NUL in the path is rejected
+    // on every platform (a file as GROK_HOME is ENOENT on Windows, and Windows
+    // opens a directory as an empty file).
+    const unreadable = fetchGrokQuota({ environment: { GROK_HOME: join(root, 'bad\0home') }, home: root });
+    assert.equal(unreadable.status, 'retryable_error');
+    assert.equal(unreadable.failureReason, 'localRecordUnreadable');
   } finally {
     rmSync(root, { recursive: true, force: true });
   }
@@ -254,6 +291,7 @@ test('Grok fetch drops an expired billing period and handles a missing log quiet
     now: new Date('2026-09-08T00:00:00Z'),
   });
   assert.equal(missing.status, 'no_data');
+  assert.equal(missing.emptyReason, 'noLocalRecord');
 });
 
 test('Kimi parser supports summary, detail.remaining, duration, and reset spellings', () => {
@@ -433,6 +471,7 @@ test('Kimi expired credentials without a refresh token return without network ac
       fetchImpl: async () => { called = true; },
     });
     assert.equal(result.status, 'expired_credentials');
+    assert.equal(result.failureReason, undefined);
     assert.equal(called, false);
   } finally {
     rmSync(root, { recursive: true, force: true });
@@ -673,6 +712,7 @@ test('Kimi treats refresh HTTP 401 and 403 as unauthorized without leaking crede
         });
         const serialized = JSON.stringify(result);
         assert.equal(result.status, 'unauthorized');
+        assert.equal(result.failureReason, undefined);
         assert.equal(serialized.includes(`secret-access-${status}`), false);
         assert.equal(serialized.includes(`secret-refresh-${status}`), false);
         assert.equal(serialized.includes('server echoed'), false);
@@ -708,10 +748,84 @@ test('Kimi refresh retry failures stay generic and never include token-shaped se
     const serialized = JSON.stringify(result);
     assert.equal(calls, 3);
     assert.equal(result.status, 'retryable_error');
+    assert.equal(result.failureReason, 'loginRefreshFailed');
     assert.equal(serialized.includes('secret-expired-access'), false);
     assert.equal(serialized.includes('secret-refresh-value'), false);
   } finally {
     rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test('Kimi distinguishes a failed forced refresh after 401 from a failed second usage request', async t => {
+  const home = mkdtempSync(join(tmpdir(), 'vbu-kimi-refresh-reason-'));
+  t.after(() => rmSync(home, { recursive: true, force: true }));
+  const directory = join(home, '.kimi-code', 'credentials');
+  const path = join(directory, 'kimi-code.json');
+  mkdirSync(directory, { recursive: true });
+  for (const mode of ['offline', 'usage-timeout', 'unwritable']) {
+    writeFileSync(path, JSON.stringify({ access_token: 'fake-access', refresh_token: 'fake-refresh' }));
+    const methods = [];
+    const result = await fetchKimiCodeQuota({ home, environment: {}, sleepImpl: async () => {},
+      fetchImpl: async (_url, { method }) => {
+        methods.push(method);
+        if (method === 'GET' && methods.length > 1) throw new DOMException('private timeout', 'TimeoutError');
+        if (method === 'GET') return jsonResponse({}, 401);
+        if (mode === 'offline') throw new Error('private auth server details');
+        if (mode === 'unwritable') {
+          rmSync(path);
+          mkdirSync(path);
+        }
+        return jsonResponse({ access_token: 'fake-rotated', expires_in: 3600 });
+      } });
+    assert.equal(result.status, 'retryable_error');
+    assert.equal(result.failureReason, mode === 'usage-timeout' ? 'timedOut' : 'loginRefreshFailed');
+    if (mode === 'usage-timeout') assert.deepEqual(methods, ['GET', 'POST', 'GET']);
+    assert.doesNotMatch(JSON.stringify(result), /private auth|private timeout|fake-access|fake-refresh|fake-rotated/);
+  }
+});
+
+test('Kimi and ZCode distinguish empty windows, malformed responses and transport failures', async t => {
+  const home = mkdtempSync(join(tmpdir(), 'vbu-quota-reasons-'));
+  t.after(() => rmSync(home, { recursive: true, force: true }));
+  const directory = join(home, '.kimi-code', 'credentials');
+  mkdirSync(directory, { recursive: true });
+  writeFileSync(join(directory, 'kimi-code.json'), JSON.stringify({ access_token: 'synthetic-key' }));
+  const environment = { Z_AI_API_KEY: 'synthetic-key' };
+  for (const [fetchQuota, empty, malformed] of [
+    [fetchKimiCodeQuota, [{ usages: {} }, { usage: {} }, { limits: [] }, { usages: { unknown: {} } }],
+      [null, {}, { usages: [], usage: [], limits: {} }, { usages: { limit_5h: { used_ratio: 1, reset_at: 1e20 } } }]],
+    [fetchZaiQuota, [{ ...zaiPayload, data: { limits: [] } }],
+      [{}, { ...zaiPayload, data: { limits: [{ type: 'NEW_LIMIT' }] } }]],
+  ]) {
+    const read = fetchImpl => fetchQuota({ home, environment, fetchImpl });
+    for (const payload of empty) {
+      const result = await read(() => jsonResponse(payload));
+      assert.equal(result.status, 'no_data');
+      assert.equal(result.emptyReason, 'noWindow');
+      assert.equal(result.failureReason, undefined);
+    }
+    for (const [fetchImpl, reason, httpStatus] of [
+      ...malformed.map(payload => [() => jsonResponse(payload), 'unrecognizedResponse']),
+      [() => new Response('private invalid JSON'), 'unrecognizedResponse'],
+      [() => new Response('private response', { status: 502 }), 'httpStatus', 502],
+      [() => { throw new DOMException('private timeout', 'TimeoutError'); }, 'timedOut'],
+      [() => { throw new TypeError('private network details'); }, 'unreachable'],
+    ]) {
+      const result = await read(fetchImpl);
+      assert.equal(result.status, 'retryable_error');
+      assert.equal(result.failureReason, reason);
+      assert.equal(result.httpStatus, httpStatus);
+      assert.doesNotMatch(JSON.stringify(result), /synthetic-key|private|NEW_LIMIT/);
+    }
+    for (const status of [401, 403]) {
+      const result = await read(() => jsonResponse({}, status));
+      assert.equal(result.status, 'unauthorized');
+      assert.equal(result.failureReason, undefined);
+    }
+    const missing = await fetchQuota({ home: join(home, 'absent'), environment: {},
+      fetchImpl: () => assert.fail('unexpected request') });
+    assert.equal(missing.status, 'missing_credentials');
+    assert.equal(missing.failureReason, undefined);
   }
 });
 
@@ -852,6 +966,8 @@ test('fetch handles only requested products and uses sanitized cache on transien
     });
     assert.equal(cached.products[0].status, 'ok');
     assert.equal(cached.products[0].source, 'cache');
+    assert.equal(cached.products[0].failureReason, 'unreachable');
+    assert.equal(cached.products[0].httpStatus, undefined);
     assert.equal(JSON.stringify(cached).includes('must-never-enter-cache'), false);
 
     const cachedAfterServerError = await fetchQuotaProducts(['kimi-code'], {
@@ -862,6 +978,10 @@ test('fetch handles only requested products and uses sanitized cache on transien
     });
     assert.equal(cachedAfterServerError.products[0].status, 'ok');
     assert.equal(cachedAfterServerError.products[0].source, 'cache');
+    assert.equal(cachedAfterServerError.products[0].failureReason, 'httpStatus');
+    assert.equal(cachedAfterServerError.products[0].httpStatus, 503);
+    assert.equal(readFileSync(join(root, 'cache', 'quota-cache.json'), 'utf8'), cacheText);
+    assert.doesNotMatch(cacheText, /failureReason|httpStatus/);
 
     writeFileSync(join(root, '.kimi', 'credentials', 'kimi-code.json'), JSON.stringify({
       access_token: 'a-different-account-token',
@@ -890,4 +1010,15 @@ test('fetch handles only requested products and uses sanitized cache on transien
   } finally {
     rmSync(root, { recursive: true, force: true });
   }
+});
+
+test('a timeout through the proxy tunnel is reported as timedOut, not unreachable', () => {
+  // Native fetch throws TimeoutError; http.request (the proxy tunnel) throws
+  // AbortError carrying the TimeoutError as its cause.
+  const timeout = new DOMException('timed out', 'TimeoutError');
+  const tunnelAbort = Object.assign(new Error('aborted'), { name: 'AbortError', cause: timeout });
+  assert.equal(requestFailureReason(timeout), 'timedOut');
+  assert.equal(requestFailureReason(tunnelAbort), 'timedOut');
+  assert.equal(requestFailureReason(new TypeError('fetch failed')), 'unreachable');
+  assert.equal(requestFailureReason(new SyntaxError('bad json')), 'unrecognizedResponse');
 });

@@ -334,6 +334,7 @@ test('quota reads with the Vibe Usage sign-in, scoped to the account, and says w
     ? json({ shouldLogout: true }) : json({}, 401)) });
   assert.equal(ended.status, 'unsupported');
   assert.equal(ended.signIn, 'expired');
+  assert.equal(ended.failureReason, 'credentialsRejected');
   assert.equal(ended.cacheScope, undefined);
   assert.equal(readStoredCursorLogin(environment).rejected, true);
   const again = await fetchCursorQuota({ environment, fetchImpl: async () => assert.fail('no request once ended') });
@@ -496,6 +497,7 @@ test('sync and quota: a stored sign-in sends nothing on a system proxy the proce
   const quota = await fetchCursorQuota({ environment: process.env, fetchImpl: async () => assert.fail('no request') });
   assert.equal(quota.status, 'unsupported');
   assert.match(quota.message, /system proxy/);
+  assert.equal(quota.pauseReason, 'proxyUnsupported');
   assert.equal(fetchMock.mock.callCount(), 0);
   // An app's sign-in: the app has turned the system proxy into variables.
   setProvidedCursorLogin(JSON.stringify(cursorCredential({ accessToken: tokenFor('user_a'), refreshToken: 'r' })));
@@ -522,9 +524,10 @@ test('sync: while a desktop app syncs Cursor with its own sign-in, a run with an
   // The same account: nothing to protect, and the app's record is carried
   // forward, so a later switch to another account is still caught.
   writeStoredCursorLogin(cursorCredential({ accessToken: tokenFor('user_app'), refreshToken: 'r' }), process.env);
-  const same = await cursor.parse({ previousInfo: appInfo() });
+  const recorded = appInfo();
+  const same = await cursor.parse({ previousInfo: recorded });
   assert.equal(same.buckets.length, 1);
-  assert.deepEqual(same.info.app, appInfo().app);
+  assert.deepEqual(same.info.app, recorded.app);
   writeStoredCursorLogin(cursorCredential({ accessToken: tokenFor('user_other'), refreshToken: 'r' }), process.env);
   assert.match((await cursor.parse({ previousInfo: same.info })).warnings[0], /正由桌面 App 用另一个账号同步/);
   // The app itself always reads, and records that it did.

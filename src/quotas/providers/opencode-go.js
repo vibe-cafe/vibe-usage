@@ -3,6 +3,7 @@ import { homedir } from 'node:os';
 import { delimiter, join } from 'node:path';
 import { attachCacheScope } from '../cache.js';
 import { quotaResult } from '../schema.js';
+import { parseQuotaPayload, requestFailureReason } from '../response.js';
 import { isSqliteUnavailableError, queryDbJson, sqliteUnavailableError } from '../../parsers/sqlite.js';
 
 const PRODUCT_ID = 'opencode-go';
@@ -224,9 +225,10 @@ export function parseOpenCodeGoUsage(payload) {
     throw new Error('OpenCode usage response is not an object');
   }
   const usage = payload.usage;
+  if (!isRecord(usage)) throw new Error('Missing OpenCode usage object');
   const meters = [];
   for (const [id, label] of METER_ORDER) {
-    const item = usage?.[id];
+    const item = usage[id];
     if (!item || typeof item !== 'object' || Array.isArray(item)) continue;
     const percent = Number(item.percent);
     if (!Number.isFinite(percent)) continue;
@@ -234,6 +236,9 @@ export function parseOpenCodeGoUsage(payload) {
     const resetsAt = date(item.resetsAt);
     if (resetsAt) meter.resetsAt = resetsAt.toISOString();
     meters.push(meter);
+  }
+  if (!meters.length && METER_ORDER.some(([id]) => Object.hasOwn(usage, id))) {
+    throw new Error('Unrecognized OpenCode usage windows');
   }
   return meters;
 }
@@ -266,6 +271,7 @@ export async function fetchOpenCodeGoQuota({
     return quotaResult({
       id: PRODUCT_ID,
       status: 'retryable_error',
+      failureReason: 'credentialsUnreadable',
       message: sqliteUnavailableError('OpenCode Go').message,
       fetchedAt: now,
     });
@@ -274,6 +280,7 @@ export async function fetchOpenCodeGoQuota({
     return quotaResult({
       id: PRODUCT_ID,
       status: 'retryable_error',
+      failureReason: 'credentialsUnreadable',
       message: 'OpenCode credential store could not be read',
       fetchedAt: now,
     });
@@ -331,14 +338,17 @@ export async function fetchOpenCodeGoQuota({
       return attachCacheScope(quotaResult({
         id: PRODUCT_ID,
         status: 'retryable_error',
+        failureReason: 'httpStatus',
+        httpStatus: response.status,
         message: `OpenCode usage API returned HTTP ${response.status}`,
         fetchedAt: now,
       }), scope);
     }
-    const meters = parseOpenCodeGoUsage(await response.json());
+    const meters = parseQuotaPayload(parseOpenCodeGoUsage, await response.json());
     return attachCacheScope(quotaResult({
       id: PRODUCT_ID,
       status: meters.length ? 'ok' : 'no_data',
+      emptyReason: meters.length ? undefined : 'noWindow',
       meters,
       message: meters.length ? undefined : 'OpenCode usage API returned no window',
       fetchedAt: now,
@@ -348,6 +358,7 @@ export async function fetchOpenCodeGoQuota({
     return attachCacheScope(quotaResult({
       id: PRODUCT_ID,
       status: 'retryable_error',
+      failureReason: requestFailureReason(error),
       message: error?.name === 'TimeoutError'
         ? 'OpenCode usage request timed out'
         : 'OpenCode usage request failed',

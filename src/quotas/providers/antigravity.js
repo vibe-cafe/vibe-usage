@@ -247,7 +247,7 @@ function binaryKey(binary) {
 
 const quota = (status, now, extra = {}) => quotaResult({ id: 'antigravity', status, fetchedAt: now, ...extra });
 const UNAUTHORIZED = { message: 'Sign in to Antigravity and retry' };
-const RETRY = { message: 'Check the Antigravity connection and retry' };
+const RETRY = { failureReason: 'programNoAnswer', message: 'Check the Antigravity connection and retry' };
 
 /**
  * One read, in the order the maintainer set on 2026-11-24: the official
@@ -380,9 +380,9 @@ export async function readAntigravityQuota({
   }
 }
 
-const NEVER_USED = { message: 'Use Antigravity once on this computer to show its quota' };
-const NOT_YET = { message: 'Antigravity quota has not been read yet' };
-const USED_SINCE = { message: 'Antigravity was used after its window reset; the next read shows it' };
+const NEVER_USED = { emptyReason: 'noLocalRecord', message: 'Use Antigravity once on this computer to show its quota' };
+const NOT_YET = { emptyReason: 'noLocalRecord', message: 'Antigravity quota has not been read yet' };
+const USED_SINCE = { emptyReason: 'periodEnded', message: 'Antigravity was used after its window reset; the next read shows it' };
 
 /** What to show without asking Google: the remembered outcome. */
 function rememberedResult(state, now, activity) {
@@ -398,7 +398,8 @@ function rememberedResult(state, now, activity) {
   if (!meters.length) return state.failure ? quota('retryable_error', now, RETRY) : quota('no_data', now, USED_SINCE);
   // After a failed read the numbers are the last good ones: the clients mark
   // `source: "cache"` as "live read failed".
-  return quota('ok', now, { meters, dataAsOf, source: state.failure ? 'cache' : 'live' });
+  return quota('ok', now, { meters, dataAsOf, source: state.failure ? 'cache' : 'live',
+    failureReason: state.failure ? RETRY.failureReason : undefined });
 }
 
 /**
@@ -414,7 +415,9 @@ export async function fetchAntigravityQuota(options = {}) {
   } = options;
   const binary = antigravityBinary(environment, home, platform);
   const desktop = firstExecutable(antigravityDesktopPaths(environment, home, platform), platform);
-  if (!binary && !desktop) return quota('missing_credentials', now, { message: 'Install agy or Antigravity Desktop and sign in' });
+  if (!binary && !desktop) return quota('missing_credentials', now, {
+    failureReason: 'programNotFound', message: 'Install agy or Antigravity Desktop and sign in',
+  });
 
   const state = loadAntigravityState(statePath);
   const before = activityImpl(home);
