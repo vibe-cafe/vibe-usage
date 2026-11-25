@@ -55,6 +55,23 @@ export function getSyncHistoryPath() {
   return HISTORY_FILE;
 }
 
+// What an index build was doing when the run stopped (`indexing.phase`). A
+// counter that drops from 9,650 to 0 between two syncs is the next phase
+// starting, not progress lost; without the phase the history read like a reset
+// (2026-11-25). Closed list: anything else is left out.
+export const INDEXING_PHASES = Object.freeze([
+  'discovery', 'replay-index', 'segments', 'usage', // Codex
+  'transcripts', // Claude Code
+]);
+
+function indexingRecord(indexing) {
+  return {
+    ...(INDEXING_PHASES.includes(indexing.phase) ? { phase: indexing.phase } : {}),
+    completed: count(indexing.completed),
+    total: count(indexing.total),
+  };
+}
+
 const NETWORK_ERROR_CODES = new Set([
   'ECONNRESET', 'ECONNREFUSED', 'ECONNABORTED', 'ENOTFOUND', 'EAI_AGAIN',
   'ETIMEDOUT', 'EHOSTUNREACH', 'ENETUNREACH', 'ENETDOWN', 'EPIPE',
@@ -195,7 +212,7 @@ export function beginSyncRecord({ surface: defaultSurface = 'cli', now = () => D
       item.buckets = count(item.buckets) + count(buckets);
       item.sessions = count(item.sessions) + count(sessions);
       if (skipped) item.skipped = true;
-      if (indexing) item.indexing = { completed: count(indexing.completed), total: count(indexing.total) };
+      if (indexing) item.indexing = indexingRecord(indexing);
       if (error) item.error = isWarningCode(error) ? error : 'parser_error';
       if (hasWarnings) {
         item.warnings ??= {};
@@ -286,9 +303,7 @@ function sanitizeTool(raw) {
   if (!raw || typeof raw !== 'object') return null;
   const tool = { buckets: count(raw.buckets), sessions: count(raw.sessions) };
   if (raw.skipped === true) tool.skipped = true;
-  if (raw.indexing && typeof raw.indexing === 'object') {
-    tool.indexing = { completed: count(raw.indexing.completed), total: count(raw.indexing.total) };
-  }
+  if (raw.indexing && typeof raw.indexing === 'object') tool.indexing = indexingRecord(raw.indexing);
   if (isWarningCode(raw.error)) tool.error = raw.error;
   if (raw.warnings && typeof raw.warnings === 'object') {
     const warnings = {};

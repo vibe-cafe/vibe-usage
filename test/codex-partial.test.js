@@ -209,3 +209,52 @@ test('a run that cannot read every header is still skipped', async () => {
   assert.equal(first.result.skipped, true);
   assert.equal(first.result.indexing.phase, 'discovery');
 });
+
+test('a cold start reads the conversations in use first; history follows, and the end equals one uninterrupted read', async () => {
+  const m = machine();
+  // A month of history, every conversation in two homes (Orca hard-links each
+  // rollout into every account's home), named so that a directory-order read
+  // reaches it first; an old conversation and a fork of it made today; and a
+  // conversation in use.
+  const monthAgo = (clock.now - 30 * 24 * 3600e3) / 1000;
+  for (let i = 1; i <= 6; i++) {
+    const name = `rollout-2026-07-0${i}T08-00-00-h${i}.jsonl`;
+    writeFileSync(m.file('codex', name), jsonl([
+      sessionMeta(`2026-07-0${i}T08:00:00.000Z`, `history-${i}`),
+      tokenCount(`2026-07-0${i}T08:05:00.000Z`, 100 * i, 100 * i + 1),
+    ]));
+    linkSync(m.file('codex', name), m.file('orca1', name));
+    fs.utimesSync(m.file('codex', name), monthAgo, monthAgo);
+  }
+  writeFileSync(m.file('codex', 'rollout-2026-07-10T08-00-00-parent.jsonl'), parent);
+  fs.utimesSync(m.file('codex', 'rollout-2026-07-10T08-00-00-parent.jsonl'), monthAgo, monthAgo);
+  writeFileSync(m.file('orca1', 'rollout-2026-07-17T09-00-00-fork.jsonl'), fork);
+  writeFileSync(m.file('orca1', 'rollout-2026-07-18T10-00-00-active.jsonl'), active([tokenCount('2026-07-18T10:05:00.000Z', 40, 41)]));
+
+  // 15 headers (150 ms). Pass 1, the conversations in use: the fork's index,
+  // the active conversation (170 ms). Pass 2, what they lack: the parent's
+  // index, its usage, the fork's usage (200 ms). Pass 3, history, newest
+  // first: one index read, then the budget is gone.
+  const runs = [await m.run(205, { extraRoots: true })];
+  const first = runs[0].result;
+  assert.equal(first.skipped, undefined, JSON.stringify(first));
+  assert.ok(first.indexing, 'history is left for the next runs');
+  assert.equal(input(first), 40 + 3000 + 5, 'the conversations in use, the fork with its parent');
+  assert.equal(input(first, FORK_WINDOW), 40 + 5, 'never the parent\'s history copied into the fork');
+
+  while (runs.at(-1).result.indexing && runs.length < 6) runs.push(await m.run(205, { extraRoots: true }));
+  const last = runs.at(-1).result;
+  assert.equal(last.indexing, undefined, `complete after ${runs.length} runs`);
+  const expected = await m.uncached({ extraRoots: true });
+  // Byte for byte, in the order one uninterrupted read emits them.
+  assert.equal(JSON.stringify({ buckets: last.buckets, sessions: last.sessions }),
+    JSON.stringify({ buckets: expected.buckets, sessions: expected.sessions }));
+  assert.equal(input(expected), 40 + 3000 + 5 + 2100);
+  // No run ever sent more for a window than the complete read has there.
+  const final = new Map(last.buckets.map(bucket => [`${bucket.bucketStart}|${bucket.model}|${bucket.project}`, bucket.totalTokens]));
+  for (const { result } of runs) {
+    for (const bucket of result.buckets) {
+      assert.ok(bucket.totalTokens <= final.get(`${bucket.bucketStart}|${bucket.model}|${bucket.project}`), JSON.stringify(bucket));
+    }
+  }
+});

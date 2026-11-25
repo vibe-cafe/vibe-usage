@@ -110,7 +110,7 @@ maintainer (Hogan), 一键诊断 plan, step 2.
 | `lastSync.buckets` / `.sessions` | number | What the parser produced in that sync (not what was uploaded). |
 | `lastSync.skipped` | boolean | The parser marked its result partial, so the sync kept its old state. Cursor is always `true` (it only re-reads recent windows); use `incomplete` to decide whether it is a problem. |
 | `lastSync.incomplete` | boolean | `skipped` and not one of the normal cases (Cursor's partial view, an index still being built): the parser gave up and this tool's data is incomplete. Some parsers do this without any warning (an incompatible MiniMax Code / Devin database), so never show such a tool as healthy: 「已跳过，结果不完整」. |
-| `lastSync.indexing` | `{ completed: number, total: number }` \| null | Building a local index (Claude Code / Codex cold cache); continues next sync. |
+| `lastSync.indexing` | `{ phase?: string, completed: number, total: number }` \| null | Building a local index (Claude Code / Codex cold cache); continues next sync. `phase` (added 2026-11-25, absent in records written before) is one of `discovery`, `replay-index`, `segments`, `usage` (Codex) or `transcripts` (Claude Code); the counts belong to that phase, so `completed` can fall when the next phase starts. |
 | `lastSync.warnings` | `{ <warning code>: number }` | How many warnings of each code (parsers cap their own warning lists, typically at 20). |
 | `lastSync.error` | warning code \| null | The parser threw instead of returning; usually `parser_error`, `sqlite_unavailable` or `auth_rejected`. |
 | `lastSync.serverDropped` | number | Buckets the server soft-dropped because it does not know this source yet. |

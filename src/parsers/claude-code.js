@@ -482,8 +482,11 @@ function readGuard(filePath, offset) {
   };
 }
 
+// Size, mtime and inode; never the device number, which macOS changes on many
+// reboots: comparing it rejected every entry after the reboot of 2026-11-25 and
+// rebuilt the whole cache (see sameSignature() in codex-cache.js).
 function sameSignature(a, b) {
-  return a.size === b.size && a.mtimeMs === b.mtimeMs && a.dev === b.dev && a.ino === b.ino;
+  return a.size === b.size && a.mtimeMs === b.mtimeMs && a.ino === b.ino;
 }
 
 /**
@@ -496,7 +499,7 @@ function canResume(cache, candidate) {
   const prior = cache.signature;
   const now = candidate.signature;
   if (cache.state.fallbackProject !== candidate.fallbackProject) return false;
-  if (prior.dev !== now.dev || prior.ino !== now.ino) return false;
+  if (prior.ino !== now.ino) return false;
   if (now.size < prior.size || now.mtimeMs < prior.mtimeMs) return false;
   if (cache.parsedBytes <= 0 || cache.parsedBytes > now.size || !cache.guardHash) return false;
   try {
@@ -742,7 +745,8 @@ export async function parse({ extraRoots = [], magpie } = {}) {
     // The signature captured at discovery, never a fresh stat: each file is
     // read only up to the size captured then, so a fresh stat taken after an
     // append would store the shorter result under the longer file's manifest.
-    const sig = (c) => `${c.signature.size}:${c.signature.mtimeMs}:${c.signature.dev}:${c.signature.ino}`;
+    // Without the device number, like sameSignature().
+    const sig = (c) => `${c.signature.size}:${c.signature.mtimeMs}:${c.signature.ino}`;
     const parts = [`tz|${localTimeZoneToken()}`, magpieToken, ...roots.map(root => `root|${root}`)];
     for (const [sessionId, candidates] of projectGroups) {
       for (const c of candidates) parts.push(`p|${sessionId}|${c.filePath}|${sig(c)}`);
