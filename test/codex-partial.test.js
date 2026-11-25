@@ -239,13 +239,13 @@ test('a cold start reads the conversations in use first; history follows, and th
 
   // 15 headers (150 ms). Pass 1, the conversations in use: the fork's index,
   // the active conversation (170 ms). Pass 2, what they lack: the parent's
-  // index, its usage, the fork's usage (200 ms). Pass 3, history, newest
-  // first: one index read, then the budget is gone.
+  // index, then the fork's usage (190 ms). Pass 3, history, newest first --
+  // the parent's own usage is history too: indexes until the budget is gone.
   const runs = [await m.run(205, { extraRoots: true })];
   const first = runs[0].result;
   assert.equal(first.skipped, undefined, JSON.stringify(first));
   assert.ok(first.indexing, 'history is left for the next runs');
-  assert.equal(input(first), 40 + 3000 + 5, 'the conversations in use, the fork with its parent');
+  assert.equal(input(first), 40 + 5, 'the conversations in use: the fork without its parent\'s copied history');
   assert.equal(input(first, FORK_WINDOW), 40 + 5, 'never the parent\'s history copied into the fork');
 
   while (runs.at(-1).result.indexing && runs.length < 6) runs.push(await m.run(205, { extraRoots: true }));
@@ -276,12 +276,15 @@ test('what a conversation in use needs from compressed history is read with the 
 
   // Five headers (50 ms); the fork's index and the three conversations in use
   // (90 ms) already pass the backlog's 80 ms (of 120 ms). The fork's
-  // compressed parent is still read -- it is what a conversation in use
-  // needs -- and so are the fork and the parent's usage: everything in one run.
+  // compressed parent's index is still read -- it is what a conversation in
+  // use needs (100 ms) -- and so is the fork (110 ms). The parent's own usage
+  // is history: a compressed read past the backlog's share, next run.
   const first = await m.run(120);
-  assert.equal(first.result.indexing, undefined, JSON.stringify(first.result.indexing));
-  assert.deepEqual(view(first.result), view(await m.uncached()));
-  assert.equal(input(first.result, FORK_WINDOW), 10 + 20 + 30 + 5);
+  assert.equal(first.result.indexing?.phase, 'usage', JSON.stringify(first.result.indexing));
+  assert.equal(input(first.result), 10 + 20 + 30 + 5);
+  const second = await m.run(120);
+  assert.equal(second.result.indexing, undefined, JSON.stringify(second.result.indexing));
+  assert.deepEqual(view(second.result), view(await m.uncached()));
 });
 
 test('a fork made today needs only its parent: an older ancestor waits for history', needsZstd, async () => {
@@ -324,4 +327,33 @@ test('a fork made today needs only its parent: an older ancestor waits for histo
   assert.equal(last.result.indexing, undefined);
   assert.deepEqual(view(last.result), view(await m.uncached()));
   assert.equal(input(last.result), 3000 + 300 + 7);
+});
+
+test('two forks made today of one compressed parent are both uploaded before the parent\'s own usage', needsZstd, async () => {
+  const m = machine();
+  const forkAt = (at, id, own, total) => jsonl([
+    sessionMeta(at, id, { forked_from_id: 'parent-1' }),
+    { ...tokenCount('2026-07-10T08:05:00.000Z', 1000, 1001), timestamp: at },
+    { ...tokenCount('2026-07-10T08:20:00.000Z', 2000, 3002), timestamp: at },
+    tokenCount(at.replace(':00:00.000Z', ':01:00.000Z'), own, total),
+  ]);
+  writeFileSync(m.file('codex', 'rollout-a-parent.jsonl.zst'), zlib.zstdCompressSync(Buffer.from(parent)));
+  writeFileSync(m.file('codex', 'rollout-b-fork1.jsonl'), forkAt('2026-07-17T09:00:00.000Z', 'fork-1', 5, 3008));
+  const hourAgo = (clock.now - 3600e3) / 1000;
+  fs.utimesSync(m.file('codex', 'rollout-b-fork1.jsonl'), hourAgo, hourAgo);
+  writeFileSync(m.file('codex', 'rollout-c-fork2.jsonl'), forkAt('2026-07-17T10:00:00.000Z', 'fork-2', 9, 3012));
+
+  // Three headers (30 ms), both forks' indexes (50 ms), the parent's index
+  // (60 ms), the newer fork (70 ms), the older one (80 ms) in a 75 ms budget.
+  // The parent's own usage -- a compressed read -- comes after them: it waits.
+  const first = await m.run(75);
+  assert.equal(first.result.skipped, undefined, JSON.stringify(first.result));
+  assert.ok(first.result.indexing, 'the parent\'s own usage waits');
+  assert.equal(input(first.result), 5 + 9, 'both forks, without the history they copied');
+
+  let last = first;
+  for (let i = 0; i < 3 && last.result.indexing; i++) last = await m.run(75);
+  assert.equal(last.result.indexing, undefined);
+  assert.deepEqual(view(last.result), view(await m.uncached()));
+  assert.equal(input(last.result), 3000 + 5 + 9);
 });

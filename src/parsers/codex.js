@@ -1764,10 +1764,14 @@ async function parseCodexHomes({ codexExtraHome, extraRoots = [], magpie, codexU
   const involvesCompressed = file => file.compressed || !!file.members?.some(member => member.compressed);
   const { recent, needed, rank } = sessionPriorities(files, sessionKey, Date.now() - RECENT_WINDOW_MS);
   // `limited`: compressed reads only within BACKLOG_SHARE. Not in pass 2:
-  // what it reads is for the conversations in use.
+  // what it reads is for the conversations in use. `usage`: whose own usage a
+  // pass may read. Pass 2 builds a parent's replay index (and merges its
+  // copies) for its forks, but leaves the parent's own usage to pass 3: read
+  // between two forks of it, a large compressed parent could use up the
+  // budget the second fork was waiting for (cross-review round 3).
   const passes = [
     { mayRead: item => recent.has(sessionKey(item)) && !involvesCompressed(item), limited: false },
-    { mayRead: item => needed(sessionKey(item)), limited: false },
+    { mayRead: item => needed(sessionKey(item)), usage: item => recent.has(sessionKey(item)), limited: false },
     { mayRead: () => true, limited: true },
   ];
   const backlogBudget = budget * BACKLOG_SHARE;
@@ -1877,7 +1881,7 @@ async function parseCodexHomes({ codexExtraHome, extraRoots = [], magpie, codexU
     return -1;
   };
 
-  for (const { mayRead, limited } of passes) {
+  for (const { mayRead, usage = mayRead, limited } of passes) {
     const first = mayRead === passes[0].mayRead;
     // A pass that left nothing for later is the last: a warm sync makes one.
     if (pendingPhase !== null || pendingPaths.size > 0 || pendingIds.size > 0) {
@@ -1888,8 +1892,9 @@ async function parseCodexHomes({ codexExtraHome, extraRoots = [], magpie, codexU
       break;
     }
     // May this pass read these rollouts (or merge these groups) now?
-    const canRead = (...items) => items.every(mayRead)
-      && Date.now() - startedAt < (limited && items.some(involvesCompressed) ? backlogBudget : budget);
+    const withinBudget = items => Date.now() - startedAt < (limited && items.some(involvesCompressed) ? backlogBudget : budget);
+    const canRead = (...items) => items.every(mayRead) && withinBudget(items);
+    const canReadUsage = file => usage(file) && withinBudget([file]);
     const leaveForNextRun = file => {
       pendingPaths.add(file.filePath);
       if (file.header?.sessionId) pendingIds.add(file.header.sessionId);
@@ -2196,7 +2201,7 @@ async function parseCodexHomes({ codexExtraHome, extraRoots = [], magpie, codexU
       if (result) {
         // Summarized in this run's duplicate-id loop: not taken from the cache.
         if (!file.summarizedThisRun) cacheStats.resultHits++;
-      } else if (!canRead(file)) {
+      } else if (!canReadUsage(file)) {
         leftOut(file);
         continue;
       } else {
