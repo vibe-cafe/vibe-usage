@@ -11,7 +11,7 @@ import { createServer } from 'node:http';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import {
-  CURSOR_CLIENT_ID, CursorLoginError, REFRESH_HOLD_MS, cursorCredential, cursorLoginPath, cursorLoginRequest,
+  CURSOR_CLIENT_ID, CursorLoginError, REFRESH_HOLD_MS, cursorApiBase, cursorCredential, cursorLoginPath, cursorLoginRequest,
   freshCursorLogin, markStoredCursorLoginRejected, pollCursorLogin, readStoredCursorLogin,
   refreshCursorCredential, resetProvidedCursorLoginForTests, resolveCursorLogin, setProvidedCursorLogin,
   writeStoredCursorLogin,
@@ -19,6 +19,7 @@ import {
 import * as cursor from '../src/parsers/cursor.js';
 import { fetchCursorQuota, cursorQuotaNetworkURLs } from '../src/quotas/providers/cursor.js';
 import { envProxyBlock } from '../src/env-proxy.js';
+import { systemProxyConfigured } from '../src/system-proxy.js';
 import { quotaResult } from '../src/quotas/schema.js';
 
 const DAY = 24 * 60 * 60 * 1000;
@@ -43,12 +44,14 @@ function json(body, status = 200) {
 // The process-wide environment the sync parser reads.
 function isolateParser(t, extra = {}) {
   const dir = tempDir(t);
-  const keys = ['VIBE_USAGE_CONFIG_DIR', 'CURSOR_STATE_DB_PATH', 'CURSOR_WEB_BASE_URL', 'VIBE_USAGE_CURSOR_API_BASE_URL'];
+  const keys = ['VIBE_USAGE_CONFIG_DIR', 'CURSOR_STATE_DB_PATH', 'CURSOR_WEB_BASE_URL', 'VIBE_USAGE_CURSOR_API_BASE_URL', 'VIBE_USAGE_SYSTEM_PROXY'];
   const previous = Object.fromEntries(keys.map(key => [key, process.env[key]]));
   process.env.VIBE_USAGE_CONFIG_DIR = dir;
   process.env.CURSOR_STATE_DB_PATH = join(dir, 'no-cursor-here', 'state.vscdb');
   delete process.env.CURSOR_WEB_BASE_URL;
   delete process.env.VIBE_USAGE_CURSOR_API_BASE_URL;
+  // No system proxy unless a test says so (system-proxy.js would ask the OS).
+  process.env.VIBE_USAGE_SYSTEM_PROXY = '0';
   Object.assign(process.env, extra);
   t.after(() => {
     for (const key of keys) {
@@ -309,7 +312,7 @@ test('sync: a proxy the CLI cannot follow stops the sign-in path before renewal'
 
 test('quota reads with the Vibe Usage sign-in, scoped to the account, and says when it ended', async t => {
   const dir = tempDir(t);
-  const environment = { VIBE_USAGE_CONFIG_DIR: dir, VIBE_USAGE_QUOTA_CACHE_DIR: dir, CURSOR_STATE_DB_PATH: join(dir, 'none.vscdb') };
+  const environment = { VIBE_USAGE_CONFIG_DIR: dir, VIBE_USAGE_QUOTA_CACHE_DIR: dir, CURSOR_STATE_DB_PATH: join(dir, 'none.vscdb'), VIBE_USAGE_SYSTEM_PROXY: '0' };
   const payload = { individualUsage: { plan: { enabled: true, totalPercentUsed: 12 } } };
   const first = cursorCredential({ accessToken: tokenFor('user_a', 30 * DAY, 'first'), refreshToken: 'r' });
   writeStoredCursorLogin(first, environment);
@@ -375,10 +378,10 @@ async function standIn(t, { pollsBeforeConfirm = 1, user = 'user_cli' } = {}) {
     ...Object.fromEntries(Object.entries(process.env).filter(([key]) => !/^(https?|all|no)_proxy$/i.test(key))),
     HOME: home, USERPROFILE: home, VIBE_USAGE_CONFIG_DIR: home, VIBE_USAGE_STATE_DIR: home,
     VIBE_USAGE_QUOTA_CACHE_DIR: home, VIBE_USAGE_DEV: '0', CURSOR_STATE_DB_PATH: join(home, 'none.vscdb'),
-    CURSOR_WEB_BASE_URL: base, VIBE_USAGE_CURSOR_API_BASE_URL: base,
+    CURSOR_WEB_BASE_URL: base, VIBE_USAGE_CURSOR_API_BASE_URL: base, VIBE_USAGE_SYSTEM_PROXY: '0',
   };
-  const run = (args, input) => new Promise(resolve => {
-    const child = execFile(process.execPath, [CLI, ...args], { env, timeout: 30_000 }, (error, stdout, stderr) => {
+  const run = (args, input, extra = {}) => new Promise(resolve => {
+    const child = execFile(process.execPath, [CLI, ...args], { env: { ...env, ...extra }, timeout: 30_000 }, (error, stdout, stderr) => {
       resolve({ code: error ? error.code ?? 1 : 0, stdout, stderr });
     });
     child.stdin.end(input ?? '');
@@ -446,4 +449,122 @@ test('the app hands its sign-in over on stdin: quota reads with it, refresh prin
   const unusable = await run(['quota', 'fetch', '--product', 'cursor', '--json', '--cursor-login-stdin'], 'garbage');
   assert.equal(JSON.parse(unusable.stdout).products[0].signIn, 'expired');
   assert.match(unusable.stderr, /无法识别/);
+});
+
+test('a terminal sign-in is refused on a system proxy the CLI was not told about; an app\'s is not', async t => {
+  const { state, home, run } = await standIn(t);
+  const terminal = await run(['login', 'cursor', '--no-browser'], '', { VIBE_USAGE_SYSTEM_PROXY: '1' });
+  assert.equal(terminal.code, 1);
+  assert.match(terminal.stderr, /检测到系统代理，但这个进程没有收到代理环境变量/);
+  assert.equal(state.polls, 0, 'nothing sent');
+  assert.equal(existsSync(join(home, 'cursor-login.json')), false);
+  // The apps turn the system proxy into variables before they run --json.
+  const app = await run(['login', 'cursor', '--json'], '', { VIBE_USAGE_SYSTEM_PROXY: '1' });
+  assert.equal(app.code, 0, app.stderr);
+  assert.ok(state.polls > 0);
+});
+
+// --- Cross-review round 1 (GPT-6.2 Astra, 2026-11-25) ---------------------------------
+
+test('system proxy detection reads scutil / the registry, and an unknown answer is "not configured"', () => {
+  const ask = (platform, out) => systemProxyConfigured({ platform, env: {}, run: () => out });
+  assert.equal(ask('darwin', '<dictionary> {\n  HTTPSEnable : 1\n  HTTPSProxy : 127.0.0.1\n}'), true);
+  assert.equal(ask('darwin', '<dictionary> {\n  ProxyAutoConfigEnable : 1\n}'), true);
+  assert.equal(ask('darwin', '<dictionary> {\n  HTTPEnable : 0\n  HTTPSEnable : 0\n  ExceptionsList : <array> {}\n}'), false);
+  assert.equal(ask('win32', '    ProxyEnable    REG_DWORD    0x1\r\n    ProxyServer    REG_SZ    127.0.0.1:7890'), true);
+  assert.equal(ask('win32', '    ProxyEnable    REG_DWORD    0x0\r\n    AutoConfigURL    REG_SZ    http://127.0.0.1/pac'), true);
+  assert.equal(ask('win32', '    ProxyEnable    REG_DWORD    0x0'), false);
+  assert.equal(ask('linux', 'anything'), false);
+  assert.equal(systemProxyConfigured({ platform: 'darwin', env: {}, run: () => { throw new Error('no scutil'); } }), false);
+  assert.equal(systemProxyConfigured({ platform: 'darwin', env: { VIBE_USAGE_SYSTEM_PROXY: '1' }, run: () => '' }), true);
+});
+
+test('the api2 stand-in hook only takes a loopback address', () => {
+  assert.equal(cursorApiBase({ VIBE_USAGE_CURSOR_API_BASE_URL: 'http://127.0.0.1:4321/' }), 'http://127.0.0.1:4321');
+  assert.equal(cursorApiBase({ VIBE_USAGE_CURSOR_API_BASE_URL: 'https://example.com' }), 'https://api2.cursor.sh');
+  assert.equal(cursorApiBase({ VIBE_USAGE_CURSOR_API_BASE_URL: 'not a url' }), 'https://api2.cursor.sh');
+});
+
+test('sync and quota: a stored sign-in sends nothing on a system proxy the process was not told about', async t => {
+  isolateParser(t, { VIBE_USAGE_SYSTEM_PROXY: '1' });
+  writeStoredCursorLogin(cursorCredential({ accessToken: tokenFor('user_a', DAY), refreshToken: 'r' }), process.env);
+  const fetchMock = t.mock.method(globalThis, 'fetch', async () => { throw new Error('no request'); });
+  const result = await cursor.parse({ previousInfo: RECENT_INFO('user_a') });
+  assert.match(result.warnings[0], /检测到系统代理/);
+  const quota = await fetchCursorQuota({ environment: process.env, fetchImpl: async () => assert.fail('no request') });
+  assert.equal(quota.status, 'unsupported');
+  assert.match(quota.message, /system proxy/);
+  assert.equal(fetchMock.mock.callCount(), 0);
+  // An app's sign-in: the app has turned the system proxy into variables.
+  setProvidedCursorLogin(JSON.stringify(cursorCredential({ accessToken: tokenFor('user_a'), refreshToken: 'r' })));
+  fetchMock.mock.restore();
+  t.mock.method(globalThis, 'fetch', async () => new Response(CSV()));
+  assert.equal((await cursor.parse({ previousInfo: RECENT_INFO('user_a') })).buckets.length, 1);
+});
+
+test('sync: while a desktop app syncs Cursor with its own sign-in, a run with another account skips', async t => {
+  isolateParser(t);
+  writeStoredCursorLogin(cursorCredential({ accessToken: tokenFor('user_cli'), refreshToken: 'r' }), process.env);
+  const appInfo = (ageMs = 60_000) => ({ account: cursor.cursorAccountLabel('auth0|user_app'), appSignIn: true,
+    syncedAt: new Date(Date.now() - ageMs).toISOString() });
+  const fetchMock = t.mock.method(globalThis, 'fetch', async () => new Response(CSV()));
+  const skipped = await cursor.parse({ previousInfo: appInfo() });
+  assert.equal(fetchMock.mock.callCount(), 0);
+  assert.deepEqual(Object.keys(skipped).sort(), ['buckets', 'sessions', 'skipped', 'warnings']);
+  assert.match(skipped.warnings[0], /正由桌面 App 用另一个账号同步/);
+  // The app has not synced for over 7 days: this run takes over.
+  const resumed = await cursor.parse({ previousInfo: appInfo(8 * DAY) });
+  assert.ok(fetchMock.mock.callCount() > 0);
+  assert.equal(resumed.info.account, cursor.cursorAccountLabel('auth0|user_cli'));
+  assert.equal(resumed.info.appSignIn, undefined);
+  // The same account: nothing to protect.
+  writeStoredCursorLogin(cursorCredential({ accessToken: tokenFor('user_app'), refreshToken: 'r' }), process.env);
+  assert.equal((await cursor.parse({ previousInfo: appInfo() })).buckets.length, 1);
+  // The app itself always reads, and records that it did.
+  setProvidedCursorLogin(JSON.stringify(cursorCredential({ accessToken: tokenFor('user_app2'), refreshToken: 'r' })));
+  const app = await cursor.parse({ previousInfo: appInfo() });
+  assert.equal(app.info.appSignIn, true);
+  assert.equal(app.info.account, cursor.cursorAccountLabel('auth0|user_app2'));
+});
+
+test('a renewal in flight never writes over a logout or a newer sign-in', async t => {
+  const env = { VIBE_USAGE_CONFIG_DIR: tempDir(t) };
+  const near = cursorCredential({ accessToken: tokenFor('user_a', 2 * DAY, 'near'), refreshToken: 'r' });
+  writeStoredCursorLogin(near, env);
+  // A logout lands while Cursor is answering the renewal.
+  const renewed = await freshCursorLogin(resolveCursorLogin(env), { env, fetchImpl: async () => {
+    rmSync(cursorLoginPath(env));
+    return json({ access_token: tokenFor('user_a', 60 * DAY, 'renewed') });
+  } });
+  assert.equal(renewed.refreshed, true, 'this run may still use it');
+  assert.equal(existsSync(cursorLoginPath(env)), false, 'the logout stands');
+  // A newer sign-in (account B) lands while A's renewal is being refused.
+  writeStoredCursorLogin(near, env);
+  const b = cursorCredential({ accessToken: tokenFor('user_b'), refreshToken: 'rb' });
+  await freshCursorLogin(resolveCursorLogin(env), { env, fetchImpl: async () => {
+    writeStoredCursorLogin(b, env);
+    return json({ shouldLogout: true });
+  } });
+  assert.equal(readStoredCursorLogin(env).credential.accessToken, b.accessToken, 'A\'s refusal does not end B');
+});
+
+test('after a temporary renewal failure, a rejected read does not renew again within the hold', async t => {
+  isolateParser(t);
+  writeStoredCursorLogin(cursorCredential({ accessToken: tokenFor('user_a', 2 * DAY, 'near'), refreshToken: 'r' }), process.env);
+  let refreshes = 0;
+  t.mock.method(globalThis, 'fetch', async url => {
+    if (String(url).endsWith('/oauth/token')) { refreshes++; return json({}, 503); }
+    return new Response('', { status: 401 });
+  });
+  const first = await cursor.parse({ previousInfo: RECENT_INFO('user_a') });
+  assert.equal(refreshes, 1, 'one renewal per run');
+  assert.match(first.warnings[0], /续期本次未完成/);
+  await cursor.parse({ previousInfo: RECENT_INFO('user_a') });
+  assert.equal(refreshes, 1, 'held for 6 hours');
+  // A token already past its expiry is not renewed during the hold either.
+  writeStoredCursorLogin(cursorCredential({ accessToken: tokenFor('user_a', -DAY, 'lapsed'), refreshToken: 'r' }), process.env,
+    { refreshHeldUntil: new Date(Date.now() + REFRESH_HOLD_MS).toISOString() });
+  const lapsed = await cursor.parse({ previousInfo: RECENT_INFO('user_a') });
+  assert.equal(refreshes, 1);
+  assert.match(lapsed.warnings[0], /续期本次未完成/);
 });

@@ -114,7 +114,7 @@ test('Cursor isolates missing/rejected credentials and uses only same-account un
   assert.equal(rejected.products[0].source,'live');
   const expired = await fetchQuotaProducts(['cursor'], { environment, now: new Date('2026-11-02'), fetchImpl: failing });
   assert.equal(expired.products[0].status,'retryable_error');
-  const missing = await fetchCursorQuota({ environment: { CURSOR_STATE_DB_PATH: join(root,'absent') }, fetchImpl: () => assert.fail('unexpected network') });
+  const missing = await fetchCursorQuota({ environment: { ...environment, CURSOR_STATE_DB_PATH: join(root,'absent') }, fetchImpl: () => assert.fail('unexpected network') });
   assert.equal(missing.status,'missing_credentials');
 });
 

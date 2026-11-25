@@ -4,7 +4,7 @@ import { homedir } from 'node:os';
 import { aggregateToBuckets, roundToHalfHour } from './aggregate.js';
 import { queryDbJsonSnapshotOnLock, sqliteUnavailableError, isSqliteUnavailableError } from './sqlite.js';
 import { envProxyBlockFor } from '../env-proxy.js';
-import { cursorRefreshURL, endStoredCursorLogin, freshCursorLogin, resolveCursorLogin } from '../cursor-login.js';
+import { cursorRefreshURL, cursorSignInBlock, endStoredCursorLogin, freshCursorLogin, resolveCursorLogin } from '../cursor-login.js';
 
 const STATE_DB_RELATIVE = join('User', 'globalStorage', 'state.vscdb');
 const ACCESS_TOKEN_KEY = 'cursorAuth/accessToken';
@@ -56,6 +56,17 @@ export const LOGIN_EXPIRED_NOTICE =
   'Cursor 登录已失效（在 Vibe Usage 里登录的那一份），Cursor 用量暂停同步，其他工具照常同步。'
   + '运行 vibe-usage login cursor（或在 App 设置里重新登录 Cursor）即可恢复。';
 const LOGIN_EXPIRED_WARNING = `cursor: ${LOGIN_EXPIRED_NOTICE}`;
+
+// A desktop app syncs Cursor with its own sign-in (the last committed progress
+// says so) and this run -- a terminal or the background service -- would read
+// another account. Cursor uploads under the fixed `cursor-cloud` hostname, so
+// two collectors would write two accounts into the same keys and keep
+// resetting each other's progress. The app's account wins; this run skips
+// (no request, no info). It resumes once the app has not synced for 7 days.
+export const APP_ACCOUNT_NOTICE =
+  'Cursor 正由桌面 App 用另一个账号同步（以 App 里登录的为准），本次跳过，避免两个账号的用量写进同一条记录。';
+const APP_ACCOUNT_WARNING = `cursor: ${APP_ACCOUNT_NOTICE}`;
+const APP_SIGN_IN_HOLD_MS = 7 * DAY_MS;
 
 // A proxy this process cannot follow (`env-proxy.js`): skip like the encrypted
 // token above, with no request and no info, so state and recorded progress
@@ -633,7 +644,7 @@ function laterDate(a, b) {
   return a > b ? a : b;
 }
 
-function resultInfo({ account, latestEventAt, latestTokenAt, events, tokenEvents, fallbackLatestAt, syncedAt, backfill }) {
+function resultInfo({ account, latestEventAt, latestTokenAt, events, tokenEvents, fallbackLatestAt, syncedAt, backfill, appSignIn }) {
   return {
     ...(account ? { account } : {}),
     ...(latestEventAt ? { latestEventAt: new Date(latestEventAt).toISOString() } : {}),
@@ -643,6 +654,8 @@ function resultInfo({ account, latestEventAt, latestTokenAt, events, tokenEvents
     ...(fallbackLatestAt ? { fallbackLatestAt } : {}),
     ...(syncedAt ? { syncedAt: new Date(syncedAt).toISOString() } : {}),
     ...(backfill ? { backfill: { before: new Date(backfill.before).toISOString(), until: new Date(backfill.until).toISOString() } } : {}),
+    // Read with a desktop app's own sign-in (see APP_ACCOUNT_NOTICE).
+    ...(appSignIn ? { appSignIn: true } : {}),
   };
 }
 
@@ -840,10 +853,19 @@ export async function parse({ previousInfo, envProxyBlock } = {}) {
       return { buckets: [], sessions: [], skipped: true, warnings: [ENCRYPTED_TOKEN_WARNING] };
     }
   }
+  const runToken = login ? login.credential.accessToken : token;
+  const recordedAt = Date.parse(previousInfo?.syncedAt);
+  if (login?.kind !== 'provided' && previousInfo?.appSignIn && previousInfo.account
+      && Number.isFinite(recordedAt) && Date.now() - recordedAt < APP_SIGN_IN_HOLD_MS
+      && cursorAccountLabel(decodeJwtSub(runToken)) !== previousInfo.account) {
+    return { buckets: [], sessions: [], skipped: true, warnings: [APP_ACCOUNT_WARNING] };
+  }
   // A stored sign-in may be renewed on the way, so its renewal URL must be
-  // reachable through the user's proxy too.
-  const urls = login?.kind === 'stored' ? [cursorWebBase(), cursorRefreshURL()] : [cursorWebBase()];
-  const block = envProxyBlock !== undefined ? envProxyBlock : envProxyBlockFor(urls);
+  // reachable through the user's proxy too, and a system proxy this process
+  // was not told about stops it (`cursorSignInBlock()`).
+  const block = envProxyBlock !== undefined ? envProxyBlock
+    : login?.kind === 'stored' ? cursorSignInBlock([cursorWebBase(), cursorRefreshURL()])
+      : envProxyBlockFor([cursorWebBase()]);
   if (block) {
     return {
       buckets: [], sessions: [], skipped: true,
@@ -851,6 +873,7 @@ export async function parse({ previousInfo, envProxyBlock } = {}) {
     };
   }
   if (!login) return readCursorUsage(token, previousInfo);
+  const appSignIn = login.kind === 'provided';
 
   const renewalSkipped = reason => ({
     buckets: [], sessions: [], skipped: true,
@@ -860,7 +883,7 @@ export async function parse({ previousInfo, envProxyBlock } = {}) {
   if (fresh.expired) return { buckets: [], sessions: [], skipped: true, warnings: [LOGIN_EXPIRED_WARNING] };
   if (fresh.retryable) return renewalSkipped(fresh.reason);
   try {
-    return await readCursorUsage(fresh.credential.accessToken, previousInfo);
+    return await readCursorUsage(fresh.credential.accessToken, previousInfo, { appSignIn });
   } catch (err) {
     if (!err?.sessionRejected) throw err;
   }
@@ -871,7 +894,7 @@ export async function parse({ previousInfo, envProxyBlock } = {}) {
     if (renewed.retryable) return renewalSkipped(renewed.reason);
     if (renewed.credential) {
       try {
-        return await readCursorUsage(renewed.credential.accessToken, previousInfo);
+        return await readCursorUsage(renewed.credential.accessToken, previousInfo, { appSignIn });
       } catch (err) {
         if (!err?.sessionRejected) throw err;
       }
@@ -883,7 +906,7 @@ export async function parse({ previousInfo, envProxyBlock } = {}) {
   return { buckets: [], sessions: [], skipped: true, warnings: [LOGIN_EXPIRED_WARNING] };
 }
 
-async function readCursorUsage(token, previousInfo) {
+async function readCursorUsage(token, previousInfo, { appSignIn = false } = {}) {
   const sub = decodeJwtSub(token);
   const account = cursorAccountLabel(sub);
   // A different Cursor account: forget the old account's times before any
@@ -983,6 +1006,7 @@ async function readCursorUsage(token, previousInfo) {
       fallbackLatestAt,
       syncedAt: startedAt,
       backfill,
+      appSignIn,
     }),
   };
 }

@@ -2,7 +2,7 @@ import { existsSync } from 'node:fs';
 import { homedir } from 'node:os';
 import { join, resolve } from 'node:path';
 import { isEncryptedCursorToken } from '../../parsers/cursor.js';
-import { cursorRefreshURL, cursorWebBase, endStoredCursorLogin, freshCursorLogin, resolveCursorLogin } from '../../cursor-login.js';
+import { cursorRefreshURL, cursorSignInBlock, cursorWebBase, endStoredCursorLogin, freshCursorLogin, resolveCursorLogin } from '../../cursor-login.js';
 import { queryDbJsonSnapshotOnLock } from '../../parsers/sqlite.js';
 import { attachCacheScope } from '../cache.js';
 import { quotaResult } from '../schema.js';
@@ -112,6 +112,13 @@ export async function fetchCursorQuota({
   const login = resolveCursorLogin(environment);
   if (login?.unusable) return expired();
   if (login) {
+    if (login.kind === 'stored') {
+      // The registry already applied the environment's proxy; a terminal or
+      // background run on a machine with a system proxy it was not told
+      // about must not send the stored sign-in direct.
+      const block = cursorSignInBlock([], { env: environment, blockFor: () => null });
+      if (block) return result('unsupported', { message: block.message });
+    }
     const options = { env: environment, fetchImpl, now, ...(sleep ? { sleep } : {}) };
     const fresh = await freshCursorLogin(login, options);
     if (fresh.expired) return expired();

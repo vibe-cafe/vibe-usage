@@ -27,6 +27,8 @@ import {
 import { homedir } from 'node:os';
 import { dirname, join } from 'node:path';
 import { COLLECTOR_VERSION } from './client-meta.js';
+import { chosenProxies, envProxyBlockFor } from './env-proxy.js';
+import { systemProxyConfigured } from './system-proxy.js';
 
 const HOUR_MS = 60 * 60 * 1000;
 const DAY_MS = 24 * HOUR_MS;
@@ -55,9 +57,17 @@ export function cursorWebBase(env = process.env) {
   return (env.CURSOR_WEB_BASE_URL?.trim() || 'https://cursor.com').replace(/\/+$/, '');
 }
 
-// Test hook only (a local stand-in server); not a supported setting.
+// Test hook only: a local stand-in server on a loopback address. Anything
+// else is ignored, so a stray value cannot send a sign-in to another host.
 export function cursorApiBase(env = process.env) {
-  return (env.VIBE_USAGE_CURSOR_API_BASE_URL?.trim() || 'https://api2.cursor.sh').replace(/\/+$/, '');
+  const override = env.VIBE_USAGE_CURSOR_API_BASE_URL?.trim();
+  if (override) {
+    try {
+      const url = new URL(override);
+      if (['127.0.0.1', 'localhost', '[::1]'].includes(url.hostname)) return url.origin;
+    } catch { /* ignored */ }
+  }
+  return 'https://api2.cursor.sh';
 }
 
 /** The URLs sign-in and renewal request, for `envProxyBlockFor()`. */
@@ -68,6 +78,27 @@ export function cursorLoginNetworkURLs(env = process.env) {
 /** The URL renewal requests. */
 export function cursorRefreshURL(env = process.env) {
   return `${cursorApiBase(env)}/oauth/token`;
+}
+
+const SYSTEM_PROXY_BLOCK = Object.freeze({
+  reason: 'systemProxy',
+  message: 'A system proxy is configured but this process was given no proxy variables; not sent, to avoid a direct connection. Set HTTPS_PROXY first.',
+  notice: '检测到系统代理，但这个进程没有收到代理环境变量（终端里请先设置 HTTPS_PROXY），为避免直连已跳过',
+});
+
+/**
+ * Why the sign-in's own requests (sign-in, renewal, and reads with a stored
+ * sign-in) must not be sent now, or null. On top of `envProxyBlockFor()`: a
+ * terminal or background run without proxy variables on a machine with a
+ * system proxy / PAC (`system-proxy.js`) would go direct. The desktop apps
+ * pass their sign-in on stdin and turn the system proxy into variables
+ * themselves, so this is not applied to them.
+ */
+export function cursorSignInBlock(urls, { env = process.env, blockFor = envProxyBlockFor, systemProxy = systemProxyConfigured } = {}) {
+  const block = blockFor(urls, { env });
+  if (block) return block;
+  if (!chosenProxies(env).https && systemProxy({ env })) return SYSTEM_PROXY_BLOCK;
+  return null;
 }
 
 // --- Tokens -----------------------------------------------------------------
@@ -434,7 +465,9 @@ export function resolveCursorLogin(env = process.env) {
  * `force`, after Cursor rejected `login.credential`). Returns
  * `{ credential, refreshed? }`, `{ expired: true }` (sign in again) or
  * `{ retryable: true, reason }` (skip this run, try again next time). A
- * provided (app) sign-in is never renewed here: the app does that.
+ * provided (app) sign-in is never renewed here: the app does that. After a
+ * renewal that failed for a temporary reason nothing is asked for 6 hours,
+ * forced or not; the current token is used while it is still valid.
  */
 export async function freshCursorLogin(login, {
   env = process.env, fetchImpl = globalThis.fetch, now = new Date(), force = false,
@@ -442,46 +475,66 @@ export async function freshCursorLogin(login, {
 } = {}) {
   if (!login || login.unusable) return { expired: true };
   const nowMs = now.getTime();
-  const expiresMs = Date.parse(login.credential.expiresAt);
-  const live = !Number.isFinite(expiresMs) || expiresMs > nowMs;
-  if (login.kind === 'provided') return live && !force ? { credential: login.credential } : { expired: true };
+  const isLive = credential => {
+    const expiresMs = Date.parse(credential.expiresAt);
+    return !Number.isFinite(expiresMs) || expiresMs > nowMs;
+  };
+  const isDue = credential => {
+    const expiresMs = Date.parse(credential.expiresAt);
+    return force || Number.isFinite(expiresMs) && expiresMs - nowMs <= REFRESH_LEAD_MS;
+  };
+  const isHeld = until => Boolean(until) && Date.parse(until) > nowMs;
+  const heldAnswer = credential => (isLive(credential) && !force
+    ? { credential } : { retryable: true, reason: 'held' });
 
-  const due = force || Number.isFinite(expiresMs) && expiresMs - nowMs <= REFRESH_LEAD_MS;
-  if (!due) return { credential: login.credential };
-  const held = login.refreshHeldUntil && Date.parse(login.refreshHeldUntil) > nowMs;
-  if (held && live && !force) return { credential: login.credential };
+  if (login.kind === 'provided') return isLive(login.credential) && !force ? { credential: login.credential } : { expired: true };
+  if (!isDue(login.credential)) return { credential: login.credential };
+  if (isHeld(login.refreshHeldUntil)) return heldAnswer(login.credential);
 
   const release = await acquireLock(cursorLoginPath(env), sleep);
-  if (!release) return live && !force ? { credential: login.credential } : { retryable: true, reason: 'lock busy' };
+  if (!release) return isLive(login.credential) && !force ? { credential: login.credential } : { retryable: true, reason: 'lock busy' };
   try {
     const latest = readStoredCursorLogin(env);
     // Signed out (or ended) by another process meanwhile.
     if (!latest || latest.rejected || latest.invalid) return { expired: true };
-    // Another process renewed it meanwhile.
+    // Another process renewed it, or the user signed in again, meanwhile.
     if (latest.credential.accessToken !== login.credential.accessToken) {
       return { credential: latest.credential, refreshed: true };
     }
+    if (isHeld(latest.refreshHeldUntil)) return heldAnswer(latest.credential);
     const outcome = await refreshCursorCredential(latest.credential, { env, fetchImpl, now });
+    // Write back only over the very sign-in the request was made with: a
+    // logout or a new sign-in during the request wins (they take this lock
+    // too, but do not wait for it forever).
+    const unchanged = () => readStoredCursorLogin(env)?.credential?.accessToken === latest.credential.accessToken;
     if (outcome.status === 'ok') {
-      try { writeStoredCursorLogin(outcome.credential, env); } catch { /* this run still has it */ }
+      if (unchanged()) {
+        try { writeStoredCursorLogin(outcome.credential, env); } catch { /* this run still has it */ }
+      }
       return { credential: outcome.credential, refreshed: true };
     }
     if (outcome.status === 'expired') {
-      markStoredCursorLoginRejected(env, { email: latest.credential.email, userId: latest.credential.userId, now });
+      if (unchanged()) markStoredCursorLoginRejected(env, { email: latest.credential.email, userId: latest.credential.userId, now });
       return { expired: true };
     }
-    try {
-      writeStoredCursorLogin(latest.credential, env, { refreshHeldUntil: new Date(nowMs + REFRESH_HOLD_MS).toISOString() });
-    } catch { /* tries again next run */ }
-    return live && !force ? { credential: latest.credential } : { retryable: true, reason: outcome.reason };
+    if (unchanged()) {
+      try {
+        writeStoredCursorLogin(latest.credential, env, { refreshHeldUntil: new Date(nowMs + REFRESH_HOLD_MS).toISOString() });
+      } catch { /* tries again next run */ }
+    }
+    return isLive(latest.credential) && !force ? { credential: latest.credential } : { retryable: true, reason: outcome.reason };
   } finally {
     release();
   }
 }
 
-/** The stored sign-in was rejected again right after renewal: end it. */
+/**
+ * The stored sign-in was rejected again right after renewal: end it, unless
+ * the file meanwhile holds another sign-in (a new login, another renewal).
+ */
 export function endStoredCursorLogin(login, env = process.env) {
   if (login?.kind !== 'stored' || !login.credential) return;
+  if (readStoredCursorLogin(env)?.credential?.accessToken !== login.credential.accessToken) return;
   markStoredCursorLoginRejected(env, { email: login.credential.email, userId: login.credential.userId });
 }
 
@@ -502,7 +555,8 @@ function writeJsonLine(value) {
  * `~/.vibe-usage/cursor-login.json`.
  */
 export async function runCursorLogin(args, {
-  env = process.env, fetchImpl = globalThis.fetch, envProxyBlockFor, openBrowser,
+  env = process.env, fetchImpl = globalThis.fetch, blockFor = envProxyBlockFor, systemProxy = systemProxyConfigured,
+  openBrowser, sleep = ms => new Promise(resolve => setTimeout(resolve, ms)),
 } = {}) {
   const json = args.includes('--json');
   const refresh = args.includes('--refresh');
@@ -515,7 +569,10 @@ export async function runCursorLogin(args, {
   };
   if (unknown.length) return fail('usage', `Unknown login option: ${unknown[0]}`);
 
-  const block = envProxyBlockFor?.(refresh ? [cursorRefreshURL(env)] : cursorLoginNetworkURLs(env), { env });
+  // With --json a desktop app runs this and has turned the system proxy into
+  // variables already; in a terminal the system proxy is checked too.
+  const urls = refresh ? [cursorRefreshURL(env)] : cursorLoginNetworkURLs(env);
+  const block = json ? blockFor(urls, { env }) : cursorSignInBlock(urls, { env, blockFor, systemProxy });
   if (block) return fail('proxy', `无法按你的代理设置连接 Cursor，未发送任何请求：${block.notice}`);
 
   if (refresh) {
@@ -553,23 +610,33 @@ export async function runCursorLogin(args, {
   if (!credential) return fail('failed', 'Cursor 返回的登录无法识别，请重试。');
 
   if (json) return writeJsonLine({ event: 'credential', credential });
+  const release = await acquireLock(cursorLoginPath(env), sleep);
   try {
     writeStoredCursorLogin(credential, env);
   } catch {
     return fail('failed', `登录成功，但保存失败：无法写入 ${cursorLoginPath(env)}`);
+  } finally {
+    release?.();
   }
   const until = credential.expiresAt ? `，有效期至 ${credential.expiresAt.slice(0, 10)}，到期前会自动续期` : '';
   console.log(`已登录 Cursor：${credential.email || 'Cursor 账号'}${until}。`);
 }
 
 /** `vibe-usage logout cursor`: forget the stored sign-in. */
-export function runCursorLogout(args, { env = process.env } = {}) {
+export async function runCursorLogout(args, { env = process.env, sleep = ms => new Promise(resolve => setTimeout(resolve, ms)) } = {}) {
   if (args.length) {
     console.error(`Unknown logout option: ${args[0]}`);
     process.exitCode = 1;
     return;
   }
-  const removed = deleteStoredCursorLogin(env);
+  // Under the renewal lock, so a renewal in flight cannot write it back.
+  const release = await acquireLock(cursorLoginPath(env), sleep);
+  let removed;
+  try {
+    removed = deleteStoredCursorLogin(env);
+  } finally {
+    release?.();
+  }
   console.log(removed ? '已退出 Cursor 登录，本机保存的登录已删除。' : '本机没有保存 Cursor 登录。');
   console.log('Cursor 官网上的这条登录可在 cursor.com 设置里的 Active Sessions 撤销。');
 }

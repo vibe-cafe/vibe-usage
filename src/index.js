@@ -16,8 +16,8 @@ import { COLLECTOR_VERSION } from './client-meta.js';
 import { kikiStartTime } from './kiki-migration.js';
 import { magpieStartTime } from './magpie-migration.js';
 import { ENCRYPTED_TOKEN_NOTICE, localCursorTokenEncrypted } from './parsers/cursor.js';
-import { envProxyBlockFor, setupEnvProxy } from './env-proxy.js';
-import { cursorLoginStatusLine, setProvidedCursorLogin } from './cursor-login.js';
+import { setupEnvProxy } from './env-proxy.js';
+import { cursorLoginStatusLine, readStoredCursorLogin, setProvidedCursorLogin } from './cursor-login.js';
 
 function printSmallHeader() {
   console.log();
@@ -110,9 +110,14 @@ async function showStatus() {
           // An encrypted token (issue #144) also stops new events, and then
           // checking the account is the wrong advice. Read only here, through
           // the parser's own read; only a yes/no comes back.
-          console.log(dimText(localCursorTokenEncrypted()
-            ? `       ${ENCRYPTED_TOKEN_NOTICE}`
-            : '       已超过 48 小时没有新的 Cursor 事件；如最近用过 Cursor，请确认 Cursor 登录的是这个账号'));
+          // With a stored Vibe Usage sign-in the local token is not used,
+          // so neither its encryption nor Cursor's account is the suspect.
+          const signedIn = Boolean(readStoredCursorLogin()?.credential);
+          console.log(dimText(signedIn
+            ? '       已超过 48 小时没有新的 Cursor 事件；如最近用过 Cursor，请确认下面这份 Cursor 登录是这个账号'
+            : localCursorTokenEncrypted()
+              ? `       ${ENCRYPTED_TOKEN_NOTICE}`
+              : '       已超过 48 小时没有新的 Cursor 事件；如最近用过 Cursor，请确认 Cursor 登录的是这个账号'));
         }
       }
       if (tool.id === 'cursor') {
@@ -321,7 +326,7 @@ function extractOption(args, name) {
   return { args: [...args.slice(0, idx), ...args.slice(idx + 2)], value };
 }
 
-// Boolean global flag: present anywhere in argv → true, removed from args.
+// `--cursor-login-stdin`: the whole of stdin, bounded.
 async function readStdin(limit) {
   const chunks = [];
   let size = 0;
@@ -333,6 +338,7 @@ async function readStdin(limit) {
   return Buffer.concat(chunks).toString('utf8');
 }
 
+// Boolean global flag: present anywhere in argv → true, removed from args.
 function extractFlag(args, name) {
   const flag = `--${name}`;
   const idx = args.findIndex(a => a === flag);
@@ -491,11 +497,10 @@ export async function run(rawArgs) {
       }
       const { runCursorLogin, runCursorLogout } = await import('./cursor-login.js');
       if (command === 'logout') {
-        runCursorLogout(args.slice(2));
+        await runCursorLogout(args.slice(2));
       } else {
         const { browserCommand, runBrowserCommand } = await import('./login-page.js');
         await runCursorLogin(args.slice(2), {
-          envProxyBlockFor,
           openBrowser: url => {
             const launch = browserCommand(url);
             if (launch) runBrowserCommand(launch);
