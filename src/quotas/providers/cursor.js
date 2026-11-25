@@ -105,7 +105,9 @@ export async function fetchCursorQuota({
   // Sent as a cookie the ciphertext is a certain 401 ("sign in again"). Like
   // missing_credentials this result carries no cache scope, so the registry
   // neither writes a cache entry for it nor falls back to an older one.
-  if (isEncryptedCursorToken(token)) return result('unsupported', { message: ENCRYPTED_TOKEN_MESSAGE });
+  if (isEncryptedCursorToken(token)) {
+    return result('unsupported', { failureReason: 'credentialsEncrypted', message: ENCRYPTED_TOKEN_MESSAGE });
+  }
   const scoped = (status, extra) => attachCacheScope(result(status, extra), token);
   try {
     const signal = AbortSignal.timeout(timeoutMs);

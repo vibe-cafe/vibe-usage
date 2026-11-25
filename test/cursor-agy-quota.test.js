@@ -135,13 +135,18 @@ test('Cursor reports an encrypted login as unsupported: no request, no cache ent
     const encrypted = await fixture(t, encoding, login);
     // Same cache directory that holds the readable account's `ok` entry.
     const environment = { ...encrypted.environment, VIBE_USAGE_QUOTA_CACHE_DIR: readable.root };
-    const noNetwork = () => assert.fail('unexpected network');
+    let requests = 0;
+    const noNetwork = () => { requests += 1; throw new Error('unexpected network'); };
     const direct = await fetchCursorQuota({ environment, now, fetchImpl: noNetwork });
     assert.equal(direct.status, 'unsupported');
+    // #190: the card can say why (encrypted login), not just "nothing read".
+    assert.equal(direct.failureReason, 'credentialsEncrypted');
+    assert.equal(direct.pauseReason, undefined);
     assert.equal(direct.cacheScope, undefined);
     const envelope = await fetchQuotaProducts(['cursor'], { environment, now, fetchImpl: noNetwork });
     const [product] = envelope.products;
     assert.equal(product.status, 'unsupported');
+    assert.equal(product.failureReason, 'credentialsEncrypted');
     assert.equal(product.source, 'live');
     assert.deepEqual(product.meters, []);
     assert.match(product.message, /encrypted/);
@@ -154,7 +159,9 @@ test('Cursor reports an encrypted login as unsupported: no request, no cache ent
     // A fresh cache directory stays empty.
     const fresh = await fetchQuotaProducts(['cursor'], { environment: encrypted.environment, now, fetchImpl: noNetwork });
     assert.equal(fresh.products[0].status, 'unsupported');
+    assert.equal(fresh.products[0].failureReason, 'credentialsEncrypted');
     assert.equal(existsSync(join(encrypted.root, 'quota-cache.json')), false);
+    assert.equal(requests, 0);
   }
   // A readable login afterwards is fetched exactly as before.
   let calls = 0;
