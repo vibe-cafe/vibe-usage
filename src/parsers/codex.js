@@ -833,8 +833,8 @@ const RECENT_WINDOW_MS = 3 * 24 * 60 * 60 * 1000;
 
 /**
  * The order in which a run reads sessions. `recent`: the keys of sessions with
- * a plain rollout modified since `since`. `needed(key)`: those and every session
- * one of them descends from (forks and sub-agents need their parent's replay
+ * a plain rollout modified since `since`. `needed(key)`: those and the parent of
+ * each that is a fork or a sub-agent (its replay boundary needs the parent's
  * index). `rank(key)`: the newest plain mtime of the session (a session with
  * compressed rollouts only: when it started), raised to that of any fork or
  * sub-agent of it, so a parent goes with the newest of them.
@@ -857,10 +857,11 @@ function sessionPriorities(files, sessionKey, since) {
       const parentId = file.header?.forkedFromId || (file.header?.isSubagent ? file.header.parentThreadId : null);
       if (parentId && parentId !== key) parentOf.set(key, parentId);
     }
+    // A fork's replay boundary needs its parent's index, not the parent's
+    // own parent: reading that one in pass 2 could use up the budget the
+    // fork's usage was waiting for (cross-review 2026-11-25).
     const needed = new Set(recent);
-    for (let key of recent) {
-      while (parentOf.has(key) && !needed.has(parentOf.get(key))) needed.add(key = parentOf.get(key));
-    }
+    for (const key of recent) if (parentOf.has(key)) needed.add(parentOf.get(key));
     // Chains are short; the bound only matters for a cycle in damaged headers.
     for (let changed = true, round = 0; changed && round < 32; round++) {
       changed = false;
@@ -1494,6 +1495,7 @@ async function indexFromCompressedCopy(file, sameSession, fileMeta, needsIndex) 
 function writeCodexManifests(manifests, files, complete, parentIds = new Set()) {
   if (!codexCacheEnabled()) return;
   const next = new Map([...manifests.keys()].map(codexHome => [codexHome, new Map()]));
+  const currentSignatures = new Map(files.filter(file => !file.members).map(file => [file.filePath, file.signature]));
   for (const file of files) {
     const records = next.get(file.codexHome);
     if (!records) continue;
@@ -1518,8 +1520,18 @@ function writeCodexManifests(manifests, files, complete, parentIds = new Set()) 
       const signature = !file.cacheWritten && file.recordSignature ? file.recordSignature : file.signature;
       const entrySignature = !file.cacheWritten && file.entrySignature && !sameSignature(file.entrySignature, signature)
         ? file.entrySignature : undefined;
-      records.set(file.filePath, manifestRecord(file.cache, signature, file.cacheSource, boundaryParent ?? undefined,
-        file.filePath, parentIds.has(file.cache.header?.sessionId), entrySignature));
+      // A proven copy names its plain twin with the twin's signature as it is
+      // now: a record that took a new device number while its `copyOf` kept
+      // the old one is one a 0.15.x collector accepts but whose copy it then
+      // rejects, putting the compressed file back into the group's key -- and
+      // the two collectors would rewrite that group on every run.
+      let cache = file.cache;
+      const twin = cache.copyOf && currentSignatures.get(cache.copyOf.filePath);
+      if (twin && twin.dev !== cache.copyOf.signature?.dev && sameSignature(twin, cache.copyOf.signature)) {
+        cache = { ...cache, copyOf: { ...cache.copyOf, signature: twin } };
+      }
+      records.set(file.filePath, manifestRecord(cache, signature, file.cacheSource, boundaryParent ?? undefined,
+        file.filePath, parentIds.has(cache.header?.sessionId), entrySignature));
     } else if (previous) {
       records.set(file.filePath, previous);
     }

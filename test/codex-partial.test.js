@@ -283,3 +283,45 @@ test('what a conversation in use needs from compressed history is read with the 
   assert.deepEqual(view(first.result), view(await m.uncached()));
   assert.equal(input(first.result, FORK_WINDOW), 10 + 20 + 30 + 5);
 });
+
+test('a fork made today needs only its parent: an older ancestor waits for history', needsZstd, async () => {
+  const m = machine();
+  const grand = jsonl([
+    sessionMeta('2026-07-01T08:00:00.000Z', 'grand-1'),
+    tokenCount('2026-07-01T08:05:00.000Z', 1000, 1001),
+    tokenCount('2026-07-01T08:20:00.000Z', 2000, 3002),
+  ]);
+  const middle = jsonl([
+    sessionMeta('2026-07-05T08:00:00.000Z', 'middle-1', { forked_from_id: 'grand-1' }),
+    { ...tokenCount('2026-07-01T08:05:00.000Z', 1000, 1001), timestamp: '2026-07-05T08:00:00.000Z' },
+    { ...tokenCount('2026-07-01T08:20:00.000Z', 2000, 3002), timestamp: '2026-07-05T08:00:00.000Z' },
+    tokenCount('2026-07-05T08:01:00.000Z', 300, 3303),
+  ]);
+  const TODAY = '2026-07-18T09:00:00.000Z';
+  const today = jsonl([
+    sessionMeta(TODAY, 'today-1', { forked_from_id: 'middle-1' }),
+    { ...tokenCount('2026-07-01T08:05:00.000Z', 1000, 1001), timestamp: TODAY },
+    { ...tokenCount('2026-07-01T08:20:00.000Z', 2000, 3002), timestamp: TODAY },
+    { ...tokenCount('2026-07-05T08:01:00.000Z', 300, 3303), timestamp: TODAY },
+    tokenCount('2026-07-18T09:01:00.000Z', 7, 3311),
+  ]);
+  writeFileSync(m.file('codex', 'rollout-a-grand.jsonl.zst'), zlib.zstdCompressSync(Buffer.from(grand)));
+  writeFileSync(m.file('codex', 'rollout-b-middle.jsonl'), middle);
+  const monthAgo = (clock.now - 30 * 24 * 3600e3) / 1000;
+  fs.utimesSync(m.file('codex', 'rollout-b-middle.jsonl'), monthAgo, monthAgo);
+  writeFileSync(m.file('codex', 'rollout-c-today.jsonl'), today);
+
+  // Three headers (30 ms), today's fork's index (40 ms), its parent's index
+  // (50 ms), then the fork (60 ms) inside a 55 ms budget. The compressed
+  // grandparent is what the parent's own usage needs, not the fork's: it waits.
+  const first = await m.run(55);
+  assert.equal(first.result.skipped, undefined, JSON.stringify(first.result));
+  assert.ok(first.result.indexing, 'the parent and its parent wait');
+  assert.equal(input(first.result), 7, 'today\'s fork, without the history it copied');
+
+  let last = first;
+  for (let i = 0; i < 4 && last.result.indexing; i++) last = await m.run(55);
+  assert.equal(last.result.indexing, undefined);
+  assert.deepEqual(view(last.result), view(await m.uncached()));
+  assert.equal(input(last.result), 3000 + 300 + 7);
+});

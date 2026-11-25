@@ -6,6 +6,7 @@ import fs, {
 import { syncBuiltinESMExports } from 'node:module';
 import { join } from 'node:path';
 import { tmpdir } from 'node:os';
+import zlib from 'node:zlib';
 import { parse } from '../src/parsers/codex.js';
 import { codexCacheDir, fileSignature, olderCodexCacheDir } from '../src/parsers/codex-cache.js';
 import { codexSegmentSignature, legacyCodexSegmentSignature } from '../src/parsers/codex-segments.js';
@@ -383,6 +384,35 @@ test('after a reboot, groups whose members kept only algorithm-6 entries are not
       const { result, paths } = await opened(run);
       assert.deepEqual(paths, []);
       assert.deepEqual(view(result), view(await uncached()));
+    } finally {
+      restore();
+    }
+  }, { onlyGroup: true });
+});
+
+test('a record written after a reboot names a compressed copy\'s twin as it is now', { skip: typeof zlib.zstdCompressSync === 'function' ? false : 'node:zlib has no zstd before Node 22.15' }, async () => {
+  // A 0.15.x collector still running compares `copyOf` with the device number.
+  // A record that took the new number while its `copyOf` kept the old one is
+  // one it accepts and whose copy it then rejects: the compressed file goes
+  // back into the group's key, and the two collectors rewrite that group on
+  // every run.
+  await withHomes(async ({ homes, file, run }) => {
+    // Codex compressed its own copy; the one in the other home stays plain.
+    rmSync(file('codex', parentFile));
+    writeFileSync(file('codex', `${parentFile}.zst`), zlib.zstdCompressSync(Buffer.from(parent)));
+    await run();
+    await run();
+    const recordOf = path => JSON.parse(readFileSync(manifestPath(homes.codex), 'utf8')).records[path];
+    assert.ok(recordOf(file('codex', `${parentFile}.zst`)).copyOf, 'proven a copy of the plain file');
+    const restore = shiftDeviceNumbers(1000);
+    try {
+      // A new conversation: the manifest of that home is written again.
+      writeFileSync(file('codex', 'rollout-2026-07-11T08-00-00-new-1.jsonl'),
+        jsonl([sessionMeta('2026-07-11T08:00:00.000Z', 'new-1'), turn, tokenCount('2026-07-11T08:05:00.000Z', 5, 6)]));
+      assert.deepEqual([...new Set((await opened(run)).paths)], [file('codex', 'rollout-2026-07-11T08-00-00-new-1.jsonl')]);
+      const record = recordOf(file('codex', `${parentFile}.zst`));
+      assert.equal(record.signature.dev, String(statSync(file('codex', `${parentFile}.zst`)).dev));
+      assert.equal(record.copyOf.signature.dev, String(statSync(file('orca', parentFile)).dev));
     } finally {
       restore();
     }
