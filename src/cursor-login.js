@@ -581,10 +581,12 @@ export async function runCursorLogin(args, {
   };
   if (unknown.length) return fail('usage', `Unknown login option: ${unknown[0]}`);
 
-  // With --json a desktop app runs this and has turned the system proxy into
-  // variables already; in a terminal the system proxy is checked too.
+  // A desktop app (it sets VIBE_USAGE_SURFACE to mac-app / windows-app) has
+  // turned the system proxy into variables already; any other caller, with
+  // or without --json, gets the system-proxy check too.
   const urls = refresh ? [cursorRefreshURL(env)] : cursorLoginNetworkURLs(env);
-  const block = json ? blockFor(urls, { env }) : cursorSignInBlock(urls, { env, blockFor, systemProxy });
+  const fromApp = /-app$/.test(env.VIBE_USAGE_SURFACE?.trim() || '');
+  const block = fromApp ? blockFor(urls, { env }) : cursorSignInBlock(urls, { env, blockFor, systemProxy });
   if (block) return fail('proxy', `无法按你的代理设置连接 Cursor，未发送任何请求：${block.notice}`);
 
   if (refresh) {

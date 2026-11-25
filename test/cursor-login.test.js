@@ -459,8 +459,13 @@ test('a terminal sign-in is refused on a system proxy the CLI was not told about
   assert.match(terminal.stderr, /检测到系统代理，但这个进程没有收到代理环境变量/);
   assert.equal(state.polls, 0, 'nothing sent');
   assert.equal(existsSync(join(home, 'cursor-login.json')), false);
-  // The apps turn the system proxy into variables before they run --json.
-  const app = await run(['login', 'cursor', '--json'], '', { VIBE_USAGE_SYSTEM_PROXY: '1' });
+  // --json alone is not an app: still refused.
+  const script = await run(['login', 'cursor', '--json'], '', { VIBE_USAGE_SYSTEM_PROXY: '1' });
+  assert.equal(script.code, 1);
+  assert.equal(JSON.parse(script.stdout.trim()).code, 'proxy');
+  assert.equal(state.polls, 0);
+  // The apps turn the system proxy into variables before they start the CLI.
+  const app = await run(['login', 'cursor', '--json'], '', { VIBE_USAGE_SYSTEM_PROXY: '1', VIBE_USAGE_SURFACE: 'mac-app' });
   assert.equal(app.code, 0, app.stderr);
   assert.ok(state.polls > 0);
 });
@@ -475,6 +480,14 @@ test('system proxy detection reads scutil / the registry, and an unknown answer 
   assert.equal(ask('win32', '    ProxyEnable    REG_DWORD    0x1\r\n    ProxyServer    REG_SZ    127.0.0.1:7890'), true);
   assert.equal(ask('win32', '    ProxyEnable    REG_DWORD    0x0\r\n    AutoConfigURL    REG_SZ    http://127.0.0.1/pac'), true);
   assert.equal(ask('win32', '    ProxyEnable    REG_DWORD    0x0'), false);
+  // A machine-wide policy: the HKLM settings count, not the user's.
+  const windows = (policy, machine, user) => systemProxyConfigured({ platform: 'win32', env: {}, run: (file, [, key]) => {
+    if (key.includes('Policies')) { if (policy === null) throw new Error('no key'); return policy; }
+    return key.startsWith('HKLM') ? machine : user;
+  } });
+  assert.equal(windows('    ProxySettingsPerUser    REG_DWORD    0x0', '    ProxyEnable    REG_DWORD    0x1', '    ProxyEnable    REG_DWORD    0x0'), true);
+  assert.equal(windows(null, '    ProxyEnable    REG_DWORD    0x1', '    ProxyEnable    REG_DWORD    0x0'), false);
+  assert.equal(windows('    ProxySettingsPerUser    REG_DWORD    0x1', '    ProxyEnable    REG_DWORD    0x1', '    ProxyEnable    REG_DWORD    0x0'), false);
   assert.equal(ask('linux', 'anything'), false);
   // When unsure, do not send.
   assert.equal(systemProxyConfigured({ platform: 'darwin', env: {}, run: () => { throw new Error('no scutil'); } }), true);

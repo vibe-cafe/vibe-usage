@@ -25,10 +25,19 @@ export function systemProxyConfigured({ platform = process.platform, env = proce
       return /\b(?:HTTPEnable|HTTPSEnable|SOCKSEnable|ProxyAutoConfigEnable|ProxyAutoDiscoveryEnable)\s*:\s*1\b/.test(out);
     }
     if (platform === 'win32') {
-      const out = run('reg', ['query', 'HKCU\\Software\\Microsoft\\Windows\\CurrentVersion\\Internet Settings'], {
+      const query = key => run('reg', ['query', key], {
         encoding: 'utf8', timeout: 2000, windowsHide: true, stdio: ['ignore', 'pipe', 'ignore'],
       });
-      return /\bProxyEnable\s+REG_DWORD\s+0x0*1\b/i.test(out) || /\bAutoConfigURL\s+REG_SZ\s+\S/i.test(out);
+      const configured = out => /\bProxyEnable\s+REG_DWORD\s+0x0*1\b/i.test(out) || /\bAutoConfigURL\s+REG_SZ\s+\S/i.test(out);
+      // A machine-wide policy (ProxySettingsPerUser = 0) moves the settings
+      // to HKLM; a missing policy key (reg exits non-zero) means per user.
+      let machineWide = false;
+      try {
+        machineWide = /\bProxySettingsPerUser\s+REG_DWORD\s+0x0+\b/i.test(
+          query('HKLM\\SOFTWARE\\Policies\\Microsoft\\Windows\\CurrentVersion\\Internet Settings'));
+      } catch { /* no policy */ }
+      const key = machineWide ? 'HKLM' : 'HKCU';
+      return configured(query(`${key}\\Software\\Microsoft\\Windows\\CurrentVersion\\Internet Settings`));
     }
   } catch {
     return platform === 'darwin' || platform === 'win32';
