@@ -44,6 +44,15 @@ export const QUOTA_PAUSE_REASONS = Object.freeze([
   'proxyNotDetected',
 ]);
 
+/**
+ * A product the user can sign in to through Vibe Usage itself, additive within
+ * schema v1 and only with status `unsupported`: `required` (no usable sign-in;
+ * Cursor's own local login is encrypted, issue #144) or `expired` (the sign-in
+ * Vibe Usage kept was ended by the vendor). Clients that know it offer
+ * `vibe-usage login <product>`; older ones show `unsupported` as before.
+ */
+export const QUOTA_SIGN_IN_STATES = Object.freeze(['required', 'expired']);
+
 const FETCH_STATUSES = new Set([
   'ok',
   'no_data',
@@ -173,6 +182,7 @@ export function quotaResult({
   emptyReason,
   pauseReason,
   egressRegion,
+  signIn,
 }) {
   if (!FETCHABLE_QUOTA_PRODUCT_IDS.includes(id)) {
     throw new TypeError(`unsupported quota product: ${id}`);
@@ -203,6 +213,12 @@ export function quotaResult({
     }
     result.pauseReason = pauseReason;
     if (typeof egressRegion === 'string' && /^[A-Z]{2}$/.test(egressRegion)) result.egressRegion = egressRegion;
+  }
+  if (signIn !== undefined && signIn !== null) {
+    if (!QUOTA_SIGN_IN_STATES.includes(signIn) || status !== 'unsupported') {
+      throw new TypeError(`invalid quota signIn: ${signIn}`);
+    }
+    result.signIn = signIn;
   }
   return result;
 }

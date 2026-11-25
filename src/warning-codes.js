@@ -31,6 +31,7 @@ export const WARNING_CODES = Object.freeze({
   sqlite_unavailable: '没有可用的 SQLite（node:sqlite 和 sqlite3 命令都没有）',
   decoder_unavailable: '缺少解压组件（zstd）',
   cursor_token_encrypted: '本地登录令牌已加密',
+  cursor_login_expired: '在 Vibe Usage 里登录的 Cursor 已失效，需要重新登录',
   proxy_unsupported: '设置了代理但无法照着走，已跳过（避免直连）',
   auth_rejected: '登录凭证被拒绝，需要在该工具里重新登录',
   network_timeout: '网络请求超时',
@@ -61,6 +62,8 @@ const RULES = [
   // Cursor 3.27+ token encryption (issue #144). Its notice also says
   // "暂不支持读取", so it must precede the format rule.
   ['cursor_token_encrypted', /已加密保存登录凭证|issues\/144/],
+  // The separate Vibe Usage sign-in (cursor-login.js) was ended by Cursor.
+  ['cursor_login_expired', /Cursor 登录已失效/],
   // env-proxy.js: a proxy this process cannot follow, so nothing was sent.
   ['proxy_unsupported', /为避免直连已跳过/],
   ['sqlite_unavailable', /sqlite3 CLI not found/i],

@@ -36,7 +36,8 @@ async function fixture(t, encoding = 'utf8', login = token) {
   try { ({ DatabaseSync } = await import('node:sqlite')); } catch {}
   if (DatabaseSync) { const db = new DatabaseSync(dbPath); try { db.exec(sql); } finally { db.close(); } }
   else execFileSync('sqlite3', [dbPath, sql]);
-  return { root, dbPath, environment: { CURSOR_STATE_DB_PATH: dbPath, VIBE_USAGE_QUOTA_CACHE_DIR: root } };
+  // VIBE_USAGE_CONFIG_DIR: no Vibe Usage Cursor sign-in from the real home.
+  return { root, dbPath, environment: { CURSOR_STATE_DB_PATH: dbPath, VIBE_USAGE_QUOTA_CACHE_DIR: root, VIBE_USAGE_CONFIG_DIR: root } };
 }
 
 test('Cursor preserves percentage units, zero and reset, and never invents a missing limit', () => {
@@ -142,8 +143,8 @@ test('Cursor reports an encrypted login as unsupported: no request, no cache ent
     assert.equal(product.source, 'live');
     assert.deepEqual(product.meters, []);
     assert.match(product.message, /encrypted/);
-    assert.match(product.message, /will not fix/);
-    assert.match(product.message, /https:\/\/github\.com\/vibe-cafe\/vibe-usage\/issues\/144/);
+    assert.match(product.message, /vibe-usage login cursor/);
+    assert.equal(product.signIn, 'required');
     assert.doesNotMatch(product.message, /sign in again, then retry/);
     const output = JSON.stringify(envelope);
     for (const secret of [cipher, 'cursor-safe-storage']) assert.ok(!output.includes(secret));

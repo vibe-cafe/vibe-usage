@@ -26,9 +26,14 @@ async function withCursorDb(t, { value = TOKEN } = {}) {
   const root = mkdtempSync(join(tmpdir(), 'vibe-usage-cursor-test-'));
   const dbPath = join(root, 'state.vscdb');
   const previous = process.env.CURSOR_STATE_DB_PATH;
+  const previousConfigDir = process.env.VIBE_USAGE_CONFIG_DIR;
+  // No Vibe Usage Cursor sign-in (cursor-login.js) from the real home.
+  process.env.VIBE_USAGE_CONFIG_DIR = root;
   t.after(() => {
     if (previous === undefined) delete process.env.CURSOR_STATE_DB_PATH;
     else process.env.CURSOR_STATE_DB_PATH = previous;
+    if (previousConfigDir === undefined) delete process.env.VIBE_USAGE_CONFIG_DIR;
+    else process.env.VIBE_USAGE_CONFIG_DIR = previousConfigDir;
     rmSync(root, { recursive: true, force: true });
   });
 
@@ -295,7 +300,7 @@ for (const [label, value] of [
   ['v1 TEXT', `cursor-safe-storage:v1:${CIPHER_PAYLOAD}`],
   ['a later version stored as a UTF-16LE BLOB', Buffer.from(`cursor-safe-storage:v9:${CIPHER_PAYLOAD}`, 'utf16le')],
 ]) {
-  test(`Cursor skips an encrypted token (${label}) without any request, info or re-login advice`, async (t) => {
+  test(`Cursor skips an encrypted token (${label}) without any request or info, pointing at the Vibe Usage sign-in`, async (t) => {
     await withCursorDb(t, { value });
     const fetchMock = t.mock.method(globalThis, 'fetch', async () => {
       throw new Error('an encrypted token must not reach cursor.com');
@@ -317,9 +322,10 @@ for (const [label, value] of [
     const [warning] = result.warnings;
     assert.match(warning, /^cursor: 新版 Cursor 已加密保存登录凭证/);
     assert.match(warning, /其他工具照常同步/);
-    assert.match(warning, /重新登录 Cursor 无法解决/);
-    assert.match(warning, /https:\/\/github\.com\/vibe-cafe\/vibe-usage\/issues\/144/);
-    assert.doesNotMatch(warning, /sign in again|cursor-safe-storage/);
+    // Signing in to Cursor again only writes the same ciphertext; the way
+    // back is the separate Vibe Usage sign-in.
+    assert.match(warning, /运行 vibe-usage login cursor（或在 App 设置里登录 Cursor）即可恢复/);
+    assert.doesNotMatch(warning, /sign in again|cursor-safe-storage|在 Cursor 中重新登录/);
     assert.ok(!warning.includes(CIPHER_PAYLOAD));
   });
 }
