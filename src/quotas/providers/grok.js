@@ -215,7 +215,13 @@ export async function requestGrokBilling(binary, {
   let bytes = 0;
   const answer = await withProcess(binary, () => ['agent', '--no-leader', 'stdio'], {
     prefix: 'vibe-usage-grok-quota-', environment, timeoutMs: protocolMs, spawnImpl,
-    configureEnv: env => setVariable(env, 'GROK_DISABLE_AUTOUPDATER', '1'),
+    // Only in this child, which is stopped right after the answer: no
+    // self-update download, and no worktree clean-up pass that would be cut
+    // off midway. The user's own Grok keeps both as configured.
+    configureEnv: env => {
+      setVariable(env, 'GROK_DISABLE_AUTOUPDATER', '1');
+      setVariable(env, 'GROK_WORKTREE_AUTO_GC', '0');
+    },
     failureMessage: BILLING_UNAVAILABLE,
   }, async ({ child, abort, signal }) => {
     function count(chunk) {

@@ -71,7 +71,7 @@ const fake = String.raw`
   const { SCENARIO, ANSWER } = process.env;
   const reply = (id, fields) => console.log(JSON.stringify({ jsonrpc: '2.0', id, ...fields }));
   trace({ argv: process.argv.slice(2), cwd: process.cwd(), pid: process.pid,
-    envKeys: Object.keys(process.env), updater: process.env.GROK_DISABLE_AUTOUPDATER,
+    envKeys: Object.keys(process.env), updater: process.env.GROK_DISABLE_AUTOUPDATER, gc: process.env.GROK_WORKTREE_AUTO_GC,
     proxy: process.env.HTTPS_PROXY, bypass: process.env.NO_PROXY });
   const lines = require('node:readline').createInterface({ input: process.stdin });
   lines.on('line', line => {
@@ -159,6 +159,7 @@ test('a live read sends exactly two ACP requests, isolates the child and returns
     { jsonrpc: '2.0', id: 2, method: '_x.ai/billing', params: {} },
   ]);
   assert.equal(child.updater, '1');
+  assert.equal(child.gc, '0');
   assert.deepEqual(child.envKeys.filter(key => /^(bigmodel_api_key|z_ai_api_key|grok_disable_autoupdater)$/i.test(key)),
     ['GROK_DISABLE_AUTOUPDATER']);
   assert.equal(child.proxy, f.environment.HTTPS_PROXY);
