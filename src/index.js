@@ -15,7 +15,7 @@ import { fetchAccount } from './api.js';
 import { COLLECTOR_VERSION } from './client-meta.js';
 import { kikiStartTime } from './kiki-migration.js';
 import { magpieStartTime } from './magpie-migration.js';
-import { ENCRYPTED_TOKEN_NOTICE, localCursorTokenEncrypted } from './parsers/cursor.js';
+import { ENCRYPTED_TOKEN_NOTICE, localCursorTokenEncrypted, recentAppRecord } from './parsers/cursor.js';
 import { setupEnvProxy } from './env-proxy.js';
 import { cursorLoginStatusLine, readStoredCursorLogin, setProvidedCursorLogin } from './cursor-login.js';
 
@@ -110,11 +110,12 @@ async function showStatus() {
           // An encrypted token (issue #144) also stops new events, and then
           // checking the account is the wrong advice. Read only here, through
           // the parser's own read; only a yes/no comes back.
-          // With a stored Vibe Usage sign-in the local token is not used,
-          // so neither its encryption nor Cursor's account is the suspect.
-          const signedIn = Boolean(readStoredCursorLogin()?.credential);
+          // With a Vibe Usage sign-in (stored, or a desktop app's own) the
+          // local token is not used, so neither its encryption nor Cursor's
+          // account is the suspect.
+          const signedIn = Boolean(readStoredCursorLogin()?.credential || recentAppRecord(cursorInfo));
           console.log(dimText(signedIn
-            ? '       已超过 48 小时没有新的 Cursor 事件；如最近用过 Cursor，请确认下面这份 Cursor 登录是这个账号'
+            ? '       已超过 48 小时没有新的 Cursor 事件；如最近用过 Cursor，请确认在 Vibe Usage 里登录的 Cursor 是这个账号'
             : localCursorTokenEncrypted()
               ? `       ${ENCRYPTED_TOKEN_NOTICE}`
               : '       已超过 48 小时没有新的 Cursor 事件；如最近用过 Cursor，请确认 Cursor 登录的是这个账号'));

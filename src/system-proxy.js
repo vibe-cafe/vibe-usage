@@ -8,7 +8,10 @@
 // separate Cursor sign-in adds, that is not acceptable: when this answers yes
 // and no proxy variable is set, they are not sent and the user is told to set
 // HTTPS_PROXY. A TUN-only setup configures no system proxy and is unaffected.
-// Unknown (the query failed) counts as not configured.
+// A query that fails on macOS / Windows counts as configured (when unsure, do
+// not send). Not covered: Linux desktop proxy settings, and Windows proxies
+// handed out only by WPAD ("Automatically detect settings" is on by default,
+// so it cannot tell a proxy apart from none) -- the desktop apps' known gap.
 import { execFileSync } from 'node:child_process';
 
 export function systemProxyConfigured({ platform = process.platform, env = process.env, run = execFileSync } = {}) {
@@ -28,7 +31,7 @@ export function systemProxyConfigured({ platform = process.platform, env = proce
       return /\bProxyEnable\s+REG_DWORD\s+0x0*1\b/i.test(out) || /\bAutoConfigURL\s+REG_SZ\s+\S/i.test(out);
     }
   } catch {
-    // Unknown: not configured.
+    return platform === 'darwin' || platform === 'win32';
   }
   return false;
 }

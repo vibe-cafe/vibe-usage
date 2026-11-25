@@ -63,6 +63,9 @@ const LOGIN_EXPIRED_WARNING = `cursor: ${LOGIN_EXPIRED_NOTICE}`;
 // two collectors would write two accounts into the same keys and keep
 // resetting each other's progress. The app's account wins; this run skips
 // (no request, no info). It resumes once the app has not synced for 7 days.
+// The record (`parserMeta.cursor.app`: the app's account label and time) is
+// written only by the app's runs; every other run carries it forward as is,
+// so an ordinary sync of the same account does not clear it.
 export const APP_ACCOUNT_NOTICE =
   'Cursor 正由桌面 App 用另一个账号同步（以 App 里登录的为准），本次跳过，避免两个账号的用量写进同一条记录。';
 const APP_ACCOUNT_WARNING = `cursor: ${APP_ACCOUNT_NOTICE}`;
@@ -644,7 +647,7 @@ function laterDate(a, b) {
   return a > b ? a : b;
 }
 
-function resultInfo({ account, latestEventAt, latestTokenAt, events, tokenEvents, fallbackLatestAt, syncedAt, backfill, appSignIn }) {
+function resultInfo({ account, latestEventAt, latestTokenAt, events, tokenEvents, fallbackLatestAt, syncedAt, backfill, app }) {
   return {
     ...(account ? { account } : {}),
     ...(latestEventAt ? { latestEventAt: new Date(latestEventAt).toISOString() } : {}),
@@ -654,8 +657,8 @@ function resultInfo({ account, latestEventAt, latestTokenAt, events, tokenEvents
     ...(fallbackLatestAt ? { fallbackLatestAt } : {}),
     ...(syncedAt ? { syncedAt: new Date(syncedAt).toISOString() } : {}),
     ...(backfill ? { backfill: { before: new Date(backfill.before).toISOString(), until: new Date(backfill.until).toISOString() } } : {}),
-    // Read with a desktop app's own sign-in (see APP_ACCOUNT_NOTICE).
-    ...(appSignIn ? { appSignIn: true } : {}),
+    // The desktop app's own sign-in, last seen (see APP_ACCOUNT_NOTICE).
+    ...(app ? { app } : {}),
   };
 }
 
@@ -853,13 +856,13 @@ export async function parse({ previousInfo, envProxyBlock } = {}) {
       return { buckets: [], sessions: [], skipped: true, warnings: [ENCRYPTED_TOKEN_WARNING] };
     }
   }
-  const runToken = login ? login.credential.accessToken : token;
-  const recordedAt = Date.parse(previousInfo?.syncedAt);
-  if (login?.kind !== 'provided' && previousInfo?.appSignIn && previousInfo.account
-      && Number.isFinite(recordedAt) && Date.now() - recordedAt < APP_SIGN_IN_HOLD_MS
-      && cursorAccountLabel(decodeJwtSub(runToken)) !== previousInfo.account) {
+  const runAccount = cursorAccountLabel(decodeJwtSub(login ? login.credential.accessToken : token));
+  const recordedApp = recentAppRecord(previousInfo);
+  if (login?.kind !== 'provided' && recordedApp && recordedApp.account !== runAccount) {
     return { buckets: [], sessions: [], skipped: true, warnings: [APP_ACCOUNT_WARNING] };
   }
+  const app = login?.kind === 'provided' && runAccount
+    ? { account: runAccount, syncedAt: new Date().toISOString() } : recordedApp;
   // A stored sign-in may be renewed on the way, so its renewal URL must be
   // reachable through the user's proxy too, and a system proxy this process
   // was not told about stops it (`cursorSignInBlock()`).
@@ -872,8 +875,7 @@ export async function parse({ previousInfo, envProxyBlock } = {}) {
       warnings: [`cursor: ${PROXY_SKIP_NOTICE_PREFIX}${block.notice}，其他工具照常同步。`],
     };
   }
-  if (!login) return readCursorUsage(token, previousInfo);
-  const appSignIn = login.kind === 'provided';
+  if (!login) return readCursorUsage(token, previousInfo, { app });
 
   const renewalSkipped = reason => ({
     buckets: [], sessions: [], skipped: true,
@@ -883,7 +885,7 @@ export async function parse({ previousInfo, envProxyBlock } = {}) {
   if (fresh.expired) return { buckets: [], sessions: [], skipped: true, warnings: [LOGIN_EXPIRED_WARNING] };
   if (fresh.retryable) return renewalSkipped(fresh.reason);
   try {
-    return await readCursorUsage(fresh.credential.accessToken, previousInfo, { appSignIn });
+    return await readCursorUsage(fresh.credential.accessToken, previousInfo, { app });
   } catch (err) {
     if (!err?.sessionRejected) throw err;
   }
@@ -894,19 +896,27 @@ export async function parse({ previousInfo, envProxyBlock } = {}) {
     if (renewed.retryable) return renewalSkipped(renewed.reason);
     if (renewed.credential) {
       try {
-        return await readCursorUsage(renewed.credential.accessToken, previousInfo, { appSignIn });
+        return await readCursorUsage(renewed.credential.accessToken, previousInfo, { app });
       } catch (err) {
         if (!err?.sessionRejected) throw err;
       }
-      endStoredCursorLogin({ kind: 'stored', credential: renewed.credential });
+      await endStoredCursorLogin({ kind: 'stored', credential: renewed.credential });
     }
   } else if (login.kind === 'stored') {
-    endStoredCursorLogin({ kind: 'stored', credential: fresh.credential });
+    await endStoredCursorLogin({ kind: 'stored', credential: fresh.credential });
   }
   return { buckets: [], sessions: [], skipped: true, warnings: [LOGIN_EXPIRED_WARNING] };
 }
 
-async function readCursorUsage(token, previousInfo, { appSignIn = false } = {}) {
+/** `parserMeta.cursor.app` while it still protects the app's account (7 days). */
+export function recentAppRecord(info, now = Date.now()) {
+  const app = info?.app;
+  const at = Date.parse(app?.syncedAt);
+  if (typeof app?.account !== 'string' || !app.account || !Number.isFinite(at) || now - at >= APP_SIGN_IN_HOLD_MS) return null;
+  return { account: app.account, syncedAt: new Date(at).toISOString() };
+}
+
+async function readCursorUsage(token, previousInfo, { app = null } = {}) {
   const sub = decodeJwtSub(token);
   const account = cursorAccountLabel(sub);
   // A different Cursor account: forget the old account's times before any
@@ -1006,7 +1016,7 @@ async function readCursorUsage(token, previousInfo, { appSignIn = false } = {}) 
       fallbackLatestAt,
       syncedAt: startedAt,
       backfill,
-      appSignIn,
+      app,
     }),
   };
 }

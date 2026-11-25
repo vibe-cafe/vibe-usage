@@ -136,7 +136,7 @@ export async function fetchCursorQuota({
       if (answer.status !== 'unauthorized') return answer;
       rejected = renewed.credential;
     }
-    endStoredCursorLogin({ kind: 'stored', credential: rejected }, environment);
+    await endStoredCursorLogin({ kind: 'stored', credential: rejected }, environment, sleep ? { sleep } : {});
     return expired();
   }
 

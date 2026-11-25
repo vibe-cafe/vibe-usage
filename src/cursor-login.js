@@ -47,7 +47,9 @@ const MAX_POLL_NETWORK_ERRORS = 5;
 const MAX_BODY_BYTES = 64 * 1024;
 const MAX_TOKEN_LENGTH = 16_384;
 const LOCK_STALE_MS = 60_000;
-const LOCK_RETRIES = 40;
+// Up to 20 s: longer than one renewal request (15 s), so a login or logout
+// waits for a renewal in flight instead of racing it.
+const LOCK_RETRIES = 200;
 const LOCK_RETRY_MS = 100;
 // Honest identification for the requests this module adds (sign-in, profile,
 // renewal); the existing usage reads are unchanged.
@@ -510,8 +512,12 @@ export async function freshCursorLogin(login, {
     if (outcome.status === 'ok') {
       if (unchanged()) {
         try { writeStoredCursorLogin(outcome.credential, env); } catch { /* this run still has it */ }
+        return { credential: outcome.credential, refreshed: true };
       }
-      return { credential: outcome.credential, refreshed: true };
+      // Signed out meanwhile: the renewed token is dropped, nothing more is
+      // read with it. Signed in again: use that one.
+      const current = readStoredCursorLogin(env);
+      return current?.credential ? { credential: current.credential, refreshed: true } : { expired: true };
     }
     if (outcome.status === 'expired') {
       if (unchanged()) markStoredCursorLoginRejected(env, { email: latest.credential.email, userId: latest.credential.userId, now });
@@ -529,13 +535,19 @@ export async function freshCursorLogin(login, {
 }
 
 /**
- * The stored sign-in was rejected again right after renewal: end it, unless
- * the file meanwhile holds another sign-in (a new login, another renewal).
+ * The stored sign-in was rejected again right after renewal: end it, under
+ * the lock, unless the file meanwhile holds another sign-in (a new login,
+ * another renewal).
  */
-export function endStoredCursorLogin(login, env = process.env) {
+export async function endStoredCursorLogin(login, env = process.env, { sleep = ms => new Promise(resolve => setTimeout(resolve, ms)) } = {}) {
   if (login?.kind !== 'stored' || !login.credential) return;
-  if (readStoredCursorLogin(env)?.credential?.accessToken !== login.credential.accessToken) return;
-  markStoredCursorLoginRejected(env, { email: login.credential.email, userId: login.credential.userId });
+  const release = await acquireLock(cursorLoginPath(env), sleep);
+  try {
+    if (readStoredCursorLogin(env)?.credential?.accessToken !== login.credential.accessToken) return;
+    markStoredCursorLoginRejected(env, { email: login.credential.email, userId: login.credential.userId });
+  } finally {
+    release?.();
+  }
 }
 
 // --- Commands -----------------------------------------------------------------

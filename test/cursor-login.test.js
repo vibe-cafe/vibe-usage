@@ -475,7 +475,9 @@ test('system proxy detection reads scutil / the registry, and an unknown answer 
   assert.equal(ask('win32', '    ProxyEnable    REG_DWORD    0x0\r\n    AutoConfigURL    REG_SZ    http://127.0.0.1/pac'), true);
   assert.equal(ask('win32', '    ProxyEnable    REG_DWORD    0x0'), false);
   assert.equal(ask('linux', 'anything'), false);
-  assert.equal(systemProxyConfigured({ platform: 'darwin', env: {}, run: () => { throw new Error('no scutil'); } }), false);
+  // When unsure, do not send.
+  assert.equal(systemProxyConfigured({ platform: 'darwin', env: {}, run: () => { throw new Error('no scutil'); } }), true);
+  assert.equal(systemProxyConfigured({ platform: 'linux', env: {}, run: () => { throw new Error('none'); } }), false);
   assert.equal(systemProxyConfigured({ platform: 'darwin', env: { VIBE_USAGE_SYSTEM_PROXY: '1' }, run: () => '' }), true);
 });
 
@@ -505,8 +507,8 @@ test('sync and quota: a stored sign-in sends nothing on a system proxy the proce
 test('sync: while a desktop app syncs Cursor with its own sign-in, a run with another account skips', async t => {
   isolateParser(t);
   writeStoredCursorLogin(cursorCredential({ accessToken: tokenFor('user_cli'), refreshToken: 'r' }), process.env);
-  const appInfo = (ageMs = 60_000) => ({ account: cursor.cursorAccountLabel('auth0|user_app'), appSignIn: true,
-    syncedAt: new Date(Date.now() - ageMs).toISOString() });
+  const appInfo = (ageMs = 60_000) => ({ account: cursor.cursorAccountLabel('auth0|user_app'), syncedAt: new Date().toISOString(),
+    app: { account: cursor.cursorAccountLabel('auth0|user_app'), syncedAt: new Date(Date.now() - ageMs).toISOString() } });
   const fetchMock = t.mock.method(globalThis, 'fetch', async () => new Response(CSV()));
   const skipped = await cursor.parse({ previousInfo: appInfo() });
   assert.equal(fetchMock.mock.callCount(), 0);
@@ -516,14 +518,19 @@ test('sync: while a desktop app syncs Cursor with its own sign-in, a run with an
   const resumed = await cursor.parse({ previousInfo: appInfo(8 * DAY) });
   assert.ok(fetchMock.mock.callCount() > 0);
   assert.equal(resumed.info.account, cursor.cursorAccountLabel('auth0|user_cli'));
-  assert.equal(resumed.info.appSignIn, undefined);
-  // The same account: nothing to protect.
+  assert.equal(resumed.info.app, undefined, 'a stale record is dropped');
+  // The same account: nothing to protect, and the app's record is carried
+  // forward, so a later switch to another account is still caught.
   writeStoredCursorLogin(cursorCredential({ accessToken: tokenFor('user_app'), refreshToken: 'r' }), process.env);
-  assert.equal((await cursor.parse({ previousInfo: appInfo() })).buckets.length, 1);
+  const same = await cursor.parse({ previousInfo: appInfo() });
+  assert.equal(same.buckets.length, 1);
+  assert.deepEqual(same.info.app, appInfo().app);
+  writeStoredCursorLogin(cursorCredential({ accessToken: tokenFor('user_other'), refreshToken: 'r' }), process.env);
+  assert.match((await cursor.parse({ previousInfo: same.info })).warnings[0], /正由桌面 App 用另一个账号同步/);
   // The app itself always reads, and records that it did.
   setProvidedCursorLogin(JSON.stringify(cursorCredential({ accessToken: tokenFor('user_app2'), refreshToken: 'r' })));
   const app = await cursor.parse({ previousInfo: appInfo() });
-  assert.equal(app.info.appSignIn, true);
+  assert.equal(app.info.app.account, cursor.cursorAccountLabel('auth0|user_app2'));
   assert.equal(app.info.account, cursor.cursorAccountLabel('auth0|user_app2'));
 });
 
@@ -536,7 +543,7 @@ test('a renewal in flight never writes over a logout or a newer sign-in', async 
     rmSync(cursorLoginPath(env));
     return json({ access_token: tokenFor('user_a', 60 * DAY, 'renewed') });
   } });
-  assert.equal(renewed.refreshed, true, 'this run may still use it');
+  assert.deepEqual(renewed, { expired: true }, 'the renewed token is dropped, nothing more is read');
   assert.equal(existsSync(cursorLoginPath(env)), false, 'the logout stands');
   // A newer sign-in (account B) lands while A's renewal is being refused.
   writeStoredCursorLogin(near, env);

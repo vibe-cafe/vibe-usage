@@ -182,7 +182,7 @@ npx @vibe-cafe/vibe-usage logout cursor   # 删除本机保存的这份登录
 - **以 Cursor 命令行的身份登录，只用来读用量。** 登录走的是 Cursor 给自家命令行准备的浏览器登录（`cursor.com/loginDeepControl`，`redirectTarget=cli`），续期用 Cursor 客户端的公开编号。Cursor 没有开放第三方读取用量的接口，这种用法不在 Cursor 官方支持范围内；Cursor 的使用政策不鼓励自动化访问，目前没有见过因此封号的情况。随时可以退出，并在 cursor.com 设置里的 Active Sessions 撤销这条登录。
 - **存在哪：** 只用命令行时存在 `~/.vibe-usage/cursor-login.json`（只有本人能读写，0600）；桌面 App 存在自己的钥匙串 / 凭据管理器里，每次运行时通过标准输入交给 CLI，CLI 不写文件。不上传、不写日志，不碰 Cursor 自己存的任何东西。
 - **联网：** 登录时每 2 秒查一次确认结果（`api2.cursor.sh/auth/poll`，最多 5 分钟），确认后读一次账号邮箱（`cursor.com/api/auth/me`，只用来显示是哪个账号）；登录约 60 天有效，到期前 7 天续期一次（`api2.cursor.sh/oauth/token`），续期暂时失败时 6 小时后再试；读用量和额度的请求和以前一样。全部按代理设置走（见下面「代理」），照不了就不发。Cursor 不做出口检测。
-- **两份都有时：** 在 Vibe Usage 里的登录优先；没有被加密的 Cursor 用户不用登录，照旧读取 Cursor 本机的登录。同一个账号从一种换到另一种不算换账号，不会重新上传。桌面 App 用自己的 Cursor 登录同步时，终端或后台服务如果读到的是另一个账号，会跳过 Cursor（以 App 为准），避免两个账号的用量写进同一条记录；App 7 天没同步后恢复。
+- **两份都有时：** 在 Vibe Usage 里的登录优先；没有被加密的 Cursor 用户不用登录，照旧读取 Cursor 本机的登录。同一个账号从一种换到另一种不算换账号，不会重新上传。桌面 App 用自己的 Cursor 登录同步时，终端或后台服务如果读到的是另一个账号，会跳过 Cursor（以 App 为准），避免两个账号的用量写进同一条记录；App 7 天没同步后恢复。升级后请运行一次 `npx @vibe-cafe/vibe-usage daemon restart`，让已经在跑的后台服务用上这条规则。
 - **系统代理：** CLI 只认代理环境变量。电脑设了系统代理（或 PAC）、终端里却没设代理变量时，`login cursor` 和用这份登录的同步不会发请求（否则会直连），请先 `export HTTPS_PROXY=…`；后台服务没有代理变量，这种机器上它会跳过 Cursor。桌面 App 会自己把系统代理传给 CLI，不受影响。
 - `status` 会显示保存的登录是哪个账号、有效期到哪天（不显示凭据本身）。
 
