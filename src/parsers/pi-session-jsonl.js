@@ -64,6 +64,8 @@ export async function parsePiSessionJsonl({
   const entriesById = new Map();
   const anonymousEntries = [];
   const eventsById = new Map();
+  // recordId -> { score, output } of the copy whose usage is kept (model time).
+  const outputById = new Map();
   const anonymousEvents = [];
   const seenFiles = new Set();
   const recordOwners = new Map();
@@ -130,8 +132,9 @@ export async function parsePiSessionJsonl({
           }
         }
 
+        let event = null;
         if (message.role === 'user' || message.role === 'assistant' || message.role === 'toolResult') {
-          const event = {
+          event = {
             sessionId,
             source,
             project,
@@ -144,6 +147,15 @@ export async function parsePiSessionJsonl({
 
         if (message.role !== 'assistant' || !message.usage) continue;
         const usage = message.usage;
+        // Model time: the reply's output (reasoning included) sets its cap --
+        // for copies of one record, the output of the copy whose usage is kept.
+        if (!recordId) {
+          if (event) event.outputTokens = toCount(usage.output);
+        } else {
+          const kept = outputById.get(recordId);
+          const usageScore = toCount(usage.input) + toCount(usage.cacheWrite) + toCount(usage.output) + toCount(usage.cacheRead);
+          if (!kept || usageScore > kept.score) outputById.set(recordId, { score: usageScore, output: toCount(usage.output) });
+        }
         const inputTokens = toCount(usage.input) + toCount(usage.cacheWrite);
         // Pi's Usage type names this field `reasoning` (a documented subset of
         // `output`); older/adjacent stores wrote `reasoningTokens`. Reading only
@@ -191,7 +203,9 @@ export async function parsePiSessionJsonl({
     ...anonymousEvents,
     ...[...eventsById].map(([id, event]) => {
       const owner = recordOwners.get(id);
-      return owner ? { ...event, sessionId: owner.sessionId, project: owner.project } : event;
+      const kept = outputById.get(id);
+      const timed = kept && event.role === 'assistant' ? { ...event, outputTokens: kept.output } : event;
+      return owner ? { ...timed, sessionId: owner.sessionId, project: owner.project } : timed;
     }),
   ];
   return {

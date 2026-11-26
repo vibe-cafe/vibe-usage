@@ -105,9 +105,12 @@ test('current Kimi parser counts all delta scopes, cache creation, and subagents
     firstMessageAt: '2026-07-17T00:01:00.000Z',
     lastMessageAt: '2026-07-17T00:04:00.000Z',
     durationSeconds: 180,
-    activeSeconds: 120,
+    // Model time: three steps 60 s after the event before each, with 2, 1
+    // and 1 output tokens: at most 30 s + output / 20 per second each.
+    activeSeconds: 90,
     messageCount: 4,
     userMessageCount: 1,
     userPromptHours: [1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0],
+    activity: [['2026-07-17T00:00:00.000Z', 90, 0, 0, 0, 0, 0]],
   });
 });

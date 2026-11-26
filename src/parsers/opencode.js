@@ -13,7 +13,9 @@ import {
   sqliteStatToken,
 } from './parser-cache.js';
 
-const OPENCODE_CACHE_ALGO = 1;
+// The snapshot holds sessions: 2 is model time (2026-11-25). An earlier
+// release keeps reading its own version and never sees 5-minute cells.
+const OPENCODE_CACHE_ALGO = 2;
 
 // Select only accounting/timing metadata, never message text or tool inputs.
 // Keep the existing top-level model/project precedence for old uploads.
@@ -188,8 +190,21 @@ export async function parse({ extraRoots = [], magpie } = {}) {
     const project = row.rootPath ? basename(row.rootPath)
       : (row.directory ? basename(row.directory) : 'unknown');
     const base = { source: 'opencode', project, timestamp: row.timestamp };
-    events.push({ ...base, sessionId: row.sessionId, role: row.role === 'user' ? 'user' : 'assistant' });
     const tokens = row.tokens;
+    const role = row.role === 'user' ? 'user' : 'assistant';
+    // Model time: a reply's output (reasoning included) sets its cap; a row
+    // without token counts is unknown (aggregate.js replySpan()).
+    const outputTokens = role === 'assistant' && tokens ? (tokens.output || 0) + (tokens.reasoning || 0) : undefined;
+    // A reply runs from its creation (the request) to its completion; buckets
+    // keep the creation time they always had. A reply without a completion
+    // (still streaming, or abandoned) counts nothing until it has one: timed
+    // early, the cells it filled would stay on the server (larger value kept).
+    const completed = role === 'assistant' && row.completed != null ? new Date(row.completed) : null;
+    const timing = role !== 'assistant' ? {}
+      : completed && Number.isFinite(completed.getTime()) && completed >= row.timestamp
+        ? { timestamp: completed, requestAt: row.timestamp }
+        : { requestAt: row.timestamp };
+    events.push({ ...base, ...timing, sessionId: row.sessionId, role, ...(outputTokens !== undefined ? { outputTokens } : {}) });
     if (!row.modelID || !tokens || (!tokens.input && !tokens.output)) continue;
     entries.push({ ...base, model: row.modelID,
       ...(magpie && row.providerID === 'magpie' ? { magpie: {

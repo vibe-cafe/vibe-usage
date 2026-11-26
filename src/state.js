@@ -64,12 +64,19 @@ export function loadState(identity) {
     const parsed = JSON.parse(readFileSync(STATE_FILE, 'utf-8'));
     const buckets = parsed.buckets ?? {};
     const sessions = parsed.sessions ?? {};
+    // Model-time rows (2026-11-25). Older CLIs neither read nor write the key,
+    // so a file they saved simply has none and the rows are sent again (the
+    // server keeps the larger value of each cell: nothing changes there).
+    const activity = parsed.activity && typeof parsed.activity === 'object' && !Array.isArray(parsed.activity)
+      && Object.keys(parsed.activity).length > 0 ? parsed.activity : null;
     // Local parser diagnostics (currently Cursor's account/newest event).
     // Purely additive; older CLIs ignore it and it never enters an upload.
     const parserMeta = parserMetaFrom(parsed);
-    const withMeta = (value) => (Object.keys(parserMeta).length > 0
-      ? { ...value, parserMeta }
-      : value);
+    const withMeta = (value) => ({
+      ...value,
+      ...(activity ? { activity } : {}),
+      ...(Object.keys(parserMeta).length > 0 ? { parserMeta } : {}),
+    });
     if (!isIdentity(identity) || !isIdentity(parsed.identity)) {
       // No identity recorded — written by a CLI older than 0.11.1. Adopt the
       // entries as-is rather than forcing a re-upload: on upgrade day that
@@ -151,6 +158,10 @@ export function saveState(state, identity) {
     buckets: state.buckets ?? {},
     sessions: state.sessions ?? {},
   };
+  if (state.activity && typeof state.activity === 'object'
+    && Object.keys(state.activity).length > 0) {
+    payload.activity = state.activity;
+  }
   if (state.parserMeta && typeof state.parserMeta === 'object'
     && Object.keys(state.parserMeta).length > 0) {
     payload.parserMeta = state.parserMeta;
@@ -243,7 +254,7 @@ export function sessionHash(s) {
 // this run. A throwing parser emits no items, so without this guard its keys
 // would look "dead" and get evicted — turning one transient failure into a
 // full re-upload of that tool's history on the next sync.
-export function pruneState(state, liveBucketKeys, liveSessionKeys, okSources) {
+export function pruneState(state, liveBucketKeys, liveSessionKeys, okSources, liveActivityKeys) {
   const prunable = (key) =>
     !okSources || okSources.has(key.slice(0, key.indexOf('|')));
   for (const key of Object.keys(state.buckets)) {
@@ -252,7 +263,25 @@ export function pruneState(state, liveBucketKeys, liveSessionKeys, okSources) {
   for (const key of Object.keys(state.sessions)) {
     if (prunable(key) && !liveSessionKeys.has(key)) delete state.sessions[key];
   }
+  // Only when this sync built model-time rows at all (the server asked for
+  // them): a sync that did not must not read their absence as deletion.
+  if (liveActivityKeys && state.activity) {
+    for (const key of Object.keys(state.activity)) {
+      if (prunable(key) && !liveActivityKeys.has(key)) delete state.activity[key];
+    }
+  }
   return state;
+}
+
+// Model-time rows (2026-11-25): seconds of model time per 5-minute cell of one
+// half-hour, for one tool, project and machine. Same identity as the server's
+// usage_activity row.
+export function activityKey(a) {
+  return `${a.source}|${a.project}|${a.hostname}|${a.bucketStart}`;
+}
+
+export function activityHash(a) {
+  return hash((a.outputSeconds || []).map(v => Number(v) || 0));
 }
 
 function hash(parts) {

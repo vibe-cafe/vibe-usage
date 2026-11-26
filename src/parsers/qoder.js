@@ -19,6 +19,10 @@ import {
 } from './parser-cache.js';
 
 const QODER_CACHE_ALGO = 1;
+// The whole-source snapshot holds sessions, so it moves with how they are
+// computed: 2 is model time (2026-11-25). An earlier release keeps reading its
+// own version and never sees sessions carrying 5-minute cells.
+const QODER_SNAPSHOT_ALGO = 2;
 
 /**
  * Qoder (Alibaba's agentic coding platform). Two editions with fully separate
@@ -395,7 +399,7 @@ async function parseEdition(edition) {
       `db|${dbPath}|${dbSig}`,
       ...filesWithSig.map((f) => `jsonl|${f.file}|${f.sig}`),
     ]);
-    const snap = loadSourceSnapshot(snapshotKey, QODER_CACHE_ALGO, manifest);
+    const snap = loadSourceSnapshot(snapshotKey, QODER_SNAPSHOT_ALGO, manifest);
     if (snap
       && Array.isArray(snap.buckets) && Array.isArray(snap.sessions)) {
       return { buckets: snap.buckets, sessions: snap.sessions, skipped: false, warnings: [] };
@@ -411,7 +415,7 @@ async function parseEdition(edition) {
     warnings: ctx.warnings,
   };
   if (manifest && !ctx.skipped && ctx.warnings.length === 0) {
-    saveSourceSnapshot(snapshotKey, QODER_CACHE_ALGO, manifest, {
+    saveSourceSnapshot(snapshotKey, QODER_SNAPSHOT_ALGO, manifest, {
       buckets: result.buckets,
       sessions: result.sessions,
     });

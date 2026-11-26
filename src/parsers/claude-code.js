@@ -30,7 +30,24 @@ import {
   saveSourceSnapshot,
 } from './parser-cache.js';
 
-const CLAUDE_SNAPSHOT_ALGO = 1;
+const CLAUDE_SNAPSHOT_ALGO = 2;
+// What a transcript entry's cached `session` was computed with. 2: model time
+// (aggregate.js, approved 2026-11-25) -- replies as runs of assistant lines,
+// output tokens from the entry's own usage records. An entry without it (written
+// by an earlier release, which may still be running as a daemon) has its
+// session recomputed from the cached events and rewritten once; the transcript
+// is not read again.
+const CLAUDE_SESSION_ALGO = 2;
+
+// An earlier release reads `session` from this shared entry and uploads it as
+// it is. The 5-minute cells go to the server only when its settings say
+// `activity: true`, and only as summed rows -- never inside a session -- so
+// they are kept beside the session, where an earlier release does not look.
+function cachedSessionFields(session) {
+  if (!session) return { session, sessionAlgo: CLAUDE_SESSION_ALGO };
+  const { activity, ...rest } = session;
+  return { session: rest, ...(activity ? { activity } : {}), sessionAlgo: CLAUDE_SESSION_ALGO };
+}
 
 const MAX_WARNINGS = 20;
 const READ_CHUNK_BYTES = 1024 * 1024;
@@ -287,7 +304,7 @@ async function finalizeCandidateSession(
   // unusual copied/rewritten file without retaining every event on the common
   // path: re-read only that candidate and let extractSessions() sort it.
   const events = await collectTimingEvents(candidate, projectForObject);
-  return extractSessions(events)[0] || null;
+  return extractSessions(events, { replyMode: 'runs' })[0] || null;
 }
 
 // ---------------------------------------------------------------------------
@@ -419,17 +436,34 @@ function restoreState(saved) {
  * need a second read of the file.
  */
 function sessionFromState(state, sessionId) {
+  // Output tokens per reply come from the usage records: each record carries
+  // the time of the assistant line it was taken from, so it is added to the
+  // first assistant event at that time and every other assistant event adds 0.
+  // A reply with no record at all -- an API error or a zero-usage copy of an
+  // earlier session's history -- then has a known output of 0 and counts no
+  // model time.
+  const outputAt = new Map();
+  const addOutput = (record) => outputAt.set(record.ms, (outputAt.get(record.ms) || 0) + record.output);
+  for (const record of state.keyed.values()) addOutput(record);
+  for (const record of state.anonymous) addOutput(record);
   const events = [];
   for (let i = 0; i < state.events.length; i += 2) {
-    events.push({
+    const ms = state.events[i];
+    const isUser = state.events[i + 1] === 1;
+    const event = {
       sessionId,
       source: 'claude-code',
       project: state.sessionProject,
-      timestamp: new Date(state.events[i]),
-      role: state.events[i + 1] === 1 ? 'user' : 'assistant',
-    });
+      timestamp: new Date(ms),
+      role: isUser ? 'user' : 'assistant',
+    };
+    if (!isUser) {
+      event.outputTokens = outputAt.get(ms) || 0;
+      outputAt.delete(ms);
+    }
+    events.push(event);
   }
-  return extractSessions(events)[0] || null;
+  return extractSessions(events, { replyMode: 'runs' })[0] || null;
 }
 
 function usageEntriesFromState(state, collectMagpie) {
@@ -553,9 +587,11 @@ async function scanProjectCandidate(candidate, ctx) {
     }
   }
   if (cache && cache.parsedBytes === candidate.size && cache.session !== undefined
+    && cache.sessionAlgo === CLAUDE_SESSION_ALGO
     && sameSignature(cache.signature, candidate.signature)
     && cache.state.fallbackProject === candidate.fallbackProject) {
-    return scanResult(cachedState, cache.session, ctx.collectMagpie);
+    const session = cache.session && cache.activity ? { ...cache.session, activity: cache.activity } : cache.session;
+    return scanResult(cachedState, session, ctx.collectMagpie);
   }
 
   const resume = !!cache && canResume(cache, candidate);
@@ -579,7 +615,7 @@ async function scanProjectCandidate(candidate, ctx) {
       guardHash,
       fullReadAt: resume ? cache.fullReadAt : Date.now(),
       state: serializeState(state),
-      ...(completed ? { session: completed.session } : {}),
+      ...(completed ? cachedSessionFields(completed.session) : {}),
     });
     if (!saved) {
       // Stopping at the budget is only progress if the work is on disk. With
@@ -615,7 +651,8 @@ async function scanProjectCandidate(candidate, ctx) {
 }
 
 async function scanTranscriptCandidate(candidate, ctx) {
-  const sessionAccumulator = createSessionAccumulator();
+  // Legacy transcripts carry no usage: replies are capped as unknown output.
+  const sessionAccumulator = createSessionAccumulator({ replyMode: 'runs' });
   const requestIds = ctx.collectMagpie ? new Set() : null;
   const projectForObject = (obj) => projectFromCwd(obj.cwd, 'unknown');
   await readJsonl(candidate, (obj) => {

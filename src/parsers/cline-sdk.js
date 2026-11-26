@@ -80,6 +80,8 @@ export function readClineSdk(sessionDirs, { onWarning = () => {}, onFatal = () =
               inputTokens: input - cachedInputTokens,
               outputTokens: toCount(metric?.outputTokens),
               cachedInputTokens,
+              // Model time: a recorded output count, zero included, is known.
+              outputKnown: metric?.outputTokens != null,
             }];
           });
           copies.push({ sessionId: child.name, artifactId: payload.sessionId, project, messages,
@@ -120,7 +122,10 @@ export function readClineSdk(sessionDirs, { onWarning = () => {}, onFatal = () =
         outputTokens: message.outputTokens, cachedInputTokens: message.cachedInputTokens,
         reasoningOutputTokens: 0 });
     }
-    events.push({ ...base, sessionId: message.sessionId, role: message.role });
+    // Model time: an assistant message that records its output count has it,
+    // zero included; one that does not is timed as unknown.
+    events.push({ ...base, sessionId: message.sessionId, role: message.role,
+      ...(message.role === 'assistant' && message.outputKnown ? { outputTokens: message.outputTokens } : {}) });
   }
   return { entries, events };
 }

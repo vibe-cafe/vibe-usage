@@ -4,6 +4,7 @@ import { appendFileSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, rena
 import { basename, dirname, join } from 'node:path';
 import { tmpdir } from 'node:os';
 import { parse } from '../src/parsers/codex.js';
+import { CODEX_PARSER_ALGORITHM_VERSION } from '../src/parsers/codex-cache.js';
 import {
   CODEX_ULTRAFAST_ALL_HISTORY,
   codexUltrafastModel,
@@ -347,26 +348,37 @@ function foldUltrafast(owner) {
   owner.buckets = [...merged.values()];
   delete owner.ultrafastBuckets;
 }
-function asAlgorithm6(data) {
-  data.algorithmVersion = 6;
-  if (data.result) foldUltrafast(data.result);
-  if (data.tail) {
-    foldUltrafast(data.tail);
-    if (data.tail.serviceTier === 'ultrafast') data.tail.serviceTier = null;
+const CURRENT_FOLDER = `v${CODEX_PARSER_ALGORITHM_VERSION}`;
+
+/**
+ * Turn this version's entries into what an older collector leaves: version 7
+ * in its own `v7` folder, version 6 (with Ultrafast folded into the plain
+ * model, as it computed it) in the per-home directory itself. Neither has this
+ * version's folder or its manifest.
+ */
+function asOlderAlgorithm(data, version) {
+  data.algorithmVersion = version;
+  if (version < 7) {
+    if (data.result) foldUltrafast(data.result);
+    if (data.tail) {
+      foldUltrafast(data.tail);
+      if (data.tail.serviceTier === 'ultrafast') data.tail.serviceTier = null;
+    }
   }
   return `${JSON.stringify(data)}\n`;
 }
-function downgradeCacheToAlgorithm6(cacheDir) {
+function downgradeCache(cacheDir, version) {
   const visit = (dir) => {
     for (const entry of readdirSync(dir, { withFileTypes: true })) {
       const path = join(dir, entry.name);
       if (entry.isDirectory()) { visit(path); continue; }
-      if (!entry.name.endsWith('.json') || basename(dir) !== 'v7') continue;
-      writeFileSync(join(dirname(dir), entry.name), asAlgorithm6(JSON.parse(readFileSync(path, 'utf8'))));
+      if (!entry.name.endsWith('.json') || basename(dir) !== CURRENT_FOLDER) continue;
+      const target = version === 7 ? join(dirname(dir), 'v7') : dirname(dir);
+      mkdirSync(target, { recursive: true });
+      writeFileSync(join(target, entry.name), asOlderAlgorithm(JSON.parse(readFileSync(path, 'utf8')), version));
       rmSync(path);
     }
-    // An algorithm-6 collector has no v7 directory, so no manifest either.
-    if (basename(dir) === 'v7') rmSync(join(dir, 'manifest.v1'), { force: true });
+    if (basename(dir) === CURRENT_FOLDER) rmSync(join(dir, 'manifest.v1'), { force: true });
   };
   visit(cacheDir);
 }
@@ -376,7 +388,7 @@ function olderCacheFiles(cacheDir) {
   const visit = (dir) => {
     for (const entry of readdirSync(dir, { withFileTypes: true })) {
       const path = join(dir, entry.name);
-      if (entry.isDirectory()) { if (entry.name !== 'v7') visit(path); continue; }
+      if (entry.isDirectory()) { if (entry.name !== CURRENT_FOLDER) visit(path); continue; }
       files[path.slice(cacheDir.length)] = readFileSync(path, 'utf8');
     }
   };
@@ -384,111 +396,84 @@ function olderCacheFiles(cacheDir) {
   return files;
 }
 
-test('algorithm-6 summaries are used as they are while the machine has no cut, and are not rewritten', async () => {
-  await withFixture({ 'rollout-mixed.jsonl': mixedSession(), 'rollout-other.jsonl': mixedSession('other') }, async (fixture) => {
-    const cold = await parseAt(null);
-    downgradeCacheToAlgorithm6(fixture.cacheDir);
-    const older = olderCacheFiles(fixture.cacheDir);
-    assert.equal(Object.keys(older).length, 4, 'two summaries and two tails');
-    const warm = await parseAt(null);
-    assert.equal(warm.cache.filesRead, 0);
-    assert.equal(warm.cache.resultHits, 2);
-    assert.deepEqual(uploaded(warm), uploaded(cold));
-    // Nothing an older collector owns was written, restamped or removed --
-    // neither by using its summaries nor by re-reading under a cut.
-    await parseAt(W1030);
-    await parseAt(CODEX_ULTRAFAST_ALL_HISTORY);
-    assert.deepEqual(olderCacheFiles(fixture.cacheDir), older);
-  });
-});
-
-test('algorithm-6 summaries wholly before the cut are kept; one with a window at or after it is re-read', async () => {
-  await withFixture({
-    // Only the 10:00 window.
-    'rollout-early.jsonl': mixedSession('early').slice(0, 5),
-    // Reaches into 10:30.
-    'rollout-late.jsonl': mixedSession('late'),
-  }, async (fixture) => {
-    const expected = await parseUncached(W1030);
-    await parseAt(null);
-    downgradeCacheToAlgorithm6(fixture.cacheDir);
-
-    const afterCut = await parseAt(W1030);
-    assert.equal(afterCut.cache.resultHits, 1, 'the early rollout comes from its algorithm-6 summary');
-    // An older summary that is not exact under the cut is not used, so that one
-    // rollout's usage is read again. Its header is not: algorithm 6 computed
-    // it exactly as this version does, and it does not depend on the cut.
-    assert.equal(afterCut.cache.headerHits, 2);
-    assert.equal(afterCut.cache.filesRead, 1, 'only the usage of the rollout with a post-cut window is read again');
-    assert.deepEqual(uploaded(afterCut), uploaded(expected));
-    assert.deepEqual(byKey(afterCut), {
-      [`${MODEL}@10:00`]: 110, [`${MODEL}@10:30`]: 60, [`${UF}@10:30`]: 40,
+for (const version of [6, 7]) {
+  test(`an algorithm-${version} summary never stands in: usage is read again and sessions get model time`, async () => {
+    await withFixture({ 'rollout-mixed.jsonl': mixedSession(), 'rollout-other.jsonl': mixedSession('other') }, async (fixture) => {
+      const expected = await parseUncached(W1030);
+      await parseAt(W1030);
+      downgradeCache(fixture.cacheDir, version);
+      const older = olderCacheFiles(fixture.cacheDir);
+      assert.equal(Object.keys(older).length, 4, 'two summaries and two tails');
+      const upgraded = await parseAt(W1030);
+      // Every session's usage is read again (its older summary has no model
+      // time), but no header is: it is the same under every version listed.
+      assert.equal(upgraded.cache.resultHits, 0);
+      assert.equal(upgraded.cache.headerHits, 2);
+      assert.equal(upgraded.cache.filesRead, 2);
+      assert.deepEqual(uploaded(upgraded), uploaded(expected));
+      assert.deepEqual(upgraded.sessions, expected.sessions);
+      assert.ok(upgraded.sessions.every(session => Array.isArray(session.activity)));
+      // Nothing an older collector owns was written, restamped or removed.
+      assert.deepEqual(olderCacheFiles(fixture.cacheDir), older);
+      const again = await parseAt(W1030);
+      assert.equal(again.cache.filesRead, 0);
+      assert.deepEqual(uploaded(again), uploaded(expected));
     });
-
-    // The rebuilt summary is cut-independent from now on.
-    const again = await parseAt(W1030);
-    assert.equal(again.cache.filesRead, 0);
-    assert.deepEqual(uploaded(again), uploaded(expected));
-    // With the cut at the epoch even the early summary has to go.
-    const all = await parseAt(CODEX_ULTRAFAST_ALL_HISTORY);
-    assert.equal(all.cache.filesRead, 1);
-    assert.equal(all.cache.resultHits, 1, 'the rollout already rebuilt by this version is not read again');
-    assert.deepEqual(uploaded(all), uploaded(await parseUncached(CODEX_ULTRAFAST_ALL_HISTORY)));
   });
-});
 
-test('an algorithm-6 entry whose summary is not exact under the cut still gives its header and replay index', async () => {
-  // A fork starts with a copy of its parent's records. The replay index is what
-  // tells that copy from the fork's own usage, so it has to arrive intact.
-  const copied = (records, instant) => records.slice(1).map(record => ({ ...record, timestamp: instant }));
-  const parent = [
-    sessionMeta(at('10:05'), 'parent'),
-    turnContext(at('10:05'), { model: MODEL, serviceTier: null }),
-    tokenCount(at('10:05', '10'), usage(50), 50),
-    turnContext(at('10:31'), { model: MODEL, serviceTier: ULTRAFAST_TIER_VALUE }),
-    tokenCount(at('10:31', '10'), usage(40), 90),
-  ];
-  const fork = [
-    sessionMeta(at('10:40'), 'fork', { forked_from_id: 'parent' }),
-    ...copied(parent, at('10:40', '01')),
-    turnContext(at('10:41'), { model: MODEL, serviceTier: ULTRAFAST_TIER_VALUE }),
-    tokenCount(at('10:41', '10'), usage(7), 97),
-  ];
-  await withFixture({ 'rollout-parent.jsonl': parent, 'rollout-fork.jsonl': fork }, async (fixture) => {
-    const expected = await parseUncached(W1030);
-    assert.deepEqual(byKey(expected), { [`${MODEL}@10:00`]: 50, [`${UF}@10:30`]: 47 }, 'the copied 90 tokens are not counted again');
-    await parseAt(null);
-    downgradeCacheToAlgorithm6(fixture.cacheDir);
-    const older = olderCacheFiles(fixture.cacheDir);
+  test(`an algorithm-${version} entry still gives its header and replay index`, async () => {
+    // A fork starts with a copy of its parent's records. The replay index is what
+    // tells that copy from the fork's own usage, so it has to arrive intact.
+    const copied = (records, instant) => records.slice(1).map(record => ({ ...record, timestamp: instant }));
+    const parent = [
+      sessionMeta(at('10:05'), 'parent'),
+      turnContext(at('10:05'), { model: MODEL, serviceTier: null }),
+      tokenCount(at('10:05', '10'), usage(50), 50),
+      turnContext(at('10:31'), { model: MODEL, serviceTier: ULTRAFAST_TIER_VALUE }),
+      tokenCount(at('10:31', '10'), usage(40), 90),
+    ];
+    const fork = [
+      sessionMeta(at('10:40'), 'fork', { forked_from_id: 'parent' }),
+      ...copied(parent, at('10:40', '01')),
+      turnContext(at('10:41'), { model: MODEL, serviceTier: ULTRAFAST_TIER_VALUE }),
+      tokenCount(at('10:41', '10'), usage(7), 97),
+    ];
+    await withFixture({ 'rollout-parent.jsonl': parent, 'rollout-fork.jsonl': fork }, async (fixture) => {
+      const expected = await parseUncached(W1030);
+      assert.deepEqual(byKey(expected), { [`${MODEL}@10:00`]: 50, [`${UF}@10:30`]: 47 }, 'the copied 90 tokens are not counted again');
+      await parseAt(null);
+      downgradeCache(fixture.cacheDir, version);
+      const older = olderCacheFiles(fixture.cacheDir);
 
-    // Both summaries have a window at or after the cut: the usage is read again,
-    // one pass per rollout. Neither header nor index is.
-    const afterCut = await parseAt(W1030);
-    assert.equal(afterCut.cache.headerHits, 2);
-    assert.equal(afterCut.cache.indexHits, 2);
-    assert.equal(afterCut.cache.resultHits, 0);
-    assert.equal(afterCut.cache.filesRead, 2);
-    assert.deepEqual(uploaded(afterCut), uploaded(expected));
-    assert.deepEqual(olderCacheFiles(fixture.cacheDir), older);
+      // The usage is read again, one pass per rollout. Neither header nor index is.
+      const upgraded = await parseAt(W1030);
+      assert.equal(upgraded.cache.headerHits, 2);
+      assert.equal(upgraded.cache.indexHits, 2);
+      assert.equal(upgraded.cache.resultHits, 0);
+      assert.equal(upgraded.cache.filesRead, 2);
+      assert.deepEqual(uploaded(upgraded), uploaded(expected));
+      assert.deepEqual(olderCacheFiles(fixture.cacheDir), older);
 
-    // What was taken over is now part of this version's own entries.
-    const again = await parseAt(W1030);
-    assert.equal(again.cache.filesRead, 0);
-    assert.equal(again.cache.resultHits, 2);
-    assert.deepEqual(uploaded(again), uploaded(expected));
+      // What was taken over is now part of this version's own entries.
+      const again = await parseAt(W1030);
+      assert.equal(again.cache.filesRead, 0);
+      assert.equal(again.cache.resultHits, 2);
+      assert.deepEqual(uploaded(again), uploaded(expected));
+    });
   });
-});
 
-test('an algorithm-6 tail is never resumed: it lost the Ultrafast tier', async () => {
-  const records = mixedSession();
-  // Stop inside an Ultrafast turn whose tokens have not been written yet.
-  await withFixture({ 'rollout-mixed.jsonl': records.slice(0, 8) }, async (fixture) => {
-    await parseAt(null);
-    downgradeCacheToAlgorithm6(fixture.cacheDir);
-    appendFileSync(join(fixture.dir, 'rollout-mixed.jsonl'), `${JSON.stringify(records[8])}\n`);
-    const appended = await parseAt(W1030);
-    assert.equal(appended.cache.tailHits, 0);
-    // Resuming from the old tail would have filed these 40 tokens under the plain model.
-    assert.deepEqual(byKey(appended), { [`${MODEL}@10:00`]: 55, [`${MODEL}@10:30`]: 60, [`${UF}@10:30`]: 40 });
+  test(`an algorithm-${version} tail is never resumed`, async () => {
+    const records = mixedSession();
+    // Stop inside an Ultrafast turn whose tokens have not been written yet.
+    await withFixture({ 'rollout-mixed.jsonl': records.slice(0, 8) }, async (fixture) => {
+      await parseAt(null);
+      downgradeCache(fixture.cacheDir, version);
+      appendFileSync(join(fixture.dir, 'rollout-mixed.jsonl'), `${JSON.stringify(records[8])}\n`);
+      const appended = await parseAt(W1030);
+      assert.equal(appended.cache.tailHits, 0);
+      // Resuming from an algorithm-6 tail would have filed these 40 tokens
+      // under the plain model; one of algorithm 7 would have no model time.
+      assert.deepEqual(byKey(appended), { [`${MODEL}@10:00`]: 55, [`${MODEL}@10:30`]: 60, [`${UF}@10:30`]: 40 });
+    });
   });
-});
+}

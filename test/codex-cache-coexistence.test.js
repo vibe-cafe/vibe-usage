@@ -540,58 +540,71 @@ function assertOlderLayout(machine) {
   assert.ok(summaries.every(entry => entry.algorithmVersion === 6));
 }
 
-async function assertFinishesOnFirstRun(machine) {
+/**
+ * Upgrading from the older cache to version 8: no older summary stands in (its
+ * sessions have no model time), so every session's usage is read again, over
+ * as many runs as the budget needs -- none of them skipped. Headers and replay
+ * indexes are taken from the older entries: no header is read and no replay
+ * index rebuilt from a rollout. The result equals an uncached read, the warm
+ * run after it reads nothing, and the older collector's files are untouched.
+ */
+async function assertRereadsUsageKeepingHeadersAndIndexes(machine) {
   const before = machine.olderFiles();
-  const first = await machine.newRun(TWO_HOME_CUT);
-  const trace = JSON.stringify({ done: first.done, s: Math.round(first.elapsedMs / 1000), at: first.indexing, cache: first.result.cache });
-  assert.equal(first.done, true, `the first run after the upgrade did not finish: ${trace}`);
-  const cache = first.result.cache;
-  // No header is read and no replay index is rebuilt from a rollout.
-  assert.equal(cache.headerHits, machine.physicalFiles, trace);
-  // Every physical copy, and the three groups whose summary is still exact.
-  assert.equal(cache.indexHits, machine.duplicateCopies + (machine.groups - 1), trace);
-  assert.equal(cache.resultHits, (machine.groups - 1) + 1, trace);
-  // The one session with usage after the cut is the only thing read: its two
-  // copies, merged once.
-  assert.equal(cache.filesRead, 2, trace);
-  assert.equal(first.elapsedMs, 2 * FULL_READ_MS, trace);
+  const expected = await machine.uncached(TWO_HOME_CUT);
+  const runs = [];
+  let run;
+  do {
+    run = await machine.newRun(TWO_HOME_CUT);
+    runs.push(run);
+    const trace = JSON.stringify({ run: runs.length, done: run.done, s: Math.round(run.elapsedMs / 1000), at: run.indexing, cache: run.result.cache });
+    assert.notEqual(run.result.skipped, true, trace);
+    // One rollout read may finish past the budget check, never two.
+    assert.ok(run.elapsedMs <= BUDGET_MS + 2 * FULL_READ_MS, trace);
+    if (runs.length === 1) {
+      assert.equal(run.result.cache.headerHits, machine.physicalFiles, trace);
+      assert.equal(run.result.cache.resultHits, 0, trace);
+      assert.equal(run.result.cache.indexHits >= machine.duplicateCopies, true, trace);
+    }
+  } while (!run.done && runs.length < 8);
+  assert.equal(run.done, true, `not complete after ${runs.length} runs`);
+  // Every copy of every session read once, across the runs.
+  assert.equal(runs.reduce((total, r) => total + r.filesRead, 0), machine.physicalFiles);
   assert.deepEqual(machine.olderFiles(), before, 'the older collector\'s files were rewritten');
 
-  const expected = await machine.uncached(TWO_HOME_CUT);
-  assert.deepEqual(sorted(first.result), sorted(expected));
-  assert.deepEqual(first.result.sessions, expected.sessions);
+  assert.deepEqual(sorted(run.result), sorted(expected));
+  assert.deepEqual(run.result.sessions, expected.sessions);
   const sum = buckets => buckets.reduce((total, b) => total + b.inputTokens + b.outputTokens, 0);
-  assert.equal(sum(first.result.buckets), machine.tokens());
+  assert.equal(sum(run.result.buckets), machine.tokens());
   assert.equal(machine.ultrafastTokensAfterCut(), 7010);
-  assert.equal(sum(first.result.buckets.filter(b => b.model.endsWith('-ultrafast'))), machine.ultrafastTokensAfterCut());
+  assert.equal(sum(run.result.buckets.filter(b => b.model.endsWith('-ultrafast'))), machine.ultrafastTokensAfterCut());
 
-  const second = await machine.newRun(TWO_HOME_CUT);
-  assert.equal(second.done, true);
-  assert.equal(second.filesRead, 0);
-  assert.equal(second.elapsedMs, 0);
-  assert.deepEqual(sorted(second.result), sorted(expected));
+  const warm = await machine.newRun(TWO_HOME_CUT);
+  assert.equal(warm.done, true);
+  assert.equal(warm.filesRead, 0);
+  assert.equal(warm.elapsedMs, 0);
+  assert.deepEqual(sorted(warm.result), sorted(expected));
+  return runs;
 }
 
-test('duplicate sessions in two homes: the first run after the upgrade takes headers and indexes from the older entries', async () => {
+test('duplicate sessions in two homes: the upgrade takes headers and indexes from the older entries and reads usage again', async () => {
   const machine = createTwoHomeMachine();
   await machine.olderRun();
   assertOlderLayout(machine);
-  await assertFinishesOnFirstRun(machine);
+  await assertRereadsUsageKeepingHeadersAndIndexes(machine);
 });
 
-test('duplicate sessions in two homes: a rebuild that 0.15.0 left half-done is completed from the older entries', async () => {
+test('duplicate sessions in two homes: a version-7 rebuild left half-done is completed from the older entries', async () => {
   const machine = createTwoHomeMachine();
   await machine.olderRun();
   assertOlderLayout(machine);
   assert.equal(machine.leaveHalfRebuilt(), machine.duplicateCopies);
-  await assertFinishesOnFirstRun(machine);
+  await assertRereadsUsageKeepingHeadersAndIndexes(machine);
 });
 
 test('duplicate sessions in two homes: headers and indexes written by algorithm 5 are not taken over', async () => {
   // Algorithm 5 hashed durable usage records without their response id and
   // kept no model provider, so its headers and indexes are not what this
-  // version computes. (Its summaries still stand in where Magpie was never
-  // active.) Such a machine reads the copies again, across several runs.
+  // version computes. Such a machine reads the copies again, across several runs.
   const machine = createTwoHomeMachine();
   await machine.olderRun();
   machine.restampOlder(5);
@@ -601,7 +614,8 @@ test('duplicate sessions in two homes: headers and indexes written by algorithm 
   // keep reading every file to its end in the background, which this clock
   // charged as a full read), so the budget runs out in the replay index.
   assert.match(first.indexing, /^replay-index /);
-  // Only the session that exists once: its algorithm-5 summary is usable whole.
-  assert.equal(first.result.cache.headerHits, 1);
+  // Nothing of algorithm 5 is taken: not its headers and indexes, and since
+  // algorithm 8 not its summaries either (they hold no model time).
+  assert.equal(first.result.cache.headerHits, 0);
   assert.equal(first.result.cache.indexHits, 0);
 });

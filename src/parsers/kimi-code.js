@@ -288,7 +288,7 @@ export function parseCurrentKimiRoots(roots, {
 
       // Each usage.record marks an assistant step completing — use it as an
       // assistant timing event so active-time math has both sides of a turn.
-      sessionEvents.push({ sessionId: sessionDir, source, project, timestamp: ts, role: 'assistant' });
+      sessionEvents.push({ sessionId: sessionDir, source, project, timestamp: ts, role: 'assistant', outputTokens });
     }
   }
 
@@ -444,6 +444,8 @@ function parseLegacyKimi() {
             project,
             timestamp: evTs,
             role: LEGACY_USER_EVENT_TYPES.has(type) ? 'user' : 'assistant',
+            // Model time: a StatusUpdate carries the step's output tokens.
+            ...(type === 'StatusUpdate' && payload.token_usage ? { outputTokens: payload.token_usage.output || 0 } : {}),
           });
         }
       }

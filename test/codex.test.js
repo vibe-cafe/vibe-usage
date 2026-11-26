@@ -4,7 +4,7 @@ import { appendFileSync, chmodSync, mkdirSync, mkdtempSync, readdirSync, readFil
 import { basename, dirname, join } from 'node:path';
 import { tmpdir } from 'node:os';
 import { parse } from '../src/parsers/codex.js';
-import { codexCacheDir } from '../src/parsers/codex-cache.js';
+import { CODEX_PARSER_ALGORITHM_VERSION, codexCacheDir } from '../src/parsers/codex-cache.js';
 import { createMagpieContext } from '../src/parsers/magpie.js';
 
 const previousCindyDirs = process.env.VIBE_USAGE_CINDY_DIRS;
@@ -1513,7 +1513,7 @@ function downgradeCacheToAlgorithm5(cacheDir) {
     for (const entry of readdirSync(dir, { withFileTypes: true })) {
       const path = join(dir, entry.name);
       if (entry.isDirectory()) { visit(path); continue; }
-      if (!entry.name.endsWith('.json') || basename(dir) !== 'v7') continue;
+      if (!entry.name.endsWith('.json') || basename(dir) !== `v${CODEX_PARSER_ALGORITHM_VERSION}`) continue;
       const data = JSON.parse(readFileSync(path, 'utf8'));
       data.algorithmVersion = 5;
       if (data.header) delete data.header.modelProvider;
@@ -1522,8 +1522,8 @@ function downgradeCacheToAlgorithm5(cacheDir) {
       writeFileSync(join(dirname(dir), entry.name), `${JSON.stringify(data)}\n`);
       rmSync(path);
     }
-    // An algorithm-5 collector has no v7 directory, so no manifest either.
-    if (basename(dir) === 'v7') rmSync(join(dir, 'manifest.v1'), { force: true });
+    // An algorithm-5 collector has no directory of this version, so no manifest either.
+    if (basename(dir) === `v${CODEX_PARSER_ALGORITHM_VERSION}`) rmSync(join(dir, 'manifest.v1'), { force: true });
   };
   visit(cacheDir);
 }
@@ -1546,58 +1546,16 @@ async function withMagpieLedger(fixture, { ledger, startAt }, fn) {
   }
 }
 
-test('algorithm-5 caches stay valid where Magpie has never been active', async () => {
+test('algorithm-5 caches are not used: every rollout is read again, with or without Magpie', async () => {
+  // Algorithm 5 summaries held sessions without model time (algorithm 8) and
+  // its headers and indexes were computed differently, so nothing of it is
+  // taken -- also where Magpie was never active, which used to make its
+  // summaries valid.
   const t = '2026-07-10T08:00:00.000Z';
-  const fixture = createPersistentFixture({
-    'rollout-a.jsonl': [sessionMeta(t, 'legacy-a'), tokenCount(t, usage(100, 20, 10, 2), 110)],
-    'rollout-b.jsonl': [sessionMeta(t, 'legacy-b'), tokenCount(t, usage(20, 0, 2, 0), 22)],
-  });
-  try {
-    await withCodexEnv(fixture, async () => {
-      const cold = await parse();
-      downgradeCacheToAlgorithm5(fixture.cacheDir);
-      await withMagpieLedger(fixture, { ledger: false }, async (magpie) => {
-        const warm = await parse({ magpie });
-        assert.deepEqual(warm.buckets, cold.buckets);
-        assert.deepEqual(warm.sessions, cold.sessions);
-        assert.equal(warm.cache.filesRead, 0);
-        assert.equal(warm.cache.resultHits, 2);
-
-        // An append does not resume from a tail written before algorithm 7:
-        // those tails stored the Ultrafast tier as "no tier", and they belong
-        // to a collector that may still be running. The one rollout that grew
-        // is read from the start once (header + usage pass) ...
-        appendFileSync(
-          join(fixture.dir, 'rollout-a.jsonl'),
-          JSON.stringify(tokenCount('2026-07-10T08:05:00.000Z', usage(5, 0, 3, 0), 118)) + '\n'
-        );
-        const appended = await parse({ magpie });
-        assert.equal(appended.cache.tailHits, 0);
-        assert.equal(appended.cache.filesRead, 2);
-        assert.equal(appended.cache.resultHits, 1, 'the untouched rollout still comes from its algorithm-5 entry');
-        assert.deepEqual(sumBuckets(appended.buckets), { input: 105, output: 13, cached: 20, reasoning: 2 });
-
-        // ... and the next append resumes from the tail that read left behind.
-        appendFileSync(
-          join(fixture.dir, 'rollout-a.jsonl'),
-          JSON.stringify(tokenCount('2026-07-10T08:06:00.000Z', usage(5, 0, 3, 0), 126)) + '\n'
-        );
-        const resumed = await parse({ magpie });
-        assert.equal(resumed.cache.tailHits, 1);
-        assert.equal(resumed.cache.filesRead, 1);
-        assert.deepEqual(sumBuckets(resumed.buckets), { input: 110, output: 16, cached: 20, reasoning: 2 });
-      });
-    });
-  } finally {
-    rmSync(fixture.root, { recursive: true, force: true });
-  }
-});
-
-test('algorithm-5 caches are rebuilt once Magpie has a ledger or a cut', async () => {
-  const t = '2026-07-10T08:00:00.000Z';
-  for (const magpieState of [{ ledger: true }, { ledger: false, startAt: 'none' }]) {
+  for (const magpieState of [{ ledger: false }, { ledger: true }, { ledger: false, startAt: 'none' }]) {
     const fixture = createPersistentFixture({
-      'rollout-a.jsonl': [sessionMeta(t, 'magpie-a'), tokenCount(t, usage(100, 20, 10, 2), 110)],
+      'rollout-a.jsonl': [sessionMeta(t, 'legacy-a'), tokenCount(t, usage(100, 20, 10, 2), 110)],
+      'rollout-b.jsonl': [sessionMeta(t, 'legacy-b'), tokenCount(t, usage(20, 0, 2, 0), 22)],
     });
     try {
       await withCodexEnv(fixture, async () => {
@@ -1607,7 +1565,9 @@ test('algorithm-5 caches are rebuilt once Magpie has a ledger or a cut', async (
           const rebuilt = await parse({ magpie });
           assert.deepEqual(rebuilt.buckets, cold.buckets);
           assert.equal(rebuilt.cache.resultHits, 0, JSON.stringify(magpieState));
-          assert.equal(rebuilt.cache.filesRead, 2, JSON.stringify(magpieState));
+          assert.equal(rebuilt.cache.headerHits, 0, JSON.stringify(magpieState));
+          // Each rollout read twice: its header, then its usage.
+          assert.equal(rebuilt.cache.filesRead, 4, JSON.stringify(magpieState));
         });
       });
     } finally {

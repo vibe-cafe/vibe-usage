@@ -129,7 +129,9 @@ test('WorkBuddy sync uploads routed-model buckets and session metadata once', as
     assert.equal(received[0].buckets.every(bucket => bucket.source === 'workbuddy'), true);
     assert.equal(received[0].sessions[0].source, 'workbuddy');
     assert.equal(received[0].sessions[0].messageCount, 3);
-    assert.equal(received[0].sessions[0].activeSeconds, 10);
+    assert.equal(received[0].sessions[0].activeSeconds, 20);
+    // The local per-session cells travel as rows of their own, never inside a session.
+    assert.equal('activity' in received[0].sessions[0], false);
 
     const payload = JSON.stringify(received[0]);
     assert.equal(payload.includes('PRIVATE_WORKBUDDY'), false);

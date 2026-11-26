@@ -110,6 +110,27 @@ test('Pi-compatible parsers count cache writes as input tokens', async () => {
   }
 });
 
+test('Pi replies are timed with their own output tokens', async () => {
+  // 100 s after the prompt with 20 output tokens (reasoning included): at
+  // most 30 s + 20 / 20 per second of model time.
+  const root = mkdtempSync(join(tmpdir(), 'vibe-usage-pi-timed-'));
+  const previousPi = process.env.VIBE_USAGE_PI_SESSION_DIRS;
+  try {
+    const piSessions = join(root, 'pi-sessions');
+    const path = join(piSessions, '--work-project--', 'timed.jsonl');
+    mkdirSync(join(path, '..'), { recursive: true });
+    writeFileSync(path, sessionLines().replace('2026-07-27T13:20:05.000Z', '2026-07-27T13:21:40.000Z'));
+    process.env.VIBE_USAGE_PI_SESSION_DIRS = piSessions;
+
+    const pi = await parsePi();
+    assert.equal(pi.sessions.length, 1);
+    assert.equal(pi.sessions[0].activeSeconds, 31);
+  } finally {
+    restoreEnv('VIBE_USAGE_PI_SESSION_DIRS', previousPi);
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
 test('OMP scans multiple stores and deduplicates copied records', async () => {
   const root = mkdtempSync(join(tmpdir(), 'vibe-usage-omp-dedup-'));
   const previous = process.env.VIBE_USAGE_OMP_SESSION_DIRS;

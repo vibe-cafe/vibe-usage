@@ -21,11 +21,11 @@ function sleep(ms) {
   return new Promise(resolve => setTimeout(resolve, ms));
 }
 
-export async function ingest(apiUrl, apiKey, buckets, opts, sessions) {
+export async function ingest(apiUrl, apiKey, buckets, opts, sessions, activity) {
   let lastError;
   for (let attempt = 0; attempt < MAX_RETRIES; attempt++) {
     try {
-      return await _send(apiUrl, apiKey, buckets, opts, sessions);
+      return await _send(apiUrl, apiKey, buckets, opts, sessions, activity);
     } catch (err) {
       lastError = err;
       // Don't retry auth errors or client errors
@@ -40,9 +40,10 @@ export async function ingest(apiUrl, apiKey, buckets, opts, sessions) {
   throw lastError;
 }
 
-export function encodeIngestBody(buckets, opts, sessions) {
+export function encodeIngestBody(buckets, opts, sessions, activity) {
   const payload = { buckets };
   if (sessions && sessions.length > 0) payload.sessions = sessions;
+  if (activity && activity.length > 0) payload.activity = activity;
   if (opts?.client) payload.client = opts.client;
   const raw = Buffer.from(JSON.stringify(payload));
   const useGzip = raw.length >= GZIP_MIN_BYTES;
@@ -52,10 +53,10 @@ export function encodeIngestBody(buckets, opts, sessions) {
   };
 }
 
-function _send(apiUrl, apiKey, buckets, opts, sessions) {
+function _send(apiUrl, apiKey, buckets, opts, sessions, activity) {
   return new Promise((resolve, reject) => {
     const url = new URL('/api/usage/ingest', apiUrl);
-    const { body, useGzip } = encodeIngestBody(buckets, opts, sessions);
+    const { body, useGzip } = encodeIngestBody(buckets, opts, sessions, activity);
     const totalBytes = body.length;
     const mod = url.protocol === 'https:' ? https : http;
 

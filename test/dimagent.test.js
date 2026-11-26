@@ -117,7 +117,10 @@ test('parse reads DimAgent SQLite usage and excludes forked copies', async () =>
     const forkSession = result.sessions.find(session => session.userMessageCount === 1);
     assert.equal(mainSession.project, 'example-app');
     assert.equal(mainSession.messageCount, 5);
-    assert.equal(mainSession.activeSeconds, 5);
+    // Model time: 0 → 5 s, 5 → 10 s and 300 → 303 s (each assistant event from
+    // the event before it); the five idle minutes before the second prompt are
+    // not counted.
+    assert.equal(mainSession.activeSeconds, 13);
     assert.equal(forkSession.messageCount, 2);
   } finally {
     if (previousDbPath === undefined) delete process.env.VIBE_USAGE_DIMAGENT_DB;

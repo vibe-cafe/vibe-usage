@@ -16,7 +16,15 @@ import { join } from 'node:path';
 // separate from ~/.vibe-usage/state.json, whose hashes are the authoritative
 // record of successful uploads and must remain backward-compatible.
 export const CODEX_CACHE_SCHEMA_VERSION = 1;
-export const CODEX_PARSER_ALGORITHM_VERSION = 7;
+export const CODEX_PARSER_ALGORITHM_VERSION = 8;
+// Version 8 (2026-11-25) counts model time per reply (aggregate.js): a
+// session's `activeSeconds` changed meaning and it gained its 5-minute
+// `activity` cells. No earlier summary can stand in for that -- every rollout
+// is read once more -- but headers and replay indexes are computed exactly as
+// before, so those of versions 6 and 7 are still taken (from where each keeps
+// them) and an upgrade does not rebuild them. Version 8 has its own `v8`
+// folder, for the same reason version 7 got one:
+//
 // Version 7 keeps Codex Ultrafast usage apart from the plain model's buckets
 // (`result.ultrafastBuckets`, raw model name) so the per-machine cut can name it
 // when results are assembled; a tail also carries the raw `ultrafast` tier.
@@ -46,12 +54,14 @@ export const CODEX_PARSER_ALGORITHM_VERSION = 7;
 //   - A version-5 summary additionally requires that Magpie was never active.
 // An older tail is never resumed: it stored the Ultrafast tier as "no tier", so
 // continuing from it would file the rest of the session under the plain model.
-const MERGED_ULTRAFAST_SUMMARY_ALGORITHM_VERSIONS = new Set([6]);
+// Version 8: none -- every older summary holds sessions without model time.
+const MERGED_ULTRAFAST_SUMMARY_ALGORITHM_VERSIONS = new Set();
 // Version 6 (#143) only started keeping raw Magpie attribution data (the
 // session's model provider and per-response ids). Where Magpie has never been
 // active (no ledger, no cut), attribution is a no-op and a version-5 entry
 // yields exactly the same buckets and sessions.
-const MAGPIE_FREE_COMPATIBLE_ALGORITHM_VERSIONS = new Set([5]);
+// Version 8: none, for the same reason.
+const MAGPIE_FREE_COMPATIBLE_ALGORITHM_VERSIONS = new Set();
 // The `header` and `index` alone, when the entry has no summary or its summary
 // is not exact under the cut. Neither depends on the tier or the cut, so they
 // are valid wherever the listed version computes them exactly as this one does.
@@ -66,7 +76,10 @@ const MAGPIE_FREE_COMPATIBLE_ALGORITHM_VERSIONS = new Set([5]);
 // made of. Version 5 is not listed for exactly that reason: its headers and
 // indexes carry no model provider, and it fingerprinted durable usage records
 // without their response id.
-const SAME_HEADER_AND_INDEX_ALGORITHM_VERSIONS = new Set([6]);
+const SAME_HEADER_AND_INDEX_ALGORITHM_VERSIONS = new Set([6, 7]);
+// Where each older version keeps its entries, newest first: version 7 in its
+// own folder, versions up to 6 in the per-home directory itself.
+const OLDER_ENTRY_FOLDERS = ['v7', ''];
 
 function acceptedOlderSummaryAlgorithm(version, magpieFree) {
   return MERGED_ULTRAFAST_SUMMARY_ALGORITHM_VERSIONS.has(version)
@@ -131,7 +144,7 @@ export function signatureMatches(stored, wanted) {
     : sameSignature(stored, wanted);
 }
 
-/** Where versions up to 6 keep their entries. Read-only for this version. */
+/** Where versions up to 6 keep their entries (version 7: its `v7` folder inside). Read-only for this version. */
 export function olderCodexCacheDir(codexHome) {
   const base = process.env.VIBE_USAGE_CACHE_DIR?.trim()
     || join(homedir(), '.vibe-usage', 'cache');
@@ -147,8 +160,8 @@ function entryPath(codexHome, filePath) {
   return join(codexCacheDir(codexHome), `${hash(filePath, 32)}.json`);
 }
 
-function olderEntryPath(codexHome, filePath) {
-  return join(olderCodexCacheDir(codexHome), `${hash(filePath, 32)}.json`);
+function olderEntryPaths(codexHome, filePath) {
+  return OLDER_ENTRY_FOLDERS.map(folder => join(olderCodexCacheDir(codexHome), folder, `${hash(filePath, 32)}.json`));
 }
 
 function tailPath(codexHome, filePath) {
@@ -203,16 +216,31 @@ export function loadOlderCodexFileCache(codexHome, filePath, signature, { magpie
   if (!codexCacheEnabled() || !signature) return null;
   const summaryAccepted = version => acceptedOlderSummaryAlgorithm(version, magpieFree);
   const partsAccepted = version => SAME_HEADER_AND_INDEX_ALGORITHM_VERSIONS.has(version);
-  const older = readSummary(olderEntryPath(codexHome, filePath), filePath,
-    version => summaryAccepted(version) || partsAccepted(version));
-  if (!older || !signatureMatches(older.signature, signature)) return null;
-  const parts = partsAccepted(older.algorithmVersion);
-  return {
-    signature: older.signature,
-    entry: summaryAccepted(older.algorithmVersion) ? older : null,
-    header: (parts && older.header) || null,
-    index: (parts && older.index) || null,
-  };
+  // Newest first. A header and an index are the same whichever listed version
+  // computed them, so each is taken from the first entry that has it: a
+  // version-7 rebuild left half-done (header, no index yet) is completed from
+  // the version-6 entry next to it.
+  let found = null;
+  for (const path of olderEntryPaths(codexHome, filePath)) {
+    const entry = readSummary(path, filePath, version => summaryAccepted(version) || partsAccepted(version));
+    if (!entry || !signatureMatches(entry.signature, signature)) continue;
+    const parts = partsAccepted(entry.algorithmVersion);
+    found ??= { signature: entry.signature, entry: null, header: null, index: null, copyOf: null };
+    if (!found.entry && summaryAccepted(entry.algorithmVersion)) found.entry = entry;
+    if (parts) {
+      found.header ??= entry.header || null;
+      found.index ??= entry.index || null;
+      // The proof that this compressed file holds exactly a plain copy's bytes
+      // (codex.js indexFromCompressedCopy(); version 7 records it). It is about
+      // the two files only, and planCodexSegments() trusts it only while the
+      // plain copy still has the recorded signature. Without it every shared
+      // conversation's compressed copy was decompressed and merged again after
+      // the upgrade: on the maintainer's Mac Codex had not finished after 20
+      // runs.
+      found.copyOf ??= entry.copyOf || null;
+    }
+  }
+  return found;
 }
 
 export function saveCodexFileCache(codexHome, filePath, signature, data) {

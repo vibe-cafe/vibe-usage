@@ -18,7 +18,10 @@ import {
 
 const SOURCE = 'dsh';
 // 2: cached models carry `project` instead of the session's full `cwd`.
-const DSH_CACHE_ALGO = 2;
+// 3: model time (2026-11-25) -- file entries keep each reply's output tokens,
+// zero included, and the whole-source snapshot holds sessions with 5-minute
+// cells. An earlier release keeps reading its own version.
+const DSH_CACHE_ALGO = 3;
 
 // Verified against deepseek-ai/deepseek-harness, released formats V0-V4:
 // packages/session/session-format/src/filename.ts, session-format-v0-to-v1,
@@ -287,6 +290,9 @@ function buildSessionModel(text, fileVersion) {
       role: 'assistant',
       timeMs,
       usage: parseUsage(rec.data.usage),
+      // Model time: the reply's output, reasoning included; a usage block of
+      // zeros is a known 0, a missing one unknown (aggregate.js replySpan()).
+      outputTokens: rec.data.usage && typeof rec.data.usage === 'object' ? toCount(rec.data.usage.outputTokens) : undefined,
       model:
         typeof rec.data.message?.source?.model === 'string' && rec.data.message.source.model
           ? rec.data.message.source.model
@@ -435,7 +441,11 @@ function modelToResult(model, skipCount) {
   for (let i = skipCount; i < model.messages.length; i++) {
     const msg = model.messages[i];
     const timestamp = new Date(msg.timeMs);
-    events.push({ sessionId, source: SOURCE, project, timestamp, role: msg.role });
+    // Model time: a reply's output (reasoning included) sets its cap; a reply
+    // without usage is unknown (aggregate.js replySpan()).
+    const outputTokens = msg.role === 'assistant' ? msg.outputTokens : undefined;
+    events.push({ sessionId, source: SOURCE, project, timestamp, role: msg.role,
+      ...(outputTokens !== undefined ? { outputTokens } : {}) });
     if (msg.usage) {
       entries.push({
         source: SOURCE,

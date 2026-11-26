@@ -4,12 +4,12 @@ import { setTimeout as sleep } from 'node:timers/promises';
 import { loadConfig, saveConfig, persistApiUrlMigration } from './config.js';
 import {
   loadState, saveState, pruneState, stateIdentity, migrateStateIdentityApiUrl,
-  bucketKey, bucketHash, sessionKey, sessionHash,
+  bucketKey, bucketHash, sessionKey, sessionHash, activityKey, activityHash,
 } from './state.js';
 import { ingest, fetchSettings, registerCodexUltrafastStart } from './api.js';
 import { createSyncClient, forBatch } from './client-meta.js';
 import { parsers } from './parsers/index.js';
-import { aggregateToBuckets } from './parsers/aggregate.js';
+import { ACTIVITY_CELLS, aggregateToBuckets } from './parsers/aggregate.js';
 import { normalizeParserResult } from './parsers/contract.js';
 import { extraRootList } from './extra-roots.js';
 import { bucketStartRange, planKikiMigration } from './kiki-migration.js';
@@ -27,6 +27,44 @@ import { classifyParserError, countWarningCodes } from './warning-codes.js';
 
 const BATCH_SIZE = 100;
 const SESSION_BATCH_SIZE = 500;
+const ACTIVITY_BATCH_SIZE = 500;
+
+/**
+ * Model-time upload rows (2026-11-25): the `activity` of every session, added
+ * up per tool, project, machine and half-hour. Only sources whose parser
+ * returned a complete view this sync contribute -- a row is the whole local
+ * picture of its key, so a skipped or still indexing parser (Codex reading its
+ * history) does not send a partial sum. The server keeps the larger value of
+ * each cell, like the token buckets: a window whose older session log was
+ * deleted comes back smaller and does not erase what was uploaded.
+ */
+export function buildActivityRows(sessions, completeSources) {
+  const rows = new Map();
+  for (const session of sessions) {
+    if (!completeSources.has(session.source) || !Array.isArray(session.activity)) continue;
+    for (const [bucketStart, ...cells] of session.activity) {
+      const row = {
+        source: session.source,
+        project: session.project,
+        hostname: session.hostname,
+        bucketStart,
+        outputSeconds: new Array(ACTIVITY_CELLS).fill(0),
+      };
+      const key = activityKey(row);
+      const existing = rows.get(key) ?? row;
+      for (let i = 0; i < ACTIVITY_CELLS; i++) existing.outputSeconds[i] += Number(cells[i]) || 0;
+      rows.set(key, existing);
+    }
+  }
+  return [...rows.values()];
+}
+
+/** A session as uploaded: its local `activity` travels as rows of its own. */
+function withoutActivity(session) {
+  if (!('activity' in session)) return session;
+  const { activity: _activity, ...rest } = session;
+  return rest;
+}
 
 /** Print one stderr summary per hold reason; returns one `source` per (reason, source) line. */
 function reportMagpieWithheld(plan) {
@@ -395,6 +433,11 @@ async function runSyncPasses({
       : `${codexUltrafast.startAt} 之前保持原名，之后的 Ultrafast 用量单独计价`;
     process.stderr.write(`${dim(`  codex: 已登记这台设备的 Ultrafast 档位起点，${scope}。`)}\n`);
   }
+  // Model-time rows go up only when this sync's own settings answer asks for
+  // them: a server that predates them (or turned them off) would drop them,
+  // and a sync on the cached privacy choice has no answer at all.
+  const activityEnabled = confirmedSettings?.activity === true;
+
   // Set when the Codex parser's turn comes and it is skipped for want of an
   // answer. A machine without Codex has nothing held: no warning, no failed sync.
   let codexHeld = false;
@@ -603,11 +646,13 @@ async function runSyncPasses({
       // this fast path; otherwise deleting the final local log would leave dead
       // state entries forever. Failed-parser sources remain protected.
       announceIdentityChange();
-      const before = Object.keys(state.buckets).length + Object.keys(state.sessions).length;
+      const size = () => Object.keys(state.buckets).length + Object.keys(state.sessions).length
+        + Object.keys(state.activity ?? {}).length;
+      const before = size();
       const magpiePlan = planMagpie([], magpie);
       noteHeld(reportMagpieWithheld(magpiePlan));
-      pruneState(state, magpiePlan.preserveBuckets, new Set(), okSources);
-      const pruned = before - (Object.keys(state.buckets).length + Object.keys(state.sessions).length);
+      pruneState(state, magpiePlan.preserveBuckets, new Set(), okSources, activityEnabled ? new Set() : undefined);
+      const pruned = before - size();
       for (const { source, code } of reportParserInfoChanges(state, parserInfos)) record.noteWarning(source, code);
       const metaChanged = recordParserInfos(state, parserInfos);
       if (pruned > 0 || metaChanged) saveState(state, identity);
@@ -717,14 +762,19 @@ async function runSyncPasses({
     }
     allBuckets = migration.buckets;
     const uploadSessions = migration.sessions;
+    const activityRows = activityEnabled ? buildActivityRows(uploadSessions, okSources) : [];
     const changedBuckets = [];
     const changedSessions = [];
+    const changedActivity = [];
     const liveBucketKeys = new Set([...magpiePlan.preserveBuckets, ...migration.preserveBuckets]);
     const liveSessionKeys = new Set(migration.preserveSessions);
+    const liveActivityKeys = activityEnabled ? new Set() : undefined;
     // key -> hash, committed to state only after the owning batch's upload
     // succeeds (a failed batch re-sends next sync — no silent gap).
     const pendingBucketState = new Map();
     const pendingSessionState = new Map();
+    const pendingActivityState = new Map();
+    if (!state.activity) state.activity = {};
 
     for (const b of allBuckets) {
       const key = bucketKey(b);
@@ -739,8 +789,16 @@ async function runSyncPasses({
       const h = sessionHash(s);
       liveSessionKeys.add(key);
       if (migration.preserveSessions.has(key) || state.sessions[key] === h) continue;
-      changedSessions.push(s);
+      changedSessions.push(withoutActivity(s));
       pendingSessionState.set(key, h);
+    }
+    for (const a of activityRows) {
+      const key = activityKey(a);
+      const h = activityHash(a);
+      liveActivityKeys.add(key);
+      if (state.activity[key] === h) continue;
+      changedActivity.push(a);
+      pendingActivityState.set(key, h);
     }
 
     // Parser info is written into state.parserMeta only once every item its
@@ -759,6 +817,7 @@ async function runSyncPasses({
     };
     for (const key of pendingBucketState.keys()) noteUnsent(`b:${key}`);
     for (const key of pendingSessionState.keys()) noteUnsent(`s:${key}`);
+    for (const key of pendingActivityState.keys()) noteUnsent(`a:${key}`);
     const heldInfos = new Map(parserInfos
       .filter(({ source }) => unsentBySource.has(source))
       .map(item => [item.source, item]));
@@ -783,12 +842,14 @@ async function runSyncPasses({
     // keys is independent of whether anything uploads, so it must NOT be coupled
     // to upload success. If we deferred this to the batch loop, a first-batch
     // failure would throw before any saveState and the prune would be lost.
-    const before = Object.keys(state.buckets).length + Object.keys(state.sessions).length;
-    pruneState(state, liveBucketKeys, liveSessionKeys, okSources);
-    const pruned = before - (Object.keys(state.buckets).length + Object.keys(state.sessions).length);
+    const stateSize = () => Object.keys(state.buckets).length + Object.keys(state.sessions).length
+      + Object.keys(state.activity).length;
+    const before = stateSize();
+    pruneState(state, liveBucketKeys, liveSessionKeys, okSources, liveActivityKeys);
+    const pruned = before - stateSize();
     if (pruned > 0 || metaChanged) saveState(state, identity);
 
-    if (changedBuckets.length === 0 && changedSessions.length === 0) {
+    if (changedBuckets.length === 0 && changedSessions.length === 0 && changedActivity.length === 0) {
       if (!quiet && final) {
         if (uploadedAnything()) printDashboardLink();
         else console.log(dim('无新增数据。'));
@@ -798,6 +859,11 @@ async function runSyncPasses({
 
     const allBucketsToSend = changedBuckets;
     const allSessionsToSend = changedSessions;
+    const allActivityToSend = changedActivity;
+    // Set when the server answered a batch without acknowledging model-time
+    // rows: they are then neither committed nor sent again this sync.
+    let activityUnacknowledged = false;
+    let totalActivitySynced = 0;
 
     let totalIngested = 0;
     let totalSessionsSynced = 0;
@@ -810,7 +876,8 @@ async function runSyncPasses({
     const droppedSources = new Set();
     const bucketBatches = Math.ceil(allBucketsToSend.length / BATCH_SIZE);
     const sessionBatches = Math.ceil(allSessionsToSend.length / SESSION_BATCH_SIZE);
-    const totalBatches = Math.max(bucketBatches, sessionBatches, 1);
+    const activityBatches = Math.ceil(allActivityToSend.length / ACTIVITY_BATCH_SIZE);
+    const totalBatches = Math.max(bucketBatches, sessionBatches, activityBatches, 1);
     // One syncId per runSync, shared by both passes.
     syncClient ??= createSyncClient({
       defaultSurface: surface,
@@ -826,6 +893,7 @@ async function runSyncPasses({
     if (!quiet) {
       const pending = [`${allBucketsToSend.length} buckets`];
       if (allSessionsToSend.length > 0) pending.push(`${allSessionsToSend.length} sessions`);
+      if (allActivityToSend.length > 0) pending.push(`${allActivityToSend.length} activity`);
       const batchNote = totalBatches > 1 ? `，分 ${totalBatches} 批` : '';
       console.log(dim(`  待上传 ${pending.join(' · ')}${batchNote}`));
     }
@@ -837,6 +905,11 @@ async function runSyncPasses({
       for (let batchIdx = 0; batchIdx < totalBatches; batchIdx++) {
         const batch = allBucketsToSend.slice(batchIdx * BATCH_SIZE, (batchIdx + 1) * BATCH_SIZE);
         const batchSessions = allSessionsToSend.slice(batchIdx * SESSION_BATCH_SIZE, (batchIdx + 1) * SESSION_BATCH_SIZE);
+        const batchActivity = activityUnacknowledged ? []
+          : allActivityToSend.slice(batchIdx * ACTIVITY_BATCH_SIZE, (batchIdx + 1) * ACTIVITY_BATCH_SIZE);
+        // Batches that were there only for rows the server has stopped
+        // acknowledging carry nothing left to send.
+        if (batchIdx > 0 && batch.length === 0 && batchSessions.length === 0 && batchActivity.length === 0) continue;
         const batchNum = batchIdx + 1;
         const prefix = totalBatches > 1 ? `  ${dim(`[${batchNum}/${totalBatches}]`)} 上传中 ` : '  上传中 ';
 
@@ -857,7 +930,8 @@ async function runSyncPasses({
             const pct = Math.round((sent / total) * 100);
             process.stdout.write(`\r${prefix}${dim(`${formatBytes(sent)}/${formatBytes(total)} (${pct}%)${etaNote}`)}\x1b[K`);
           },
-        }, batchSessions.length > 0 ? batchSessions : undefined);
+        }, batchSessions.length > 0 ? batchSessions : undefined,
+        batchActivity.length > 0 ? batchActivity : undefined);
         uploadedBytes += batchBytes;
         totalIngested += result.ingested ?? batch.length;
         totalSessionsSynced += result.sessions ?? 0;
@@ -916,6 +990,25 @@ async function runSyncPasses({
             markCommitted(`s:${key}`);
           }
         }
+        if (batchActivity.length > 0) {
+          if (typeof result.activity === 'number') {
+            totalActivitySynced += result.activity;
+            for (const a of batchActivity) {
+              if (batchUnknownSources.has(a.source)) continue;
+              const key = activityKey(a);
+              const entry = pendingActivityState.get(key);
+              if (entry) {
+                state.activity[key] = entry;
+                batchStateChanged = true;
+                markCommitted(`a:${key}`);
+              }
+            }
+          } else {
+            // A server that does not know the rows ignores them. Leave them
+            // uncommitted for a later sync and stop sending them now.
+            activityUnacknowledged = true;
+          }
+        }
         if (batchStateChanged) saveState(state, identity);
         // Same moment the batch is committed to state.json: if a desktop app
         // kills the process later (its 120s timeout while Cursor is still
@@ -929,6 +1022,7 @@ async function runSyncPasses({
       }
       const syncParts = [`${totalIngested} buckets`];
       if (totalSessionsSynced > 0) syncParts.push(`${totalSessionsSynced} sessions`);
+      if (totalActivitySynced > 0) syncParts.push(`${totalActivitySynced} activity`);
       console.log(success(`已同步 ${syncParts.join(' · ')}`));
       if (!quiet && uploadedBytes > 0) {
         const elapsed = (Date.now() - uploadStartedAt) / 1000;

@@ -362,10 +362,13 @@ test('Claude parser handles a resumed session with 200k timing events', { timeou
   }
 });
 
-test('Claude streaming session rollup preserves out-of-order timestamp semantics', async () => {
-  const root = mkdtempSync(join(tmpdir(), 'vibe-usage-claude-order-test-'));
+test('Claude replies without usage records keep the session and count no model time', async () => {
+  // Claude Code writes usage on every reply it got from the API; a line
+  // without it is a synthetic one (an API error, an interrupted request), so
+  // it is a known output of 0, not an unknown one capped at 2 minutes.
+  const root = mkdtempSync(join(tmpdir(), 'vibe-usage-claude-no-usage-test-'));
   try {
-    writeSession(root, '-Users-dev-proj', 'out-of-order-session', [
+    writeSession(root, '-Users-dev-proj', 'no-usage-session', [
       record({ type: 'assistant', timestamp: '2026-08-23T10:05:00.000Z' }),
       record({ type: 'user', timestamp: '2026-08-23T10:00:00.000Z' }),
       record({ type: 'assistant', timestamp: '2026-08-23T10:02:00.000Z' }),
@@ -375,10 +378,35 @@ test('Claude streaming session rollup preserves out-of-order timestamp semantics
     const result = await withClaudeRoots([root], () => parse());
     assert.deepEqual(result.buckets, []);
     assert.equal(result.sessions.length, 1);
+    assert.equal(result.sessions[0].durationSeconds, 600);
+    assert.equal(result.sessions[0].activeSeconds, 0);
+    assert.deepEqual(result.sessions[0].activity, []);
+    assert.equal(result.sessions[0].messageCount, 4);
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test('Claude streaming session rollup preserves out-of-order timestamp semantics', async () => {
+  const root = mkdtempSync(join(tmpdir(), 'vibe-usage-claude-order-test-'));
+  try {
+    const usage = { input_tokens: 10, output_tokens: 100 };
+    writeSession(root, '-Users-dev-proj', 'out-of-order-session', [
+      record({ type: 'assistant', timestamp: '2026-08-23T10:05:00.000Z', usage }),
+      record({ type: 'user', timestamp: '2026-08-23T10:00:00.000Z' }),
+      record({ type: 'assistant', timestamp: '2026-08-23T10:02:00.000Z', usage }),
+      record({ type: 'user', timestamp: '2026-08-23T10:10:00.000Z' }),
+    ]);
+
+    const result = await withClaudeRoots([root], () => parse());
+    assert.equal(result.sessions.length, 1);
     assert.equal(result.sessions[0].firstMessageAt, '2026-08-23T10:00:00.000Z');
     assert.equal(result.sessions[0].lastMessageAt, '2026-08-23T10:10:00.000Z');
     assert.equal(result.sessions[0].durationSeconds, 600);
-    assert.equal(result.sessions[0].activeSeconds, 180);
+    // One reply (10:02 and 10:05 after the 10:00 prompt) with 200 output
+    // tokens: at most 30 s + 200 / 20 per second = 40 s of model time.
+    assert.equal(result.sessions[0].activeSeconds, 40);
+    assert.deepEqual(result.sessions[0].activity, [['2026-08-23T10:00:00.000Z', 40, 0, 0, 0, 0, 0]]);
     assert.equal(result.sessions[0].messageCount, 4);
     assert.equal(result.sessions[0].userMessageCount, 2);
   } finally {

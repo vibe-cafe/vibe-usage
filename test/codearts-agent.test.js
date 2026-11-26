@@ -145,7 +145,10 @@ test('CodeArts Agent counts child calls but folds child timing into one human se
     assert.equal(result.sessions[0].project, 'root-project');
     assert.equal(result.sessions[0].messageCount, 4);
     assert.equal(result.sessions[0].userMessageCount, 1);
-    assert.equal(result.sessions[0].activeSeconds, 2);
+    // Model time, one reply per assistant event from the event before it: the
+    // root reply (0 → 1 s), the folded child prompt (1 → 2 s) and the child
+    // reply (2 → 3 s).
+    assert.equal(result.sessions[0].activeSeconds, 3);
     assert.equal(result.sessions[0].firstMessageAt, '2026-09-17T01:00:00.000Z');
     assert.equal(result.sessions[0].lastMessageAt, '2026-09-17T01:00:03.000Z');
   } finally {

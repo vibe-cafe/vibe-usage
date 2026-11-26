@@ -7,7 +7,7 @@ import { syncBuiltinESMExports } from 'node:module';
 import { join, sep } from 'node:path';
 import { tmpdir } from 'node:os';
 import { parse } from '../src/parsers/codex.js';
-import { codexCacheDir, olderCodexCacheDir } from '../src/parsers/codex-cache.js';
+import { CODEX_PARSER_ALGORITHM_VERSION, codexCacheDir, olderCodexCacheDir } from '../src/parsers/codex-cache.js';
 
 // The per-home manifest (codex-cache.js): a warm sync starts from it without
 // opening the entries, and reads a full replay index only for the boundary of
@@ -310,7 +310,7 @@ test('a slim index whose entry is gone is built again from the rollout', async (
   });
 });
 
-test('a record taken from an older version is held to the same rules as its entry', async () => {
+test('a record of an older version\'s summary is never used', async () => {
   await withHomes(async ({ homes, file, run, uncached }) => {
     setUp(file);
     await run();
@@ -320,19 +320,18 @@ test('a record taken from an older version is held to the same rules as its entr
     const record = manifest.records[file('codex', plainFile)];
     assert.ok(record?.result, 'the plain conversation has a record with a summary');
     // An algorithm-6 summary for exactly this file state whose numbers differ,
-    // so whether it is used shows in the output. It folds Ultrafast into the
-    // plain model, so it may stand in only for windows before the cut.
+    // so whether it is used shows in the output. Since algorithm 8 no older
+    // summary stands in (its sessions have no model time), with or without a
+    // cut.
     record.src = 6;
     record.result = { ...record.result, ultrafastBuckets: undefined,
       buckets: record.result.buckets.map(bucket => ({ ...bucket, inputTokens: bucket.inputTokens + 1000 })) };
     delete record.result.ultrafastBuckets;
     writeFileSync(path, JSON.stringify(manifest));
-    const cut = '2026-07-10T07:00:00.000Z'; // the plain conversation's window is at or after it
+    const cut = '2026-07-10T07:00:00.000Z';
     assert.deepEqual(view(await run({ codexUltrafastStartAt: cut })), view(await uncached({ codexUltrafastStartAt: cut })));
-    // Without a cut the same record is exact by the older version's rules.
     writeFileSync(path, JSON.stringify(manifest));
-    const used = await run();
-    assert.equal(totalInput(used), totalInput(await uncached()) + 1000);
+    assert.deepEqual(view(await run()), view(await uncached()));
   });
 });
 
@@ -474,7 +473,7 @@ test('a fork left for the next run keeps the parent state its summary was checke
   });
 });
 
-test('a fork summary checked against an algorithm-5 parent index is checked again once that index is rebuilt', async () => {
+test('an algorithm-5 parent index is never taken, so a fork\'s copy of the parent never counts', async () => {
   await withHomes(async ({ homes, file, run, uncached }) => {
     const single = { extraRoots: [] };
     writeFileSync(file('codex', parentFile), parent);
@@ -497,14 +496,13 @@ test('a fork summary checked against an algorithm-5 parent index is checked agai
       unlinkSync(join(dir, name));
     }
     rmSync(join(dir, 'manifest.v1'), { force: true });
-    // Magpie-free and no cut: the algorithm-5 entry is taken whole, and with
-    // its index the fork's copy of the parent counts (as it does without the
-    // manifest). Two runs put that state, parent file unchanged, in the manifest.
-    await run(single);
-    assert.equal(totalInput(await run(single)), 6005);
-    // The cut moves before all history: an algorithm-5 summary may no longer
-    // stand in, so the parent is indexed again by this version. Its file has
-    // not changed; the index used for it has.
+    // Since algorithm 8 nothing of an algorithm-5 entry is taken, also where
+    // Magpie is free and there is no cut: the parent is indexed again by this
+    // version, so the fork's copy of it never counts.
+    const first = await run(single);
+    assert.deepEqual(view(first), view(await uncached(single)));
+    assert.equal(totalInput(first), 3005);
+    assert.equal(totalInput(await run(single)), 3005);
     const all = { ...single, codexUltrafastStartAt: '1970-01-01T00:00:00.000Z' };
     const rebuilt = await run(all);
     assert.deepEqual(view(rebuilt), view(await uncached(all)));
@@ -590,7 +588,10 @@ test('an algorithm-5 entry is never served from the manifest, so an entry an old
     await run(single);
     const path = join(dir, 'manifest.v1');
     const manifest = JSON.parse(readFileSync(path, 'utf8'));
-    assert.equal(manifest.records[file('codex', parentFile)], undefined, 'an algorithm-5 entry is not recorded');
+    // Nothing of the algorithm-5 entry is taken: the parent is read again by
+    // this version and recorded as its own.
+    assert.equal(manifest.records[file('codex', parentFile)]?.src, CODEX_PARSER_ALGORITHM_VERSION,
+      'an algorithm-5 entry is not recorded');
     // A manifest written before this rule would hold it anyway.
     const { tokenTimes, tokenFingerprints, taskBoundaries, ...slim } = older.index;
     manifest.records[file('codex', parentFile)] = { signature: older.signature, src: 5, header: older.header,
@@ -643,7 +644,10 @@ test('a full index is taken from this version\'s entry first, also behind a reco
     await run(single);
     const manifest = JSON.parse(readFileSync(join(dir, 'manifest.v1'), 'utf8'));
     const record = manifest.records[file('codex', parentFile)];
-    assert.equal(record?.src, 6, 'the parent is recorded from its algorithm-6 entry');
+    // Since algorithm 8 the parent's usage is read again by this version (no
+    // older summary stands in), with the header and index of its algorithm-6
+    // entry: the record is this version's own.
+    assert.equal(record?.src, CODEX_PARSER_ALGORITHM_VERSION, 'the parent is recorded as this version\'s entry');
     assert.ok(record.index, 'with its (slim) index');
     // The older collector's audit rebuilds the parent's entry, same file
     // state; then a new fork of it appears.
