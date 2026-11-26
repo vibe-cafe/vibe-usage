@@ -282,6 +282,26 @@ test('a pause returns the local 0% reading or the pause message, without spawnin
   assert.equal(existsSync(f.trace), false);
 });
 
+test('under an app that still describes Grok as offline, only the local log is read', async t => {
+  const f = fixture(t);
+  f.writeLog(40);
+  const under = (surface, version) => ({
+    environment: { ...f.environment, VIBE_USAGE_SURFACE: surface, VIBE_USAGE_SURFACE_VERSION: version },
+  });
+  for (const [surface, version] of [['mac-app', '0.8.0'], ['windows-app', '0.7.9'], ['windows-app', 'dev']]) {
+    const result = await f.fetch({ ...under(surface, version), egressPause: () => assert.fail('egress check') });
+    assert.deepEqual(result, { id: 'grok', status: 'ok', source: 'local', planLabel: 'Local plan', meters: [meter(40)],
+      fetchedAt: now.toISOString(), dataAsOf: eventTime });
+  }
+  const absent = await fetchGrokQuota({ ...f.options, ...under('mac-app', '0.8.0'), grokBinary: null });
+  assert.equal(absent.failureReason, undefined);
+  assert.equal(existsSync(f.trace), false);
+  for (const [surface, version] of [['mac-app', '0.8.1'], ['windows-app', '0.7.10'], ['cli', '0.15.10']]) {
+    assert.equal((await f.fetch(under(surface, version))).source, 'live');
+  }
+  assert.equal(f.calls().filter(call => call.argv).length, 3);
+});
+
 test('the 2 MiB log tail bounds fallback reads and live tier lookup', async t => {
   const f = fixture(t);
   f.writeLog(43);

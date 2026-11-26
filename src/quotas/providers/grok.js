@@ -2,6 +2,7 @@ import { accessSync, closeSync, constants, fstatSync, openSync, readSync, statSy
 import { homedir } from 'node:os';
 import { delimiter, join, resolve } from 'node:path';
 import { StringDecoder } from 'node:string_decoder';
+import { desktopAppOlderThan } from '../../client-meta.js';
 import { quotaResult } from '../schema.js';
 import { cleanupAllowanceMs, setVariable, TimedOut, withProcess } from './child-process.js';
 
@@ -275,12 +276,21 @@ export async function requestGrokBilling(binary, {
   return answer;
 }
 
+// Mac 0.8.0 / Windows 0.7.9 and earlier tell their users that Grok's quota is
+// read from its local log, offline (Windows settings and PRIVACY.md), and
+// resolve a PAC only for cli-chat-proxy.grok.com. Under them the CLI keeps to
+// the log; the live read starts with the app versions that describe it and
+// route every xAI host (vibe-usage-app#91, vibe-usage-windows#69). Terminal and
+// daemon runs read live as documented in the README.
+const LIVE_READ_MIN_APP = { 'mac-app': '0.8.1', 'windows-app': '0.7.10' };
+
 export async function fetchGrokQuota({
   environment = process.env, home = homedir(), platform = process.platform, now = new Date(),
   egressGate = async () => null, grokBinary = findGrokBinary({ environment, home, platform }),
   maxLogBytes = DEFAULT_MAX_LOG_BYTES, spawnImpl, timeoutMs,
 } = {}) {
   const readLog = () => readLogTail(grokBillingLogPath(environment, home), maxLogBytes);
+  if (desktopAppOlderThan(LIVE_READ_MIN_APP, environment)) return logQuota(readLog, now);
   if (!grokBinary) return logQuota(readLog, now, 'programNotFound');
   const quota = fields => quotaResult({ id: PRODUCT_ID, fetchedAt: now, ...fields });
   const paused = await egressGate();
