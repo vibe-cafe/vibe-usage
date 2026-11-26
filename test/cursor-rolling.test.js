@@ -230,7 +230,7 @@ test('an encrypted Cursor token pauses Cursor, keeps its progress, and the gap f
       const { stderr } = await sync();
       assert.equal(backend.csvRequests + backend.eventsRequests, requestsBefore, 'no request reaches cursor.com');
       assert.match(stderr, /cursor: 新版 Cursor 已加密保存登录凭证/);
-      assert.match(stderr, /issues\/144/);
+      assert.match(stderr, /vibe-usage login cursor/);
       assert.doesNotMatch(stderr, /sign in again/);
       assert.ok(!stderr.includes(cipher));
       assert.deepEqual(state().buckets, saved.buckets, 'no Cursor state key is pruned or rewritten');

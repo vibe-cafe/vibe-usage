@@ -1,24 +1,54 @@
-import { closeSync, fstatSync, openSync, readSync } from 'node:fs';
+import { accessSync, closeSync, constants, fstatSync, openSync, readSync, statSync } from 'node:fs';
 import { homedir } from 'node:os';
-import { join } from 'node:path';
+import { delimiter, join, resolve } from 'node:path';
+import { StringDecoder } from 'node:string_decoder';
+import { desktopAppOlderThan } from '../../client-meta.js';
 import { quotaResult } from '../schema.js';
+import { cleanupAllowanceMs, setVariable, TimedOut, withProcess } from './child-process.js';
 
 const PRODUCT_ID = 'grok';
 const DEFAULT_MAX_LOG_BYTES = 2 * 1024 * 1024;
+const BILLING_UNAVAILABLE = 'Grok billing service unavailable';
+const OUTPUT_LIMIT = 1024 * 1024;
+const GROK_ACCOUNT_REQUIRED = /billing (?:data )?requires auth(?:entication)? with grok\.com\b/i;
+const LOGIN_REQUIRED = /auth(?:entication)? (?:is )?required|not (?:signed|logged) in/i;
 
-export function grokBillingLogPath(environment = process.env, home = homedir()) {
+function grokHome(environment, home) {
   const configured = environment.GROK_HOME?.trim();
   let root = configured || join(home, '.grok');
   if (root === '~') root = home;
   else if (root.startsWith('~/') || root.startsWith('~\\')) root = join(home, root.slice(2));
-  return join(root, 'logs', 'unified.jsonl');
+  return root;
+}
+
+export function grokBillingLogPath(environment = process.env, home = homedir()) {
+  return join(grokHome(environment, home), 'logs', 'unified.jsonl');
+}
+
+export function findGrokBinary({ environment = process.env, home = homedir(), platform = process.platform } = {}) {
+  const windows = platform === 'win32';
+  const pathKey = windows ? Object.keys(environment).find(key => key.toUpperCase() === 'PATH') : 'PATH';
+  const directories = [
+    join(grokHome(environment, home), 'bin'),
+    ...(environment[pathKey] || '').split(windows ? ';' : delimiter).filter(Boolean),
+  ];
+  if (!windows) directories.push(join(home, '.local', 'bin'));
+  for (const directory of directories) {
+    const path = resolve(directory, windows ? 'grok.exe' : 'grok');
+    try {
+      if (!statSync(path).isFile()) continue;
+      if (!windows) accessSync(path, constants.X_OK);
+      return path;
+    } catch { /* Try the next installation. */ }
+  }
+  return null;
 }
 
 function readLogTail(path, maxBytes = DEFAULT_MAX_LOG_BYTES) {
   const descriptor = openSync(path, 'r');
   try {
     const size = fstatSync(descriptor).size;
-    const length = Math.min(size, maxBytes);
+    const length = Math.min(size, maxBytes, DEFAULT_MAX_LOG_BYTES);
     if (length <= 0) return '';
     const buffer = Buffer.allocUnsafe(length);
     const offset = size - length;
@@ -42,7 +72,7 @@ function readLogTail(path, maxBytes = DEFAULT_MAX_LOG_BYTES) {
 }
 
 function finiteNumber(value) {
-  const number = typeof value === 'number' ? value : Number(value);
+  const number = typeof value === 'string' && value.trim() ? Number(value) : value;
   return Number.isFinite(number) ? number : null;
 }
 
@@ -60,13 +90,38 @@ function periodLabel(type, seconds) {
   return Number.isInteger(days) && days > 0 ? `${days}d` : 'Credits';
 }
 
-/**
- * Reads only Grok CLI's structured, non-secret billing status event. Other log
- * messages are parsed only far enough to reject them and are never returned,
- * cached, logged, or uploaded by Vibe Usage.
- */
-export function parseGrokBillingLog(text, now = new Date()) {
-  if (typeof text !== 'string' || !text) return null;
+function tier(...values) {
+  return values.find(value => typeof value === 'string' && value.trim())?.trim();
+}
+
+export function parseGrokBillingConfig(config, now = new Date()) {
+  if (!config || typeof config !== 'object' || Array.isArray(config)) return null;
+  const startsAt = date(config.currentPeriod?.start || config.billingPeriodStart);
+  const resetsAt = date(config.currentPeriod?.end || config.billingPeriodEnd);
+  if (!startsAt || !resetsAt || startsAt >= resetsAt) return null;
+  const windowSeconds = (resetsAt - startsAt) / 1000;
+  const used = finiteNumber(config.used?.val ?? config.used);
+  const limit = finiteNumber(config.monthlyLimit?.val ?? config.monthlyLimit);
+  // Grok omits zero-valued fields, including the percentage for a fresh period.
+  const utilization = finiteNumber(config.creditUsagePercent)
+    ?? (used !== null && limit > 0 ? used / limit * 100 : 0);
+  return {
+    started: startsAt <= now,
+    active: now < resetsAt,
+    meters: [{
+      id: 'subscription-credits',
+      label: periodLabel(config.currentPeriod?.type, windowSeconds),
+      utilization,
+      resetsAt: resetsAt.toISOString(),
+      windowSeconds,
+    }],
+    planLabel: tier(config.subscriptionTier),
+  };
+}
+
+// Only the official CLI's billing events, newest first.
+function* billingEvents(text) {
+  if (typeof text !== 'string' || !text) return;
   const lines = text.split(/\r?\n/);
   for (let index = lines.length - 1; index >= 0; index -= 1) {
     const line = lines[index].trim();
@@ -77,51 +132,38 @@ export function parseGrokBillingLog(text, now = new Date()) {
     } catch {
       continue;
     }
-    if (event?.msg !== 'billing: fetched credits config') continue;
-    const config = event?.ctx?.config;
-    if (!config || typeof config !== 'object' || Array.isArray(config)) continue;
-    const utilization = finiteNumber(config.creditUsagePercent);
+    if (event?.msg === 'billing: fetched credits config') yield event;
+  }
+}
+
+export function parseGrokBillingLog(text, now = new Date()) {
+  for (const event of billingEvents(text)) {
+    const parsed = parseGrokBillingConfig(event.ctx?.config, now);
     const dataAsOf = date(event.ts);
-    const startsAt = date(config.currentPeriod?.start || config.billingPeriodStart);
-    const resetsAt = date(config.currentPeriod?.end || config.billingPeriodEnd);
-    if (utilization === null || !dataAsOf || !startsAt || !resetsAt) continue;
-    const windowSeconds = (resetsAt.getTime() - startsAt.getTime()) / 1000;
-    if (windowSeconds <= 0) continue;
-    const planLabel = [event.ctx?.subscriptionTier, config.subscriptionTier]
-      .find(value => typeof value === 'string' && value.trim())?.trim();
+    if (!parsed || !dataAsOf) continue;
     return {
-      active: resetsAt > now,
-      dataAsOf,
-      meters: [{
-        id: 'subscription-credits',
-        label: periodLabel(config.currentPeriod?.type, windowSeconds),
-        utilization,
-        resetsAt: resetsAt.toISOString(),
-        windowSeconds,
-      }],
-      planLabel,
+      active: parsed.active, dataAsOf, meters: parsed.meters,
+      planLabel: tier(event.ctx.subscriptionTier, parsed.planLabel),
     };
   }
   return null;
 }
 
-export function fetchGrokQuota({
-  environment = process.env,
-  home = homedir(),
-  now = new Date(),
-  maxLogBytes = DEFAULT_MAX_LOG_BYTES,
-} = {}) {
+// The local record, after the live read could not answer (`failureReason`,
+// #190): a reading or an empty state carries why live failed; a record that
+// cannot be read at all reports that instead.
+function logQuota(readLog, now, failureReason) {
   let parsed;
   try {
-    parsed = parseGrokBillingLog(
-      readLogTail(grokBillingLogPath(environment, home), maxLogBytes),
-      now
-    );
+    parsed = parseGrokBillingLog(readLog(), now);
   } catch (error) {
     const status = error?.code === 'ENOENT' ? 'no_data' : 'retryable_error';
     return quotaResult({
       id: PRODUCT_ID,
       status,
+      ...(status === 'no_data'
+        ? { emptyReason: 'noLocalRecord', failureReason }
+        : { failureReason: 'localRecordUnreadable' }),
       message: status === 'no_data'
         ? 'Grok billing status is not available yet'
         : 'Grok billing status could not be read',
@@ -133,6 +175,8 @@ export function fetchGrokQuota({
     return quotaResult({
       id: PRODUCT_ID,
       status: 'no_data',
+      emptyReason: parsed ? 'periodEnded' : 'noLocalRecord',
+      failureReason,
       message: 'Grok billing status is not available yet',
       fetchedAt: now,
       dataAsOf: parsed?.dataAsOf,
@@ -147,5 +191,146 @@ export function fetchGrokQuota({
     fetchedAt: now,
     dataAsOf: parsed.dataAsOf,
     source: 'local',
+    failureReason,
   });
+}
+
+async function* rpcReplies(stdout, count, signal) {
+  const decoder = new StringDecoder('utf8');
+  let partial = '';
+  try {
+    for await (const chunk of stdout.iterator({ destroyOnReturn: false })) {
+      count(chunk);
+      signal.throwIfAborted();
+      const lines = decoder.write(chunk).split('\n');
+      lines[0] = partial + lines[0];
+      partial = lines.pop();
+      for (const line of lines) {
+        let reply;
+        try { reply = JSON.parse(line); } catch { continue; }
+        if (reply?.jsonrpc === '2.0' && !('method' in reply)) yield reply;
+      }
+    }
+  } finally {
+    // Keep counting bytes already in the pipes while the process is stopped.
+    stdout.on('data', count);
+  }
+}
+
+export async function requestGrokBilling(binary, {
+  environment = process.env, timeoutMs = 10_000, spawnImpl, platform = process.platform,
+} = {}) {
+  const protocolMs = timeoutMs - cleanupAllowanceMs(platform);
+  if (protocolMs <= 0) throw new Error(BILLING_UNAVAILABLE);
+  let bytes = 0;
+  const answer = await withProcess(binary, () => ['agent', '--no-leader', 'stdio'], {
+    prefix: 'vibe-usage-grok-quota-', environment, timeoutMs: protocolMs, spawnImpl,
+    // Only in this child, which is stopped right after the answer: no
+    // self-update download, and no worktree clean-up pass that would be cut
+    // off midway. The user's own Grok keeps both as configured.
+    configureEnv: env => {
+      setVariable(env, 'GROK_DISABLE_AUTOUPDATER', '1');
+      setVariable(env, 'GROK_WORKTREE_AUTO_GC', '0');
+    },
+    failureMessage: BILLING_UNAVAILABLE,
+  }, async ({ child, abort, signal }) => {
+    function count(chunk) {
+      bytes += chunk.length;
+      if (bytes > OUTPUT_LIMIT) abort(new Error(BILLING_UNAVAILABLE));
+    }
+    child.stderr.on('data', count);
+    const send = (id, method, params) => {
+      child.stdin.write(JSON.stringify({ jsonrpc: '2.0', id, method, params }) + '\n');
+    };
+    let pending = 1;
+    send(1, 'initialize', {
+      protocolVersion: 1, clientCapabilities: { fs: { readTextFile: false, writeTextFile: false }, terminal: false },
+    });
+    for await (const reply of rpcReplies(child.stdout, count, signal)) {
+      if (reply.id !== pending) continue;
+      if (reply.error) {
+        const { code, message, data } = reply.error;
+        if (pending === 1 || !Number.isInteger(code) || typeof message !== 'string') {
+          throw new Error(BILLING_UNAVAILABLE);
+        }
+        // Grok 1.0.45 uses ACP's generic error message with a specific auth
+        // explanation in data. Retain only the known billing distinction.
+        if (code === -32000 && typeof data === 'string') {
+          if (GROK_ACCOUNT_REQUIRED.test(data)) {
+            return { error: { code, message: 'Billing data requires auth with grok.com.' } };
+          }
+          if (!GROK_ACCOUNT_REQUIRED.test(message) && LOGIN_REQUIRED.test(data)) {
+            return { error: { code, message: 'Authentication required.' } };
+          }
+        }
+        return { error: { code, message } };
+      }
+      if (!Object.hasOwn(reply, 'result')) throw new Error(BILLING_UNAVAILABLE);
+      if (pending === 2) return { result: reply.result };
+      pending = 2;
+      send(2, '_x.ai/billing', {});
+    }
+    throw new Error(BILLING_UNAVAILABLE);
+  });
+  if (bytes > OUTPUT_LIMIT) throw new Error(BILLING_UNAVAILABLE);
+  return answer;
+}
+
+// Mac 0.8.0 / Windows 0.7.9 and earlier tell their users that Grok's quota is
+// read from its local log, offline (Windows settings and PRIVACY.md), and
+// resolve a PAC only for cli-chat-proxy.grok.com. Under them the CLI keeps to
+// the log; the live read starts with the app versions that describe it and
+// route every xAI host (vibe-usage-app#91, vibe-usage-windows#69). Terminal and
+// daemon runs read live as documented in the README.
+const LIVE_READ_MIN_APP = { 'mac-app': '0.8.1', 'windows-app': '0.7.10' };
+
+export async function fetchGrokQuota({
+  environment = process.env, home = homedir(), platform = process.platform, now = new Date(),
+  egressGate = async () => null, grokBinary = findGrokBinary({ environment, home, platform }),
+  maxLogBytes = DEFAULT_MAX_LOG_BYTES, spawnImpl, timeoutMs,
+} = {}) {
+  const readLog = () => readLogTail(grokBillingLogPath(environment, home), maxLogBytes);
+  if (desktopAppOlderThan(LIVE_READ_MIN_APP, environment)) return logQuota(readLog, now);
+  if (!grokBinary) return logQuota(readLog, now, 'programNotFound');
+  const quota = fields => quotaResult({ id: PRODUCT_ID, fetchedAt: now, ...fields });
+  const paused = await egressGate();
+  if (paused) {
+    const local = logQuota(readLog, now);
+    const reason = { pauseReason: paused.pauseReason, egressRegion: paused.region };
+    if (local.status === 'ok') return quota({ ...local, ...reason });
+    return quota({ status: 'unsupported', message: paused.message, ...reason });
+  }
+
+  let answer;
+  try {
+    answer = await requestGrokBilling(grokBinary, { environment, platform, timeoutMs, spawnImpl });
+  } catch (failure) {
+    return logQuota(readLog, now, failure instanceof TimedOut ? 'timedOut' : 'programNoAnswer');
+  }
+  const { error, result } = answer;
+  if (error?.code === -32000) {
+    if (GROK_ACCOUNT_REQUIRED.test(error.message)) {
+      return quota({ status: 'no_data', emptyReason: 'sessionWithoutPlanLimits' });
+    }
+    if (LOGIN_REQUIRED.test(error.message)) {
+      return quota({
+        status: 'unauthorized', failureReason: 'credentialsMissing',
+        message: 'Run grok login in a terminal to sign in.',
+      });
+    }
+  }
+  // -32601: a Grok too old to know the billing method; anything else (the
+  // billing service's own error, -32603) is no answer.
+  if (error) return logQuota(readLog, now, error.code === -32601 ? 'programOutdated' : 'programNoAnswer');
+  const parsed = parseGrokBillingConfig(result?.config ?? result, now);
+  if (!parsed?.active || !parsed.started) return logQuota(readLog, now, 'unrecognizedResponse');
+  let planLabel = tier(result.subscription_tier, result.subscriptionTier, parsed.planLabel);
+  if (!planLabel) {
+    // Grok also writes this call's tier to its billing event.
+    try {
+      const ctx = billingEvents(readLog()).next().value?.ctx;
+      planLabel = tier(ctx?.subscriptionTier, ctx?.config?.subscriptionTier);
+    } catch { /* The live meters stand on their own. */ }
+  }
+  return quota({ status: 'ok', meters: parsed.meters, planLabel });
 }

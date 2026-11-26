@@ -4,6 +4,7 @@ import { homedir } from 'node:os';
 import { aggregateToBuckets, roundToHalfHour } from './aggregate.js';
 import { queryDbJsonSnapshotOnLock, sqliteUnavailableError, isSqliteUnavailableError } from './sqlite.js';
 import { envProxyBlockFor } from '../env-proxy.js';
+import { cursorRefreshURL, cursorSignInBlock, endStoredCursorLogin, freshCursorLogin, resolveCursorLogin } from '../cursor-login.js';
 
 const STATE_DB_RELATIVE = join('User', 'globalStorage', 'state.vscdb');
 const ACCESS_TOKEN_KEY = 'cursorAuth/accessToken';
@@ -41,12 +42,34 @@ const BACKFILL_BUDGET_MS = 40_000;
 // in again -- useless, since signing in writes the same ciphertext. Decided
 // 2026-11-07 (issue #144): no local decryption (no `Local State`, DPAPI or
 // Keychain); recognize the whole prefix family, skip Cursor with a notice,
-// and keep its recorded progress.
+// and keep its recorded progress. Since 2026-11-25 the way back is the
+// separate Vibe Usage sign-in (`cursor-login.js`), which the notice names.
 const ENCRYPTED_TOKEN_PREFIX = 'cursor-safe-storage:';
 export const ENCRYPTED_TOKEN_NOTICE =
-  '新版 Cursor 已加密保存登录凭证，vibe-usage 暂不支持读取，Cursor 用量暂停同步，其他工具照常同步。'
-  + '重新登录 Cursor 无法解决，进展见 https://github.com/vibe-cafe/vibe-usage/issues/144';
+  '新版 Cursor 已加密保存登录凭证，Cursor 用量暂停同步，其他工具照常同步。'
+  + '运行 vibe-usage login cursor（或在 App 设置里登录 Cursor）即可恢复。';
 const ENCRYPTED_TOKEN_WARNING = `cursor: ${ENCRYPTED_TOKEN_NOTICE}`;
+
+// The separate sign-in exists but cannot be used: Cursor ended it, or a stored
+// one is unreadable. Skipped like the encrypted token: no request, no info.
+export const LOGIN_EXPIRED_NOTICE =
+  'Cursor 登录已失效（在 Vibe Usage 里登录的那一份），Cursor 用量暂停同步，其他工具照常同步。'
+  + '运行 vibe-usage login cursor（或在 App 设置里重新登录 Cursor）即可恢复。';
+const LOGIN_EXPIRED_WARNING = `cursor: ${LOGIN_EXPIRED_NOTICE}`;
+
+// A desktop app syncs Cursor with its own sign-in (the last committed progress
+// says so) and this run -- a terminal or the background service -- would read
+// another account. Cursor uploads under the fixed `cursor-cloud` hostname, so
+// two collectors would write two accounts into the same keys and keep
+// resetting each other's progress. The app's account wins; this run skips
+// (no request, no info). It resumes once the app has not synced for 7 days.
+// The record (`parserMeta.cursor.app`: the app's account label and time) is
+// written only by the app's runs; every other run carries it forward as is,
+// so an ordinary sync of the same account does not clear it.
+export const APP_ACCOUNT_NOTICE =
+  'Cursor 正由桌面 App 用另一个账号同步（以 App 里登录的为准），本次跳过，避免两个账号的用量写进同一条记录。';
+const APP_ACCOUNT_WARNING = `cursor: ${APP_ACCOUNT_NOTICE}`;
+const APP_SIGN_IN_HOLD_MS = 7 * DAY_MS;
 
 // A proxy this process cannot follow (`env-proxy.js`): skip like the encrypted
 // token above, with no request and no info, so state and recorded progress
@@ -277,6 +300,14 @@ function cursorWebBase() {
   return (process.env.CURSOR_WEB_BASE_URL?.trim() || 'https://cursor.com').replace(/\/+$/, '');
 }
 
+function sessionRejected(failures) {
+  const err = new Error(
+    `Cursor session rejected (${failures.join('; ')}). Open Cursor and sign in again (Cursor Settings → Account), then re-run sync.`,
+  );
+  err.sessionRejected = true;
+  return err;
+}
+
 function authRejected(status, statusText) {
   const err = new Error(`auth rejected (${status} ${statusText})`);
   err.authRejected = true;
@@ -314,9 +345,7 @@ async function fetchUsageCsv(token, range) {
       throw err;
     }
   }
-  throw new Error(
-    `Cursor session rejected (${failures.join('; ')}). Open Cursor and sign in again (Cursor Settings → Account), then re-run sync.`,
-  );
+  throw sessionRejected(failures);
 }
 
 function parseCsv(text) {
@@ -563,9 +592,7 @@ async function fetchUsageEvents(token, options = {}) {
       throw err;
     }
   }
-  throw new Error(
-    `Cursor session rejected (${failures.join('; ')}). Open Cursor and sign in again (Cursor Settings → Account), then re-run sync.`,
-  );
+  throw sessionRejected(failures);
 }
 
 /**
@@ -620,7 +647,7 @@ function laterDate(a, b) {
   return a > b ? a : b;
 }
 
-function resultInfo({ account, latestEventAt, latestTokenAt, events, tokenEvents, fallbackLatestAt, syncedAt, backfill }) {
+function resultInfo({ account, latestEventAt, latestTokenAt, events, tokenEvents, fallbackLatestAt, syncedAt, backfill, app }) {
   return {
     ...(account ? { account } : {}),
     ...(latestEventAt ? { latestEventAt: new Date(latestEventAt).toISOString() } : {}),
@@ -630,6 +657,8 @@ function resultInfo({ account, latestEventAt, latestTokenAt, events, tokenEvents
     ...(fallbackLatestAt ? { fallbackLatestAt } : {}),
     ...(syncedAt ? { syncedAt: new Date(syncedAt).toISOString() } : {}),
     ...(backfill ? { backfill: { before: new Date(backfill.before).toISOString(), until: new Date(backfill.until).toISOString() } } : {}),
+    // The desktop app's own sign-in, last seen (see APP_ACCOUNT_NOTICE).
+    ...(app ? { app } : {}),
   };
 }
 
@@ -792,41 +821,102 @@ function exportSkipped(err) {
   return { buckets: [], sessions: [], skipped: true, warnings: [`cursor: ${err.message}`] };
 }
 
-export async function parse({
-  previousInfo,
-  envProxyBlock: block = envProxyBlockFor([cursorWebBase()]),
-} = {}) {
-  const dbPath = getCursorStateDbPath();
+export async function parse({ previousInfo, envProxyBlock } = {}) {
+  // The separate Vibe Usage sign-in (`cursor-login.js`) comes first: the
+  // desktop app's (stdin), else the stored one. Without it, Cursor's own
+  // local login is read exactly as before.
+  const login = resolveCursorLogin();
+  if (login?.unusable) {
+    // Cursor ended it, or it cannot be read: like the encrypted token, no
+    // request and no info, so state and recorded progress survive.
+    return { buckets: [], sessions: [], skipped: true, warnings: [LOGIN_EXPIRED_WARNING] };
+  }
   let token = null;
-  let sqliteUnavailable = false;
-
-  if (dbPath) {
-    try {
-      token = readAccessToken(dbPath);
-    } catch (err) {
-      if (!isSqliteUnavailableError(err)) throw err;
-      sqliteUnavailable = true;
+  if (!login) {
+    const dbPath = getCursorStateDbPath();
+    let sqliteUnavailable = false;
+    if (dbPath) {
+      try {
+        token = readAccessToken(dbPath);
+      } catch (err) {
+        if (!isSqliteUnavailableError(err)) throw err;
+        sqliteUnavailable = true;
+      }
+    }
+    if (!token) {
+      if (sqliteUnavailable) throw sqliteUnavailableError('Cursor');
+      return { buckets: [], sessions: [] };
+    }
+    if (isEncryptedCursorToken(token)) {
+      // No request and no info: sync.js then keeps every Cursor state key and
+      // the recorded parserMeta (syncedAt, backfill) untouched, so once a
+      // readable token is back, planBackfill() fills the paused weeks. Printed
+      // on every run (parser warnings are never filtered); nothing from the
+      // token itself goes into the message.
+      return { buckets: [], sessions: [], skipped: true, warnings: [ENCRYPTED_TOKEN_WARNING] };
     }
   }
-  if (!token) {
-    if (sqliteUnavailable) throw sqliteUnavailableError('Cursor');
-    return { buckets: [], sessions: [] };
+  const runAccount = cursorAccountLabel(decodeJwtSub(login ? login.credential.accessToken : token));
+  const recordedApp = recentAppRecord(previousInfo);
+  if (login?.kind !== 'provided' && recordedApp && recordedApp.account !== runAccount) {
+    return { buckets: [], sessions: [], skipped: true, warnings: [APP_ACCOUNT_WARNING] };
   }
-  if (isEncryptedCursorToken(token)) {
-    // No request and no info: sync.js then keeps every Cursor state key and
-    // the recorded parserMeta (syncedAt, backfill) untouched, so once a
-    // readable token is back, planBackfill() fills the paused weeks. Printed
-    // on every run (parser warnings are never filtered); nothing from the
-    // token itself goes into the message.
-    return { buckets: [], sessions: [], skipped: true, warnings: [ENCRYPTED_TOKEN_WARNING] };
-  }
+  const app = login?.kind === 'provided' && runAccount
+    ? { account: runAccount, syncedAt: new Date().toISOString() } : recordedApp;
+  // A stored sign-in may be renewed on the way, so its renewal URL must be
+  // reachable through the user's proxy too, and a system proxy this process
+  // was not told about stops it (`cursorSignInBlock()`).
+  const block = envProxyBlock !== undefined ? envProxyBlock
+    : login?.kind === 'stored' ? cursorSignInBlock([cursorWebBase(), cursorRefreshURL()])
+      : envProxyBlockFor([cursorWebBase()]);
   if (block) {
     return {
       buckets: [], sessions: [], skipped: true,
       warnings: [`cursor: ${PROXY_SKIP_NOTICE_PREFIX}${block.notice}，其他工具照常同步。`],
     };
   }
+  if (!login) return readCursorUsage(token, previousInfo, { app });
 
+  const renewalSkipped = reason => ({
+    buckets: [], sessions: [], skipped: true,
+    warnings: [`cursor: Cursor 登录续期本次未完成，Cursor 本次未同步，下次重试 (${reason})`],
+  });
+  const fresh = await freshCursorLogin(login);
+  if (fresh.expired) return { buckets: [], sessions: [], skipped: true, warnings: [LOGIN_EXPIRED_WARNING] };
+  if (fresh.retryable) return renewalSkipped(fresh.reason);
+  try {
+    return await readCursorUsage(fresh.credential.accessToken, previousInfo, { app });
+  } catch (err) {
+    if (!err?.sessionRejected) throw err;
+  }
+  // Rejected. A stored sign-in that was not just renewed gets one renewal and
+  // one more try; the app renews its own (`login cursor --refresh`).
+  if (login.kind === 'stored' && !fresh.refreshed) {
+    const renewed = await freshCursorLogin(login, { force: true });
+    if (renewed.retryable) return renewalSkipped(renewed.reason);
+    if (renewed.credential) {
+      try {
+        return await readCursorUsage(renewed.credential.accessToken, previousInfo, { app });
+      } catch (err) {
+        if (!err?.sessionRejected) throw err;
+      }
+      await endStoredCursorLogin({ kind: 'stored', credential: renewed.credential });
+    }
+  } else if (login.kind === 'stored') {
+    await endStoredCursorLogin({ kind: 'stored', credential: fresh.credential });
+  }
+  return { buckets: [], sessions: [], skipped: true, warnings: [LOGIN_EXPIRED_WARNING] };
+}
+
+/** `parserMeta.cursor.app` while it still protects the app's account (7 days). */
+export function recentAppRecord(info, now = Date.now()) {
+  const app = info?.app;
+  const at = Date.parse(app?.syncedAt);
+  if (typeof app?.account !== 'string' || !app.account || !Number.isFinite(at) || now - at >= APP_SIGN_IN_HOLD_MS) return null;
+  return { account: app.account, syncedAt: new Date(at).toISOString() };
+}
+
+async function readCursorUsage(token, previousInfo, { app = null } = {}) {
   const sub = decodeJwtSub(token);
   const account = cursorAccountLabel(sub);
   // A different Cursor account: forget the old account's times before any
@@ -926,6 +1016,7 @@ export async function parse({
       fallbackLatestAt,
       syncedAt: startedAt,
       backfill,
+      app,
     }),
   };
 }

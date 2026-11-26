@@ -133,6 +133,8 @@ maintainer (Hogan), 一键诊断 plan, step 2.
 | `sqlite_unavailable` | 没有可用的 SQLite |
 | `decoder_unavailable` | 缺少解压组件（zstd） |
 | `cursor_token_encrypted` | 本地登录令牌已加密（Cursor 3.27+，#144） |
+| `cursor_login_expired` | 在 Vibe Usage 里登录的 Cursor 已失效，需要重新登录（Cursor 单独登录，2026-11-25） |
+| `cursor_app_account` | 桌面 App 用另一个 Cursor 账号同步，本进程（终端或后台服务）跳过（Cursor 单独登录，2026-11-25） |
 | `proxy_unsupported` | 设置了代理但无法照着走（SOCKS，或运行环境不支持），带厂商账号的请求已跳过，避免直连 |
 | `auth_rejected` | 登录凭证被拒绝，需要在该工具里重新登录 |
 | `network_timeout` | 网络请求超时 |

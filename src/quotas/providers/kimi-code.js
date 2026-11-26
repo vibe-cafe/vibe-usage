@@ -16,6 +16,7 @@ import { homedir } from 'node:os';
 import { dirname, join } from 'node:path';
 import { attachCacheScope } from '../cache.js';
 import { canonicalizeMeters, quotaResult } from '../schema.js';
+import { parseQuotaPayload, requestFailureReason } from '../response.js';
 
 const PRODUCT_ID = 'kimi-code';
 const DEFAULT_USAGE_URL = 'https://api.kimi.com/coding/v1/usages';
@@ -110,7 +111,11 @@ export function parseKimiUsage(payload, now = new Date()) {
     throw new Error('Kimi usage response is not an object');
   }
   const meters = [];
-  if (payload.usages && typeof payload.usages === 'object' && !Array.isArray(payload.usages)) {
+  const isObject = value => value !== null && typeof value === 'object' && !Array.isArray(value);
+  if (!isObject(payload.usages) && !isObject(payload.usage) && !Array.isArray(payload.limits)) {
+    throw new Error('Missing Kimi usage containers');
+  }
+  if (isObject(payload.usages)) {
     const currentMeters = [
       ['limit_5h', '5h', 5 * 3600],
       ['limit_7d', '7d', 7 * 86400],
@@ -133,7 +138,7 @@ export function parseKimiUsage(payload, now = new Date()) {
       meters.push(meter);
     }
   }
-  if (payload.usage && typeof payload.usage === 'object' && !Array.isArray(payload.usage)) {
+  if (isObject(payload.usage)) {
     const summary = meterFrom(payload.usage, payload.usage, 0, 'Weekly', now);
     if (summary) meters.push(summary);
   }
@@ -491,7 +496,7 @@ export async function fetchKimiCodeQuota({
       ? 'Kimi Code could not securely save the refreshed login'
       : 'Kimi Code login refresh failed';
     return attachCacheScope(quotaResult({ id: PRODUCT_ID, status: 'retryable_error',
-      message, fetchedAt: now }), token);
+      failureReason: 'loginRefreshFailed', message, fetchedAt: now }), token);
   }
 
   let token = accessToken(credentials);
@@ -538,8 +543,11 @@ export async function fetchKimiCodeQuota({
         const message = error instanceof RefreshPersistenceError
           ? 'Kimi Code could not securely save the refreshed login'
           : 'Kimi Code login refresh failed';
+        // The follow-up usage GET can itself fail after the login was renewed.
+        const failureReason = error instanceof RefreshRetryableError || error instanceof RefreshPersistenceError
+          ? 'loginRefreshFailed' : requestFailureReason(error);
         return attachCacheScope(quotaResult({ id: PRODUCT_ID, status: 'retryable_error',
-          message, fetchedAt: now }), token);
+          failureReason, message, fetchedAt: now }), token);
       }
     }
     if (response.status === 401 || response.status === 403) {
@@ -548,18 +556,21 @@ export async function fetchKimiCodeQuota({
     }
     if (!response.ok) {
       return attachCacheScope(quotaResult({ id: PRODUCT_ID, status: 'retryable_error',
+        failureReason: 'httpStatus', httpStatus: response.status,
         message: `Kimi usage API returned HTTP ${response.status}`, fetchedAt: now }), token);
     }
-    const meters = parseKimiUsage(await response.json(), now);
+    const meters = parseQuotaPayload(parseKimiUsage, await response.json(), now);
     return attachCacheScope(quotaResult({
       id: PRODUCT_ID,
       status: meters.length ? 'ok' : 'no_data',
+      emptyReason: meters.length ? undefined : 'noWindow',
       meters,
       fetchedAt: now,
       dataAsOf: now,
     }), token);
   } catch (error) {
     return attachCacheScope(quotaResult({ id: PRODUCT_ID, status: 'retryable_error',
+      failureReason: requestFailureReason(error),
       message: error?.name === 'TimeoutError' ? 'Kimi usage request timed out' : 'Kimi usage request failed',
       fetchedAt: now }), token);
   }
