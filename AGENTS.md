@@ -694,6 +694,22 @@ Model time (2026-11-25, see the approval entry "model time" above: algorithm 8, 
 
 No first run was `skipped`, no run reached 65 s, and every completed output is byte-identical to an uncached read (489 s / 541 s for all homes, 339 s / 340 s for `~/.codex` only), leaving out the 6 bucket and 6 session keys that changed on disk after the copy. A reboot right after the update cannot complete in run 1, as the rule for reboots asks: with a new algorithm no older summary stands in, so it reads like the plain update; once the update has completed, a reboot does (last row, output equal to an uncached read). Each empty-cache first run carried every conversation with a message in the 24 hours before it (238 on Node 24, 216 on Node 22 an hour later) and every closed half-hour window of them, all equal to the uncached read. Against a copy of `state.json` (9,723 buckets, 15,573 sessions, 12,355 of them Codex): a completed series sends every Codex session still on disk once (12,068, new `activeSeconds`), one changed and up to two new buckets (conversations after the copy), and 3,284-3,287 activity rows (2,526-2,529 for `~/.codex` only); partial runs send the sessions they completed and existing bucket keys with lower values, which the server ignores (it keeps the larger value).
 
+Model time, before release (2026-11-26; copy of the maintainer's cache taken 2026-11-26 12:34 +08:00, which 0.15.10 (`3f4695e`) keeps complete -- it completes from it in run 1, 1.0 s on Node 24, 2.2 s on Node 22; this change measured at `a217abb`, with 0.15.10 merged in; the same series as above, the reboot rows from `3f4695e`'s completed cache).
+
+| Start | Node | this change |
+|---|---|---|
+| current cache, all homes | 24 / 22 | 53.3 s partial, 7, 53.3 s, 2022 MB / 45.1 s partial, 10, 48.6 s, 2317 MB |
+| current cache, `~/.codex` only | 24 | 40.3 s partial, 7, 40.3 s, 976 MB |
+| current cache, `~/.codex` only | 22 | 54.2 s partial, then fails every run (the cross-runtime index above; `3f4695e` on the same copy fails from run 1) |
+| no `v7`, all homes | 24 / 22 | 45.1 s partial, 10, 49.4 s, 2108 MB / 45.1 s partial, 13, 60.5 s, 2083 MB |
+| no `v7`, `~/.codex` only | 24 / 22 | 36.7 s partial, 10, 36.7 s, 1015 MB / 37.0 s partial, 12, 56.1 s, 1214 MB |
+| `3f4695e`'s completed cache, device number shifted, all homes | 24 / 22 | 53.0 s partial, 7, 53.0 s, 1988 MB / 45.7 s partial, 9, 50.0 s, 2134 MB |
+| the same, `~/.codex` only | 24 / 22 | 38.7 s partial, 7, 38.7 s, 953 MB / 53.8 s partial, then fails every run (the same) |
+| empty cache, all homes (first run only) | 24 / 22 | 45.3 s partial, 914 MB / 47.9 s partial, 1052 MB |
+| this change's completed cache (7 runs from the current one), device number shifted, all homes | 24 | 3.3 s complete, 1 |
+
+No first run was `skipped`, no run reached 61 s, and every completed output is byte-identical to an uncached read on the same runtime (494 s / 549 s for all homes, 347 s / 347 s for `~/.codex` only), leaving out the 5 bucket and 5 session keys that changed on disk after the copy. The two runtimes' uncached reads differ in 209 Codex sessions, each with more messages on Node 22: the U+2028 line split of Node 24's `readline` (see "Codex compressed rollouts"), not this change. The empty-cache first runs carried every conversation with a message in the 24 hours before them (230 on Node 24, 232 on Node 22), all equal to the uncached read. Against a copy of `state.json` (9,778 buckets, 15,742 sessions: 12,528 Codex, 2,392 Claude Code, 701 Grok, 88 Antigravity, 27 OpenCode, 6 WorkBuddy): a completed series sends 12,241 Codex sessions once (new `activeSeconds`), no changed bucket and one to three new ones (conversations after the copy), and 3,299-3,301 activity rows (2,542-2,543 for `~/.codex` only); first runs send 497-2,043 sessions.
+
 ## Development & Testing
 
 ```bash
