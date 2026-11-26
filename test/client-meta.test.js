@@ -1,6 +1,6 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { COLLECTOR_VERSION, createSyncClient, forBatch } from '../src/client-meta.js';
+import { COLLECTOR_VERSION, createSyncClient, desktopAppOlderThan, forBatch } from '../src/client-meta.js';
 
 function withEnv(values, fn) {
   const previous = {};
@@ -63,4 +63,29 @@ test('the Codex Ultrafast cut is declared only when the sync knows it', () => {
   const declared = createSyncClient({ hostname: 'host', codexUltrafastStartAt: '2026-11-10T10:30:00.000Z' });
   assert.equal(declared.codexUltrafastStartAt, '2026-11-10T10:30:00.000Z');
   assert.equal(forBatch(declared, 1, 3).codexUltrafastStartAt, '2026-11-10T10:30:00.000Z');
+});
+
+test('desktopAppOlderThan compares an app surface version against its minimum', () => {
+  const minimums = { 'mac-app': '0.8.1', 'windows-app': '0.7.10' };
+  const older = (surface, version) => desktopAppOlderThan(minimums, {
+    ...(surface && { VIBE_USAGE_SURFACE: surface }),
+    ...(version !== undefined && { VIBE_USAGE_SURFACE_VERSION: version }),
+  });
+  assert.equal(older('mac-app', '0.8.0'), true);
+  assert.equal(older('mac-app', '0.7.9'), true);
+  assert.equal(older('windows-app', '0.7.9'), true);
+  assert.equal(older('windows-app', '0.5.12'), true);
+  assert.equal(older('mac-app', '0.8.1'), false);
+  assert.equal(older('mac-app', ' 0.9.0 '), false);
+  assert.equal(older('windows-app', '0.7.10'), false);
+  assert.equal(older('windows-app', '0.8.0'), false);
+  assert.equal(older('windows-app', '1.0.0-beta.1'), false);
+  // An app whose version cannot be read is treated as older.
+  assert.equal(older('mac-app', undefined), true);
+  assert.equal(older('windows-app', 'dev'), true);
+  // Terminal, daemon and unknown surfaces are not apps with a minimum.
+  assert.equal(older(undefined, undefined), false);
+  assert.equal(older('cli', '0.0.1'), false);
+  assert.equal(older('daemon', '0.0.1'), false);
+  assert.equal(older('toString', '0.0.1'), false);
 });
