@@ -48,6 +48,19 @@ test('unknown app identity cannot inject an arbitrary surface', () => {
   });
 });
 
+test('upload batches carry only the current, recognized Mac interface style', () => {
+  for (const style of ['modern', 'classic']) {
+    withEnv({ VIBE_USAGE_SURFACE: 'mac-app', VIBE_USAGE_INTERFACE_STYLE: style }, () => {
+      assert.equal(forBatch(createSyncClient(), 1, 2).interfaceStyle, style);
+    });
+  }
+  for (const [surface, style] of [['mac-app', 'other'], ['mac-app', null], ['cli', 'modern']]) {
+    withEnv({ VIBE_USAGE_SURFACE: surface, VIBE_USAGE_INTERFACE_STYLE: style }, () => {
+      assert.equal(Object.hasOwn(forBatch(createSyncClient(), 1, 2), 'interfaceStyle'), false);
+    });
+  }
+});
+
 test('batch metadata keeps one sync id across all requests', () => {
   const client = createSyncClient({ hostname: 'host' });
   const first = forBatch(client, 0, 2);

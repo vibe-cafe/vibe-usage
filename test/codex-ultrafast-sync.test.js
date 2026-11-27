@@ -241,6 +241,26 @@ const legacyBucket = (bucketStart, total) => ({
 const legacyUpload = (server, buckets) => server.ingest({ buckets, client: { collectorVersion: '0.14.12', surface: 'mac-app', hostname: HOST } });
 
 // ---------------------------------------------------------------- scenarios ---
+test('a Mac reports its style only with new usage, never in cut registration', async t => {
+  const server = await startServer(t);
+  const m = machine(t, server);
+  m.env.VIBE_USAGE_SURFACE = 'mac-app';
+  m.env.VIBE_USAGE_INTERFACE_STYLE = 'modern';
+  m.write(earlyOnly());
+  await m.sync({ surface: 'mac-app' });
+  const [registration] = server.sent('POST', '/api/usage/codex-ultrafast-start');
+  assert.equal(Object.hasOwn(registration.payload.client, 'interfaceStyle'), false);
+  const uploads = () => server.sent('POST', '/api/usage/ingest').map(r => r.payload.client.interfaceStyle);
+  assert.deepEqual(uploads(), ['modern']);
+
+  m.env.VIBE_USAGE_INTERFACE_STYLE = 'classic';
+  await m.sync({ surface: 'mac-app' });
+  assert.deepEqual(uploads(), ['modern']);
+  m.append(rest());
+  await m.sync({ surface: 'mac-app' });
+  assert.deepEqual(uploads(), ['modern', 'classic']);
+});
+
 test('upgrade on a machine with history: the cut lands after the last uploaded window and stays there', async (t) => {
   const server = await startServer(t);
   const m = machine(t, server);

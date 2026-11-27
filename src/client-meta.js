@@ -66,8 +66,12 @@ export function createSyncClient({ defaultSurface = 'cli', hostname, codexUltraf
 }
 
 export function forBatch(client, batchIndex, batchCount) {
+  // Only ingest batches report the style. Cut registration also uses createSyncClient.
+  const interfaceStyle = process.env.VIBE_USAGE_INTERFACE_STYLE;
   return {
     ...client,
+    ...(client.surface === 'mac-app' && (interfaceStyle === 'modern' || interfaceStyle === 'classic')
+      ? { interfaceStyle } : {}),
     batchIndex,
     batchCount,
   };
