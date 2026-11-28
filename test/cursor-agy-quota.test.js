@@ -63,6 +63,22 @@ test('Cursor preserves percentage units, zero and reset, and never invents a mis
   assert.deepEqual(missing, []);
 });
 
+test('Cursor web summary labels plan and personal meters by billing cycle length', () => {
+  const billingCycleStart = '2026-11-01T00:00:00Z';
+  const allowance = { used: 25, limit: 100 };
+  for (const [days, label] of [[6, '7d'], [7, '7d'], [8, '7d'], [30, 'Month'], [null, 'Month']]) {
+    const cycle = days === null ? {} : { billingCycleStart,
+      billingCycleEnd: new Date(Date.parse(billingCycleStart) + days * 86400000).toISOString() };
+    for (const [id, individualUsage] of [['plan', { plan: allowance }], ['personal', { overall: allowance }]]) {
+      const meters = parseCursorQuota({ ...cycle, individualUsage });
+      assert.deepEqual(meters.map(m => [m.id, m.label]), [[id, label]]);
+    }
+  }
+  const team = parseCursorQuota({ billingCycleStart, billingCycleEnd: '2026-11-08T00:00:00Z',
+    teamUsage: { pooled: allowance }, individualUsage: { onDemand: allowance } });
+  assert.deepEqual(team.map(m => [m.id, m.label]), [['team', 'Team'], ['on-demand', 'On-demand']]);
+});
+
 test('Cursor reads only its login row, including UTF-16 BLOBs, without changing the store', async t => {
   for (const encoding of ['utf8','utf16le']) {
     const { dbPath } = await fixture(t, encoding);

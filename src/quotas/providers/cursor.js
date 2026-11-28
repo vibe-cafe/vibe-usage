@@ -97,6 +97,7 @@ function cursorMeters({ start, end, plan, overall, pooled, onDemand }) {
   const resetsAt = Number.isFinite(end) ? new Date(end).toISOString() : undefined;
   // The real cycle length lets the card draw the same elapsed-time bar as Codex.
   const windowSeconds = Number.isFinite(start) && end > start ? (end - start) / 1000 : undefined;
+  const cycleLabel = windowSeconds >= 6 * 86400 && windowSeconds <= 8 * 86400 ? '7d' : 'Month';
   const add = (id, label, value, extra = {}) => {
     if (finite(value)) meters.push({ id, label, utilization: value, resetsAt, windowSeconds, ...extra });
   };
@@ -104,17 +105,17 @@ function cursorMeters({ start, end, plan, overall, pooled, onDemand }) {
     ? item.used / item.limit * 100 : undefined;
   if (plan?.enabled !== false) {
     // Auto/API split the same allowance, so they ride along as detail of the
-    // one Month row instead of reading as separate limits. Percentage units:
+    // one plan row instead of reading as separate limits. Percentage units:
     // 0.36 means 0.36%, not 36%.
     const breakdown = [['auto', 'Cursor models', plan?.autoPercentUsed],
       ['api', 'Third-party models', plan?.apiPercentUsed]]
       .filter(([, , value]) => finite(value))
       .map(([id, label, utilization]) => ({ id, label, utilization }));
-    add('plan', 'Month', finite(plan?.totalPercentUsed) ? plan.totalPercentUsed : ratio(plan),
+    add('plan', cycleLabel, finite(plan?.totalPercentUsed) ? plan.totalPercentUsed : ratio(plan),
       breakdown.length ? { breakdown } : {});
   }
   if (!meters.length) {
-    add('personal', 'Month', ratio(overall));
+    add('personal', cycleLabel, ratio(overall));
     if (!meters.length) add('team', 'Team', ratio(pooled));
   }
   add('on-demand', 'On-demand', ratio(onDemand));

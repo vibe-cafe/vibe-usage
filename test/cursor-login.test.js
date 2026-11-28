@@ -318,7 +318,7 @@ const planPath = '/aiserver.v1.DashboardService/GetPlanInfo';
 const planURL = 'https://api2.cursor.sh' + planPath;
 const summaryURL = 'https://cursor.com/api/usage-summary';
 const period = {
-  billingCycleStart: String(Date.parse('2026-11-05T00:00:00Z')),
+  billingCycleStart: String(Date.parse('2026-11-28T00:00:00Z')),
   billingCycleEnd: Date.parse('2026-12-05T00:00:00Z'),
   planUsage: { totalPercentUsed: 6, autoPercentUsed: 0, apiPercentUsed: .36 },
   spendLimitUsage: { individualUsed: 125, individualLimit: 500 },
@@ -363,9 +363,9 @@ test('quota: one dashboard request replaces a zero summary in the same account c
     'Connect-Protocol-Version': '1', 'User-Agent': `vibe-usage/${COLLECTOR_VERSION}` });
   assert.equal(body, '{}');
   assert.equal(redirect, 'error');
-  const cycle = { resetsAt: '2026-12-05T00:00:00.000Z', windowSeconds: 30 * 86400 };
+  const cycle = { resetsAt: '2026-12-05T00:00:00.000Z', windowSeconds: 7 * 86400 };
   assert.deepEqual(current.meters, [
-    { id: 'plan', label: 'Month', utilization: 6, ...cycle, breakdown: [
+    { id: 'plan', label: '7d', utilization: 6, ...cycle, breakdown: [
       { id: 'auto', label: 'Cursor models', utilization: 0 },
       { id: 'api', label: 'Third-party models', utilization: .36 },
     ] },
