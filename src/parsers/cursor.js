@@ -4,7 +4,7 @@ import { homedir } from 'node:os';
 import { aggregateToBuckets, roundToHalfHour } from './aggregate.js';
 import { queryDbJsonSnapshotOnLock, sqliteUnavailableError, isSqliteUnavailableError } from './sqlite.js';
 import { envProxyBlockFor } from '../env-proxy.js';
-import { cursorRefreshURL, cursorSignInBlock, endStoredCursorLogin, freshCursorLogin, resolveCursorLogin } from '../cursor-login.js';
+import { cursorRefreshURL, cursorSessionCookie, cursorSignInBlock, endStoredCursorLogin, freshCursorLogin, resolveCursorLogin } from '../cursor-login.js';
 
 const STATE_DB_RELATIVE = join('User', 'globalStorage', 'state.vscdb');
 const ACCESS_TOKEN_KEY = 'cursorAuth/accessToken';
@@ -30,6 +30,8 @@ const RECENT_MS = 7 * DAY_MS;
 const GAP_LIMIT_MS = 6 * DAY_MS;
 const BACKFILL_BLOCK_MS = 7 * DAY_MS;
 const BACKFILL_FLOOR = Date.parse('2024-01-01T00:00:00Z');
+const BILLING_FLOOR = Date.parse('2026-10-01T00:00:00Z');
+const BILLING_BLOCK_MS = 31 * DAY_MS;
 // No new history block starts once Cursor has spent this long in one sync
 // (uploads not included); a started block finishes. A heavy week measured
 // ~12k rows, roughly 8-19s.
@@ -391,8 +393,7 @@ function parseInt0(value) {
 /**
  * Parse the legacy CSV export. Returns `unusable` (with a reason) when Cursor
  * changed the header, returned no rows, or returned rows whose token columns
- * are all empty — the caller then tries the events API instead of uploading an
- * empty snapshot that would prune history.
+ * are all empty. The recent-window caller then tries the dashboard fallbacks.
  */
 function entriesFromCsv(csv) {
   const rows = parseCsv(String(csv).replace(/^\uFEFF/, ''));
@@ -411,7 +412,7 @@ function entriesFromCsv(csv) {
   // tokens, the run uploaded an empty snapshot, and sync.js pruned Cursor's
   // incremental state as if the account had gone quiet — the dashboard just
   // stopped counting Cursor. Treat a header we do not recognise as unusable
-  // and try the events API before giving up.
+  // and try the dashboard fallbacks before giving up.
   const hasTokenColumn =
     inputCacheWriteIdx >= 0 || inputNoCacheIdx >= 0 || cacheReadIdx >= 0 || outputIdx >= 0;
   if (dateIdx < 0 || modelIdx < 0 || !hasTokenColumn) {
@@ -498,9 +499,8 @@ function eventDedupKey(event) {
   return JSON.stringify([event?.timestamp, event?.model, event?.tokenUsage]);
 }
 
-async function fetchAllEventPages(headers, signal, { startDate = '0' } = {}) {
+async function fetchAllEventPages(headers, signal, { startDate = '0', endDate = String(Date.now()) } = {}) {
   const url = `${cursorWebBase()}${EVENTS_PATH}`;
-  const endDate = String(Date.now());
   const events = [];
   const seen = new Set();
   let total = null;
@@ -641,13 +641,92 @@ function entriesFromEvents(events) {
   return { entries, latestEventAt, latestTokenAt, tokenEventCount };
 }
 
+function invalidBillingPage() {
+  return skipped('Cursor usage request skipped (invalid Billing V2 page).');
+}
+
+function billingEvent(row) {
+  if (typeof row?.product !== 'string' || typeof row.chargeCategory !== 'string') throw invalidBillingPage();
+  if (row.product !== 'cursor' || row.chargeCategory !== 'usage') return null;
+  const usage = row.usage ?? {};
+  const tokenUsage = {
+    inputTokens: usage['prompt-text-tokens'],
+    cacheWriteTokens: usage['cache-write-text-tokens'],
+    cacheReadTokens: usage['cached-prompt-text-tokens'],
+    outputTokens: usage['completion-text-tokens'],
+  };
+  if (!Object.values(tokenUsage).some(tokenCount)) {
+    if (tokenCount(row.totalTokens)) throw invalidBillingPage();
+    return null;
+  }
+  const timestamp = Date.parse(row.eventTime);
+  const model = row.displayExtras?.model;
+  if (!Number.isFinite(timestamp) || typeof model !== 'string' || !model.trim()
+    || typeof row.billingItemId !== 'string' || !row.billingItemId) throw invalidBillingPage();
+  return { timestamp, model, tokenUsage };
+}
+
+// One complete Billing V2 window. Pages share a deadline; nothing from an
+// incomplete response is used. Only the fields needed for token accounting
+// leave the page reader (in particular, no principal or contracted price).
+async function fetchBilling(token, start, end) {
+  const url = new URL(cursorWebBase() + '/api/dashboard/v2/query-billing-items');
+  url.search = new URLSearchParams({
+    scope: 'user', product: 'cursor', pageSize: '500', startTime: new Date(start).toISOString(), endTime: new Date(end).toISOString(),
+  }).toString();
+  if (!decodeJwtSub(token)) throw skipped('Cursor Billing V2 requires a session subject');
+  const headers = {
+    ...baseHeaders('application/json'), Cookie: cursorSessionCookie(token), 'x-cursor-dashboard-surface': 'v2',
+  };
+  const signal = AbortSignal.timeout(FETCH_TIMEOUT_MS);
+  const seenIds = new Set();
+  const cursors = new Set();
+  const events = [];
+  for (let page = 0; page < MAX_PAGES; page++) {
+    let json;
+    try {
+      const resp = await fetch(url.toString(), { headers, signal, redirect: 'error' });
+      if (resp.status === 401 || resp.status === 403) throw sessionRejected([String(resp.status)]);
+      if (!resp.ok) throw skipped(`Cursor usage request skipped (HTTP ${resp.status})`);
+      json = await resp.json();
+    } catch (err) {
+      if (err.sessionRejected || err.skip) throw err;
+      if (err instanceof SyntaxError) throw invalidBillingPage();
+      throw usageNetworkError(err, signal);
+    }
+    if (!Array.isArray(json?.data) || !json.pagination || typeof json.pagination !== 'object'
+      || Array.isArray(json.pagination) || (json.availability && json.availability !== 'available')) throw invalidBillingPage();
+    for (const row of json.data) {
+      const event = billingEvent(row);
+      if (!event || event.timestamp < start || event.timestamp > end || seenIds.has(row.billingItemId)) continue;
+      seenIds.add(row.billingItemId);
+      events.push(event);
+    }
+    const next = json.pagination.nextCursor;
+    if (next == null || next === '') return entriesFromEvents(events);
+    if (typeof next !== 'string' || cursors.has(next)) throw invalidBillingPage();
+    cursors.add(next);
+    url.searchParams.set('cursor', next);
+  }
+  throw skipped('Cursor usage request skipped (Billing V2 pagination limit).');
+}
+
+async function probeBilling(token, start, end) {
+  try {
+    return await fetchBilling(token, start, end);
+  } catch (err) {
+    if (!err.skip) throw err;
+    return null;
+  }
+}
+
 function laterDate(a, b) {
   if (!a) return b || null;
   if (!b) return a;
   return a > b ? a : b;
 }
 
-function resultInfo({ account, latestEventAt, latestTokenAt, events, tokenEvents, fallbackLatestAt, syncedAt, backfill, app }) {
+function resultInfo({ account, latestEventAt, latestTokenAt, events, tokenEvents, fallbackLatestAt, syncedAt, backfill, app, billingAccounts }) {
   return {
     ...(account ? { account } : {}),
     ...(latestEventAt ? { latestEventAt: new Date(latestEventAt).toISOString() } : {}),
@@ -659,6 +738,7 @@ function resultInfo({ account, latestEventAt, latestTokenAt, events, tokenEvents
     ...(backfill ? { backfill: { before: new Date(backfill.before).toISOString(), until: new Date(backfill.until).toISOString() } } : {}),
     // The desktop app's own sign-in, last seen (see APP_ACCOUNT_NOTICE).
     ...(app ? { app } : {}),
+    ...(billingAccounts?.length ? { billingAccounts } : {}),
   };
 }
 
@@ -684,13 +764,26 @@ export function planBackfill(previousInfo, now, recentStart) {
   return current;
 }
 
-/**
- * The recent CSV path: windows starting at or after `recentStart`, plus the
- * existing stale-gap probe. The CSV can be valid but stop growing (observed
- * after account switches/unification): when its newest token row is 24h-7d
- * old, take dashboard events newer than that row -- only newer ones, since the
- * events API labels history `default` and re-adding it would double-count.
- */
+async function probeCsvGap(token, boundaryMs, now) {
+  const billing = await probeBilling(token, boundaryMs, now);
+  if (billing?.entries.length) {
+    // The CSV owns its last half hour even if V2 has a later row in it.
+    const entries = billing.entries.filter(e => windowOf(e.timestamp) > windowOf(boundaryMs));
+    if (entries.length) return { ...billing, entries, events: entries.length, source: 'billing-v2' };
+  }
+  try {
+    const page = await fetchUsageEvents(token, { startDate: String(Math.max(0, boundaryMs - HOUR_MS)) });
+    const newer = page.events.filter(e => {
+      const at = eventTimestamp(e?.timestamp);
+      return at && windowOf(at) > windowOf(boundaryMs);
+    });
+    return { ...entriesFromEvents(newer), events: newer.length, source: 'events' };
+  } catch (err) {
+    if (!err.skip) throw err;
+    return null; // A failed optional probe leaves the usable CSV intact.
+  }
+}
+
 async function recentFromCsv(csvResult, { token, previousInfo, recentStart }) {
   let entries = csvResult.entries;
   let latest = csvResult.latestEventAt;
@@ -698,35 +791,25 @@ async function recentFromCsv(csvResult, { token, previousInfo, recentStart }) {
   let events = csvResult.events;
   let fallbackLatestAt = previousInfo?.fallbackLatestAt;
   const warnings = [];
+  let gap;
 
   const boundaryMs = latestToken ? latestToken.getTime() : NaN;
   const now = Date.now();
   if (Number.isFinite(boundaryMs) && now - boundaryMs > DAY_MS && now - boundaryMs <= 7 * DAY_MS) {
-    try {
-      const probe = await fetchUsageEvents(token, { startDate: String(Math.max(0, boundaryMs - HOUR_MS)) });
-      const newer = probe.events.filter((event) => {
-        const timestamp = eventTimestamp(event?.timestamp);
-        return timestamp && timestamp.getTime() > boundaryMs;
-      });
-      const extra = entriesFromEvents(newer);
-      if (extra.entries.length > 0) {
-        entries = entries.concat(extra.entries);
-        if (extra.latestEventAt && (!latest || extra.latestEventAt > latest)) latest = extra.latestEventAt;
-        if (extra.latestTokenAt && (!latestToken || extra.latestTokenAt > latestToken)) latestToken = extra.latestTokenAt;
-        events += newer.length;
-        const probedThrough = Date.parse(fallbackLatestAt);
-        if (!Number.isFinite(probedThrough) || probedThrough < latestToken.getTime()) {
-          warnings.push(
-            `cursor: CSV 最新 token 事件停在 ${new Date(boundaryMs).toISOString()}，`
-            + `已从仪表盘事件接口补回 ${extra.tokenEventCount} 个更新的 token 事件；`
-            + '这些事件的模型名可能不完整（不影响 token 总量）。',
-          );
-        }
-        fallbackLatestAt = latestToken.toISOString();
+    const extra = await probeCsvGap(token, boundaryMs, now);
+    if (extra?.entries.length) {
+      gap = extra;
+      entries = entries.concat(extra.entries);
+      latest = laterDate(latest, extra.latestEventAt);
+      latestToken = laterDate(latestToken, extra.latestTokenAt);
+      events += extra.events;
+      const probedThrough = Date.parse(fallbackLatestAt);
+      if (!Number.isFinite(probedThrough) || probedThrough < latestToken.getTime()) {
+        const detail = extra.source === 'billing-v2' ? `Billing V2 补回 ${extra.entries.length} 个更新的 token 事件。`
+          : `已从仪表盘事件接口补回 ${extra.tokenEventCount} 个更新的 token 事件；这些事件的模型名可能不完整（不影响 token 总量）。`;
+        warnings.push(`cursor: CSV 最新 token 事件停在 ${new Date(boundaryMs).toISOString()}，` + detail);
       }
-    } catch {
-      // The CSV data is still valid; a failed freshness probe must not
-      // discard it or fail the whole sync.
+      fallbackLatestAt = latestToken.toISOString();
     }
   }
 
@@ -738,6 +821,7 @@ async function recentFromCsv(csvResult, { token, previousInfo, recentStart }) {
     tokenEvents: entries.length,
     fallbackLatestAt,
     warnings,
+    gap,
   };
 }
 
@@ -751,10 +835,7 @@ async function recentFromCsv(csvResult, { token, previousInfo, recentStart }) {
  * a new token event is rebuilt from all of its events, so a later upload never
  * replaces 10 + 20 with 20 under the same key.
  *
- * Known cost: on the run where the CSV first comes back empty, a rebuilt
- * window can hold events the CSV already uploaded under another model name
- * (`auto` there, `default` here); that part counts twice. At most one window
- * per switch from a usable to an empty export.
+ * sync.js checks the source of a previously uploaded window before upload.
  */
 async function eventsFallback(csvResult, { token, previousInfo }) {
   const previousLatest = Date.parse(previousInfo?.latestTokenAt ?? previousInfo?.latestEventAt);
@@ -767,7 +848,8 @@ async function eventsFallback(csvResult, { token, previousInfo }) {
     : Date.now() - 7 * DAY_MS;
   // An empty export with a recognized header is the normal idle week; only a
   // changed header or token-less rows mean the export itself is in doubt.
-  const idle = !csvResult.headerMismatch && csvResult.events === 0;
+  const idle = !csvResult || (!csvResult.headerMismatch && csvResult.events === 0);
+  const reason = csvResult ? `CSV 导出不可用（${csvResult.unusable}）` : 'Billing V2 本次未读到用量';
 
   let events;
   try {
@@ -777,7 +859,7 @@ async function eventsFallback(csvResult, { token, previousInfo }) {
       return {
         entries: [],
         events: 0,
-        warnings: [`cursor: CSV 导出不可用（${csvResult.unusable}）；事件接口也失败：${err.message}`],
+        warnings: [`cursor: ${reason}；事件接口也失败：${err.message}`],
       };
     }
     throw err;
@@ -797,13 +879,12 @@ async function eventsFallback(csvResult, { token, previousInfo }) {
   const warnings = [];
   if (fallback.entries.length > 0) {
     warnings.push(
-      `cursor: CSV 导出不可用（${csvResult.unusable}），已从仪表盘事件接口补回${windowLabel}的 `
+      `cursor: ${reason}，已从仪表盘事件接口补回${windowLabel}的 `
       + `${fallback.tokenEventCount} 个 token 事件；这些事件的模型名可能显示为 default（不影响 token 总量）。`,
     );
   } else if (!idle) {
     warnings.push(
-      `cursor: CSV 导出不可用（${csvResult.unusable}），事件接口在${windowLabel}也没有读到 token 用量。`
-      + '如果刚切换到 X 订阅，Cursor 的用量可能并入 grok.com/dashboard；本次已跳过以保留历史。',
+      `cursor: ${reason}，Billing V2 和事件接口在${windowLabel}也没有读到 token 用量。本次保留历史。`,
     );
   }
   return {
@@ -813,6 +894,22 @@ async function eventsFallback(csvResult, { token, previousInfo }) {
     latestTokenAt: fallback.latestTokenAt,
     warnings,
   };
+}
+
+async function historyFromEvents(token, start, before, alreadyRead) {
+  try {
+    const page = await fetchUsageEvents(token, { startDate: String(start), endDate: String(before - 1) });
+    // The recent events fallback may have already rebuilt some of these
+    // windows after a long gap. Keep just one complete copy.
+    const seen = new Set(alreadyRead.map(e => windowOf(e.timestamp)));
+    return entriesFromEvents(page.events).entries.filter(e => {
+      const window = windowOf(e.timestamp);
+      return window >= start && window < before && !seen.has(window);
+    });
+  } catch (err) {
+    if (!err.skip) throw err;
+    return [];
+  }
 }
 
 function exportSkipped(err) {
@@ -845,7 +942,9 @@ export async function parse({ previousInfo, envProxyBlock } = {}) {
     }
     if (!token) {
       if (sqliteUnavailable) throw sqliteUnavailableError('Cursor');
-      return { buckets: [], sessions: [] };
+      // Signed out or uninstalled: the cloud rows still exist. Retain their
+      // window sources for the next time this machine can read the account.
+      return { buckets: [], sessions: [], skipped: true };
     }
     if (isEncryptedCursorToken(token)) {
       // No request and no info: sync.js then keeps every Cursor state key and
@@ -929,27 +1028,47 @@ async function readCursorUsage(token, previousInfo, { app = null } = {}) {
   const recentStart = windowOf(startedAt - RECENT_MS);
   let backfill = planBackfill(prev, startedAt, recentStart);
 
-  // 1. Recent CSV: windows from `recentStart` on.
-  let csvResult;
+  const billingAccounts = previousInfo?.billingAccounts ?? [];
+  const pinned = billingAccounts.includes(account);
+  let csvResult = null;
   try {
-    csvResult = entriesFromCsv(await fetchUsageCsv(token, { startDate: recentStart, endDate: startedAt }));
+    if (!pinned) csvResult = entriesFromCsv(await fetchUsageCsv(token, { startDate: recentStart, endDate: startedAt }));
   } catch (err) {
     // Auth failure → bubble up so the user sees they need to re-login.
     if (err && err.skip) return exportSkipped(err);
     throw err;
   }
   const warnings = [];
-  let csvEntries = [];
+  let primaryEntries = [];
   let fallbackEntries = [];
   let latestEventAt = null;
   let latestTokenAt = null;
   let fallbackLatestAt = prev.fallbackLatestAt;
   let events = 0;
   let tokenEvents = 0;
+  const windowSources = new Map();
+  function markWindows(entries, source) {
+    for (const e of entries) windowSources.set(roundToHalfHour(e.timestamp).toISOString(), source);
+  }
+  const billing = pinned || csvResult.unusable ? await probeBilling(token, recentStart, startedAt) : null;
+  const useBilling = pinned || Boolean(billing?.entries.length);
+  let syncedAt = startedAt;
 
-  if (!csvResult.unusable) {
+  if (useBilling) {
+    if (!pinned || !prev.syncedAt) backfill = { before: recentStart, until: BILLING_FLOOR };
+    if (backfill) backfill.until = Math.max(backfill.until, BILLING_FLOOR);
+  }
+  if (billing?.entries.length) {
+    primaryEntries = billing.entries;
+    markWindows(primaryEntries, 'billing-v2');
+    latestEventAt = billing.latestEventAt;
+    latestTokenAt = billing.latestTokenAt;
+    events = billing.entries.length;
+    tokenEvents = billing.entries.length;
+  } else if (csvResult && !csvResult.unusable) {
     const recent = await recentFromCsv(csvResult, { token, previousInfo: prev, recentStart });
-    csvEntries = recent.entries;
+    primaryEntries = recent.entries;
+    if (recent.gap) markWindows(recent.gap.entries, recent.gap.source);
     latestEventAt = recent.latestEventAt;
     latestTokenAt = recent.latestTokenAt;
     fallbackLatestAt = recent.fallbackLatestAt;
@@ -960,48 +1079,68 @@ async function readCursorUsage(token, previousInfo, { app = null } = {}) {
     // 2. Events fallback: once per sync, output not limited to the window.
     const fallback = await eventsFallback(csvResult, { token, previousInfo: prev });
     fallbackEntries = fallback.entries;
-    latestEventAt = laterDate(fallback.latestEventAt, csvResult.latestEventAt);
-    latestTokenAt = laterDate(fallback.latestTokenAt, csvResult.latestTokenAt);
+    latestEventAt = laterDate(fallback.latestEventAt, csvResult?.latestEventAt);
+    latestTokenAt = laterDate(fallback.latestTokenAt, csvResult?.latestTokenAt);
     events += fallback.events;
     tokenEvents += fallback.entries.length;
     warnings.push(...fallback.warnings);
+    if (pinned && !billing) {
+      syncedAt = prev.syncedAt;
+      warnings.push('cursor: Billing V2 本次读取失败，已尝试仪表盘事件接口；下次重试 Billing V2。');
+    }
   }
 
   // 3. History blocks: `[until, before)`, newest first, within the budget.
-  if (backfill) {
+  if (backfill && !(pinned && !billing)) {
     let { before } = backfill;
     while (before > backfill.until && Date.now() - startedAt < BACKFILL_BUDGET_MS) {
-      const start = Math.max(backfill.until, before - BACKFILL_BLOCK_MS);
+      const start = Math.max(backfill.until, before - (useBilling ? BILLING_BLOCK_MS : BACKFILL_BLOCK_MS));
       let block;
       try {
-        block = entriesFromCsv(await fetchUsageCsv(token, { startDate: start, endDate: before - 1 }));
+        if (useBilling) {
+          // Adjacent queries share their endpoint; locally the history block
+          // owns [start, before). This also works with an exclusive API end.
+          block = await fetchBilling(token, start, before);
+        } else {
+          block = entriesFromCsv(await fetchUsageCsv(token, { startDate: start, endDate: before - 1 }));
+        }
       } catch (err) {
         if (!(err && err.skip)) throw err;
         warnings.push(`cursor: 历史补齐本次暂停，下次同步继续（${err.message}）`);
+        if (useBilling) {
+          const missing = await historyFromEvents(token, start, before, fallbackEntries);
+          fallbackEntries = fallbackEntries.concat(missing);
+          events += missing.length;
+          tokenEvents += missing.length;
+        }
         break;
       }
       if (block.headerMismatch) break;
-      csvEntries = csvEntries.concat(block.entries.filter((entry) => {
+      const inBlock = block.entries.filter((entry) => {
         const window = windowOf(entry.timestamp);
         return window >= start && window < before;
-      }));
+      });
+      primaryEntries = primaryEntries.concat(inBlock);
+      if (useBilling) markWindows(inBlock, 'billing-v2');
       latestEventAt = laterDate(latestEventAt, block.latestEventAt);
       latestTokenAt = laterDate(latestTokenAt, block.latestTokenAt);
-      events += block.events;
-      tokenEvents += block.entries.length;
+      events += useBilling ? inBlock.length : block.events;
+      tokenEvents += useBilling ? inBlock.length : block.entries.length;
       before = start;
     }
     backfill = before > backfill.until ? { before, until: backfill.until } : null;
   }
 
-  // One source per half-hour window: a window with any CSV row is built from
-  // the CSV alone; the fallback's events for it are dropped, never added.
-  const csvWindows = new Set(csvEntries.map(entry => windowOf(entry.timestamp)));
-  const entries = csvEntries.concat(fallbackEntries.filter(entry => !csvWindows.has(windowOf(entry.timestamp))));
+  // History can cover windows the events fallback also read after a long gap.
+  const primaryWindows = new Set(primaryEntries.map(entry => windowOf(entry.timestamp)));
+  const extra = fallbackEntries.filter(entry => !primaryWindows.has(windowOf(entry.timestamp)));
+  markWindows(extra, 'events');
+  const entries = primaryEntries.concat(extra);
 
   const carried = value => (Number.isFinite(Date.parse(value)) ? new Date(Date.parse(value)) : null);
   return {
     buckets: aggregateToBuckets(entries),
+    ...(windowSources.size ? { windowSources } : {}),
     sessions: [],
     // Recent windows and history blocks only, never a whole-account view:
     // upload these, keep every older Cursor state key (no pruning).
@@ -1014,9 +1153,10 @@ async function readCursorUsage(token, previousInfo, { app = null } = {}) {
       events,
       tokenEvents,
       fallbackLatestAt,
-      syncedAt: startedAt,
+      syncedAt,
       backfill,
       app,
+      billingAccounts: useBilling && !pinned ? [...billingAccounts, account] : billingAccounts,
     }),
   };
 }

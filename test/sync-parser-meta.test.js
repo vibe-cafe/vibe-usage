@@ -64,6 +64,12 @@ async function withBackend(run) {
   const server = createServer(async (req, res) => {
     const url = new URL(req.url, 'http://127.0.0.1');
     const body = await readBody(req);
+    if (url.pathname === '/api/dashboard/v2/query-billing-items' && backend.billing) {
+      const { status = 200, data } = backend.billing(url.searchParams);
+      res.writeHead(status, { 'content-type': 'application/json' });
+      res.end(JSON.stringify({ data, pagination: {} }));
+      return;
+    }
     if (url.pathname === '/api/dashboard/export-usage-events-csv') {
       res.writeHead(200, { 'content-type': 'text/csv' });
       res.end([CSV_HEADER, ...backend.csvRows.map(r => `${new Date(r.at).toISOString()},${r.model},0,${r.input},0,1`)].join('\n'));
@@ -327,6 +333,65 @@ async function cursorClient(backend) {
 }
 
 const total = table => [...table.values()].reduce((sum, b) => sum + b.inputTokens, 0);
+
+test('a Cursor half hour retains its first uploaded source through a partial Billing V2 upload and an outage', async t => {
+  await withBackend(async backend => {
+    const client = await cursorClient(backend);
+    t.after(client.cleanup);
+    const old = roundToHalfHour(new Date(Date.now() - 5 * HOUR)).getTime();
+    const active = old + HOUR;
+    const duringOutage = active + HOUR;
+    backend.csvRows = [{ at: old, model: 'auto', input: 7 }];
+    await client.sync();
+    const csvUpload = JSON.stringify([...backend.table.values()]);
+    backend.csvRows = [];
+    function bill(at, model, count) {
+      return { billingItemId: model, eventTime: new Date(at).toISOString(), product: 'cursor', chargeCategory: 'usage',
+        displayExtras: { model }, usage: { 'prompt-text-tokens': count }, pricing: { contracted: 0 } };
+    }
+    const rows = [bill(old, 'renamed', 7), ...Array.from({ length: 101 }, (_, i) => bill(active, 'billing-' + i, 1))];
+    let outage = false;
+    backend.billing = params => outage ? { status: 503 } : {
+      data: rows.filter(r => r.eventTime >= params.get('startTime') && r.eventTime <= params.get('endTime')),
+    };
+    let batches = 0;
+    backend.reply = payload => {
+      assert.ok(!JSON.stringify(payload).includes('billingItemId'));
+      assert.ok(!JSON.stringify(payload).includes('contracted'));
+      if (++batches === 2) return { status: 400, json: { error: 'test interruption' } };
+    };
+    await assert.rejects(client.sync());
+    assert.equal(JSON.stringify([...backend.table.values()].slice(0, 1)), csvUpload);
+    assert.equal(total(backend.table), 107);
+    assert.equal(client.state().parserMeta.cursor.latestTokenAt, new Date(old).toISOString());
+    backend.reply = null;
+    // A retry may see another source before the final batch (and its
+    // parserMeta) commits. The first batch's windows already have an owner.
+    outage = true;
+    backend.events = [{ id: 'partial', at: active, model: 'default', input: 100 }];
+    await client.sync();
+    assert.equal(total(backend.table), 107);
+    outage = false;
+    await client.sync();
+    assert.equal(total(backend.table), 108);
+
+    // Legacy events call the active V2 rows "default". An event arriving a
+    // minute later would otherwise reopen and upload the whole window twice.
+    backend.csvRows = [{ at: active, model: 'csv-alias', input: 101 }];
+    backend.events = [{ id: 'overlap', at: active + 60_000, model: 'default', input: 101 },
+      { id: 'new', at: duringOutage, model: 'default', input: 3 }];
+    outage = true;
+    await client.sync();
+    assert.equal(total(backend.table), 111);
+    assert.deepEqual([...backend.table.values()].filter(b => b.model === 'default').map(b => b.inputTokens), [3]);
+
+    outage = false;
+    rows.push(bill(duringOutage, 'another-billing-alias', 3), bill(active + 60_000, 'late-billing', 2));
+    await client.sync();
+    assert.equal(total(backend.table), 113);
+    assert.ok(![...backend.table.values()].some(b => ['renamed', 'csv-alias', 'another-billing-alias'].includes(b.model)));
+  });
+});
 
 test('two fallback syncs inside one half hour add up instead of replacing each other', async () => {
   await withBackend(async (backend) => {

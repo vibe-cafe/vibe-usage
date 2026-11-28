@@ -23,6 +23,9 @@ const WIN = 'C:\\Users\\张三\\AppData\\Roaming';
 // Every warning template the parsers and roots modules write (2026-11-09),
 // with the code it must map to.
 const CASES = [
+  ['cursor: 保留已上传窗口的明细来源，本次跳过另一来源的 1 个用量桶。', 'upload_withheld'],
+  ['cursor: CSV 最新 token 事件停在 2026-11-22T00:00:00.000Z，Billing V2 补回 2 个更新的 token 事件。', 'fallback_used'],
+  ['cursor: Billing V2 本次读取失败，已尝试仪表盘事件接口；下次重试 Billing V2。', 'export_unusable'],
   // Claude Code / Claude Desktop
   [`Claude Code: cannot read directory ${PROJECT_DIR}: EACCES: permission denied, scandir '${PROJECT_DIR}'`, 'dir_unreadable'],
   [`Claude Code: cannot read directory ${HOME}/.claude: not a directory`, 'dir_unreadable'],
