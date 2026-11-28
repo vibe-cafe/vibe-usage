@@ -8,7 +8,8 @@ import {
 import { createInterface } from 'node:readline';
 import { dirname, join, resolve } from 'node:path';
 import { homedir } from 'node:os';
-import { aggregateToBuckets } from './aggregate.js';
+import { aggregateToBuckets, MODEL_MAX_LENGTH, PROJECT_MAX_LENGTH, roundToHalfHour } from './aggregate.js';
+import { projectFromCwd } from './fs-utils.js';
 import { queryDbJsonSnapshotOnLock, sqliteUnavailableError, isSqliteUnavailableError } from './sqlite.js';
 
 const KIRO_AGENT_RELATIVE = join('User', 'globalStorage', 'kiro.kiroagent');
@@ -281,6 +282,8 @@ function conversationToEntries(conversation) {
   let cumulative = summaryTokens;
   let prevAssistantTokens = 0;
   const entries = [];
+  const cwd = conversation.cwd || 'unknown';
+  const project = projectFromCwd(cwd);
 
   for (let i = 0; i < turns.length; i++) {
     const turn = turns[i] || {};
@@ -301,7 +304,8 @@ function conversationToEntries(conversation) {
     entries.push({
       source: 'kiro',
       model: normalizeCliModel(meta.model_id),
-      project: conversation.cwd || 'unknown',
+      cwd,
+      project,
       timestamp,
       inputTokens,
       outputTokens,
@@ -477,6 +481,7 @@ async function readCliSessionEntries(sessionsDir, fileName) {
 // Pure state machine over a Kiro CLI session's ordered events. Exposed for tests.
 export function cliEventsToEntries(events, { cwd = 'unknown', model = null, fallbackTimestamp = null } = {}) {
   const entries = [];
+  const project = projectFromCwd(cwd);
   let curTs = null;      // Date from the enclosing Prompt (epoch seconds)
   let cumulative = 0;    // running conversation context, re-sent every turn
   let pendingInput = 0;  // fresh input accumulated since the last assistant turn
@@ -523,7 +528,8 @@ export function cliEventsToEntries(events, { cwd = 'unknown', model = null, fall
         entries.push({
           source: 'kiro',
           model: curModel || ESTIMATE_MODEL,
-          project: cwd,
+          cwd,
+          project,
           timestamp: curTs || fallbackTimestamp || new Date(),
           inputTokens,
           outputTokens: output,
@@ -743,20 +749,39 @@ function parseLegacyTokens(base) {
   return rowsToLegacyEntries(rows);
 }
 
-export async function parse() {
+// The cwd is local to the two CLI readers. Look up the exact identity the
+// old aggregator wrote (including its column limits) before equal folder
+// names merge. aggregateToBuckets only copies upload fields to the result.
+function cliBuckets(entries, hasUploadedBucket) {
+  if (hasUploadedBucket) {
+    for (const entry of entries) {
+      if (entry.cwd === entry.project) continue;
+      const legacyBucket = {
+        source: 'kiro',
+        model: String(entry.model).slice(0, MODEL_MAX_LENGTH),
+        project: String(entry.cwd).slice(0, PROJECT_MAX_LENGTH),
+        bucketStart: roundToHalfHour(entry.timestamp).toISOString(),
+      };
+      if (hasUploadedBucket(legacyBucket)) entry.project = legacyBucket.project;
+    }
+  }
+  return { buckets: aggregateToBuckets(entries), sessions: [] };
+}
+
+export async function parse({ hasUploadedBucket } = {}) {
   // 1. Official Kiro CLI native event streams (~/.kiro/sessions/cli/*.jsonl).
   //    This is where the shipping CLI actually records conversations; the
   //    conversations_v2 DB path below is empty on those installs.
   const streamEntries = await readCliSessionStreamEntries();
   if (streamEntries.length > 0) {
-    return { buckets: aggregateToBuckets(streamEntries), sessions: [] };
+    return cliBuckets(streamEntries, hasUploadedBucket);
   }
 
   // 2. Kiro CLI conversations DB / archived snapshots (other CLI variants).
   try {
     const estimateEntries = readCliEstimateEntries();
     if (estimateEntries.length > 0) {
-      return { buckets: aggregateToBuckets(estimateEntries), sessions: [] };
+      return cliBuckets(estimateEntries, hasUploadedBucket);
     }
   } catch (err) {
     if (isSqliteUnavailableError(err)) throw sqliteUnavailableError('Kiro CLI');

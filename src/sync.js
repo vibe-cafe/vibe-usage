@@ -507,6 +507,9 @@ async function runSyncPasses({
         extraRoots: extraRootList(config.extraRoots?.[source]),
         previousInfo: state.parserMeta?.[source],
         magpie,
+        ...(source === 'kiro' && uploadProject ? {
+          hasUploadedBucket: b => Object.hasOwn(state.buckets, bucketKey({ ...b, hostname: host })),
+        } : {}),
         ...(source === 'codex' ? {
           codexExtraHome: codexHome,
           codexUltrafastStartAt: codexUltrafast.startAt,

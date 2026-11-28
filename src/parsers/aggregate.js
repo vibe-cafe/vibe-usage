@@ -17,8 +17,8 @@ export function roundToHalfHour(date) {
 
 // Server column limits (usage_buckets: model varchar(100), project varchar(200)).
 // Anything longer aborts the whole INSERT chunk with 22001, so clamp here.
-const MODEL_MAX_LENGTH = 100;
-const PROJECT_MAX_LENGTH = 200;
+export const MODEL_MAX_LENGTH = 100;
+export const PROJECT_MAX_LENGTH = 200;
 
 // Server token columns are bigint — a single fractional/NaN value aborts the
 // whole INSERT chunk with 22P02, taking every other tool's rows in the batch

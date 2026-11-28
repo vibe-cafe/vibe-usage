@@ -136,7 +136,7 @@ test('conversationsToEstimateEntries estimates Kiro CLI cache write/read/output 
   })), [
     {
       model: 'claude-sonnet-4.5',
-      project: '/repo/app',
+      project: 'app',
       inputTokens: 2,
       cachedInputTokens: 0,
       outputTokens: 3,
@@ -144,7 +144,7 @@ test('conversationsToEstimateEntries estimates Kiro CLI cache write/read/output 
     },
     {
       model: 'claude-sonnet-4.5',
-      project: '/repo/app',
+      project: 'app',
       inputTokens: 3,
       cachedInputTokens: 4,
       outputTokens: 1,
@@ -167,7 +167,7 @@ test('parse prefers archived Kiro CLI token estimates over q-client credits', as
   ].join('\n') + '\n');
   writeFileSync(join(sessionsDir, 'conv-2.json'), JSON.stringify({
     conversation_id: 'conv-2',
-    cwd: '/repo/cli',
+    cwd: 'C:\\work\\cli\\',
     created_at: 1782720000000,
     updated_at: 1782720000000,
     value: {
@@ -202,7 +202,7 @@ test('parse prefers archived Kiro CLI token estimates over q-client credits', as
       outputTokens: b.outputTokens,
     })), [{
       model: 'claude-opus-4.5',
-      project: '/repo/cli',
+      project: 'cli',
       inputTokens: 2,
       cachedInputTokens: 0,
       outputTokens: 2,
@@ -251,9 +251,9 @@ test('cliEventsToEntries estimates in/out/think, excludes signatures from output
     ms: e.timestamp.getTime(),
   })), [
     // turn 1: cache = 0 (nothing prior); system overhead is opt-in.
-    { model: 'claude-opus-4.8', project: '/x', inputTokens: 10, outputTokens: 7, reasoningOutputTokens: 5, cachedInputTokens: 0, ms: 1782720000 * 1000 },
+    { model: 'claude-opus-4.8', project: 'x', inputTokens: 10, outputTokens: 7, reasoningOutputTokens: 5, cachedInputTokens: 0, ms: 1782720000 * 1000 },
     // turn 2: cache = prior context (10+7+5+100 signature = 122); ts inherited
-    { model: 'claude-opus-4.8', project: '/x', inputTokens: 10, outputTokens: 4, reasoningOutputTokens: 0, cachedInputTokens: 122, ms: 1782720000 * 1000 },
+    { model: 'claude-opus-4.8', project: 'x', inputTokens: 10, outputTokens: 4, reasoningOutputTokens: 0, cachedInputTokens: 122, ms: 1782720000 * 1000 },
   ]);
 });
 
@@ -305,13 +305,17 @@ test('parse reads native ~/.kiro/sessions/cli/*.jsonl event streams', async () =
       totalTokens: b.totalTokens,
     })), [{
       model: 'claude-opus-4.8',
-      project: '/repo/x',
+      project: 'x',
       inputTokens: 10,
       outputTokens: 6,
       reasoningOutputTokens: 5,
       cachedInputTokens: 0,
       totalTokens: 21,   // 10 + 6 + 5
     }]);
+    const legacy = await parse({
+      hasUploadedBucket: b => b.project === '/repo/x' && b.model === 'claude-opus-4.8',
+    });
+    assert.deepEqual(legacy.buckets, [{ ...result.buckets[0], project: '/repo/x' }]);
   } finally {
     restoreEnv('KIRO_CLI_SESSIONS_DIR', prevCliSessionsDir);
     rmSync(root, { recursive: true, force: true });
