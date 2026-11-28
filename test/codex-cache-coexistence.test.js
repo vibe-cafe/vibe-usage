@@ -541,14 +541,15 @@ function assertOlderLayout(machine) {
 }
 
 /**
- * Upgrading from the older cache to version 8: no older summary stands in (its
- * sessions have no model time), so every session's usage is read again, over
- * as many runs as the budget needs -- none of them skipped. Headers and replay
- * indexes are taken from the older entries: no header is read and no replay
- * index rebuilt from a rollout. The result equals an uncached read, the warm
- * run after it reads nothing, and the older collector's files are untouched.
+ * Upgrading from the older cache to version 9: nothing of an older entry is
+ * taken -- no summary (its sessions have no model time), and no header or
+ * replay index either (a native rollout of either runtime may be counted
+ * differently; see the version-9 note in codex-cache.js). Every session is
+ * read again, over as many runs as the budget needs, and none of them is
+ * skipped. The result equals an uncached read, the warm run after it reads
+ * nothing, and the older collector's files are untouched.
  */
-async function assertRereadsUsageKeepingHeadersAndIndexes(machine) {
+async function assertRereadsEverything(machine) {
   const before = machine.olderFiles();
   const expected = await machine.uncached(TWO_HOME_CUT);
   const runs = [];
@@ -561,14 +562,14 @@ async function assertRereadsUsageKeepingHeadersAndIndexes(machine) {
     // One rollout read may finish past the budget check, never two.
     assert.ok(run.elapsedMs <= BUDGET_MS + 2 * FULL_READ_MS, trace);
     if (runs.length === 1) {
-      assert.equal(run.result.cache.headerHits, machine.physicalFiles, trace);
+      assert.equal(run.result.cache.headerHits, 0, trace);
+      assert.equal(run.result.cache.indexHits, 0, trace);
       assert.equal(run.result.cache.resultHits, 0, trace);
-      assert.equal(run.result.cache.indexHits >= machine.duplicateCopies, true, trace);
     }
-  } while (!run.done && runs.length < 8);
+  } while (!run.done && runs.length < 24);
   assert.equal(run.done, true, `not complete after ${runs.length} runs`);
-  // Every copy of every session read once, across the runs.
-  assert.equal(runs.reduce((total, r) => total + r.filesRead, 0), machine.physicalFiles);
+  // Every copy of every session read at least once, across the runs.
+  assert.ok(runs.reduce((total, r) => total + r.filesRead, 0) >= machine.physicalFiles, JSON.stringify(runs.map(r => r.filesRead)));
   assert.deepEqual(machine.olderFiles(), before, 'the older collector\'s files were rewritten');
 
   assert.deepEqual(sorted(run.result), sorted(expected));
@@ -586,19 +587,19 @@ async function assertRereadsUsageKeepingHeadersAndIndexes(machine) {
   return runs;
 }
 
-test('duplicate sessions in two homes: the upgrade takes headers and indexes from the older entries and reads usage again', async () => {
+test('duplicate sessions in two homes: nothing of the older entries is taken, every copy is read again', async () => {
   const machine = createTwoHomeMachine();
   await machine.olderRun();
   assertOlderLayout(machine);
-  await assertRereadsUsageKeepingHeadersAndIndexes(machine);
+  await assertRereadsEverything(machine);
 });
 
-test('duplicate sessions in two homes: a version-7 rebuild left half-done is completed from the older entries', async () => {
+test('duplicate sessions in two homes: a version-7 rebuild left half-done is not completed from the older entries', async () => {
   const machine = createTwoHomeMachine();
   await machine.olderRun();
   assertOlderLayout(machine);
   assert.equal(machine.leaveHalfRebuilt(), machine.duplicateCopies);
-  await assertRereadsUsageKeepingHeadersAndIndexes(machine);
+  await assertRereadsEverything(machine);
 });
 
 test('duplicate sessions in two homes: headers and indexes written by algorithm 5 are not taken over', async () => {

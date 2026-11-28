@@ -608,7 +608,7 @@ test('an algorithm-5 entry is never served from the manifest, so an entry an old
   });
 });
 
-test('a full index is taken from this version\'s entry first, also behind a record of an older entry', async () => {
+test('a new fork\'s boundary comes from this version\'s own entry, never from an older one', async () => {
   await withHomes(async ({ homes, file, run, uncached }) => {
     const single = { extraRoots: [] };
     // A second fork of the parent, which appears only at the end.
@@ -644,13 +644,15 @@ test('a full index is taken from this version\'s entry first, also behind a reco
     await run(single);
     const manifest = JSON.parse(readFileSync(join(dir, 'manifest.v1'), 'utf8'));
     const record = manifest.records[file('codex', parentFile)];
-    // Since algorithm 8 the parent's usage is read again by this version (no
-    // older summary stands in), with the header and index of its algorithm-6
-    // entry: the record is this version's own.
+    // Since algorithm 9 nothing of the older entry is taken, and at this point
+    // no fork or sub-agent names the parent (the first fork is gone), so no
+    // replay index is needed: the record is this version's own entry, for the
+    // header and the usage.
     assert.equal(record?.src, CODEX_PARSER_ALGORITHM_VERSION, 'the parent is recorded as this version\'s entry');
-    assert.ok(record.index, 'with its (slim) index');
-    // The older collector's audit rebuilds the parent's entry, same file
-    // state; then a new fork of it appears.
+    assert.equal(record.index, null, 'no replay index is needed yet');
+    // The entry is rebuilt with its full index for the same file state (two
+    // processes of this version run side by side); then a new fork of it
+    // appears, and its boundary has to come from that entry.
     writeFileSync(join(dir, own.name), rebuilt);
     writeFileSync(file('codex', fork2File), fork2);
     const result = await run(single);

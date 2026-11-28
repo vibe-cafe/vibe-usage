@@ -9,7 +9,6 @@ import {
   statSync,
 } from 'node:fs';
 import { join } from 'node:path';
-import { createInterface } from 'node:readline';
 import { Readable } from 'node:stream';
 import { createHash } from 'node:crypto';
 import {
@@ -159,10 +158,8 @@ function statRollout(filePath) {
  * into memory) and always read from its first byte: compressed offsets do not
  * correspond to text offsets. `decodedBytes()` reports how much text it held.
  *
- * Leaving a `for await` over the lines early does not close the interface:
- * the input keeps flowing to its end in the background (a whole file read,
- * or decompressed, for one header line). A caller that stops early calls
- * `close()`, which also stops the input.
+ * Leaving a `for await` over the lines early stops the input (the reader's
+ * `finally`); `close()` does the same for a caller that reads none of them.
  *
  * `head`: the caller only reads the first records (see zstdFileHeadChunks()).
  */
@@ -179,7 +176,6 @@ function readLines(filePath, snapshotSize, start = 0, { head = false } = {}) {
     }
   } else {
     input = createReadStream(filePath, {
-      encoding: 'utf-8',
       // Rollouts are append-only while Codex is working. Bound both parser
       // passes to the size captured before pass 1 so they see the same prefix
       // even when the live file grows between reads.
@@ -187,15 +183,58 @@ function readLines(filePath, snapshotSize, start = 0, { head = false } = {}) {
       ...(snapshotSize == null ? {} : { end: snapshotSize - 1 }),
     });
   }
-  const lines = createInterface({ input, crlfDelay: Infinity });
-  lines.once('close', () => {
+  const lines = jsonlLines(input);
+  lines.close = () => input.destroy();
+  if (decoded) lines.decodedBytes = () => decoded.bytes;
+  return lines;
+}
+
+/**
+ * The lines of a JSONL byte stream. A record ends at a 0x0a byte and nowhere
+ * else: Codex writes U+2028 and U+2029 raw inside JSON strings (pasted text, a
+ * model's formatted answer), and `node:readline` ends a line at each of them
+ * too (on Node 24.22; Node 22.23 does not), which cut such a record in two --
+ * neither half parsed, the replay pass saw fewer records than the index had
+ * counted, and the whole tool failed with "Codex rollout changed while
+ * syncing". Bytes are split before they are decoded, as claude-code.js does.
+ * A trailing 0x0d is dropped; a final segment without a newline is a line.
+ */
+async function* jsonlLines(input) {
+  const pending = [];
+  let pendingBytes = 0;
+  try {
+    for await (const chunk of input) {
+      let lineStart = 0;
+      for (;;) {
+        const newline = chunk.indexOf(0x0a, lineStart);
+        if (newline === -1) break;
+        let line;
+        if (pendingBytes) {
+          pending.push(chunk.subarray(lineStart, newline));
+          line = Buffer.concat(pending).toString('utf8');
+          pending.length = 0;
+          pendingBytes = 0;
+        } else {
+          line = chunk.toString('utf8', lineStart, newline);
+        }
+        yield line.endsWith('\r') ? line.slice(0, -1) : line;
+        lineStart = newline + 1;
+      }
+      if (lineStart < chunk.length) {
+        pending.push(chunk.subarray(lineStart));
+        pendingBytes += chunk.length - lineStart;
+      }
+    }
+    if (pendingBytes) {
+      const line = Buffer.concat(pending).toString('utf8');
+      yield line.endsWith('\r') ? line.slice(0, -1) : line;
+    }
+  } finally {
     // Nobody reads these lines any more: an error the decoder still raises
     // (damage past the header) must not become an uncaught exception.
     input.on('error', () => {});
     input.destroy();
-  });
-  if (decoded) lines.decodedBytes = () => decoded.bytes;
-  return lines;
+  }
 }
 
 function extractProject(meta) {

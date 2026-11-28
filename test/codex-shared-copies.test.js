@@ -403,12 +403,13 @@ test('a warm sync looks up no older entry and no tail for the copies of a shared
   });
 });
 
-// Upgrading from version 7 (algorithm 8, 2026-11-25): older summaries hold no
-// model time, so every group is merged again -- but a compressed copy that
-// version 7 proved byte-identical to a plain copy (`copyOf` in its entry) is
-// not decompressed and merged again: the proof is about the two files only.
-// Without it, on the maintainer's Mac Codex had not finished after 20 runs.
-test('the upgrade from version 7 keeps proven compressed copies out of the merge', needsZstd, async () => {
+// Upgrading from version 7 (algorithm 9): nothing of an older entry is taken --
+// not the summary (its sessions have no model time), not the header or replay
+// index (an index cached by another runtime may count a rollout's records
+// differently) and not the proof that a compressed copy equals a plain one
+// (it is taken with that version's parts). Every file is read again, the
+// compressed copy included, and the result equals an uncached read.
+test('the upgrade from version 7 takes nothing over: every file is read again, the compressed copy included', needsZstd, async () => {
   const readsAfterUpgrade = async (keepCopyOf) => withHomes(async ({ homes, file, run, uncached }) => {
     writeFileSync(file('orca1', sharedFile), shared);
     linkSync(file('orca1', sharedFile), file('orca2', sharedFile));
@@ -416,7 +417,7 @@ test('the upgrade from version 7 keeps proven compressed copies out of the merge
     writeFileSync(file('orca1', otherFile), other);
     await run();
     let proven = 0;
-    // What version 7 leaves: its entries in its own `v7` folder, no version-8 folder.
+    // What version 7 leaves: its entries in its own `v7` folder, no version-9 folder.
     for (const home of Object.values(homes)) {
       const dir = codexCacheDir(home);
       if (!existsSync(dir)) continue;
@@ -433,12 +434,12 @@ test('the upgrade from version 7 keeps proven compressed copies out of the merge
     assert.equal(proven, 1, 'version 7 proved the compressed copy');
     const upgraded = await run();
     assert.equal(upgraded.skipped, undefined);
-    assert.equal(upgraded.cache.headerHits, 4);
+    assert.equal(upgraded.cache.headerHits, 0);
     assert.deepEqual(view(upgraded), view(await uncached()));
     return upgraded.cache.filesRead;
   });
   const withProof = await readsAfterUpgrade(true);
   const withoutProof = await readsAfterUpgrade(false);
-  // Without the proof the compressed copy is proven again (one decompression).
-  assert.equal(withoutProof - withProof, 1, JSON.stringify({ withProof, withoutProof }));
+  // The older entry's proof changes nothing now: neither run takes it.
+  assert.equal(withoutProof, withProof, JSON.stringify({ withProof, withoutProof }));
 });

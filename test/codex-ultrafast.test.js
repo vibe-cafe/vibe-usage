@@ -397,7 +397,7 @@ function olderCacheFiles(cacheDir) {
 }
 
 for (const version of [6, 7]) {
-  test(`an algorithm-${version} summary never stands in: usage is read again and sessions get model time`, async () => {
+  test(`an algorithm-${version} entry is never taken: usage, headers and indexes are read again`, async () => {
     await withFixture({ 'rollout-mixed.jsonl': mixedSession(), 'rollout-other.jsonl': mixedSession('other') }, async (fixture) => {
       const expected = await parseUncached(W1030);
       await parseAt(W1030);
@@ -405,11 +405,15 @@ for (const version of [6, 7]) {
       const older = olderCacheFiles(fixture.cacheDir);
       assert.equal(Object.keys(older).length, 4, 'two summaries and two tails');
       const upgraded = await parseAt(W1030);
-      // Every session's usage is read again (its older summary has no model
-      // time), but no header is: it is the same under every version listed.
+      // Since algorithm 9 nothing of an older entry stands in: not the summary
+      // (no model time) and not the header either (an index cached by another
+      // runtime can count a rollout's records differently; see the version-9
+      // note in codex-cache.js).
       assert.equal(upgraded.cache.resultHits, 0);
-      assert.equal(upgraded.cache.headerHits, 2);
-      assert.equal(upgraded.cache.filesRead, 2);
+      assert.equal(upgraded.cache.headerHits, 0);
+      // Two files read once for the header and once for the usage: neither
+      // needs a replay index (no fork or sub-agent among them).
+      assert.equal(upgraded.cache.filesRead, 4);
       assert.deepEqual(uploaded(upgraded), uploaded(expected));
       assert.deepEqual(upgraded.sessions, expected.sessions);
       assert.ok(upgraded.sessions.every(session => Array.isArray(session.activity)));
@@ -421,9 +425,10 @@ for (const version of [6, 7]) {
     });
   });
 
-  test(`an algorithm-${version} entry still gives its header and replay index`, async () => {
+  test(`an algorithm-${version} entry gives no header and no replay index either`, async () => {
     // A fork starts with a copy of its parent's records. The replay index is what
-    // tells that copy from the fork's own usage, so it has to arrive intact.
+    // tells that copy from the fork's own usage, so it has to be right; since
+    // algorithm 9 it is built from the rollout again rather than taken over.
     const copied = (records, instant) => records.slice(1).map(record => ({ ...record, timestamp: instant }));
     const parent = [
       sessionMeta(at('10:05'), 'parent'),
@@ -445,16 +450,18 @@ for (const version of [6, 7]) {
       downgradeCache(fixture.cacheDir, version);
       const older = olderCacheFiles(fixture.cacheDir);
 
-      // The usage is read again, one pass per rollout. Neither header nor index is.
+      // Nothing of the older entry is taken: the header and the index are read
+      // from the rollout like the usage.
       const upgraded = await parseAt(W1030);
-      assert.equal(upgraded.cache.headerHits, 2);
-      assert.equal(upgraded.cache.indexHits, 2);
+      assert.equal(upgraded.cache.headerHits, 0);
+      assert.equal(upgraded.cache.indexHits, 0);
       assert.equal(upgraded.cache.resultHits, 0);
-      assert.equal(upgraded.cache.filesRead, 2);
+      // Each file is read for its header, its replay index and its usage.
+      assert.equal(upgraded.cache.filesRead, 6);
       assert.deepEqual(uploaded(upgraded), uploaded(expected));
       assert.deepEqual(olderCacheFiles(fixture.cacheDir), older);
 
-      // What was taken over is now part of this version's own entries.
+      // What this run read is now part of this version's own entries.
       const again = await parseAt(W1030);
       assert.equal(again.cache.filesRead, 0);
       assert.equal(again.cache.resultHits, 2);
