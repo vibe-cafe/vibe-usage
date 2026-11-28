@@ -356,11 +356,12 @@ test('after a reboot, a parent group whose entry a 0.15.x collector rewrote is n
   });
 });
 
-test('after a reboot, groups whose members kept only algorithm-6 entries are not merged again', async () => {
-  // Upgraded from 0.14 on a machine with several homes: the copies of a
-  // shared session took their header and index from the algorithm-6 entries
-  // and never wrote one of their own, so the manifest holds only the group.
-  // The device number the group's earlier key needs is in those entries.
+test('after a reboot, groups whose members kept only algorithm-6 entries are read again, never taken over', async () => {
+  // Upgraded from 0.14 on a machine with several homes: the members' entries
+  // are algorithm-6 ones, and since algorithm 9 nothing of them is taken --
+  // not the summary (no model time) and not the header or index (an index
+  // cached by another runtime can count a rollout's records differently). The
+  // group is read again here, once, and this version records it.
   await withHomes(async ({ homes, file, run, uncached }) => {
     await run();
     await run();
@@ -382,8 +383,12 @@ test('after a reboot, groups whose members kept only algorithm-6 entries are not
     const restore = shiftDeviceNumbers(1000);
     try {
       const { result, paths } = await opened(run);
-      assert.deepEqual(paths, []);
+      assert.ok(paths.length > 0, 'the members are read from the rollouts again');
       assert.deepEqual(view(result), view(await uncached()));
+      // This version's own entries and manifest carry the next run.
+      const again = await opened(run);
+      assert.deepEqual(again.paths, []);
+      assert.deepEqual(view(again.result), view(result));
     } finally {
       restore();
     }

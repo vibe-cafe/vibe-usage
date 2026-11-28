@@ -16,7 +16,18 @@ import { join } from 'node:path';
 // separate from ~/.vibe-usage/state.json, whose hashes are the authoritative
 // record of successful uploads and must remain backward-compatible.
 export const CODEX_CACHE_SCHEMA_VERSION = 1;
-export const CODEX_PARSER_ALGORITHM_VERSION = 8;
+export const CODEX_PARSER_ALGORITHM_VERSION = 9;
+// Version 9 reads a rollout's lines on raw 0x0a bytes instead of
+// `node:readline` (codex.js `jsonlLines()`), because Node 24's `readline` also
+// ends a line at U+2028 and U+2029 and Codex writes both unescaped inside JSON
+// strings: such a record was cut in two unparseable halves and dropped (#174,
+// the same fix claude-code.js already has). Every header, replay index and
+// summary a version before 9 computed may therefore be one record short of
+// what this version reads -- a cached index would make `parseSessionFile()`
+// fail with "Codex rollout changed while syncing" on every run, and a cached
+// summary would keep the lost usage. So nothing of versions 6-8 is taken and
+// every rollout is read once more; version 9 has its own `v9` folder.
+//
 // Version 8 (2026-11-25) counts model time per reply (aggregate.js): a
 // session's `activeSeconds` changed meaning and it gained its 5-minute
 // `activity` cells. No earlier summary can stand in for that -- every rollout
@@ -76,10 +87,14 @@ const MAGPIE_FREE_COMPATIBLE_ALGORITHM_VERSIONS = new Set();
 // made of. Version 5 is not listed for exactly that reason: its headers and
 // indexes carry no model provider, and it fingerprinted durable usage records
 // without their response id.
-const SAME_HEADER_AND_INDEX_ALGORITHM_VERSIONS = new Set([6, 7]);
+// Version 9: none -- every older index counts fewer records than version 9
+// reads (see the version-9 note above), so replaying from one would raise
+// "Codex rollout changed while syncing" on every run.
+const SAME_HEADER_AND_INDEX_ALGORITHM_VERSIONS = new Set();
 // Where each older version keeps its entries, newest first: version 7 in its
 // own folder, versions up to 6 in the per-home directory itself.
-const OLDER_ENTRY_FOLDERS = ['v7', ''];
+// Version 9: none -- no entry of an older version is taken at all.
+const OLDER_ENTRY_FOLDERS = [];
 
 function acceptedOlderSummaryAlgorithm(version, magpieFree) {
   return MERGED_ULTRAFAST_SUMMARY_ALGORITHM_VERSIONS.has(version)
