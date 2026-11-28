@@ -31,19 +31,22 @@ function dashboard(t) {
     const url = new URL(raw);
     const endpoint = url.pathname.split('/').pop();
     web.calls.push(endpoint);
-    if (endpoint === 'export-usage-events-csv') return new Response(web.csv);
+    if (endpoint === 'export-usage-events-csv') {
+      if (web.csv instanceof Response) return web.csv.clone();
+      return new Response(typeof web.csv === 'function' ? web.csv(url.searchParams) : web.csv);
+    }
     if (endpoint === 'query-billing-items') {
       web.billingRequests.push({ params: url.searchParams, init });
       return web.billing(url.searchParams);
     }
     assert.equal(endpoint, 'get-filtered-usage-events');
-    return Response.json({ usageEventsDisplay: web.events });
+    return web.events instanceof Response ? web.events.clone() : Response.json({ usageEventsDisplay: web.events });
   });
   return web;
 }
 
 const read = (prev = previousInfo) => parse({ previousInfo: prev, envProxyBlock: null });
-const current = item('current', NOW - 60_000);
+const current = item('current', NOW - 2 * 3600_000);
 const eventsRow = { timestamp: NOW - 60_000, model: 'default', tokenUsage: { outputTokens: 3 } };
 
 test('Billing V2 pages, deduplicates ids, and resumes completed CSV history to the subscription floor', async t => {
@@ -65,14 +68,15 @@ test('Billing V2 pages, deduplicates ids, and resumes completed CSV history to t
     Array(2).fill(['cursor-grok-4.6-medium', 14, 3, 420]));
   assert.equal(first.info.tokenEvents, 2);
   assert.equal(first.info.backfill, undefined);
-  assert.deepEqual(web.calls, ['export-usage-events-csv', ...Array(4).fill('query-billing-items')]);
+  assert.deepEqual(web.calls, ['export-usage-events-csv', ...Array(2 + Math.ceil((RECENT - FLOOR) / (7 * DAY))).fill('query-billing-items')]);
   assert.equal(web.billingRequests[1].params.get('cursor'), cursor);
   assert.equal(web.billingRequests.at(-1).params.get('startTime'), iso(FLOOR));
   for (const { params, init } of web.billingRequests) {
     assert.equal(params.get('scope'), 'user');
     assert.equal(params.get('product'), 'cursor');
     assert.equal(params.get('pageSize'), '500');
-    assert.ok(Date.parse(params.get('endTime')) - Date.parse(params.get('startTime')) <= 31 * DAY);
+    const span = Date.parse(params.get('endTime')) - Date.parse(params.get('startTime'));
+    if (params.get('startTime') !== iso(RECENT)) assert.ok(span <= 7 * DAY);
     const headers = new Headers(init.headers);
     assert.equal(headers.get('cookie'), 'WorkosCursorSessionToken=fixture%3A%3A' + token);
     assert.equal(headers.get('x-cursor-dashboard-surface'), 'v2');
@@ -82,7 +86,6 @@ test('Billing V2 pages, deduplicates ids, and resumes completed CSV history to t
     assert.match(headers.get('referer'), /dashboard/);
   }
   web.calls.length = 0;
-  web.csv += '\n' + iso(NOW - 60_000) + ',csv-alias,3';
   const next = await read(first.info);
   assert.deepEqual(web.calls, ['query-billing-items', 'query-billing-items']);
   assert.equal(next.buckets[0].model, 'cursor-grok-4.6-medium');
@@ -110,16 +113,16 @@ test('a fresh legacy export requests only CSV and keeps the serialized upload bu
   }]));
 });
 
-test('Billing V2 checkpoints complete 31-day blocks and retries an incomplete history page', async t => {
+test('Billing V2 checkpoints complete weekly blocks and retries an incomplete history page', async t => {
   const web = dashboard(t);
-  const boundary = RECENT - 31 * DAY;
+  const boundary = RECENT - 7 * DAY;
   const rows = [current, item('edge', boundary), item('before', boundary - 1)];
   let fail = false;
   web.billing = params => {
     const start = Date.parse(params.get('startTime'));
     const end = Date.parse(params.get('endTime'));
     if (start === boundary) web.now += 41_000;
-    if (fail && start === FLOOR) {
+    if (fail && end === boundary) {
       if (params.has('cursor')) return new Response(null, { status: 503 });
       return Response.json({ data: [item('incomplete', boundary - 1)], pagination: { nextCursor: 'next' } });
     }
@@ -141,11 +144,12 @@ test('Billing V2 checkpoints complete 31-day blocks and retries an incomplete hi
   assert.equal(resumed.buckets.at(-1).inputTokens, 14, 'the shared endpoint only belongs to the newer block');
 });
 
-for (const [label, reply] of [
-  ['challenge', () => new Response('<html>challenge</html>')],
-  ['missing team', () => Response.json({ availability: 'missing_team_id' })],
-  ['invalid page', () => Response.json({ data: [current], pagination: 'unknown' })],
-  ['HTTP 503', () => new Response(null, { status: 503 })],
+for (const [label, reply, failure] of [
+  ['challenge', () => new Response('<html>challenge</html>'), 'invalid_page'],
+  ['missing team', () => Response.json({ availability: 'missing_team_id' }), 'invalid_page'],
+  ['invalid page', () => Response.json({ data: [current], pagination: 'unknown' }), 'invalid_page'],
+  ['network', () => { throw new Error('private transport detail'); }, 'network'],
+  ['HTTP 503', () => new Response(null, { status: 503 }), 'http_503'],
   ['empty page', () => Response.json({ data: [], pagination: {} })],
 ]) {
   test('unusable Billing V2 falls back to web events: ' + label, async t => {
@@ -155,23 +159,136 @@ for (const [label, reply] of [
     const result = await read();
     assert.deepEqual(web.calls, ['export-usage-events-csv', 'query-billing-items', 'get-filtered-usage-events']);
     assert.deepEqual(result.buckets.map(b => [b.model, b.outputTokens]), [['default', 3]]);
+    assert.equal(result.info.billingFailure, failure);
   });
 }
 
 for (const status of [401, 403]) {
-  test('Billing V2 HTTP ' + status + ' follows the existing sign-in path, including a stale CSV probe', async t => {
+  test('a legacy account keeps its CSV or events after an optional Billing V2 HTTP ' + status, async t => {
     const web = dashboard(t);
     web.billing = () => new Response(null, { status });
-    for (const csv of [header, header + '\n' + iso(NOW - 3 * DAY) + ',csv,2']) {
-      web.calls.length = 0;
-      web.csv = csv;
-      const result = await read();
-      assert.deepEqual(web.calls, ['export-usage-events-csv', 'query-billing-items']);
-      assert.equal(result.info, undefined);
-      assert.match(result.warnings[0], /登录已失效/);
-    }
+    const idle = await read({ ...previousInfo, latestTokenAt: iso(NOW - 8 * DAY) });
+    assert.deepEqual(web.calls, ['export-usage-events-csv', 'query-billing-items', 'get-filtered-usage-events']);
+    assert.equal(idle.info.billingFailure, 'http_' + status);
+    assert.equal(idle.info.latestTokenAt, iso(NOW - 8 * DAY));
+    assert.deepEqual(idle.warnings, []);
+    web.csv += '\n' + iso(NOW - 3 * DAY) + ',csv,2';
+    web.events = new Response(null, { status });
+    const stale = await read();
+    assert.deepEqual(stale.buckets.map(b => b.model), ['csv']);
+    assert.equal(stale.info.billingFailure, 'http_' + status);
+    assert.deepEqual(stale.warnings, []);
+    assert.equal(web.calls.at(-1), 'get-filtered-usage-events');
+  });
+
+  test('pinned V2 HTTP ' + status + ' uses a recovered CSV or follows the sign-in path', async t => {
+    const web = dashboard(t);
+    const pinned = { ...previousInfo, billingAccounts: ['other', previousInfo.account] };
+    web.billing = () => new Response(null, { status });
+    web.csv = header + '\n' + iso(NOW - DAY / 2) + ',legacy,9';
+    const recovered = await read(pinned);
+    assert.deepEqual(web.calls, ['query-billing-items', 'export-usage-events-csv']);
+    assert.deepEqual(recovered.buckets.map(b => b.model), ['legacy']);
+    assert.deepEqual(recovered.info.billingAccounts, ['other']);
+    web.calls.length = 0;
+    await read(recovered.info);
+    assert.deepEqual(web.calls, ['export-usage-events-csv']);
+    web.csv = header;
+    web.events = new Response(null, { status });
+    const idle = await read(pinned);
+    assert.deepEqual(idle.info.billingAccounts, pinned.billingAccounts);
+    assert.equal(idle.info.billingFailure, 'http_' + status);
+    assert.doesNotMatch(idle.warnings.join(' '), /登录已失效/);
+    web.csv = new Response(null, { status });
+    const ended = await read(pinned);
+    assert.equal(ended.info, undefined);
+    assert.match(ended.warnings[0], /登录已失效/);
   });
 }
+
+test('only an empty CSV and a token at least two hours old select Billing V2', async t => {
+  const web = dashboard(t);
+  const recent = item('lag', NOW - 2 * 3600_000 + 1);
+  const model = 'Claude 4.5 Sonnet (Thinking)';
+  web.billing = () => Response.json({ data: [{ ...recent, displayExtras: { model } }], pagination: {} });
+  const lag = await read();
+  assert.equal(lag.info.billingAccounts, undefined);
+  assert.deepEqual(lag.buckets.map(b => b.model), [model]);
+  assert.deepEqual(web.calls, ['export-usage-events-csv', 'query-billing-items']);
+  web.billing = () => Response.json({ data: [current], pagination: {} });
+  for (const csv of ['unrecognized', header + '\n' + iso(NOW - DAY) + ',csv,0']) {
+    web.csv = csv;
+    assert.equal((await read()).info.billingAccounts, undefined);
+  }
+  web.csv = header;
+  assert.deepEqual((await read()).info.billingAccounts, [previousInfo.account]);
+});
+
+test('Billing V2 skips and counts unusable token rows while preserving usable models and counts', async t => {
+  const web = dashboard(t);
+  const at = NOW - DAY;
+  const model = 'Claude 4.5 Sonnet (Thinking)';
+  web.billing = params => Response.json({ data: params.get('startTime') === iso(RECENT) ? [
+    item('no-model', at, { displayExtras: {} }), item('unknown-tokens', at, { totalTokens: 15, usage: {} }),
+    item('ordinary-empty', at, { usage: {} }), item('good', at, { displayExtras: { model } }),
+  ] : [], pagination: {} });
+  const result = await read();
+  assert.deepEqual(result.buckets.map(b => [b.model, b.outputTokens]), [[model, 3]]);
+  assert.equal(result.info.billingSkippedRows, 2);
+  assert.equal(result.info.tokenEvents, 1);
+});
+
+test('a pinned account with an empty Billing V2 week keeps its anchor and requests only V2', async t => {
+  const web = dashboard(t);
+  const result = await read({ ...previousInfo, latestTokenAt: iso(NOW - 8 * DAY), billingAccounts: [previousInfo.account] });
+  assert.deepEqual(web.calls, ['query-billing-items']);
+  assert.deepEqual(result.buckets, []);
+  assert.equal(result.info.latestTokenAt, iso(NOW - 8 * DAY));
+});
+
+test('first Billing V2 selection retains the pre-October CSV checkpoint across the budget boundary', async t => {
+  const web = dashboard(t);
+  const before = FLOOR - 10 * DAY, until = before - 2 * DAY;
+  const calls = [];
+  web.csv = params => {
+    calls.push([Number(params.get('startDate')), Number(params.get('endDate'))]);
+    return calls.length <= 1 ? header : header + '\n' + iso(until) + ',legacy,41';
+  };
+  web.billing = params => {
+    if (params.get('startTime') === iso(FLOOR)) web.now += 40_000;
+    return Response.json({ data: [current, item('cut', FLOOR)], pagination: {} });
+  };
+  const first = await read({ ...previousInfo, backfill: { before: iso(before), until: iso(until) } });
+  assert.deepEqual(first.info.backfill, { before: iso(before), until: iso(until) });
+  assert.deepEqual(first.buckets.map(b => b.outputTokens), [3, 3]);
+  const next = await read(first.info);
+  assert.deepEqual(calls, [[RECENT, NOW], [until, before - 1]]);
+  assert.deepEqual(next.buckets.map(b => b.model), ['cursor-grok-4.6-medium', 'legacy']);
+  assert.equal(next.info.backfill, undefined);
+});
+
+test('weekly history switches to inclusive CSV bounds just before October and resumes both ranges', async t => {
+  const web = dashboard(t);
+  let delay = true;
+  web.billing = params => {
+    if (delay && params.get('startTime') === iso(RECENT - 7 * DAY)) web.now += 40_000;
+    return Response.json({ data: [current, item('edge', FLOOR)], pagination: {} });
+  };
+  const until = FLOOR - 2 * DAY;
+  const first = await read({ ...previousInfo, backfill: { before: iso(RECENT), until: iso(until) } });
+  assert.equal(first.info.backfill.before, iso(RECENT - 7 * DAY));
+  delay = false;
+  const csvCalls = [];
+  web.csv = params => {
+    csvCalls.push([Number(params.get('startDate')), Number(params.get('endDate'))]);
+    return header + '\n' + iso(FLOOR - 1) + ',legacy,7';
+  };
+  const next = await read(first.info);
+  assert.equal(next.info.backfill, undefined);
+  assert.deepEqual(csvCalls, [[until, FLOOR - 1]]);
+  assert.deepEqual(next.buckets.map(b => [b.model, b.outputTokens]),
+    [['cursor-grok-4.6-medium', 3], ['cursor-grok-4.6-medium', 3], ['legacy', 7]]);
+});
 
 test('a stale CSV keeps its last half hour whole and fills only later windows from Billing V2', async t => {
   const web = dashboard(t);

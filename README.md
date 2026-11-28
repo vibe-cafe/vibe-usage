@@ -192,14 +192,16 @@ npx @vibe-cafe/vibe-usage logout cursor   # 删除本机保存的这份登录
 
 ## Cursor 网络排查
 
-老订阅照常读 `cursor.com` 的 CSV。最近 7 天的 CSV 为空、表头无法识别或没有 token 计数时，CLI 先查同一仪表盘的 Billing V2（`/api/dashboard/v2/query-billing-items`）。如果 CSV 仍有用量，但最新 token 记录已停了 24 小时至 7 天，也用这个接口探测之后的半小时。Billing V2 没有可用明细、返回 `missing_team_id`、验证页或服务错误时，再试原来的网页事件接口（`/api/dashboard/get-filtered-usage-events`）。网页事件的早期模型名可能显示为 `default`。Billing V2 返回 401 或 403 时按现有登录流程处理。三个接口共用代理判断、登录凭据和 `cursor.com` 主机。
+老订阅照常读 `cursor.com` 的 CSV。最近 7 天的 CSV 为空、表头变化或缺少 token 时，CLI 会试同一仪表盘的 Billing V2（`/api/dashboard/v2/query-billing-items`）。CSV 最新 token 已停了 24 小时至 7 天时，也会先用 V2 补后续的半小时。两种情况下，如果 V2 没有可补的用量或读取失败（含 HTTP 401/403），再查原有的网页事件接口（`/api/dashboard/get-filtered-usage-events`）。已有的 CSV 用量照常同步，补洞探测失败也会保留登录。网页事件的早期模型名可能显示为 `default`。三个接口共用代理判断、登录凭据和 `cursor.com` 主机。
 
-CSV 不可用且 Billing V2 返回 token 明细后，本机记住这个 Cursor 账号，以后直接读 Billing V2。首次从 2026-10-01 起补历史，每块最多 31 天，每次同步花满 40 秒后留到下次继续。之后每次重读最近 7 天。即使 CSV 恢复，也继续用 Billing V2。本机已上传过的半小时保留最先使用的来源，避免同一笔用量换个模型名再算一次；只有另一来源能看到的该窗口增量会被跳过。历史块读取失败会保留进度，下次重试。
+最近 7 天的 CSV 为空或只有表头，且同一时段的 V2 明细中有至少 2 小时前的 token 时，本机才记住该账号优先用 V2。之后每轮直接读 V2，成功返回空页也结束本轮近期查询。V2 读取失败时复查最近 CSV，有 token 就恢复 CSV 优先。成功读到空表也保留登录。已锁定账号的 V2 返回 401/403，且 CSV 也无法确认登录时，沿用登录续期或失效流程。
+
+首次切换会用 V2 回补至 2026-10-01 00:00 UTC，更早的未完成历史接着用 CSV 补。每块最多 7 天，两段共用 40 秒预算；预算用完后，下一块留到下次同步。本机每个已上传的半小时保留首次提交的来源，同一来源仍可更新该窗口。V2 模型名沿用仪表盘原文。
 
 - `ENOTFOUND` / `EAI_AGAIN`：检查 DNS 和终端网络。
 - `UND_ERR_CONNECT_TIMEOUT` / `ETIMEDOUT` / `ECONNRESET`：检查到 Cursor 的连接及终端代理。浏览器或 Cursor 应用能联网，不代表 Node.js 使用了相同代理。
 - `CERT_*` / `UNABLE_TO_VERIFY_LEAF_SIGNATURE` 等：检查系统时间和代理或公司网络的 CA 证书配置；自定义 CA 可通过 `NODE_EXTRA_CA_CERTS` 指定。
-- `timeout after …ms`：请求超时（每页默认 120 秒）。可用 `VIBE_USAGE_CURSOR_FETCH_TIMEOUT_MS=300000` 调大，然后重跑一次 `sync` 补传历史。
+- `timeout after …ms`：默认超时为 120 秒，同一个 V2 时间块的分页共用这段时间。可用 `VIBE_USAGE_CURSOR_FETCH_TIMEOUT_MS=300000` 调大，然后重跑一次 `sync` 补传历史。
 - `Cursor session rejected`：在 Cursor 的 Account 设置中重新登录，再同步。
 - `新版 Cursor 已加密保存登录凭证`：Cursor 3.27 起会分批把本地登录凭证改为加密保存（`cursor-safe-storage:` 开头），Vibe Usage 不解密它。运行 `npx @vibe-cafe/vibe-usage login cursor`（或在 App 设置里登录 Cursor）单独登录一次即可恢复，暂停期间的用量会在之后的同步里自动补回（前提是 cursor.com 还保留记录）；在 Cursor 里重新登录不能解决（[#144](https://github.com/vibe-cafe/vibe-usage/issues/144)）。
 - `Cursor 登录已失效`：在 Vibe Usage 里登录的那一份被 Cursor 结束了（比如在 cursor.com 撤销了这条登录），重新运行 `login cursor` 即可。

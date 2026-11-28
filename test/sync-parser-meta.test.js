@@ -377,7 +377,6 @@ test('a Cursor half hour retains its first uploaded source through a partial Bil
 
     // Legacy events call the active V2 rows "default". An event arriving a
     // minute later would otherwise reopen and upload the whole window twice.
-    backend.csvRows = [{ at: active, model: 'csv-alias', input: 101 }];
     backend.events = [{ id: 'overlap', at: active + 60_000, model: 'default', input: 101 },
       { id: 'new', at: duringOutage, model: 'default', input: 3 }];
     outage = true;
@@ -389,6 +388,17 @@ test('a Cursor half hour retains its first uploaded source through a partial Bil
     rows.push(bill(duringOutage, 'another-billing-alias', 3), bill(active + 60_000, 'late-billing', 2));
     await client.sync();
     assert.equal(total(backend.table), 113);
+    assert.deepEqual(client.state().parserMeta.cursor.billingAccounts, [client.state().parserMeta.cursor.account]);
+
+    // CSV is usable again during the next V2 outage. Unlock the account, but
+    // keep both the V2 window and the events window under their original keys.
+    outage = true;
+    backend.csvRows = [{ at: active, model: 'csv-alias', input: 103 },
+      { at: duringOutage, model: 'also-csv', input: 3 }, { at: duringOutage + HOUR, model: 'auto', input: 5 }];
+    await client.sync();
+    assert.equal(client.state().parserMeta.cursor.billingAccounts, undefined);
+    assert.equal(total(backend.table), 118);
+    assert.ok(![...backend.table.values()].some(b => b.model === 'also-csv'));
     assert.ok(![...backend.table.values()].some(b => ['renamed', 'csv-alias', 'another-billing-alias'].includes(b.model)));
   });
 });

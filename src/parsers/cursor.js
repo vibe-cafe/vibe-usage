@@ -31,7 +31,7 @@ const GAP_LIMIT_MS = 6 * DAY_MS;
 const BACKFILL_BLOCK_MS = 7 * DAY_MS;
 const BACKFILL_FLOOR = Date.parse('2024-01-01T00:00:00Z');
 const BILLING_FLOOR = Date.parse('2026-10-01T00:00:00Z');
-const BILLING_BLOCK_MS = 31 * DAY_MS;
+const BILLING_MIN_AGE_MS = 2 * HOUR_MS;
 // No new history block starts once Cursor has spent this long in one sync
 // (uploads not included); a started block finishes. A heavy week measured
 // ~12k rows, roughly 8-19s.
@@ -397,7 +397,7 @@ function parseInt0(value) {
  */
 function entriesFromCsv(csv) {
   const rows = parseCsv(String(csv).replace(/^\uFEFF/, ''));
-  if (rows.length < 2) return { entries: [], events: 0, latestEventAt: null, unusable: '返回了空表' };
+  if (!rows.length || !csv.trim()) return { entries: [], events: 0, latestEventAt: null, empty: true, unusable: '返回了空表' };
 
   const header = rows[0].map(h => h.trim());
   const idx = (name) => header.indexOf(name);
@@ -415,6 +415,9 @@ function entriesFromCsv(csv) {
   // and try the dashboard fallbacks before giving up.
   const hasTokenColumn =
     inputCacheWriteIdx >= 0 || inputNoCacheIdx >= 0 || cacheReadIdx >= 0 || outputIdx >= 0;
+  if (rows.length === 1) {
+    return { entries: [], events: 0, latestEventAt: null, empty: dateIdx >= 0 && modelIdx >= 0 && hasTokenColumn, unusable: '返回了空表' };
+  }
   if (dateIdx < 0 || modelIdx < 0 || !hasTokenColumn) {
     return {
       entries: [],
@@ -429,9 +432,11 @@ function entriesFromCsv(csv) {
   let latestEventAt = null;
   let latestTokenAt = null;
   let eventCount = 0;
+  let empty = true;
   for (let r = 1; r < rows.length; r++) {
     const row = rows[r];
     if (row.length === 1 && row[0].trim() === '') continue;
+    empty = false;
     const timestamp = parseDate(row[dateIdx]);
     const model = row[modelIdx]?.trim();
     if (!timestamp || !model) continue;
@@ -465,6 +470,7 @@ function entriesFromCsv(csv) {
   if (entries.length === 0) {
     return {
       entries,
+      empty,
       events: eventCount,
       latestEventAt,
       latestTokenAt,
@@ -645,77 +651,87 @@ function invalidBillingPage() {
   return skipped('Cursor usage request skipped (invalid Billing V2 page).');
 }
 
-function billingEvent(row) {
+function billingEntry(row, diagnostics) {
   if (typeof row?.product !== 'string' || typeof row.chargeCategory !== 'string') throw invalidBillingPage();
   if (row.product !== 'cursor' || row.chargeCategory !== 'usage') return null;
   const usage = row.usage ?? {};
-  const tokenUsage = {
-    inputTokens: usage['prompt-text-tokens'],
-    cacheWriteTokens: usage['cache-write-text-tokens'],
-    cacheReadTokens: usage['cached-prompt-text-tokens'],
-    outputTokens: usage['completion-text-tokens'],
-  };
-  if (!Object.values(tokenUsage).some(tokenCount)) {
-    if (tokenCount(row.totalTokens)) throw invalidBillingPage();
+  const inputTokens = tokenCount(usage['prompt-text-tokens']) + tokenCount(usage['cache-write-text-tokens']);
+  const cachedInputTokens = tokenCount(usage['cached-prompt-text-tokens']);
+  const outputTokens = tokenCount(usage['completion-text-tokens']);
+  const model = row.displayExtras?.model;
+  if (!inputTokens && !cachedInputTokens && !outputTokens) {
+    if (tokenCount(row.totalTokens)) diagnostics.billingSkippedRows++;
+    return null;
+  }
+  if (typeof model !== 'string' || !model.trim()) {
+    diagnostics.billingSkippedRows++;
     return null;
   }
   const timestamp = Date.parse(row.eventTime);
-  const model = row.displayExtras?.model;
-  if (!Number.isFinite(timestamp) || typeof model !== 'string' || !model.trim()
-    || typeof row.billingItemId !== 'string' || !row.billingItemId) throw invalidBillingPage();
-  return { timestamp, model, tokenUsage };
+  if (!Number.isFinite(timestamp) || typeof row.billingItemId !== 'string' || !row.billingItemId) throw invalidBillingPage();
+  return {
+    source: 'cursor', hostname: 'cursor-cloud', project: 'unknown', model,
+    timestamp: new Date(timestamp), inputTokens, cachedInputTokens, outputTokens, reasoningOutputTokens: 0,
+  };
 }
 
 // One complete Billing V2 window. Pages share a deadline; nothing from an
 // incomplete response is used. Only the fields needed for token accounting
 // leave the page reader (in particular, no principal or contracted price).
-async function fetchBilling(token, start, end) {
+async function fetchBilling(token, start, end, diagnostics) {
   const url = new URL(cursorWebBase() + '/api/dashboard/v2/query-billing-items');
   url.search = new URLSearchParams({
     scope: 'user', product: 'cursor', pageSize: '500', startTime: new Date(start).toISOString(), endTime: new Date(end).toISOString(),
   }).toString();
-  if (!decodeJwtSub(token)) throw skipped('Cursor Billing V2 requires a session subject');
+  if (!decodeJwtSub(token)) throw Object.assign(skipped('Cursor Billing V2 requires a session subject'), { billingFailure: 'no_subject' });
   const headers = {
     ...baseHeaders('application/json'), Cookie: cursorSessionCookie(token), 'x-cursor-dashboard-surface': 'v2',
   };
   const signal = AbortSignal.timeout(FETCH_TIMEOUT_MS);
   const seenIds = new Set();
   const cursors = new Set();
-  const events = [];
+  const entries = [];
+  let latest = null;
   for (let page = 0; page < MAX_PAGES; page++) {
     let json;
     try {
       const resp = await fetch(url.toString(), { headers, signal, redirect: 'error' });
-      if (resp.status === 401 || resp.status === 403) throw sessionRejected([String(resp.status)]);
-      if (!resp.ok) throw skipped(`Cursor usage request skipped (HTTP ${resp.status})`);
+      if (!resp.ok) {
+        const error = resp.status === 401 || resp.status === 403
+          ? sessionRejected([String(resp.status)]) : skipped(`Cursor usage request skipped (HTTP ${resp.status})`);
+        throw Object.assign(error, { billingFailure: `http_${resp.status}` });
+      }
       json = await resp.json();
     } catch (err) {
       if (err.sessionRejected || err.skip) throw err;
       if (err instanceof SyntaxError) throw invalidBillingPage();
-      throw usageNetworkError(err, signal);
+      throw Object.assign(usageNetworkError(err, signal), { billingFailure: 'network' });
     }
     if (!Array.isArray(json?.data) || !json.pagination || typeof json.pagination !== 'object'
       || Array.isArray(json.pagination) || (json.availability && json.availability !== 'available')) throw invalidBillingPage();
     for (const row of json.data) {
-      const event = billingEvent(row);
-      if (!event || event.timestamp < start || event.timestamp > end || seenIds.has(row.billingItemId)) continue;
+      const entry = billingEntry(row, diagnostics);
+      if (!entry || entry.timestamp < start || entry.timestamp > end || seenIds.has(row.billingItemId)) continue;
       seenIds.add(row.billingItemId);
-      events.push(event);
+      entries.push(entry);
+      latest = laterDate(latest, entry.timestamp);
     }
     const next = json.pagination.nextCursor;
-    if (next == null || next === '') return entriesFromEvents(events);
+    if (next == null || next === '') return { entries, latestEventAt: latest, latestTokenAt: latest };
     if (typeof next !== 'string' || cursors.has(next)) throw invalidBillingPage();
     cursors.add(next);
     url.searchParams.set('cursor', next);
   }
-  throw skipped('Cursor usage request skipped (Billing V2 pagination limit).');
+  throw Object.assign(skipped('Cursor usage request skipped (Billing V2 pagination limit).'), { billingFailure: 'pagination_limit' });
 }
 
-async function probeBilling(token, start, end) {
+async function probeBilling(token, start, end, diagnostics) {
   try {
-    return await fetchBilling(token, start, end);
+    return await fetchBilling(token, start, end, diagnostics);
   } catch (err) {
-    if (!err.skip) throw err;
+    if (!err.skip && !err.sessionRejected) throw err;
+    diagnostics.billingFailure = err.billingFailure ?? 'invalid_page';
+    if (err.sessionRejected) diagnostics.rejection = err;
     return null;
   }
 }
@@ -726,7 +742,8 @@ function laterDate(a, b) {
   return a > b ? a : b;
 }
 
-function resultInfo({ account, latestEventAt, latestTokenAt, events, tokenEvents, fallbackLatestAt, syncedAt, backfill, app, billingAccounts }) {
+function resultInfo({ account, latestEventAt, latestTokenAt, events, tokenEvents, fallbackLatestAt, syncedAt, backfill, csvBackfill, app, billingAccounts, diagnostics }) {
+  const range = ({ before, until }) => ({ before: new Date(before).toISOString(), until: new Date(until).toISOString() });
   return {
     ...(account ? { account } : {}),
     ...(latestEventAt ? { latestEventAt: new Date(latestEventAt).toISOString() } : {}),
@@ -735,10 +752,13 @@ function resultInfo({ account, latestEventAt, latestTokenAt, events, tokenEvents
     tokenEvents,
     ...(fallbackLatestAt ? { fallbackLatestAt } : {}),
     ...(syncedAt ? { syncedAt: new Date(syncedAt).toISOString() } : {}),
-    ...(backfill ? { backfill: { before: new Date(backfill.before).toISOString(), until: new Date(backfill.until).toISOString() } } : {}),
+    ...(backfill ? { backfill: range(backfill) } : {}),
+    ...(csvBackfill ? { csvBackfill: range(csvBackfill) } : {}),
     // The desktop app's own sign-in, last seen (see APP_ACCOUNT_NOTICE).
     ...(app ? { app } : {}),
     ...(billingAccounts?.length ? { billingAccounts } : {}),
+    ...(diagnostics.billingFailure ? { billingFailure: diagnostics.billingFailure } : {}),
+    ...(diagnostics.billingSkippedRows ? { billingSkippedRows: diagnostics.billingSkippedRows } : {}),
   };
 }
 
@@ -764,8 +784,22 @@ export function planBackfill(previousInfo, now, recentStart) {
   return current;
 }
 
-async function probeCsvGap(token, boundaryMs, now) {
-  const billing = await probeBilling(token, boundaryMs, now);
+// Keep the unfinished CSV range separate while replaying V2. CSV may have
+// already passed October before discovery, or even finished all its history.
+function historyRanges(prev, now, recentStart, useBilling, firstSelection) {
+  const planned = planBackfill(prev, now, recentStart);
+  const savedCsv = prev.csvBackfill;
+  const csv = savedCsv && { before: Date.parse(savedCsv.before), until: Date.parse(savedCsv.until) };
+  const pending = r => r && r.before > r.until;
+  if (!useBilling) return [planned, csv].filter(pending);
+  const billing = firstSelection ? { before: recentStart, until: BILLING_FLOOR }
+    : planned && { before: planned.before, until: Math.max(BILLING_FLOOR, planned.until) };
+  const older = csv ?? (planned && { before: Math.min(BILLING_FLOOR, planned.before), until: planned.until });
+  return [billing, older].filter(pending);
+}
+
+async function probeCsvGap(token, boundaryMs, now, diagnostics) {
+  const billing = diagnostics.billingFailure ? null : await probeBilling(token, boundaryMs, now, diagnostics);
   if (billing?.entries.length) {
     // The CSV owns its last half hour even if V2 has a later row in it.
     const entries = billing.entries.filter(e => windowOf(e.timestamp) > windowOf(boundaryMs));
@@ -778,13 +812,12 @@ async function probeCsvGap(token, boundaryMs, now) {
       return at && windowOf(at) > windowOf(boundaryMs);
     });
     return { ...entriesFromEvents(newer), events: newer.length, source: 'events' };
-  } catch (err) {
-    if (!err.skip) throw err;
+  } catch {
     return null; // A failed optional probe leaves the usable CSV intact.
   }
 }
 
-async function recentFromCsv(csvResult, { token, previousInfo, recentStart }) {
+async function recentFromCsv(csvResult, { token, previousInfo, recentStart, diagnostics }) {
   let entries = csvResult.entries;
   let latest = csvResult.latestEventAt;
   let latestToken = csvResult.latestTokenAt ?? csvResult.latestEventAt;
@@ -796,7 +829,7 @@ async function recentFromCsv(csvResult, { token, previousInfo, recentStart }) {
   const boundaryMs = latestToken ? latestToken.getTime() : NaN;
   const now = Date.now();
   if (Number.isFinite(boundaryMs) && now - boundaryMs > DAY_MS && now - boundaryMs <= 7 * DAY_MS) {
-    const extra = await probeCsvGap(token, boundaryMs, now);
+    const extra = await probeCsvGap(token, boundaryMs, now, diagnostics);
     if (extra?.entries.length) {
       gap = extra;
       entries = entries.concat(extra.entries);
@@ -837,7 +870,7 @@ async function recentFromCsv(csvResult, { token, previousInfo, recentStart }) {
  *
  * sync.js checks the source of a previously uploaded window before upload.
  */
-async function eventsFallback(csvResult, { token, previousInfo }) {
+async function eventsFallback(csvResult, { token, previousInfo, csvConfirmed = false }) {
   const previousLatest = Date.parse(previousInfo?.latestTokenAt ?? previousInfo?.latestEventAt);
   const hasPreviousLatest = Number.isFinite(previousLatest);
   // Two hours back holds every event of any window a new event lands in: a
@@ -855,6 +888,7 @@ async function eventsFallback(csvResult, { token, previousInfo }) {
   try {
     events = await fetchUsageEvents(token, { startDate: String(fallbackStart) });
   } catch (err) {
+    if (csvConfirmed && err.sessionRejected) return { entries: [], events: 0, warnings: [] };
     if (err && err.skip) {
       return {
         entries: [],
@@ -907,7 +941,7 @@ async function historyFromEvents(token, start, before, alreadyRead) {
       return window >= start && window < before && !seen.has(window);
     });
   } catch (err) {
-    if (!err.skip) throw err;
+    if (!err.skip && !err.sessionRejected) throw err;
     return [];
   }
 }
@@ -1026,18 +1060,31 @@ async function readCursorUsage(token, previousInfo, { app = null } = {}) {
 
   const startedAt = Date.now();
   const recentStart = windowOf(startedAt - RECENT_MS);
-  let backfill = planBackfill(prev, startedAt, recentStart);
-
-  const billingAccounts = previousInfo?.billingAccounts ?? [];
+  let billingAccounts = previousInfo?.billingAccounts ?? [];
   const pinned = billingAccounts.includes(account);
+  const diagnostics = { billingSkippedRows: 0 };
+  let billing = pinned ? await probeBilling(token, recentStart, startedAt, diagnostics) : null;
   let csvResult = null;
   try {
-    if (!pinned) csvResult = entriesFromCsv(await fetchUsageCsv(token, { startDate: recentStart, endDate: startedAt }));
+    // A completed V2 read, even an empty one, needs no second opinion.
+    // If V2 fails, check whether this account has moved back to CSV.
+    if (!billing) csvResult = entriesFromCsv(await fetchUsageCsv(token, { startDate: recentStart, endDate: startedAt }));
   } catch (err) {
-    // Auth failure → bubble up so the user sees they need to re-login.
-    if (err && err.skip) return exportSkipped(err);
-    throw err;
+    if (!pinned && err.skip) return exportSkipped(err);
+    if (!pinned || (!err.skip && !err.sessionRejected)) throw err;
   }
+  const usableCsv = csvResult && !csvResult.unusable;
+  // A recognized header-only CSV also confirms the legacy session on an idle week.
+  const csvConfirmed = usableCsv || csvResult?.empty || csvResult?.events > 0;
+  if (pinned && usableCsv) billingAccounts = billingAccounts.filter(label => label !== account);
+  if (!pinned && !usableCsv) billing = await probeBilling(token, recentStart, startedAt, diagnostics);
+  if (pinned && !csvConfirmed && diagnostics.rejection) throw diagnostics.rejection;
+  const firstSelection = !pinned && csvResult?.empty && billing?.entries.some(
+    entry => entry.timestamp <= startedAt - BILLING_MIN_AGE_MS,
+  );
+  if (firstSelection) billingAccounts = [...billingAccounts, account];
+  const useBilling = billingAccounts.includes(account);
+  const history = historyRanges(prev, startedAt, recentStart, useBilling, firstSelection);
   const warnings = [];
   let primaryEntries = [];
   let fallbackEntries = [];
@@ -1050,23 +1097,17 @@ async function readCursorUsage(token, previousInfo, { app = null } = {}) {
   function markWindows(entries, source) {
     for (const e of entries) windowSources.set(roundToHalfHour(e.timestamp).toISOString(), source);
   }
-  const billing = pinned || csvResult.unusable ? await probeBilling(token, recentStart, startedAt) : null;
-  const useBilling = pinned || Boolean(billing?.entries.length);
   let syncedAt = startedAt;
 
-  if (useBilling) {
-    if (!pinned || !prev.syncedAt) backfill = { before: recentStart, until: BILLING_FLOOR };
-    if (backfill) backfill.until = Math.max(backfill.until, BILLING_FLOOR);
-  }
-  if (billing?.entries.length) {
+  if (billing && (useBilling || billing.entries.length)) {
     primaryEntries = billing.entries;
     markWindows(primaryEntries, 'billing-v2');
     latestEventAt = billing.latestEventAt;
     latestTokenAt = billing.latestTokenAt;
     events = billing.entries.length;
     tokenEvents = billing.entries.length;
-  } else if (csvResult && !csvResult.unusable) {
-    const recent = await recentFromCsv(csvResult, { token, previousInfo: prev, recentStart });
+  } else if (usableCsv) {
+    const recent = await recentFromCsv(csvResult, { token, previousInfo: prev, recentStart, diagnostics });
     primaryEntries = recent.entries;
     if (recent.gap) markWindows(recent.gap.entries, recent.gap.source);
     latestEventAt = recent.latestEventAt;
@@ -1077,7 +1118,7 @@ async function readCursorUsage(token, previousInfo, { app = null } = {}) {
     warnings.push(...recent.warnings);
   } else {
     // 2. Events fallback: once per sync, output not limited to the window.
-    const fallback = await eventsFallback(csvResult, { token, previousInfo: prev });
+    const fallback = await eventsFallback(pinned ? null : csvResult, { token, previousInfo: prev, csvConfirmed: pinned && csvConfirmed });
     fallbackEntries = fallback.entries;
     latestEventAt = laterDate(fallback.latestEventAt, csvResult?.latestEventAt);
     latestTokenAt = laterDate(fallback.latestTokenAt, csvResult?.latestTokenAt);
@@ -1091,23 +1132,30 @@ async function readCursorUsage(token, previousInfo, { app = null } = {}) {
   }
 
   // 3. History blocks: `[until, before)`, newest first, within the budget.
-  if (backfill && !(pinned && !billing)) {
-    let { before } = backfill;
-    while (before > backfill.until && Date.now() - startedAt < BACKFILL_BUDGET_MS) {
-      const start = Math.max(backfill.until, before - (useBilling ? BILLING_BLOCK_MS : BACKFILL_BLOCK_MS));
+  if (!(useBilling && !billing)) {
+    while (history.length && Date.now() - startedAt < BACKFILL_BUDGET_MS) {
+      const range = history[0];
+      const { before } = range;
+      const billingBlock = useBilling && before > BILLING_FLOOR;
+      const start = Math.max(range.until, before - BACKFILL_BLOCK_MS);
       let block;
       try {
-        if (useBilling) {
+        if (billingBlock) {
           // Adjacent queries share their endpoint; locally the history block
           // owns [start, before). This also works with an exclusive API end.
-          block = await fetchBilling(token, start, before);
+          block = await fetchBilling(token, start, before, diagnostics);
         } else {
           block = entriesFromCsv(await fetchUsageCsv(token, { startDate: start, endDate: before - 1 }));
         }
       } catch (err) {
-        if (!(err && err.skip)) throw err;
+        if (!err.skip) {
+          // Pre-October CSV and newly discovered V2 are optional history
+          // sources. Their access rules cannot invalidate the recent read.
+          if (!err.sessionRejected || !useBilling || (billingBlock && pinned)) throw err;
+        }
+        if (billingBlock) diagnostics.billingFailure = err.billingFailure ?? 'invalid_page';
         warnings.push(`cursor: 历史补齐本次暂停，下次同步继续（${err.message}）`);
-        if (useBilling) {
+        if (billingBlock) {
           const missing = await historyFromEvents(token, start, before, fallbackEntries);
           fallbackEntries = fallbackEntries.concat(missing);
           events += missing.length;
@@ -1121,14 +1169,14 @@ async function readCursorUsage(token, previousInfo, { app = null } = {}) {
         return window >= start && window < before;
       });
       primaryEntries = primaryEntries.concat(inBlock);
-      if (useBilling) markWindows(inBlock, 'billing-v2');
+      if (billingBlock) markWindows(inBlock, 'billing-v2');
       latestEventAt = laterDate(latestEventAt, block.latestEventAt);
       latestTokenAt = laterDate(latestTokenAt, block.latestTokenAt);
-      events += useBilling ? inBlock.length : block.events;
-      tokenEvents += useBilling ? inBlock.length : block.entries.length;
-      before = start;
+      events += billingBlock ? inBlock.length : block.events;
+      tokenEvents += billingBlock ? inBlock.length : block.entries.length;
+      range.before = start;
+      if (start === range.until) history.shift();
     }
-    backfill = before > backfill.until ? { before, until: backfill.until } : null;
   }
 
   // History can cover windows the events fallback also read after a long gap.
@@ -1154,9 +1202,11 @@ async function readCursorUsage(token, previousInfo, { app = null } = {}) {
       tokenEvents,
       fallbackLatestAt,
       syncedAt,
-      backfill,
+      backfill: history[0],
+      csvBackfill: history[1],
       app,
-      billingAccounts: useBilling && !pinned ? [...billingAccounts, account] : billingAccounts,
+      billingAccounts,
+      diagnostics,
     }),
   };
 }
