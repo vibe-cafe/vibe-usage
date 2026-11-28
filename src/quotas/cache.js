@@ -6,6 +6,8 @@ import { normalizeMeter, quotaResult } from './schema.js';
 
 const CACHE_VERSION = 1;
 const MAX_CACHE_AGE_MS = 7 * 24 * 60 * 60 * 1000;
+const DAY_MS = 24 * 60 * 60 * 1000;
+const PLAN_RETRY_MS = 15 * 60 * 1000;
 
 function cachePath(environment = process.env) {
   const root = environment.VIBE_USAGE_QUOTA_CACHE_DIR?.trim()
@@ -27,9 +29,12 @@ function isRecord(value) {
   return value !== null && typeof value === 'object' && !Array.isArray(value);
 }
 
+export function quotaCacheScope(id, secret) {
+  return createHash('sha256').update(`${id}\0${secret}`).digest('hex');
+}
+
 export function attachCacheScope(result, secret) {
-  const scope = createHash('sha256').update(`${result.id}\0${secret}`).digest('hex');
-  Object.defineProperty(result, 'cacheScope', { value: scope, enumerable: false });
+  Object.defineProperty(result, 'cacheScope', { value: quotaCacheScope(result.id, secret), enumerable: false });
   return result;
 }
 
@@ -64,13 +69,25 @@ export function loadCachedQuota(id, scope, environment = process.env, now = new 
   }
 }
 
-export function saveCachedQuota(result, scope, environment = process.env) {
-  if (result?.status !== 'ok' || !scope) return;
+function updateDocument(environment, update) {
   try {
     // All disposable-cache work belongs inside the failure boundary, including
     // path resolution and updating a document recovered from disk.
     const path = cachePath(environment);
     const document = loadDocument(environment) || { version: CACHE_VERSION, products: {} };
+    if (update(document) === false) return;
+    mkdirSync(dirname(path), { recursive: true, mode: 0o700 });
+    const temporary = `${path}.${process.pid}.tmp`;
+    writeFileSync(temporary, `${JSON.stringify(document)}\n`, { encoding: 'utf8', mode: 0o600 });
+    renameSync(temporary, path);
+  } catch {
+    // A read-only home must not turn a successful provider response into a CLI failure.
+  }
+}
+
+export function saveCachedQuota(result, scope, environment = process.env) {
+  if (result?.status !== 'ok' || !scope) return;
+  updateDocument(environment, document => {
     document.products[result.id] = {
       id: result.id,
       status: 'ok',
@@ -80,12 +97,52 @@ export function saveCachedQuota(result, scope, environment = process.env) {
       dataAsOf: result.dataAsOf,
       scope,
     };
-    mkdirSync(dirname(path), { recursive: true, mode: 0o700 });
-    const temporary = `${path}.${process.pid}.tmp`;
-    writeFileSync(temporary, `${JSON.stringify(document)}\n`, { encoding: 'utf8', mode: 0o600 });
-    renameSync(temporary, path);
-  } catch {
-    // The cache is disposable. A read-only home must not turn a successful
-    // provider response into a CLI failure.
+  });
+}
+
+function freshCursorPlan(record, now) {
+  const age = now - record?.checkedAt;
+  // null is a completed plan lookup with no name. A failed lookup has no label field.
+  return age >= 0 && age <= (record?.label === undefined ? PLAN_RETRY_MS : DAY_MS);
+}
+
+export function saveCursorPlan(accountScope, label, checkedAt, environment, source = 'dashboard') {
+  updateDocument(environment, document => {
+    const plans = Object.fromEntries(Object.entries(document.cursorPlans || {})
+      .filter(([, plan]) => freshCursorPlan(plan, checkedAt)));
+    const current = plans[accountScope];
+    if (source === 'web' && current && current.source !== 'web') return false;
+    plans[accountScope] = { checkedAt, label, source };
+    document.cursorPlans = plans;
+  });
+}
+
+export function loadCursorPlan(accountScope, meterScope, environment, now) {
+  const document = loadDocument(environment);
+  const record = document?.cursorPlans?.[accountScope];
+  if (freshCursorPlan(record, now)) return record;
+  // Before #216 every cached label came from a live web read. Adopt its
+  // original timestamp once so subsequent meter refreshes cannot extend it.
+  const old = document?.products.cursor;
+  if (!document?.cursorPlans && old?.scope === meterScope && old.planLabel) {
+    const legacy = { checkedAt: Date.parse(old.fetchedAt), label: old.planLabel };
+    if (freshCursorPlan(legacy, now)) {
+      saveCursorPlan(accountScope, legacy.label, legacy.checkedAt, environment, 'web');
+      return legacy;
+    }
   }
+  return null;
+}
+
+export function preferCursorWebSummary(accountScope, now, environment) {
+  const until = loadDocument(environment)?.cursorWebUntil?.[accountScope];
+  return until > now && until - now <= DAY_MS;
+}
+
+export function rememberMeterlessCursorPeriod(accountScope, now, environment) {
+  updateDocument(environment, document => {
+    const active = Object.entries(document.cursorWebUntil || {}).filter(([, until]) => until > now);
+    document.cursorWebUntil = Object.fromEntries(active);
+    document.cursorWebUntil[accountScope] = now + DAY_MS;
+  });
 }

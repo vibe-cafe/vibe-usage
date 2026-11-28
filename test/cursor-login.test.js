@@ -18,6 +18,8 @@ import {
 } from '../src/cursor-login.js';
 import * as cursor from '../src/parsers/cursor.js';
 import { fetchCursorQuota, cursorQuotaNetworkURLs } from '../src/quotas/providers/cursor.js';
+import { fetchQuotaProducts } from '../src/quotas/registry.js';
+import { COLLECTOR_VERSION } from '../src/client-meta.js';
 import { envProxyBlock } from '../src/env-proxy.js';
 import { systemProxyConfigured } from '../src/system-proxy.js';
 import { quotaResult } from '../src/quotas/schema.js';
@@ -310,24 +312,344 @@ test('sync: a proxy the CLI cannot follow stops the sign-in path before renewal'
 
 // --- Quota --------------------------------------------------------------------------
 
+const periodPath = '/aiserver.v1.DashboardService/GetCurrentPeriodUsage';
+const periodURL = 'https://api2.cursor.sh' + periodPath;
+const planPath = '/aiserver.v1.DashboardService/GetPlanInfo';
+const planURL = 'https://api2.cursor.sh' + planPath;
+const summaryURL = 'https://cursor.com/api/usage-summary';
+const period = {
+  billingCycleStart: String(Date.parse('2026-11-28T00:00:00Z')),
+  billingCycleEnd: Date.parse('2026-12-05T00:00:00Z'),
+  planUsage: { totalPercentUsed: 6, autoPercentUsed: 0, apiPercentUsed: .36 },
+  spendLimitUsage: { individualUsed: 125, individualLimit: 500 },
+};
+
+test('quota: one dashboard request replaces a zero summary in the same account cache', async t => {
+  const home = tempDir(t);
+  const environment = { VIBE_USAGE_CONFIG_DIR: home, VIBE_USAGE_QUOTA_CACHE_DIR: home };
+  const token = tokenFor('user_dashboard');
+  setProvidedCursorLogin(JSON.stringify(cursorCredential({ accessToken: token })));
+  t.after(resetProvidedCursorLoginForTests);
+  const now = new Date('2026-11-28');
+  const calls = [];
+  let primary;
+  let webStatus = 200;
+  const read = async () => (await fetchQuotaProducts(['cursor'], { environment, now, fetchImpl: async (url, init) => {
+    calls.push({ url, init });
+    if (url === periodURL) {
+      if (primary instanceof Error) throw primary;
+      return primary;
+    }
+    return json({ membershipType: 'free_trial', individualUsage: { plan: { totalPercentUsed: 0 } } }, webStatus);
+  } })).products[0];
+
+  for (const unavailable of [json({}, 404), new Response('<html>')]) {
+    primary = unavailable;
+    calls.length = 0;
+    const legacy = await read();
+    assert.deepEqual(calls.map(call => call.url), [periodURL, summaryURL]);
+    assert.equal(cookieToken(calls[1].init), token);
+    assert.equal(legacy.planLabel, 'Pro Trial');
+    assert.equal(legacy.meters[0].utilization, 0);
+  }
+  calls.length = 0;
+  primary = json(period);
+  const current = await read();
+  assert.deepEqual(calls.map(call => call.url), [periodURL]);
+  assert.equal(current.planLabel, 'Pro Trial', 'reuse the plan just read from the web fallback');
+  const { method, headers, body, redirect } = calls[0].init;
+  assert.equal(method, 'POST');
+  assert.deepEqual(headers, { Authorization: `Bearer ${token}`, 'Content-Type': 'application/json',
+    'Connect-Protocol-Version': '1', 'User-Agent': `vibe-usage/${COLLECTOR_VERSION}` });
+  assert.equal(body, '{}');
+  assert.equal(redirect, 'error');
+  const cycle = { resetsAt: '2026-12-05T00:00:00.000Z', windowSeconds: 7 * 86400 };
+  assert.deepEqual(current.meters, [
+    { id: 'plan', label: '7d', utilization: 6, ...cycle, breakdown: [
+      { id: 'auto', label: 'Cursor models', utilization: 0 },
+      { id: 'api', label: 'Third-party models', utilization: .36 },
+    ] },
+    { id: 'on-demand', label: 'On-demand', utilization: 25, ...cycle },
+  ]);
+  assert.deepEqual(JSON.parse(readFileSync(join(home, 'quota-cache.json'))).products.cursor.meters, current.meters);
+  const before = readFileSync(join(home, 'quota-cache.json'));
+  for (const [failure, reason] of [
+    [new TypeError('connection reset'), 'unreachable'],
+    [new DOMException('deadline', 'TimeoutError'), 'timedOut'],
+    [json({}, 503), 'httpStatus'], [json({}, 429), 'httpStatus'],
+  ]) {
+    primary = failure;
+    calls.length = 0;
+    const cached = await read();
+    assert.deepEqual(calls.map(call => call.url), [periodURL]);
+    assert.equal(cached.source, 'cache');
+    assert.equal(cached.failureReason, reason);
+    assert.equal(cached.httpStatus, failure.status);
+    assert.deepEqual(cached.meters, current.meters);
+    assert.deepEqual(readFileSync(join(home, 'quota-cache.json')), before);
+  }
+  for (const code of [401, 403]) {
+    primary = json({}, code);
+    calls.length = 0;
+    const rejected = await read();
+    assert.deepEqual(calls.map(call => call.url), [periodURL]);
+    assert.equal(rejected.signIn, 'expired');
+    assert.equal(rejected.failureReason, 'credentialsRejected');
+  }
+  primary = json({}, 400);
+  webStatus = 401;
+  calls.length = 0;
+  assert.equal((await read()).signIn, 'expired');
+  assert.deepEqual(calls.map(call => call.url), [periodURL, summaryURL, summaryURL]);
+  assert.equal(calls[1].init.signal, calls[2].init.signal);
+  for (const [index, value] of [[1, `auth0|user_dashboard::${token}`], [2, token]]) {
+    assert.deepEqual(calls[index].init.headers, {
+      Cookie: `WorkosCursorSessionToken=${encodeURIComponent(value)}`, Accept: 'application/json',
+      'User-Agent': 'Mozilla/5.0', Origin: 'https://cursor.com', Referer: 'https://cursor.com/dashboard?tab=usage',
+    });
+  }
+});
+
+test('quota: a rejected web cookie can still read the summary with the bare token', async t => {
+  const home = tempDir(t);
+  const environment = { VIBE_USAGE_CONFIG_DIR: home, VIBE_USAGE_QUOTA_CACHE_DIR: home };
+  const token = tokenFor('user_web');
+  setProvidedCursorLogin(JSON.stringify(cursorCredential({ accessToken: token })));
+  t.after(resetProvidedCursorLoginForTests);
+  const calls = [];
+  const answer = await fetchCursorQuota({ environment, fetchImpl: async (url, init) => {
+    calls.push(url);
+    if (url === periodURL) return json({}, 404);
+    if (init.headers.Cookie !== `WorkosCursorSessionToken=${token}`) return json({}, 403);
+    return json({ membershipType: 'ultra', individualUsage: { plan: { totalPercentUsed: 7 } } });
+  } });
+  assert.deepEqual(calls, [periodURL, summaryURL, summaryURL]);
+  assert.equal(answer.planLabel, 'Ultra');
+  assert.equal(answer.meters[0].utilization, 7);
+});
+
+test('quota: only an account with a meterless period uses the web directly for 24 hours', async t => {
+  const home = tempDir(t);
+  const environment = { VIBE_USAGE_CONFIG_DIR: home, VIBE_USAGE_QUOTA_CACHE_DIR: home };
+  t.after(resetProvidedCursorLoginForTests);
+  const start = Date.parse('2026-11-28');
+  let primary = {};
+  const calls = [];
+  async function read(user, offset, expected, nonce) {
+    const token = tokenFor(user, 60 * DAY, nonce);
+    setProvidedCursorLogin(JSON.stringify(cursorCredential({ accessToken: token })));
+    calls.length = 0;
+    const result = await fetchCursorQuota({ environment, now: new Date(start + offset), fetchImpl: async url => {
+      calls.push(url);
+      if (url === periodURL) return json(primary);
+      if (url === planURL) return json({ planInfo: { planName: 'Enterprise' } });
+      return json({ membershipType: 'team', individualUsage: { plan: { totalPercentUsed: 33 } } });
+    } });
+    assert.deepEqual(calls, expected);
+    return result.meters[0].utilization;
+  }
+  assert.equal(await read('team_a', 0, [periodURL, summaryURL]), 33);
+  primary = period;
+  assert.equal(await read('personal_b', 1000, [periodURL, planURL]), 6);
+  assert.equal(await read('team_a', DAY - 1, [summaryURL], 'renewed'), 33);
+  assert.equal(await read('team_a', DAY + 1, [periodURL]), 6);
+});
+
+test('quota: a web fallback does not replace a current GetPlanInfo name', async t => {
+  const home = tempDir(t);
+  const environment = { VIBE_USAGE_CONFIG_DIR: home, VIBE_USAGE_QUOTA_CACHE_DIR: home };
+  setProvidedCursorLogin(JSON.stringify(cursorCredential({ accessToken: tokenFor('user_plan') })));
+  t.after(resetProvidedCursorLoginForTests);
+  const calls = [];
+  async function read(primary) {
+    calls.length = 0;
+    return fetchCursorQuota({ environment, fetchImpl: async url => {
+      calls.push(url);
+      if (url === periodURL) return primary;
+      if (url === planURL) return json({ planInfo: { planName: 'Business' } });
+      return json({ membershipType: 'free', individualUsage: { plan: { totalPercentUsed: 0 } } });
+    } });
+  }
+  assert.equal((await read(json(period))).planLabel, 'Business');
+  const before = readFileSync(join(home, 'quota-cache.json'));
+  assert.equal((await read(json({}, 404))).planLabel, 'Free');
+  assert.deepEqual(calls, [periodURL, summaryURL]);
+  assert.deepEqual(readFileSync(join(home, 'quota-cache.json')), before);
+  assert.equal((await read(json(period))).planLabel, 'Business');
+  assert.deepEqual(calls, [periodURL]);
+});
+
+test('quota: HTTP 200 without a plan name is remembered for a full day', async t => {
+  const home = tempDir(t);
+  const environment = { VIBE_USAGE_CONFIG_DIR: home, VIBE_USAGE_QUOTA_CACHE_DIR: home };
+  t.after(resetProvidedCursorLoginForTests);
+  const start = Date.parse('2026-11-28');
+  for (const [user, empty] of [['no_body', new Response(null)], ['no_name', json({ planInfo: {} })]]) {
+    setProvidedCursorLogin(JSON.stringify(cursorCredential({ accessToken: tokenFor(user) })));
+    let lookups = 0;
+    const read = async offset => fetchCursorQuota({ environment, now: new Date(start + offset), fetchImpl: async url => {
+      if (url === periodURL) return json(period);
+      assert.equal(url, planURL);
+      return ++lookups === 1 ? empty : json({ planInfo: { planName: 'Team' } });
+    } });
+    assert.equal((await read(0)).planLabel, undefined);
+    const stillEmpty = await read(DAY - 1);
+    assert.equal(stillEmpty.planLabel, undefined);
+    assert.equal(stillEmpty.meters[0].utilization, 6);
+    assert.equal(lookups, 1);
+    assert.equal((await read(DAY + 1)).planLabel, 'Team');
+    assert.equal(lookups, 2);
+  }
+});
+
+test('quota: plan names follow the account, expire independently of quota refreshes, and fail independently', async t => {
+  const home = tempDir(t);
+  const environment = { VIBE_USAGE_CONFIG_DIR: home, VIBE_USAGE_QUOTA_CACHE_DIR: home };
+  t.after(resetProvidedCursorLoginForTests);
+  const start = Date.parse('2026-11-28T00:00:00Z');
+  const calls = [];
+  let plan = json({ planInfo: { planName: 'Pro' }, nextUpgrade: { name: 'Ultra' } });
+  const read = async (user, offset, nonce = 'a') => {
+    const token = tokenFor(user, 60 * DAY, nonce);
+    setProvidedCursorLogin(JSON.stringify(cursorCredential({ accessToken: token })));
+    calls.length = 0;
+    const { products: [answer] } = await fetchQuotaProducts(['cursor'], { environment, now: new Date(start + offset),
+      fetchImpl: async (url, init) => {
+        calls.push(url);
+        if (url === periodURL) return json(period);
+        if (url === planURL) {
+          assert.equal(init.method, 'POST');
+          assert.equal(init.body, '{}');
+          assert.equal(init.redirect, 'error');
+          assert.deepEqual(init.headers, { Authorization: `Bearer ${token}`, 'Content-Type': 'application/json',
+            'Connect-Protocol-Version': '1', 'User-Agent': `vibe-usage/${COLLECTOR_VERSION}` });
+          return plan;
+        }
+        throw new Error('unexpected URL');
+      } });
+    assert.equal(answer.status, 'ok');
+    assert.equal(answer.source, 'live');
+    assert.equal(answer.meters[0].utilization, 6);
+    return answer.planLabel;
+  };
+  assert.equal(await read('account_a', 0), 'Pro');
+  assert.deepEqual(calls, [periodURL, planURL]);
+  plan = json({ planInfo: { planName: 'Ultra' } });
+  assert.equal(await read('account_b', 1000), 'Ultra');
+  assert.deepEqual(calls, [periodURL, planURL]);
+  assert.equal(await read('account_a', DAY, 'renewed'), 'Pro');
+  assert.deepEqual(calls, [periodURL]);
+  plan = json({}, 401);
+  assert.equal(await read('account_a', DAY + 1), undefined);
+  assert.deepEqual(calls, [periodURL, planURL]);
+  assert.equal(await read('account_a', DAY + 60000), undefined);
+  assert.deepEqual(calls, [periodURL]);
+  plan = json({ planInfo: { planName: 'Pro+' } });
+  assert.equal(await read('account_a', DAY + 3600000), 'Pro+');
+  assert.deepEqual(calls, [periodURL, planURL]);
+  const cache = readFileSync(join(home, 'quota-cache.json'), 'utf8');
+  assert.doesNotMatch(cache, /account_a|account_b|fixture-signature|nextUpgrade/);
+});
+
+test('quota: upgrading reuses a web plan label only until 24 hours after its original read', async t => {
+  const home = tempDir(t);
+  const environment = { VIBE_USAGE_CONFIG_DIR: home, VIBE_USAGE_QUOTA_CACHE_DIR: home };
+  setProvidedCursorLogin(JSON.stringify(cursorCredential({ accessToken: tokenFor('user_legacy_cache') })));
+  t.after(resetProvidedCursorLoginForTests);
+  const fetchedAt = '2026-11-28T00:00:00Z';
+  const scope = createHash('sha256').update('cursor\0user:user_legacy_cache').digest('hex');
+  const seed = storedScope => writeFileSync(join(home, 'quota-cache.json'), JSON.stringify({ version: 1, products: { cursor: {
+    id: 'cursor', status: 'ok', meters: [], scope: storedScope, fetchedAt, planLabel: 'Pro',
+  } } }));
+  const calls = [];
+  const read = async offset => (await fetchQuotaProducts(['cursor'], { environment, now: new Date(Date.parse(fetchedAt) + offset),
+    fetchImpl: async url => {
+      calls.push(url);
+      return json(url === planURL ? { planInfo: { planName: 'Ultra' } } : period);
+    } })).products[0];
+  seed('other-account-scope');
+  assert.equal((await read(0)).planLabel, 'Ultra');
+  assert.deepEqual(calls, [periodURL, planURL]);
+  calls.length = 0;
+  seed(scope);
+  assert.equal((await read(DAY - 1)).planLabel, 'Pro');
+  assert.equal((await read(DAY + 1)).planLabel, 'Ultra');
+  assert.deepEqual(calls, [periodURL, periodURL, planURL]);
+});
+
+test('quota: spend limits and pooled usage keep the desktop meter identities', async t => {
+  const home = tempDir(t);
+  const environment = { VIBE_USAGE_CONFIG_DIR: home, VIBE_USAGE_QUOTA_CACHE_DIR: home };
+  setProvidedCursorLogin(JSON.stringify(cursorCredential({ accessToken: tokenFor('user_limits') })));
+  t.after(resetProvidedCursorLoginForTests);
+  for (const [payload, expected] of [
+    [{ planUsage: { totalPercentUsed: 0, includedSpend: 25, limit: 100 } }, [['plan', 0]]],
+    [{ planUsage: { includedSpend: 25, limit: 100 } }, [['plan', 25]]],
+    [{ spendLimitUsage: { overallUsed: 1, overallLimit: 4, pooledUsed: 3, pooledLimit: 4 } }, [['personal', 25]]],
+    [{ spendLimitUsage: { pooledUsed: 3, pooledLimit: 4, individualLimit: 100 } }, [['team', 75], ['on-demand', 0]]],
+  ]) {
+    const result = await fetchCursorQuota({ environment, fetchImpl: async url => {
+      assert.ok(url === periodURL || url === planURL);
+      return json(url === planURL ? { planInfo: { planName: 'Pro' } } : payload);
+    } });
+    assert.deepEqual(result.meters.map(m => [m.id, m.utilization]), expected);
+  }
+});
+
+test('quota: apps predating the dashboard PAC host keep the web route on a system proxy', async t => {
+  const home = tempDir(t);
+  setProvidedCursorLogin(JSON.stringify(cursorCredential({ accessToken: tokenFor('user_legacy') })));
+  t.after(resetProvidedCursorLoginForTests);
+  for (const [surface, before, after, membershipType, label] of [
+    ['mac-app', '0.8.0', '0.8.1', 'pro_student', 'Pro Student'],
+    ['windows-app', '0.7.9', '0.7.10', 'express', 'Express'],
+  ]) {
+    const environment = { VIBE_USAGE_CONFIG_DIR: home, VIBE_USAGE_QUOTA_CACHE_DIR: home, VIBE_USAGE_SYSTEM_PROXY: '1',
+      VIBE_USAGE_SURFACE: surface, VIBE_USAGE_SURFACE_VERSION: before };
+    assert.deepEqual(cursorQuotaNetworkURLs({ environment }), [summaryURL]);
+    const calls = [];
+    const result = await fetchCursorQuota({ environment, fetchImpl: async url => {
+      calls.push(url);
+      return json({ membershipType, individualUsage: { plan: { totalPercentUsed: 6 } } });
+    } });
+    assert.deepEqual(calls, [summaryURL]);
+    assert.equal(result.planLabel, label);
+    environment.VIBE_USAGE_SURFACE_VERSION = after;
+    assert.deepEqual(cursorQuotaNetworkURLs({ environment }), [periodURL, planURL, summaryURL]);
+    calls.length = 0;
+    const current = await fetchCursorQuota({ environment, fetchImpl: async url => {
+      calls.push(url);
+      return json(period);
+    } });
+    assert.deepEqual(calls, [periodURL]);
+    assert.equal(current.meters[0].resetsAt, '2026-12-05T00:00:00.000Z');
+  }
+});
+
 test('quota reads with the Vibe Usage sign-in, scoped to the account, and says when it ended', async t => {
   const dir = tempDir(t);
   const environment = { VIBE_USAGE_CONFIG_DIR: dir, VIBE_USAGE_QUOTA_CACHE_DIR: dir, CURSOR_STATE_DB_PATH: join(dir, 'none.vscdb'), VIBE_USAGE_SYSTEM_PROXY: '0' };
-  const payload = { individualUsage: { plan: { enabled: true, totalPercentUsed: 12 } } };
+  const payload = { planUsage: { totalPercentUsed: 12 } };
   const first = cursorCredential({ accessToken: tokenFor('user_a', 30 * DAY, 'first'), refreshToken: 'r' });
   writeStoredCursorLogin(first, environment);
-  assert.deepEqual(cursorQuotaNetworkURLs({ environment }), ['https://cursor.com/api/usage-summary', 'https://api2.cursor.sh/oauth/token']);
+  assert.deepEqual(cursorQuotaNetworkURLs({ environment }), [periodURL, planURL, summaryURL, 'https://api2.cursor.sh/oauth/token']);
   const used = [];
-  const ok = await fetchCursorQuota({ environment, fetchImpl: async (url, init) => { used.push(cookieToken(init)); return json(payload); } });
+  const ok = await fetchCursorQuota({ environment, fetchImpl: async (url, init) => {
+    used.push([url, init.headers.Authorization]);
+    return json(url === planURL ? { planInfo: { planName: 'Ultra' } } : payload);
+  } });
   assert.equal(ok.status, 'ok');
-  assert.equal(used[0], first.accessToken);
+  assert.deepEqual(used, [periodURL, planURL].map(url => [url, `Bearer ${first.accessToken}`]));
 
   const second = tokenFor('user_a', 60 * DAY, 'second');
+  const attempts = [];
   const renewed = await fetchCursorQuota({ environment, fetchImpl: async (url, init) => {
+    attempts.push(url);
     if (String(url).endsWith('/oauth/token')) return json({ access_token: second });
-    return cookieToken(init) === second ? json(payload) : json({}, 401);
+    return init.headers.Authorization === `Bearer ${second}` ? json(payload) : json({}, 401);
   } });
   assert.equal(renewed.status, 'ok');
+  assert.deepEqual(attempts, [periodURL, 'https://api2.cursor.sh/oauth/token', periodURL]);
   assert.equal(renewed.cacheScope, ok.cacheScope, 'a renewed token is the same account');
 
   const ended = await fetchCursorQuota({ environment, fetchImpl: async url => (String(url).endsWith('/oauth/token')
@@ -339,7 +661,7 @@ test('quota reads with the Vibe Usage sign-in, scoped to the account, and says w
   assert.equal(readStoredCursorLogin(environment).rejected, true);
   const again = await fetchCursorQuota({ environment, fetchImpl: async () => assert.fail('no request once ended') });
   assert.equal(again.signIn, 'expired');
-  assert.deepEqual(cursorQuotaNetworkURLs({ environment }), ['https://cursor.com/api/usage-summary']);
+  assert.deepEqual(cursorQuotaNetworkURLs({ environment }), [periodURL, planURL, summaryURL]);
 });
 
 test('`signIn` is a closed vocabulary that rides only on `unsupported`', () => {
@@ -367,7 +689,8 @@ async function standIn(t, { pollsBeforeConfirm = 1, user = 'user_cli' } = {}) {
       }
       if (url.pathname === '/api/auth/me') { state.cookies.push(req.headers.cookie); return send(200, { email: 'fixture@example.com', name: 'Fixture' }); }
       if (url.pathname === '/oauth/token') { state.refreshBodies.push(JSON.parse(body)); return send(200, { access_token: tokenFor(user, 60 * DAY, 'renewed') }); }
-      if (url.pathname === '/api/usage-summary') { state.cookies.push(req.headers.cookie); return send(200, { individualUsage: { plan: { enabled: true, totalPercentUsed: 7 } } }); }
+      if (url.pathname === periodPath) { state.dashboardAuth = req.headers.authorization; return send(200, { planUsage: { totalPercentUsed: 7 } }); }
+      if (url.pathname === planPath) return send(200, { planInfo: { planName: 'Pro+' } });
       return send(404, {});
     });
   });
@@ -437,7 +760,8 @@ test('the app hands its sign-in over on stdin: quota reads with it, refresh prin
   const [product] = JSON.parse(quota.stdout).products;
   assert.equal(product.status, 'ok');
   assert.equal(product.meters[0].utilization, 7);
-  assert.equal(cookieToken({ headers: { Cookie: state.cookies.at(-1) } }), credential.accessToken);
+  assert.equal(product.planLabel, 'Pro+');
+  assert.equal(state.dashboardAuth, `Bearer ${credential.accessToken}`);
   assert.ok(!quota.stdout.includes(credential.accessToken));
 
   const refresh = await run(['login', 'cursor', '--refresh', '--json', '--cursor-login-stdin'], JSON.stringify(credential));

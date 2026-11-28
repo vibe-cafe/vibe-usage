@@ -326,7 +326,8 @@ test('SOCKS blocks only the providers whose hosts are not bypassed', async (t) =
     home,
     environment: {
       HOME: home, VIBE_USAGE_QUOTA_CACHE_DIR: join(home, 'quota-cache'), VIBE_USAGE_CONFIG_DIR: home,
-      NO_PROXY: 'localhost,127.0.0.1,::1,api.kimi.com,auth.kimi.com',
+      // The web fallback is direct, but the dashboard's api2.cursor.sh is not.
+      NO_PROXY: 'localhost,127.0.0.1,::1,api.kimi.com,auth.kimi.com,cursor.com',
     },
   });
   const byId = Object.fromEntries(envelope.products.map(product => [product.id, product]));
@@ -527,6 +528,37 @@ async function withTunnel(t, proxyURL, options = {}) {
   const uninstall = installProxyTunnel({ proxies: { http: proxyURL, https: proxyURL }, bypass: () => false, ...options });
   t.after(() => uninstall());
 }
+
+test('Cursor dashboard POST carries Bearer through the configured proxy tunnel', async t => {
+  const { writeStoredCursorLogin, cursorCredential } = await import('../src/cursor-login.js');
+  const { fetchQuotaProducts } = await import('../src/quotas/registry.js');
+  const home = mkdtempSync(join(tmpdir(), 'vbu-dashboard-proxy-'));
+  t.after(() => rmSync(home, { recursive: true, force: true }));
+  const token = 'header.' + Buffer.from('{"sub":"proxy-fixture"}').toString('base64url') + '.test';
+  const base = 'http://127.0.0.1:1'; // Only the proxy can deliver this to the stand-in.
+  const seen = [];
+  const { proxyURL, asked } = await connectHarness(t, (req, res) => {
+    seen.push(req.headers.authorization);
+    req.resume();
+    res.end(JSON.stringify(req.url.endsWith('/GetPlanInfo')
+      ? { planInfo: { planName: 'Pro' } } : { planUsage: { totalPercentUsed: 6 } }));
+  });
+  const environment = { VIBE_USAGE_CONFIG_DIR: home, VIBE_USAGE_QUOTA_CACHE_DIR: home,
+    VIBE_USAGE_CURSOR_API_BASE_URL: base, CURSOR_WEB_BASE_URL: base, HTTP_PROXY: proxyURL,
+    HTTPS_PROXY: proxyURL };
+  writeStoredCursorLogin(cursorCredential({ accessToken: token }), environment);
+  // Exercise env-proxy's installed fetch. Only in this test, send even the
+  // loopback fixture through the tunnel so the proxy can count the requests.
+  const { installProxyTunnel } = await import('../src/proxy-tunnel.js');
+  const proxy = setupEnvProxy({ env: environment, httpModule: {}, versions: { node: '20' },
+    execArgv: [], installTunnel: opts => installProxyTunnel({ ...opts, bypass: () => false }) });
+  assert.equal(proxy.state, 'tunnel');
+  const { products: [product] } = await fetchQuotaProducts(['cursor'], { environment });
+  assert.deepEqual(asked, ['GetCurrentPeriodUsage', 'GetPlanInfo'].map(method => `POST ${base}/aiserver.v1.DashboardService/${method}`));
+  assert.deepEqual(seen, [`Bearer ${token}`, `Bearer ${token}`]);
+  assert.equal(product.meters[0].utilization, 6);
+  assert.equal(product.planLabel, 'Pro');
+});
 
 test('a redirect to another site drops the credential; a body is never replayed there', async (t) => {
   const seen = [];

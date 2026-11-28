@@ -2,14 +2,23 @@ import { existsSync } from 'node:fs';
 import { homedir } from 'node:os';
 import { join, resolve } from 'node:path';
 import { isEncryptedCursorToken } from '../../parsers/cursor.js';
-import { cursorRefreshURL, cursorSignInBlock, cursorWebBase, endStoredCursorLogin, freshCursorLogin, resolveCursorLogin } from '../../cursor-login.js';
+import { desktopAppOlderThan } from '../../client-meta.js';
+import { systemProxyConfigured } from '../../system-proxy.js';
+import { CURSOR_USER_AGENT, cursorApiBase, cursorRefreshURL, cursorSignInBlock, cursorUserId, cursorWebBase, endStoredCursorLogin, freshCursorLogin, resolveCursorLogin } from '../../cursor-login.js';
 import { queryDbJsonSnapshotOnLock } from '../../parsers/sqlite.js';
-import { attachCacheScope } from '../cache.js';
+import { attachCacheScope, loadCursorPlan, preferCursorWebSummary, quotaCacheScope, rememberMeterlessCursorPeriod, saveCursorPlan } from '../cache.js';
 import { quotaResult } from '../schema.js';
 import { InvalidQuotaResponse, parseQuotaPayload, requestFailureReason } from '../response.js';
 
-// `CURSOR_WEB_BASE_URL` is the test hook the sync parser already honors.
-const usageURL = environment => `${cursorWebBase(environment)}/api/usage-summary`;
+const summaryURL = environment => `${cursorWebBase(environment)}/api/usage-summary`;
+// These app releases added api2.cursor.sh to the hosts they resolve through PAC.
+function dashboardService(environment) {
+  if (desktopAppOlderThan({ 'mac-app': '0.8.1', 'windows-app': '0.7.10' }, environment)
+      && systemProxyConfigured({ env: environment })) return null;
+  return `${cursorApiBase(environment)}/aiserver.v1.DashboardService`;
+}
+const plans = { free: 'Free', free_trial: 'Pro Trial', pro_student: 'Pro Student', express: 'Express',
+  pro: 'Pro', premium: 'Pro', pro_plus: 'Pro+', ultra: 'Ultra', enterprise: 'Enterprise', team: 'Team' };
 // Issue #144: same decision as the sync parser -- no local decryption, and
 // signing in to Cursor again only writes the same ciphertext. The way back is
 // the separate Vibe Usage sign-in (`cursor-login.js`): `signIn` tells the
@@ -61,46 +70,78 @@ export function cursorSessionCookies(token) {
 export function parseCursorQuota(payload) {
   if (!payload || typeof payload !== 'object' || Array.isArray(payload)
       || !payload.individualUsage && !payload.teamUsage) throw new Error('Invalid Cursor quota response');
-  const meters = [];
   const date = value => typeof value === 'string' ? Date.parse(value) : NaN;
-  const start = date(payload.billingCycleStart);
-  const end = date(payload.billingCycleEnd);
+  const { plan, overall, onDemand } = payload.individualUsage || {};
+  return cursorMeters({ start: date(payload.billingCycleStart), end: date(payload.billingCycleEnd),
+    plan, overall, onDemand, pooled: payload.teamUsage?.pooled });
+}
+
+function periodMeters(payload) {
+  if (!payload || typeof payload !== 'object' || Array.isArray(payload)) throw new InvalidQuotaResponse();
+  const plan = payload?.planUsage;
+  const spend = payload?.spendLimitUsage;
+  // Connect JSON int64s are decimal strings; the editor passes these milliseconds to Date.
+  const date = value => Number(value) > 0 ? new Date(Number(value)).getTime() : NaN;
+  return cursorMeters({
+    start: date(payload?.billingCycleStart), end: date(payload?.billingCycleEnd),
+    plan: plan && { ...plan, used: plan.includedSpend },
+    overall: { used: spend?.overallUsed, limit: spend?.overallLimit },
+    pooled: { used: spend?.pooledUsed, limit: spend?.pooledLimit },
+    // individualUsed is a non-optional int32: protobuf can omit its zero value.
+    onDemand: { used: spend?.individualUsed ?? 0, limit: spend?.individualLimit },
+  });
+}
+
+function cursorMeters({ start, end, plan, overall, pooled, onDemand }) {
+  const meters = [];
   const resetsAt = Number.isFinite(end) ? new Date(end).toISOString() : undefined;
   // The real cycle length lets the card draw the same elapsed-time bar as Codex.
   const windowSeconds = Number.isFinite(start) && end > start ? (end - start) / 1000 : undefined;
+  const cycleLabel = windowSeconds >= 6 * 86400 && windowSeconds <= 8 * 86400 ? '7d' : 'Month';
   const add = (id, label, value, extra = {}) => {
     if (finite(value)) meters.push({ id, label, utilization: value, resetsAt, windowSeconds, ...extra });
   };
   const ratio = item => item?.enabled !== false && finite(item?.used) && finite(item?.limit) && item.limit > 0
     ? item.used / item.limit * 100 : undefined;
-  const plan = payload.individualUsage?.plan;
   if (plan?.enabled !== false) {
     // Auto/API split the same allowance, so they ride along as detail of the
-    // one Month row instead of reading as separate limits. Percentage units:
+    // one plan row instead of reading as separate limits. Percentage units:
     // 0.36 means 0.36%, not 36%.
     const breakdown = [['auto', 'Cursor models', plan?.autoPercentUsed],
       ['api', 'Third-party models', plan?.apiPercentUsed]]
       .filter(([, , value]) => finite(value))
       .map(([id, label, utilization]) => ({ id, label, utilization }));
-    add('plan', 'Month', finite(plan?.totalPercentUsed) ? plan.totalPercentUsed : ratio(plan),
+    add('plan', cycleLabel, finite(plan?.totalPercentUsed) ? plan.totalPercentUsed : ratio(plan),
       breakdown.length ? { breakdown } : {});
   }
   if (!meters.length) {
-    add('personal', 'Month', ratio(payload.individualUsage?.overall));
-    if (!meters.length) add('team', 'Team', ratio(payload.teamUsage?.pooled));
+    add('personal', cycleLabel, ratio(overall));
+    if (!meters.length) add('team', 'Team', ratio(pooled));
   }
-  add('on-demand', 'On-demand', ratio(payload.individualUsage?.onDemand));
+  add('on-demand', 'On-demand', ratio(onDemand));
   return meters;
 }
 
 /**
- * The URLs a quota read requests: the usage summary, plus the renewal URL when
- * a stored Vibe Usage sign-in may be renewed on the way.
+ * Every host that could receive credentials, including fallback and renewal.
  */
 export function cursorQuotaNetworkURLs({ environment = process.env } = {}) {
   const login = resolveCursorLogin(environment);
-  const urls = [usageURL(environment)];
+  const service = dashboardService(environment);
+  const urls = service ? [`${service}/GetCurrentPeriodUsage`, `${service}/GetPlanInfo`] : [];
+  urls.push(summaryURL(environment));
   return login?.kind === 'stored' && !login.unusable ? [...urls, cursorRefreshURL(environment)] : urls;
+}
+
+async function readPayload(response) {
+  const chunks = [];
+  let size = 0;
+  for await (const chunk of response.body || []) {
+    size += chunk.length;
+    if (size > 1024 * 1024) throw new InvalidQuotaResponse('Oversized response');
+    chunks.push(chunk);
+  }
+  return JSON.parse(Buffer.concat(chunks).toString('utf8'));
 }
 
 export async function fetchCursorQuota({
@@ -147,48 +188,88 @@ export async function fetchCursorQuota({
   try { token = readCursorQuotaToken(cursorQuotaDbPath(environment, home, platform)); }
   catch { return result('retryable_error', { failureReason: 'credentialsUnreadable', message: 'Cursor login could not be read' }); }
   if (!token) return result('missing_credentials', { message: 'Open Cursor and sign in, then retry' });
-  // Sent as a cookie the ciphertext is a certain 401 ("sign in again"). Like
-  // missing_credentials this result carries no cache scope, so the registry
-  // neither writes a cache entry for it nor falls back to an older one.
+  // Ciphertext cannot authenticate either request and carries no cache scope.
   if (isEncryptedCursorToken(token)) {
     return result('unsupported', { failureReason: 'credentialsEncrypted', message: ENCRYPTED_TOKEN_MESSAGE, signIn: 'required' });
+  }
+  // Apps resolve their own PAC. A terminal using the editor's token needs the
+  // same system-proxy check as one using a separately stored sign-in.
+  if (!/-app$/.test(environment.VIBE_USAGE_SURFACE || '')) {
+    const block = cursorSignInBlock([], { env: environment, blockFor: () => null });
+    if (block) return result('unsupported', { pauseReason: 'proxyUnsupported', message: block.message });
   }
   return readCursorQuota(token, token);
 
   async function readCursorQuota(sessionToken, scope) {
-    const scoped = (status, extra) => attachCacheScope(result(status, extra), scope);
-    try {
-      const signal = AbortSignal.timeout(timeoutMs);
-      for (const cookie of cursorSessionCookies(sessionToken)) {
-        const response = await fetchImpl(usageURL(environment), {
-          headers: { Cookie: cookie, Accept: 'application/json', 'User-Agent': 'Mozilla/5.0',
-            Origin: 'https://cursor.com', Referer: 'https://cursor.com/dashboard?tab=usage' },
-          signal, redirect: 'error',
-        });
-        if ([401, 403].includes(response.status)) { await response.body?.cancel(); continue; }
-        if (!response.ok) {
-          await response.body?.cancel();
-          return scoped('retryable_error', { failureReason: 'httpStatus', httpStatus: response.status,
-            message: `Cursor quota API returned HTTP ${response.status}` });
-        }
-        const chunks = [];
-        let size = 0;
-        for await (const chunk of response.body || []) {
-          size += chunk.length;
-          if (size > 1024 * 1024) throw new InvalidQuotaResponse('Oversized response');
-          chunks.push(chunk);
-        }
-        const payload = JSON.parse(Buffer.concat(chunks).toString('utf8'));
-        const meters = parseQuotaPayload(parseCursorQuota, payload);
-        const plans = { free: 'Free', pro: 'Pro', premium: 'Pro', pro_plus: 'Pro+', ultra: 'Ultra',
-          enterprise: 'Enterprise', team: 'Team' };
-        return scoped(meters.length ? 'ok' : 'no_data', { meters,
-          planLabel: plans[payload.membershipType],
-          ...(meters.length ? {} : { emptyReason: 'noWindow' }) });
+    const service = dashboardService(environment);
+    const userId = cursorUserId(sessionToken);
+    const accountScope = quotaCacheScope('cursor', userId ? `user:${userId}` : sessionToken);
+    if (service && !preferCursorWebSummary(accountScope, now.getTime(), environment)) {
+      const connect = {
+        method: 'POST', body: '{}', headers: { Authorization: `Bearer ${sessionToken}`,
+          'Content-Type': 'application/json', 'Connect-Protocol-Version': '1', 'User-Agent': CURSOR_USER_AGENT },
+        redirect: 'error',
+      };
+      const dashboard = attachCacheScope(await request(`${service}/GetCurrentPeriodUsage`, connect, periodMeters), scope);
+      if (dashboard.status === 'unauthorized') return dashboard;
+      if (dashboard.status === 'ok') {
+        const cached = loadCursorPlan(accountScope, dashboard.cacheScope, environment, now);
+        const label = cached ? cached.label : await readPlanLabel(`${service}/GetPlanInfo`, connect);
+        if (!cached) saveCursorPlan(accountScope, label, now.getTime(), environment);
+        if (label) dashboard.planLabel = label;
+        return dashboard;
       }
-      return scoped('unauthorized', { message: 'Open Cursor and sign in again, then retry' });
+      if (dashboard.status === 'no_data') {
+        rememberMeterlessCursorPeriod(accountScope, now.getTime(), environment);
+      } else {
+        const clientError = dashboard.httpStatus >= 400 && dashboard.httpStatus < 500 && dashboard.httpStatus !== 429;
+        if (!clientError && dashboard.failureReason !== 'unrecognizedResponse') return dashboard;
+      }
+    }
+    const signal = AbortSignal.timeout(timeoutMs);
+    let summary;
+    for (const cookie of cursorSessionCookies(sessionToken)) {
+      summary = await request(summaryURL(environment), { headers: { Cookie: cookie, Accept: 'application/json',
+        'User-Agent': 'Mozilla/5.0', Origin: 'https://cursor.com', Referer: 'https://cursor.com/dashboard?tab=usage' },
+        signal }, parseCursorQuota);
+      if (summary.status !== 'unauthorized') break;
+    }
+    if (summary.planLabel) saveCursorPlan(accountScope, summary.planLabel, now.getTime(), environment, 'web');
+    return attachCacheScope(summary, scope);
+  }
+
+  async function readPlanLabel(url, connect) {
+    // Plan & Usage reads this field separately. A failed title lookup must
+    // still deliver the current meters, even when this RPC rejects the login.
+    try {
+      const response = await fetchImpl(url, { ...connect, signal: AbortSignal.timeout(Math.min(2500, timeoutMs)) });
+      if (response.status !== 200) { await response.body?.cancel(); return; }
+      const name = (await readPayload(response))?.planInfo?.planName;
+      return typeof name === 'string' ? name.trim() || null : null;
     } catch (error) {
-      return scoped('retryable_error', { failureReason: requestFailureReason(error),
+      // Even an empty HTTP 200 completes the lookup. A broken connection while
+      // receiving the body still gets the shorter transport retry.
+      if (requestFailureReason(error) === 'unrecognizedResponse') return null;
+    }
+  }
+
+  async function request(url, init, parseMeters) {
+    try {
+      const response = await fetchImpl(url, { ...init, redirect: 'error', signal: init.signal ?? AbortSignal.timeout(timeoutMs) });
+      if (!response.ok || (parseMeters === periodMeters && response.status !== 200)) {
+        try { await response.body?.cancel(); } catch { /* the HTTP status is already known */ }
+        if ([401, 403].includes(response.status)) {
+          return result('unauthorized', { message: 'Open Cursor and sign in again, then retry' });
+        }
+        return result('retryable_error', { failureReason: 'httpStatus', httpStatus: response.status,
+          message: `Cursor quota API returned HTTP ${response.status}` });
+      }
+      const payload = await readPayload(response);
+      const meters = parseQuotaPayload(parseMeters, payload);
+      return result(meters.length ? 'ok' : 'no_data', { meters, planLabel: parseMeters === parseCursorQuota ? plans[payload.membershipType] : undefined,
+        ...(meters.length ? {} : { emptyReason: 'noWindow' }) });
+    } catch (error) {
+      return result('retryable_error', { failureReason: requestFailureReason(error),
         message: 'Cursor quota request failed; retry after checking the connection' });
     }
   }

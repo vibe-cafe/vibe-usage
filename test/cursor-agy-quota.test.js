@@ -37,7 +37,8 @@ async function fixture(t, encoding = 'utf8', login = token) {
   if (DatabaseSync) { const db = new DatabaseSync(dbPath); try { db.exec(sql); } finally { db.close(); } }
   else execFileSync('sqlite3', [dbPath, sql]);
   // VIBE_USAGE_CONFIG_DIR: no Vibe Usage Cursor sign-in from the real home.
-  return { root, dbPath, environment: { CURSOR_STATE_DB_PATH: dbPath, VIBE_USAGE_QUOTA_CACHE_DIR: root, VIBE_USAGE_CONFIG_DIR: root } };
+  return { root, dbPath, environment: { CURSOR_STATE_DB_PATH: dbPath, VIBE_USAGE_QUOTA_CACHE_DIR: root,
+    VIBE_USAGE_CONFIG_DIR: root, VIBE_USAGE_SYSTEM_PROXY: '0' } };
 }
 
 test('Cursor preserves percentage units, zero and reset, and never invents a missing limit', () => {
@@ -62,6 +63,22 @@ test('Cursor preserves percentage units, zero and reset, and never invents a mis
   assert.deepEqual(missing, []);
 });
 
+test('Cursor web summary labels plan and personal meters by billing cycle length', () => {
+  const billingCycleStart = '2026-11-01T00:00:00Z';
+  const allowance = { used: 25, limit: 100 };
+  for (const [days, label] of [[6, '7d'], [7, '7d'], [8, '7d'], [30, 'Month'], [null, 'Month']]) {
+    const cycle = days === null ? {} : { billingCycleStart,
+      billingCycleEnd: new Date(Date.parse(billingCycleStart) + days * 86400000).toISOString() };
+    for (const [id, individualUsage] of [['plan', { plan: allowance }], ['personal', { overall: allowance }]]) {
+      const meters = parseCursorQuota({ ...cycle, individualUsage });
+      assert.deepEqual(meters.map(m => [m.id, m.label]), [[id, label]]);
+    }
+  }
+  const team = parseCursorQuota({ billingCycleStart, billingCycleEnd: '2026-11-08T00:00:00Z',
+    teamUsage: { pooled: allowance }, individualUsage: { onDemand: allowance } });
+  assert.deepEqual(team.map(m => [m.id, m.label]), [['team', 'Team'], ['on-demand', 'On-demand']]);
+});
+
 test('Cursor reads only its login row, including UTF-16 BLOBs, without changing the store', async t => {
   for (const encoding of ['utf8','utf16le']) {
     const { dbPath } = await fixture(t, encoding);
@@ -78,22 +95,49 @@ test('Cursor authenticates only to the fixed official host and sanitizes results
   let calls = 0;
   const result = await fetchCursorQuota({ environment, fetchImpl: async (url, options) => {
     calls++;
-    assert.equal(url, 'https://cursor.com/api/usage-summary');
     assert.equal(options.redirect, 'error');
-    assert.ok(options.headers.Cookie.includes(encodeURIComponent(`fixture-account::${token}`)));
-    return new Response(JSON.stringify({ ...cursorPayload, accountEmail: 'private@example.invalid' }));
+    assert.equal(options.headers.Authorization, `Bearer ${token}`);
+    if (url === 'https://api2.cursor.sh/aiserver.v1.DashboardService/GetPlanInfo') {
+      return Response.json({ planInfo: { planName: 'Pro' }, accountEmail: 'private@example.invalid' });
+    }
+    assert.equal(url, 'https://api2.cursor.sh/aiserver.v1.DashboardService/GetCurrentPeriodUsage');
+    return new Response(JSON.stringify({ planUsage: { totalPercentUsed: 0 }, accountEmail: 'private@example.invalid' }));
   } });
-  assert.equal(calls,1);
+  assert.equal(calls,2);
   assert.equal(result.status,'ok');
-  assert.equal(result.planLabel,'Pro');
+  assert.equal(result.meters[0].utilization, 0);
+  assert.equal(result.planLabel, 'Pro');
   assert.ok(result.cacheScope);
   for (const secret of [token,'private@example.invalid','PRIVATE-UNRELATED']) assert.ok(!JSON.stringify(result).includes(secret));
+  const paused = await fetchCursorQuota({ environment: { ...environment, VIBE_USAGE_SYSTEM_PROXY: '1' },
+    fetchImpl: () => { calls++; throw new Error('unexpected request'); } });
+  assert.equal(paused.pauseReason, 'proxyUnsupported');
+  assert.equal(calls, 2);
+});
+
+test('desktop apps with a system proxy can read quota with the local editor token', async t => {
+  for (const [surface, version] of [['mac-app', '0.8.1'], ['windows-app', '0.7.10']]) {
+    const { environment } = await fixture(t);
+    const calls = [];
+    const { products: [answer] } = await fetchQuotaProducts(['cursor'], { environment: {
+      ...environment, VIBE_USAGE_SYSTEM_PROXY: '1', VIBE_USAGE_SURFACE: surface, VIBE_USAGE_SURFACE_VERSION: version,
+    }, fetchImpl: async (url, init) => {
+      calls.push([url.split('/').pop(), init.headers.Authorization]);
+      return Response.json(url.endsWith('/GetPlanInfo') ? { planInfo: { planName: 'Pro' } }
+        : { planUsage: { totalPercentUsed: 7 } });
+    } });
+    assert.deepEqual(calls, ['GetCurrentPeriodUsage', 'GetPlanInfo'].map(rpc => [rpc, `Bearer ${token}`]));
+    assert.equal(answer.status, 'ok');
+    assert.equal(answer.meters[0].utilization, 7);
+  }
 });
 
 test('Cursor isolates missing/rejected credentials and uses only same-account unexpired cache on transient failure', async t => {
   const { environment, root } = await fixture(t);
   const now = new Date('2026-10-23T00:00:00Z');
-  const success = () => new Response(JSON.stringify(cursorPayload));
+  const success = url => Response.json(url.endsWith('/GetPlanInfo')
+    ? { planInfo: { planName: 'Pro' } } : { planUsage: cursorPayload.individualUsage.plan,
+      billingCycleEnd: String(Date.parse(cursorPayload.billingCycleEnd)) });
   await fetchQuotaProducts(['cursor'], { environment, now, fetchImpl: success });
   const failing = async () => { throw new Error(`private proxy ${token}`); };
   const cached = await fetchQuotaProducts(['cursor'], { environment, now, fetchImpl: failing });
@@ -110,7 +154,7 @@ test('Cursor isolates missing/rejected credentials and uses only same-account un
   const rejected = await fetchQuotaProducts(['cursor'], { environment, now, fetchImpl: async () => {
     calls++; return new Response('{}',{status:401});
   } });
-  assert.equal(calls,2);
+  assert.equal(calls,1);
   assert.equal(rejected.products[0].status,'unauthorized');
   assert.equal(rejected.products[0].failureReason, undefined);
   assert.equal(rejected.products[0].source,'live');
@@ -128,7 +172,8 @@ test('Cursor reports an encrypted login as unsupported: no request, no cache ent
   const now = new Date('2026-10-23T00:00:00Z');
   const readable = await fixture(t);
   await fetchQuotaProducts(['cursor'], { environment: readable.environment, now,
-    fetchImpl: async () => new Response(JSON.stringify(cursorPayload)) });
+    fetchImpl: async url => Response.json(url.endsWith('/GetPlanInfo')
+      ? { planInfo: { planName: 'Pro' } } : { planUsage: { totalPercentUsed: 5 } }) });
   const cachePath = join(readable.root, 'quota-cache.json');
   const cacheBefore = readFileSync(cachePath);
   for (const [login, encoding] of [[`cursor-safe-storage:v1:${cipher}`, 'utf8'],
@@ -167,7 +212,7 @@ test('Cursor reports an encrypted login as unsupported: no request, no cache ent
   // A readable login afterwards is fetched exactly as before.
   let calls = 0;
   const back = await fetchQuotaProducts(['cursor'], { environment: readable.environment, now,
-    fetchImpl: async () => { calls++; return new Response(JSON.stringify(cursorPayload)); } });
+    fetchImpl: async () => { calls++; return new Response(JSON.stringify({ planUsage: { totalPercentUsed: 5 } })); } });
   assert.equal(calls, 1);
   assert.equal(back.products[0].status, 'ok');
   assert.equal(back.products[0].source, 'live');
