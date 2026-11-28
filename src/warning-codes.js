@@ -87,6 +87,7 @@ const RULES = [
   ['usage_missing', /有已完成轮次但未读到用量/],
   ['store_unavailable', /:memory: 无法从另一进程读取/],
   ['unsupported_format', new RegExp([
+    '缺少模型名或 token 明细',
     '不认识的表结构',
     '结构不兼容',
     'incompatible database schema',

@@ -106,6 +106,7 @@ const CASES = [
   [`cursor: ${ENCRYPTED_TOKEN_NOTICE}`, 'cursor_token_encrypted'],
   // The separate Vibe Usage sign-in (cursor-login.js): ended, or renewal not done this run.
   [`cursor: ${LOGIN_EXPIRED_NOTICE}`, 'cursor_login_expired'],
+  ['cursor: Billing V2 跳过 2 条缺少模型名或 token 明细的用量记录。', 'unsupported_format'],
   ['cursor: Cursor 登录续期本次未完成，Cursor 本次未同步，下次重试 (network: fetch failed)', 'network_failed'],
   ['cursor: Cursor 登录续期本次未完成，Cursor 本次未同步，下次重试 (skipped (HTTP 503))', 'remote_http_error'],
   // env-proxy.js: a proxy this process cannot follow (both reasons).

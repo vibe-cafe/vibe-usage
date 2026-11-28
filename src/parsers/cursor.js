@@ -316,11 +316,12 @@ function authRejected(status, statusText) {
   return err;
 }
 
-async function fetchCsv(headers, signal, range) {
+async function fetchCsv(headers, range, redirect = 'follow') {
   const url = `${cursorWebBase()}${CSV_PATH}?startDate=${range.startDate}&endDate=${range.endDate}&strategy=tokens`;
+  const signal = AbortSignal.timeout(FETCH_TIMEOUT_MS);
   let resp;
   try {
-    resp = await fetch(url, { headers: { ...baseHeaders('text/csv,*/*;q=0.8'), ...headers }, signal });
+    resp = await fetch(url, { headers: { ...baseHeaders('text/csv,*/*;q=0.8'), ...headers }, signal, redirect });
     // The export may time out or disconnect after headers have arrived.
     // Keep body consumption under the same deadline and soft-skip handling.
     if (resp.ok) return await resp.text();
@@ -335,10 +336,10 @@ async function fetchCsv(headers, signal, range) {
 
 async function fetchUsageCsv(token, range) {
   const failures = [];
-  for (const headers of credentialAttempts(token)) {
-    const signal = AbortSignal.timeout(FETCH_TIMEOUT_MS);
+  for (const [form, headers] of credentialAttempts(token).entries()) {
     try {
-      return await fetchCsv(headers, signal, range);
+      const csv = await fetchCsv(headers, range);
+      return { ...entriesFromCsv(csv), form };
     } catch (err) {
       if (err?.authRejected) {
         failures.push(String(err.message).replace(/^auth rejected /, ''));
@@ -348,6 +349,19 @@ async function fetchUsageCsv(token, range) {
     }
   }
   throw sessionRejected(failures);
+}
+
+// A scheduled probe gets one GET. Remember which form CSV accepted (only its
+// index). If that form is refused, try the next one on the next day's check.
+async function probeUsageCsv(token, range, check) {
+  const forms = credentialAttempts(token);
+  try {
+    return entriesFromCsv(await fetchCsv(forms[check.form], range, 'error'));
+  } catch (err) {
+    if (err.authRejected) check.form = (check.form + 1) % forms.length;
+    else if (!err.skip) throw err;
+    return null;
+  }
 }
 
 function parseCsv(text) {
@@ -397,7 +411,7 @@ function parseInt0(value) {
  */
 function entriesFromCsv(csv) {
   const rows = parseCsv(String(csv).replace(/^\uFEFF/, ''));
-  if (!rows.length || !csv.trim()) return { entries: [], events: 0, latestEventAt: null, empty: true, unusable: '返回了空表' };
+  if (!rows.length || !csv.trim()) return { entries: [], events: 0, latestEventAt: null, headerMismatch: true, unusable: '未返回 CSV 表头' };
 
   const header = rows[0].map(h => h.trim());
   const idx = (name) => header.indexOf(name);
@@ -742,7 +756,7 @@ function laterDate(a, b) {
   return a > b ? a : b;
 }
 
-function resultInfo({ account, latestEventAt, latestTokenAt, events, tokenEvents, fallbackLatestAt, syncedAt, backfill, csvBackfill, app, billingAccounts, diagnostics }) {
+function resultInfo({ account, latestEventAt, latestTokenAt, events, tokenEvents, fallbackLatestAt, syncedAt, backfill, csvBackfill, app, billingAccounts, billingCsvChecks, diagnostics }) {
   const range = ({ before, until }) => ({ before: new Date(before).toISOString(), until: new Date(until).toISOString() });
   return {
     ...(account ? { account } : {}),
@@ -757,6 +771,7 @@ function resultInfo({ account, latestEventAt, latestTokenAt, events, tokenEvents
     // The desktop app's own sign-in, last seen (see APP_ACCOUNT_NOTICE).
     ...(app ? { app } : {}),
     ...(billingAccounts?.length ? { billingAccounts } : {}),
+    ...(Object.keys(billingCsvChecks).length ? { billingCsvChecks } : {}),
     ...(diagnostics.billingFailure ? { billingFailure: diagnostics.billingFailure } : {}),
     ...(diagnostics.billingSkippedRows ? { billingSkippedRows: diagnostics.billingSkippedRows } : {}),
   };
@@ -798,8 +813,8 @@ function historyRanges(prev, now, recentStart, useBilling, firstSelection) {
   return [billing, older].filter(pending);
 }
 
-async function probeCsvGap(token, boundaryMs, now, diagnostics) {
-  const billing = diagnostics.billingFailure ? null : await probeBilling(token, boundaryMs, now, diagnostics);
+async function probeCsvGap(token, boundaryMs, now, diagnostics, recentBilling) {
+  const billing = recentBilling ?? (diagnostics.billingFailure ? null : await probeBilling(token, boundaryMs, now, diagnostics));
   if (billing?.entries.length) {
     // The CSV owns its last half hour even if V2 has a later row in it.
     const entries = billing.entries.filter(e => windowOf(e.timestamp) > windowOf(boundaryMs));
@@ -817,7 +832,7 @@ async function probeCsvGap(token, boundaryMs, now, diagnostics) {
   }
 }
 
-async function recentFromCsv(csvResult, { token, previousInfo, recentStart, diagnostics }) {
+async function recentFromCsv(csvResult, { token, previousInfo, recentStart, diagnostics, recentBilling }) {
   let entries = csvResult.entries;
   let latest = csvResult.latestEventAt;
   let latestToken = csvResult.latestTokenAt ?? csvResult.latestEventAt;
@@ -829,7 +844,7 @@ async function recentFromCsv(csvResult, { token, previousInfo, recentStart, diag
   const boundaryMs = latestToken ? latestToken.getTime() : NaN;
   const now = Date.now();
   if (Number.isFinite(boundaryMs) && now - boundaryMs > DAY_MS && now - boundaryMs <= 7 * DAY_MS) {
-    const extra = await probeCsvGap(token, boundaryMs, now, diagnostics);
+    const extra = await probeCsvGap(token, boundaryMs, now, diagnostics, recentBilling);
     if (extra?.entries.length) {
       gap = extra;
       entries = entries.concat(extra.entries);
@@ -881,7 +896,7 @@ async function eventsFallback(csvResult, { token, previousInfo, csvConfirmed = f
     : Date.now() - 7 * DAY_MS;
   // An empty export with a recognized header is the normal idle week; only a
   // changed header or token-less rows mean the export itself is in doubt.
-  const idle = !csvResult || (!csvResult.headerMismatch && csvResult.events === 0);
+  const idle = !csvResult || csvResult.empty;
   const reason = csvResult ? `CSV 导出不可用（${csvResult.unusable}）` : 'Billing V2 本次未读到用量';
 
   let events;
@@ -1061,28 +1076,50 @@ async function readCursorUsage(token, previousInfo, { app = null } = {}) {
   const startedAt = Date.now();
   const recentStart = windowOf(startedAt - RECENT_MS);
   let billingAccounts = previousInfo?.billingAccounts ?? [];
+  const billingCsvChecks = { ...previousInfo?.billingCsvChecks };
   const pinned = billingAccounts.includes(account);
   const diagnostics = { billingSkippedRows: 0 };
   let billing = pinned ? await probeBilling(token, recentStart, startedAt, diagnostics) : null;
   let csvResult = null;
-  try {
-    // A completed V2 read, even an empty one, needs no second opinion.
-    // If V2 fails, check whether this account has moved back to CSV.
-    if (!billing) csvResult = entriesFromCsv(await fetchUsageCsv(token, { startDate: recentStart, endDate: startedAt }));
-  } catch (err) {
-    if (!pinned && err.skip) return exportSkipped(err);
-    if (!pinned || (!err.skip && !err.sessionRejected)) throw err;
+  const range = { startDate: recentStart, endDate: startedAt };
+  const lastCheck = Date.parse(billingCsvChecks[account]?.at);
+  const check = { at: new Date(startedAt).toISOString(), form: billingCsvChecks[account]?.form ?? 0 };
+  if (billing) {
+    if (!Number.isFinite(lastCheck) || startedAt - lastCheck >= DAY_MS) {
+      csvResult = await probeUsageCsv(token, range, check);
+      billingCsvChecks[account] = check;
+    }
+  } else {
+    try {
+      csvResult = await fetchUsageCsv(token, range);
+      check.form = csvResult.form;
+    } catch (err) {
+      if (!err.skip && !err.sessionRejected) throw err;
+      if (!pinned || diagnostics.rejection) {
+        if (err.skip) return exportSkipped(err);
+        throw err;
+      }
+    }
+    if (pinned) billingCsvChecks[account] = check;
   }
   const usableCsv = csvResult && !csvResult.unusable;
   // A recognized header-only CSV also confirms the legacy session on an idle week.
   const csvConfirmed = usableCsv || csvResult?.empty || csvResult?.events > 0;
-  if (pinned && usableCsv) billingAccounts = billingAccounts.filter(label => label !== account);
+  if (pinned && usableCsv) {
+    billingAccounts = billingAccounts.filter(label => label !== account);
+    delete billingCsvChecks[account];
+  }
   if (!pinned && !usableCsv) billing = await probeBilling(token, recentStart, startedAt, diagnostics);
-  if (pinned && !csvConfirmed && diagnostics.rejection) throw diagnostics.rejection;
+  if (pinned && diagnostics.rejection && !csvConfirmed) {
+    return exportSkipped(skipped(`CSV 导出不可用（${csvResult.unusable}），下次同步重试。`));
+  }
   const firstSelection = !pinned && csvResult?.empty && billing?.entries.some(
     entry => entry.timestamp <= startedAt - BILLING_MIN_AGE_MS,
   );
-  if (firstSelection) billingAccounts = [...billingAccounts, account];
+  if (firstSelection) {
+    billingAccounts = [...billingAccounts, account];
+    billingCsvChecks[account] = check;
+  }
   const useBilling = billingAccounts.includes(account);
   const history = historyRanges(prev, startedAt, recentStart, useBilling, firstSelection);
   const warnings = [];
@@ -1099,7 +1136,7 @@ async function readCursorUsage(token, previousInfo, { app = null } = {}) {
   }
   let syncedAt = startedAt;
 
-  if (billing && (useBilling || billing.entries.length)) {
+  if (billing && !usableCsv && (useBilling || billing.entries.length)) {
     primaryEntries = billing.entries;
     markWindows(primaryEntries, 'billing-v2');
     latestEventAt = billing.latestEventAt;
@@ -1107,7 +1144,7 @@ async function readCursorUsage(token, previousInfo, { app = null } = {}) {
     events = billing.entries.length;
     tokenEvents = billing.entries.length;
   } else if (usableCsv) {
-    const recent = await recentFromCsv(csvResult, { token, previousInfo: prev, recentStart, diagnostics });
+    const recent = await recentFromCsv(csvResult, { token, previousInfo: prev, recentStart, diagnostics, recentBilling: billing });
     primaryEntries = recent.entries;
     if (recent.gap) markWindows(recent.gap.entries, recent.gap.source);
     latestEventAt = recent.latestEventAt;
@@ -1118,7 +1155,7 @@ async function readCursorUsage(token, previousInfo, { app = null } = {}) {
     warnings.push(...recent.warnings);
   } else {
     // 2. Events fallback: once per sync, output not limited to the window.
-    const fallback = await eventsFallback(pinned ? null : csvResult, { token, previousInfo: prev, csvConfirmed: pinned && csvConfirmed });
+    const fallback = await eventsFallback(pinned ? null : csvResult, { token, previousInfo: prev, csvConfirmed });
     fallbackEntries = fallback.entries;
     latestEventAt = laterDate(fallback.latestEventAt, csvResult?.latestEventAt);
     latestTokenAt = laterDate(fallback.latestTokenAt, csvResult?.latestTokenAt);
@@ -1145,16 +1182,13 @@ async function readCursorUsage(token, previousInfo, { app = null } = {}) {
           // owns [start, before). This also works with an exclusive API end.
           block = await fetchBilling(token, start, before, diagnostics);
         } else {
-          block = entriesFromCsv(await fetchUsageCsv(token, { startDate: start, endDate: before - 1 }));
+          block = await fetchUsageCsv(token, { startDate: start, endDate: before - 1 });
         }
       } catch (err) {
-        if (!err.skip) {
-          // Pre-October CSV and newly discovered V2 are optional history
-          // sources. Their access rules cannot invalidate the recent read.
-          if (!err.sessionRejected || !useBilling || (billingBlock && pinned)) throw err;
-        }
+        // A denied history block cannot invalidate a successful recent V2 read.
+        if (!err.skip && !(billing && (pinned || firstSelection) && err.sessionRejected)) throw err;
         if (billingBlock) diagnostics.billingFailure = err.billingFailure ?? 'invalid_page';
-        warnings.push(`cursor: 历史补齐本次暂停，下次同步继续（${err.message}）`);
+        warnings.push(`cursor: 历史补齐本次暂停，下次同步继续（${err.sessionRejected ? '历史请求被拒绝' : err.message}）`);
         if (billingBlock) {
           const missing = await historyFromEvents(token, start, before, fallbackEntries);
           fallbackEntries = fallbackEntries.concat(missing);
@@ -1186,6 +1220,9 @@ async function readCursorUsage(token, previousInfo, { app = null } = {}) {
   const entries = primaryEntries.concat(extra);
 
   const carried = value => (Number.isFinite(Date.parse(value)) ? new Date(Date.parse(value)) : null);
+  if (diagnostics.billingSkippedRows) {
+    warnings.push(`cursor: Billing V2 跳过 ${diagnostics.billingSkippedRows} 条缺少模型名或 token 明细的用量记录。`);
+  }
   return {
     buckets: aggregateToBuckets(entries),
     ...(windowSources.size ? { windowSources } : {}),
@@ -1206,6 +1243,7 @@ async function readCursorUsage(token, previousInfo, { app = null } = {}) {
       csvBackfill: history[1],
       app,
       billingAccounts,
+      billingCsvChecks,
       diagnostics,
     }),
   };

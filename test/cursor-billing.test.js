@@ -32,8 +32,8 @@ function dashboard(t) {
     const endpoint = url.pathname.split('/').pop();
     web.calls.push(endpoint);
     if (endpoint === 'export-usage-events-csv') {
-      if (web.csv instanceof Response) return web.csv.clone();
-      return new Response(typeof web.csv === 'function' ? web.csv(url.searchParams) : web.csv);
+      const csv = typeof web.csv === 'function' ? web.csv(url.searchParams, init) : web.csv;
+      return csv instanceof Response ? csv.clone() : new Response(csv);
     }
     if (endpoint === 'query-billing-items') {
       web.billingRequests.push({ params: url.searchParams, init });
@@ -216,7 +216,7 @@ test('only an empty CSV and a token at least two hours old select Billing V2', a
   assert.deepEqual(lag.buckets.map(b => b.model), [model]);
   assert.deepEqual(web.calls, ['export-usage-events-csv', 'query-billing-items']);
   web.billing = () => Response.json({ data: [current], pagination: {} });
-  for (const csv of ['unrecognized', header + '\n' + iso(NOW - DAY) + ',csv,0']) {
+  for (const csv of ['', 'unrecognized', header + '\n' + iso(NOW - DAY) + ',csv,0']) {
     web.csv = csv;
     assert.equal((await read()).info.billingAccounts, undefined);
   }
@@ -235,16 +235,113 @@ test('Billing V2 skips and counts unusable token rows while preserving usable mo
   const result = await read();
   assert.deepEqual(result.buckets.map(b => [b.model, b.outputTokens]), [[model, 3]]);
   assert.equal(result.info.billingSkippedRows, 2);
+  assert.deepEqual(result.warnings, ['cursor: Billing V2 跳过 2 条缺少模型名或 token 明细的用量记录。']);
   assert.equal(result.info.tokenEvents, 1);
 });
 
 test('a pinned account with an empty Billing V2 week keeps its anchor and requests only V2', async t => {
   const web = dashboard(t);
-  const result = await read({ ...previousInfo, latestTokenAt: iso(NOW - 8 * DAY), billingAccounts: [previousInfo.account] });
+  const result = await read({ ...previousInfo, latestTokenAt: iso(NOW - 8 * DAY), billingAccounts: [previousInfo.account],
+    billingCsvChecks: { [previousInfo.account]: { at: iso(NOW), form: 0 } } });
   assert.deepEqual(web.calls, ['query-billing-items']);
   assert.deepEqual(result.buckets, []);
   assert.equal(result.info.latestTokenAt, iso(NOW - 8 * DAY));
 });
+
+test('a selected account checks the recent CSV once per day and returns to a recovered export', async t => {
+  const web = dashboard(t);
+  web.billing = () => Response.json({ data: [current], pagination: {} });
+  let info = (await read()).info;
+  const ranges = [];
+  let recovered = false;
+  web.csv = params => {
+    ranges.push([Number(params.get('startDate')), Number(params.get('endDate'))]);
+    return recovered ? header + '\n' + iso(web.now - 60_000) + ',legacy,11' : header;
+  };
+  web.now += DAY - 1;
+  info = (await read(info)).info;
+  assert.deepEqual(ranges, []);
+  web.now++;
+  const idle = await read(info);
+  assert.deepEqual(idle.info.billingAccounts, [previousInfo.account]);
+  assert.deepEqual(idle.buckets.map(b => b.model), ['cursor-grok-4.6-medium']);
+  assert.deepEqual(ranges, [[RECENT + DAY, NOW + DAY]]);
+  recovered = true;
+  web.now += DAY - 1;
+  info = (await read(idle.info)).info;
+  assert.equal(ranges.length, 1);
+  web.now++;
+  const restored = await read(info);
+  assert.deepEqual(ranges[1], [RECENT + 2 * DAY, NOW + 2 * DAY]);
+  assert.equal(restored.info.billingAccounts, undefined);
+  assert.deepEqual(restored.buckets.map(b => [b.model, b.outputTokens]), [['legacy', 11]]);
+  web.calls.length = 0;
+  await read(restored.info);
+  assert.deepEqual(web.calls, ['export-usage-events-csv']);
+});
+
+test('daily CSV checks are independent across account switches and old selections without a timestamp', async t => {
+  const web = dashboard(t);
+  const other = 'grok|different';
+  const otherToken = 'h.' + Buffer.from(JSON.stringify({ sub: other })).toString('base64url') + '.s';
+  let info = { ...previousInfo, billingAccounts: [previousInfo.account, other] };
+  web.csv = new Response(null, { status: 403 });
+  async function syncAs(accessToken) {
+    setProvidedCursorLogin(JSON.stringify({ accessToken }));
+    web.calls.length = 0;
+    // An account switch starts history; crossing the budget keeps this test on recent reads.
+    web.billing = () => { web.now += 40_000; return Response.json({ data: [], pagination: {} }); };
+    info = (await read(info)).info;
+    assert.equal(info.billingAccounts.length, 2);
+    return web.calls.filter(c => c === 'export-usage-events-csv').length;
+  }
+  assert.equal(await syncAs(token), 1);
+  web.now = NOW + DAY / 2;
+  assert.equal(await syncAs(otherToken), 1);
+  assert.equal(await syncAs(token), 0);
+  web.now = NOW + DAY;
+  assert.equal(await syncAs(token), 1);
+  assert.equal(await syncAs(otherToken), 0);
+});
+
+test('the daily check reuses the CSV credential form that returned the recognized header', async t => {
+  const web = dashboard(t);
+  const shortCookie = 'WorkosCursorSessionToken=fixture%3A%3A' + token;
+  let csv = header;
+  web.csv = (_, init) => init.headers.Cookie === shortCookie ? csv : new Response(null, { status: 401 });
+  web.billing = () => Response.json({ data: [current], pagination: {} });
+  const first = await read();
+  assert.deepEqual(first.info.billingAccounts, [previousInfo.account]);
+  web.calls.length = 0;
+  web.now += DAY;
+  csv += '\n' + iso(NOW - 2 * DAY) + ',legacy,7';
+  const recovered = await read(first.info);
+  assert.deepEqual(web.calls, ['query-billing-items', 'export-usage-events-csv']);
+  assert.deepEqual(recovered.buckets.map(b => b.model), ['legacy', 'cursor-grok-4.6-medium']);
+  assert.equal(recovered.info.billingAccounts, undefined);
+});
+
+for (const status of [401, 403]) {
+  test('recent V2 survives history HTTP ' + status + ' and retries the same week', async t => {
+    const web = dashboard(t);
+    const backfill = { before: iso(RECENT), until: iso(RECENT - 7 * DAY) };
+    let blocked = true;
+    web.billing = params => {
+      if (params.get('startTime') === iso(RECENT)) return Response.json({ data: [current], pagination: {} });
+      return blocked ? new Response(null, { status }) : Response.json({ data: [item('old', RECENT - DAY)], pagination: {} });
+    };
+    const paused = await read({ ...previousInfo, billingAccounts: [previousInfo.account], backfill });
+    assert.deepEqual(paused.buckets.map(b => b.outputTokens), [3]);
+    assert.deepEqual(paused.info.backfill, backfill);
+    assert.equal(paused.info.billingFailure, 'http_' + status);
+    assert.match(paused.warnings.join(' '), /历史补齐本次暂停/);
+    assert.doesNotMatch(paused.warnings.join(' '), /登录已失效|sign in again/i);
+    blocked = false;
+    const resumed = await read(paused.info);
+    assert.equal(resumed.info.backfill, undefined);
+    assert.equal(resumed.info.tokenEvents, 2);
+  });
+}
 
 test('first Billing V2 selection retains the pre-October CSV checkpoint across the budget boundary', async t => {
   const web = dashboard(t);
