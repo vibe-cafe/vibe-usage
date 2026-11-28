@@ -4,9 +4,9 @@ import { join, resolve } from 'node:path';
 import { isEncryptedCursorToken } from '../../parsers/cursor.js';
 import { desktopAppOlderThan } from '../../client-meta.js';
 import { systemProxyConfigured } from '../../system-proxy.js';
-import { cursorApiBase, cursorRefreshURL, cursorSignInBlock, cursorUserId, cursorWebBase, endStoredCursorLogin, freshCursorLogin, resolveCursorLogin } from '../../cursor-login.js';
+import { CURSOR_USER_AGENT, cursorApiBase, cursorRefreshURL, cursorSignInBlock, cursorUserId, cursorWebBase, endStoredCursorLogin, freshCursorLogin, resolveCursorLogin } from '../../cursor-login.js';
 import { queryDbJsonSnapshotOnLock } from '../../parsers/sqlite.js';
-import { attachCacheScope, loadCursorPlan, quotaCacheScope, saveCursorPlan } from '../cache.js';
+import { attachCacheScope, loadCursorPlan, preferCursorWebSummary, quotaCacheScope, rememberMeterlessCursorPeriod, saveCursorPlan } from '../cache.js';
 import { quotaResult } from '../schema.js';
 import { InvalidQuotaResponse, parseQuotaPayload, requestFailureReason } from '../response.js';
 
@@ -77,6 +77,7 @@ export function parseCursorQuota(payload) {
 }
 
 function periodMeters(payload) {
+  if (!payload || typeof payload !== 'object' || Array.isArray(payload)) throw new InvalidQuotaResponse();
   const plan = payload?.planUsage;
   const spend = payload?.spendLimitUsage;
   // Connect JSON int64s are decimal strings; the editor passes these milliseconds to Date.
@@ -202,10 +203,10 @@ export async function fetchCursorQuota({
     const service = dashboardService(environment);
     const userId = cursorUserId(sessionToken);
     const accountScope = quotaCacheScope('cursor', userId ? `user:${userId}` : sessionToken);
-    if (service) {
+    if (service && !preferCursorWebSummary(accountScope, now.getTime(), environment)) {
       const connect = {
         method: 'POST', body: '{}', headers: { Authorization: `Bearer ${sessionToken}`,
-          'Content-Type': 'application/json', 'Connect-Protocol-Version': '1' },
+          'Content-Type': 'application/json', 'Connect-Protocol-Version': '1', 'User-Agent': CURSOR_USER_AGENT },
         redirect: 'error',
       };
       const dashboard = attachCacheScope(await request(`${service}/GetCurrentPeriodUsage`, connect, periodMeters), scope);
@@ -217,6 +218,12 @@ export async function fetchCursorQuota({
         if (label) dashboard.planLabel = label;
         return dashboard;
       }
+      if (dashboard.status === 'no_data') {
+        rememberMeterlessCursorPeriod(accountScope, now.getTime(), environment);
+      } else {
+        const clientError = dashboard.httpStatus >= 400 && dashboard.httpStatus < 500 && dashboard.httpStatus !== 429;
+        if (!clientError && dashboard.failureReason !== 'unrecognizedResponse') return dashboard;
+      }
     }
     const signal = AbortSignal.timeout(timeoutMs);
     let summary;
@@ -226,7 +233,7 @@ export async function fetchCursorQuota({
         signal }, parseCursorQuota);
       if (summary.status !== 'unauthorized') break;
     }
-    if (summary.planLabel) saveCursorPlan(accountScope, summary.planLabel, now.getTime(), environment);
+    if (summary.planLabel) saveCursorPlan(accountScope, summary.planLabel, now.getTime(), environment, 'web');
     return attachCacheScope(summary, scope);
   }
 
@@ -235,16 +242,20 @@ export async function fetchCursorQuota({
     // still deliver the current meters, even when this RPC rejects the login.
     try {
       const response = await fetchImpl(url, { ...connect, signal: AbortSignal.timeout(Math.min(2500, timeoutMs)) });
-      if (!response.ok) { await response.body?.cancel(); return; }
+      if (response.status !== 200) { await response.body?.cancel(); return; }
       const name = (await readPayload(response))?.planInfo?.planName;
-      if (typeof name === 'string') return name.trim() || undefined;
-    } catch { /* Keep the live meters. */ }
+      return typeof name === 'string' ? name.trim() || null : null;
+    } catch (error) {
+      // Even an empty HTTP 200 completes the lookup. A broken connection while
+      // receiving the body still gets the shorter transport retry.
+      if (requestFailureReason(error) === 'unrecognizedResponse') return null;
+    }
   }
 
   async function request(url, init, parseMeters) {
     try {
       const response = await fetchImpl(url, { ...init, redirect: 'error', signal: init.signal ?? AbortSignal.timeout(timeoutMs) });
-      if (!response.ok) {
+      if (!response.ok || (parseMeters === periodMeters && response.status !== 200)) {
         try { await response.body?.cancel(); } catch { /* the HTTP status is already known */ }
         if ([401, 403].includes(response.status)) {
           return result('unauthorized', { message: 'Open Cursor and sign in again, then retry' });

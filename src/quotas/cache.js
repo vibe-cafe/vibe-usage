@@ -6,7 +6,7 @@ import { normalizeMeter, quotaResult } from './schema.js';
 
 const CACHE_VERSION = 1;
 const MAX_CACHE_AGE_MS = 7 * 24 * 60 * 60 * 1000;
-const PLAN_AGE_MS = 24 * 60 * 60 * 1000;
+const DAY_MS = 24 * 60 * 60 * 1000;
 const PLAN_RETRY_MS = 15 * 60 * 1000;
 
 function cachePath(environment = process.env) {
@@ -75,7 +75,7 @@ function updateDocument(environment, update) {
     // path resolution and updating a document recovered from disk.
     const path = cachePath(environment);
     const document = loadDocument(environment) || { version: CACHE_VERSION, products: {} };
-    update(document);
+    if (update(document) === false) return;
     mkdirSync(dirname(path), { recursive: true, mode: 0o700 });
     const temporary = `${path}.${process.pid}.tmp`;
     writeFileSync(temporary, `${JSON.stringify(document)}\n`, { encoding: 'utf8', mode: 0o600 });
@@ -102,14 +102,17 @@ export function saveCachedQuota(result, scope, environment = process.env) {
 
 function freshCursorPlan(record, now) {
   const age = now - record?.checkedAt;
-  return age >= 0 && age <= (record?.label ? PLAN_AGE_MS : PLAN_RETRY_MS);
+  // null is a completed plan lookup with no name. A failed lookup has no label field.
+  return age >= 0 && age <= (record?.label === undefined ? PLAN_RETRY_MS : DAY_MS);
 }
 
-export function saveCursorPlan(accountScope, label, checkedAt, environment) {
+export function saveCursorPlan(accountScope, label, checkedAt, environment, source = 'dashboard') {
   updateDocument(environment, document => {
     const plans = Object.fromEntries(Object.entries(document.cursorPlans || {})
       .filter(([, plan]) => freshCursorPlan(plan, checkedAt)));
-    plans[accountScope] = { checkedAt, label };
+    const current = plans[accountScope];
+    if (source === 'web' && current && current.source !== 'web') return false;
+    plans[accountScope] = { checkedAt, label, source };
     document.cursorPlans = plans;
   });
 }
@@ -124,9 +127,22 @@ export function loadCursorPlan(accountScope, meterScope, environment, now) {
   if (!document?.cursorPlans && old?.scope === meterScope && old.planLabel) {
     const legacy = { checkedAt: Date.parse(old.fetchedAt), label: old.planLabel };
     if (freshCursorPlan(legacy, now)) {
-      saveCursorPlan(accountScope, legacy.label, legacy.checkedAt, environment);
+      saveCursorPlan(accountScope, legacy.label, legacy.checkedAt, environment, 'web');
       return legacy;
     }
   }
   return null;
+}
+
+export function preferCursorWebSummary(accountScope, now, environment) {
+  const until = loadDocument(environment)?.cursorWebUntil?.[accountScope];
+  return until > now && until - now <= DAY_MS;
+}
+
+export function rememberMeterlessCursorPeriod(accountScope, now, environment) {
+  updateDocument(environment, document => {
+    const active = Object.entries(document.cursorWebUntil || {}).filter(([, until]) => until > now);
+    document.cursorWebUntil = Object.fromEntries(active);
+    document.cursorWebUntil[accountScope] = now + DAY_MS;
+  });
 }

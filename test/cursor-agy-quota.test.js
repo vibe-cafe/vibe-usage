@@ -99,10 +99,29 @@ test('Cursor authenticates only to the fixed official host and sanitizes results
   assert.equal(calls, 2);
 });
 
+test('desktop apps with a system proxy can read quota with the local editor token', async t => {
+  for (const [surface, version] of [['mac-app', '0.8.1'], ['windows-app', '0.7.10']]) {
+    const { environment } = await fixture(t);
+    const calls = [];
+    const { products: [answer] } = await fetchQuotaProducts(['cursor'], { environment: {
+      ...environment, VIBE_USAGE_SYSTEM_PROXY: '1', VIBE_USAGE_SURFACE: surface, VIBE_USAGE_SURFACE_VERSION: version,
+    }, fetchImpl: async (url, init) => {
+      calls.push([url.split('/').pop(), init.headers.Authorization]);
+      return Response.json(url.endsWith('/GetPlanInfo') ? { planInfo: { planName: 'Pro' } }
+        : { planUsage: { totalPercentUsed: 7 } });
+    } });
+    assert.deepEqual(calls, ['GetCurrentPeriodUsage', 'GetPlanInfo'].map(rpc => [rpc, `Bearer ${token}`]));
+    assert.equal(answer.status, 'ok');
+    assert.equal(answer.meters[0].utilization, 7);
+  }
+});
+
 test('Cursor isolates missing/rejected credentials and uses only same-account unexpired cache on transient failure', async t => {
   const { environment, root } = await fixture(t);
   const now = new Date('2026-10-23T00:00:00Z');
-  const success = () => new Response(JSON.stringify(cursorPayload));
+  const success = url => Response.json(url.endsWith('/GetPlanInfo')
+    ? { planInfo: { planName: 'Pro' } } : { planUsage: cursorPayload.individualUsage.plan,
+      billingCycleEnd: String(Date.parse(cursorPayload.billingCycleEnd)) });
   await fetchQuotaProducts(['cursor'], { environment, now, fetchImpl: success });
   const failing = async () => { throw new Error(`private proxy ${token}`); };
   const cached = await fetchQuotaProducts(['cursor'], { environment, now, fetchImpl: failing });
@@ -137,7 +156,8 @@ test('Cursor reports an encrypted login as unsupported: no request, no cache ent
   const now = new Date('2026-10-23T00:00:00Z');
   const readable = await fixture(t);
   await fetchQuotaProducts(['cursor'], { environment: readable.environment, now,
-    fetchImpl: async () => new Response(JSON.stringify(cursorPayload)) });
+    fetchImpl: async url => Response.json(url.endsWith('/GetPlanInfo')
+      ? { planInfo: { planName: 'Pro' } } : { planUsage: { totalPercentUsed: 5 } }) });
   const cachePath = join(readable.root, 'quota-cache.json');
   const cacheBefore = readFileSync(cachePath);
   for (const [login, encoding] of [[`cursor-safe-storage:v1:${cipher}`, 'utf8'],

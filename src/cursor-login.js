@@ -53,7 +53,7 @@ const LOCK_RETRIES = 200;
 const LOCK_RETRY_MS = 100;
 // Honest identification for the requests this module adds (sign-in, profile,
 // renewal); the existing usage reads are unchanged.
-const USER_AGENT = `vibe-usage/${COLLECTOR_VERSION}`;
+export const CURSOR_USER_AGENT = `vibe-usage/${COLLECTOR_VERSION}`;
 
 export function cursorWebBase(env = process.env) {
   return (env.CURSOR_WEB_BASE_URL?.trim() || 'https://cursor.com').replace(/\/+$/, '');
@@ -239,7 +239,7 @@ export async function pollCursorLogin({
     let response = null;
     try {
       response = await fetchImpl(url, {
-        headers: { Accept: 'application/json', 'User-Agent': USER_AGENT },
+        headers: { Accept: 'application/json', 'User-Agent': CURSOR_USER_AGENT },
         redirect: 'error',
         signal: AbortSignal.timeout(REQUEST_TIMEOUT_MS),
       });
@@ -272,7 +272,7 @@ export async function pollCursorLogin({
 export async function fetchCursorEmail(accessToken, { env = process.env, fetchImpl = globalThis.fetch } = {}) {
   try {
     const response = await fetchImpl(`${cursorWebBase(env)}/api/auth/me`, {
-      headers: { Cookie: cursorSessionCookie(accessToken), Accept: 'application/json', 'User-Agent': USER_AGENT },
+      headers: { Cookie: cursorSessionCookie(accessToken), Accept: 'application/json', 'User-Agent': CURSOR_USER_AGENT },
       redirect: 'error',
       signal: AbortSignal.timeout(REQUEST_TIMEOUT_MS),
     });
@@ -298,7 +298,7 @@ export async function refreshCursorCredential(credential, {
   try {
     response = await fetchImpl(cursorRefreshURL(env), {
       method: 'POST',
-      headers: { 'Content-Type': 'application/json', Accept: 'application/json', 'User-Agent': USER_AGENT },
+      headers: { 'Content-Type': 'application/json', Accept: 'application/json', 'User-Agent': CURSOR_USER_AGENT },
       body: JSON.stringify({ grant_type: 'refresh_token', client_id: CURSOR_CLIENT_ID, refresh_token: credential.refreshToken }),
       redirect: 'error',
       signal: AbortSignal.timeout(REQUEST_TIMEOUT_MS),
