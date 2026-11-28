@@ -94,7 +94,7 @@ Quota results are never uploaded or added to incremental sync state. Credential-
 | Grok | `$GROK_HOME/sessions/<encoded-cwd>/<session-id>/` (default `~/.grok`) plus explicitly added Grok Homes; token usage from `updates.jsonl` `turn_completed.usage` (per-model `modelUsage`, cache reads, reasoning); project from `summary.json` cwd; copied sessions keep the more complete local record |
 | GitHub Copilot CLI | `~/.copilot/session-state/*/events.jsonl` |
 | CraftAgent | `~/.craft-agent/workspaces/*/sessions/*/.pi-sessions/*.jsonl`; honors `$CRAFT_AGENT_DIR` / `$CRAFTAGENT_DIR`; cache writes are included in input usage |
-| Cursor | the Cursor sign-in Vibe Usage keeps (`login cursor`), else `state.vscdb` (SQLite; reads only the token Cursor itself already stored locally, never refreshes it), plus `cursor.com`'s usage CSV, with the dashboard's paginated usage-events API as fallback when the CSV is empty or changes shape; cloud data is stamped with a fixed `cursor-cloud` hostname so multi-machine setups don't double-count; `status` shows the signed-in account and newest event |
+| Cursor | the Vibe Usage sign-in (`login cursor`), else Cursor's existing token in `state.vscdb`. Sync reads the dashboard CSV for legacy subscriptions and Billing V2 for unified subscriptions discovered through an unusable CSV. The web events API is the fallback. Cloud buckets use the shared `cursor-cloud` hostname. `status` shows the account and latest event. |
 | DimAgent | Legacy TypeScript store `$DIMCODE_HOME/dimcode.sqlite` (default `~/.dimcode/v2/dimcode.sqlite`): exact usage from `usage_ledger`, with forked ledger/history copies deduplicated. Rust Dim (`dima` alpha and later): `<home>/rust/dimcode.sqlite` for `$DIMCODE_HOME`, `~/.dimcode-alpha`, `~/.dimcode` and `~/.dim`, all merged into the same source — per-request `model/usage` events plus compaction summarizer usage, fork copies counted once; an unreadable store warns while the others still sync |
 | Gemini CLI | `~/.gemini/tmp/<project_hash>/chats/session-*.jsonl` (current line-delimited format) and legacy `session-*.json`; recurses into nested subagent sessions |
 | OpenCode | `~/.local/share/opencode/opencode.db` (SQLite) — both the legacy `message` table and the 2.x `session_message` projection are read, merged by message id — with `storage/message/` as the legacy alternative; cache writes are counted as 5m cache creation; supports explicitly added data roots |
@@ -192,17 +192,21 @@ npx @vibe-cafe/vibe-usage logout cursor   # 删除本机保存的这份登录
 
 ## Cursor 网络排查
 
-Cursor 用量优先读取 `cursor.com` 的 CSV 导出（模型名最准确）。如果 CSV 为空、表头变化或没有 token 计数，会自动改用仪表盘自己的分页用量事件接口（`/api/dashboard/get-filtered-usage-events`）；该接口较早事件的模型名可能显示为 `default`，但 token 总量正确。CSV 仍可用但最新事件已超过 24 小时（且不超过 7 天）时，会只向事件接口补“CSV 最新事件之后”的增量，不覆盖或重传历史。`Cursor usage export skipped (network: …)` / `Cursor usage request skipped (network: …)` 表示这次请求失败；CLI 会保留 Cursor 的历史同步状态，下次同步重新尝试。
+老订阅照常读 `cursor.com` 的 CSV。最近 7 天的 CSV 为空、表头变化或缺少 token 时，CLI 会试同一仪表盘的 Billing V2（`/api/dashboard/v2/query-billing-items`）。CSV 最新 token 已停了 24 小时至 7 天时，也会先用 V2 补后续的半小时。两种情况下，如果 V2 没有可补的用量或读取失败（含 HTTP 401/403），再查原有的网页事件接口（`/api/dashboard/get-filtered-usage-events`）。已有的 CSV 用量照常同步，补洞探测失败也会保留登录。网页事件的早期模型名可能显示为 `default`。三个接口共用代理判断、登录凭据和 `cursor.com` 主机。
+
+最近 7 天的 CSV 只有可识别的表头，且同一时段的 V2 明细中有至少 2 小时前的 token 时，本机才记住该账号优先用 V2。之后每轮先读 V2，每个账号每 24 小时额外复查一次最近 7 天的 CSV。有 token 行就从本轮恢复 CSV 优先，仍只有表头就继续用 V2。V2 读取失败时也会立即复查 CSV。近期 V2 和 CSV 都返回 401/403 才进入登录续期或失效流程。若 V2 拒绝登录，CSV 遇到网络错误、服务错误或返回零字节，则保留登录，下次同步重试。
+
+首次切换会用 V2 回补至 2026-10-01 00:00 UTC，更早的未完成历史接着用 CSV 补。每块最多 7 天，两段共用 40 秒预算。近期 V2 成功后，历史块被拒绝只会暂停回补，近期用量照常同步，下次从该块继续。本机每个已上传的半小时保留首次提交的来源，同一来源仍可更新该窗口。V2 模型名沿用仪表盘原文。缺少模型名或 token 明细的用量记录会跳过，并提示条数。
 
 - `ENOTFOUND` / `EAI_AGAIN`：检查 DNS 和终端网络。
 - `UND_ERR_CONNECT_TIMEOUT` / `ETIMEDOUT` / `ECONNRESET`：检查到 Cursor 的连接及终端代理。浏览器或 Cursor 应用能联网，不代表 Node.js 使用了相同代理。
 - `CERT_*` / `UNABLE_TO_VERIFY_LEAF_SIGNATURE` 等：检查系统时间和代理或公司网络的 CA 证书配置；自定义 CA 可通过 `NODE_EXTRA_CA_CERTS` 指定。
-- `timeout after …ms`：请求超时（每页默认 120 秒）。可用 `VIBE_USAGE_CURSOR_FETCH_TIMEOUT_MS=300000` 调大，然后重跑一次 `sync` 补传历史。
+- `timeout after …ms`：默认超时为 120 秒，同一个 V2 时间块的分页共用这段时间。可用 `VIBE_USAGE_CURSOR_FETCH_TIMEOUT_MS=300000` 调大，然后重跑一次 `sync` 补传历史。
 - `Cursor session rejected`：在 Cursor 的 Account 设置中重新登录，再同步。
 - `新版 Cursor 已加密保存登录凭证`：Cursor 3.27 起会分批把本地登录凭证改为加密保存（`cursor-safe-storage:` 开头），Vibe Usage 不解密它。运行 `npx @vibe-cafe/vibe-usage login cursor`（或在 App 设置里登录 Cursor）单独登录一次即可恢复，暂停期间的用量会在之后的同步里自动补回（前提是 cursor.com 还保留记录）；在 Cursor 里重新登录不能解决（[#144](https://github.com/vibe-cafe/vibe-usage/issues/144)）。
 - `Cursor 登录已失效`：在 Vibe Usage 里登录的那一份被 Cursor 结束了（比如在 cursor.com 撤销了这条登录），重新运行 `login cursor` 即可。
 - 数据停在某一天、或刚换过 Cursor 账号：运行 `npx @vibe-cafe/vibe-usage status`。它会显示 Cursor 当前登录账号（本地脱敏标签）和最新事件时间；如果最新事件超过 48 小时且你最近用过 Cursor，通常是客户端仍登录旧账号。切换账号后 Cursor 的本地 `state.vscdb` 会更新，重新同步即可。如果这时本机 Cursor 凭证已是加密格式，`status` 改为显示上一条的加密说明，不再提示核对账号。
-- X 订阅（The X Subscription）账号的用量由 Cursor 与 Grok 共享：如果 Cursor 仪表盘本身没有新事件，请到 `grok.com/dashboard` 的 Usage 查看；CLI 只能读取 Cursor 仪表盘返回的 Cursor 事件。
+- The X Subscription 账号即使导出 CSV 只有表头，也能通过 Billing V2 同步 Cursor 产品的 token 明细。可在 `grok.com/dashboard` 的 Usage 核对共享订阅用量。套餐内明细的扣费可以为零，Vibe Usage 仍按模型和 token 数估价。
 - 只有 X Premium+ / Grok 订阅、但 Cursor 里显示 `Free`：X Premium+ 不会自动把 Cursor 计划升级，需要在 `cursor.com/unify` 合并到 The X Subscription 后，Cursor 用量才进入共享池。`cursor.com/api/dashboard/get-sand-usage-status` 返回 `includedUsageSuperGrokPlan: "x-premium-plus"` 且 `cursorPlanName: "Free"` 就是这种状态。
 
 **代理**：环境变量里设了代理时，CLI 的请求都照着走，包括同步到我们服务器的请求（例外见本段末尾）。读法和 curl 一致：每种协议先看自己的变量（`HTTPS_PROXY` / `HTTP_PROXY`，大小写均可），再看 `ALL_PROXY`；只设 `HTTP_PROXY` 时 https 也走它（兼容做法，Node 的 fetch 本来如此）；没写协议头的地址（`127.0.0.1:7890`）按 `http://` 处理；`NO_PROXY` / `no_proxy` 按 Node 的规矩小写优先；本机回环地址不走代理。Node.js 能自己照着走时（24.14+ 自动启用；22.21+ / 24.5+ 设了 `NODE_USE_ENV_PROXY=1` 并写成完整的 `HTTPS_PROXY`，见 [Node.js 官方说明](https://nodejs.org/en/learn/http/enterprise-network-configuration)）就交给它；照不了时——代理是 SOCKS5，Node.js 版本较旧，或代理只写在 `ALL_PROXY` 里——CLI 用自带的隧道（HTTP CONNECT / SOCKS5，支持用户名密码）照样走代理。走 SOCKS5 时只把主机名交给代理，不在本机解析厂商域名；代理连得上、但 15 秒内建不起隧道（比如代理的出口断了）时，请求失败，不会卡住；跳转到别的网站时不带上原来的登录凭据。开了 `NODE_USE_ENV_PROXY=1` 时请把代理写成带协议头的完整地址：Node.js 24 在 CLI 启动之前就会拒绝没写协议头的地址，也会拒绝写在 `HTTPS_PROXY` 里的 `socks5h://`（这种情况请把 SOCKS 地址写在 `ALL_PROXY` 里，CLI 的隧道会接手）。只有 SOCKS4 这类无法识别的代理，或在 Bun 下运行且代理不是完整的 `HTTPS_PROXY=http://…` 时，CLI **不会让带厂商账号的请求改走直连**：Cursor 同步和 Kimi / ZCode / OpenCode Go / Cursor 配额会跳过并说明原因，其他工具照常同步（要访问的地址都写在 `NO_PROXY` 里的，按你的直连规则照常读取；这里从严理解：`example.com` 只算它本身，子域名要写 `.example.com`，带端口的只算那个端口）；这两种情况下，同步到我们服务器的请求和 `doctor` 的连通探测仍按运行环境原样发出，可能直连（不带厂商账号）。以下为 macOS/Linux 终端示例，代理地址须替换为实际地址：

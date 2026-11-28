@@ -59,7 +59,7 @@ export function isWarningCode(code) {
 const RULES = [
   // Codex held for one sync because the server did not report this machine's
   // Ultrafast cut (codex-ultrafast.js).
-  ['upload_withheld', /Ultrafast 档位起点/],
+  ['upload_withheld', /Ultrafast 档位起点|保留已上传窗口的明细来源/],
   // Cursor 3.27+ token encryption (issue #144). Its notice also says
   // "暂不支持读取", so it must precede the format rule.
   ['cursor_token_encrypted', /已加密保存登录凭证|issues\/144/],
@@ -78,8 +78,8 @@ const RULES = [
   ['network_timeout', /\(timeout after \d+ms\)|Request timed out/],
   ['network_failed', /\(network: /],
   ['remote_http_error', /skipped \(HTTP \d{3}/],
-  ['fallback_used', /已从仪表盘事件接口补回/],
-  ['export_unusable', /CSV 导出不可用/],
+  ['fallback_used', /已从仪表盘事件接口补回|Billing V2 补回/],
+  ['export_unusable', /CSV 导出不可用|Billing V2 本次未读到用量|Billing V2 本次读取失败/],
   ['extra_root_unavailable', /额外根目录不可用|额外目录不可用|额外 Codex Home 不可用|额外目录缺少/],
   ['extra_root_read_failed', /额外根目录读取失败/],
   ['merge_failed', /无法合并会话分段/],
@@ -87,6 +87,7 @@ const RULES = [
   ['usage_missing', /有已完成轮次但未读到用量/],
   ['store_unavailable', /:memory: 无法从另一进程读取/],
   ['unsupported_format', new RegExp([
+    '缺少模型名或 token 明细',
     '不认识的表结构',
     '结构不兼容',
     'incompatible database schema',

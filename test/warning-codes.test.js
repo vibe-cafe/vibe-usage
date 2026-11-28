@@ -23,6 +23,9 @@ const WIN = 'C:\\Users\\张三\\AppData\\Roaming';
 // Every warning template the parsers and roots modules write (2026-11-09),
 // with the code it must map to.
 const CASES = [
+  ['cursor: 保留已上传窗口的明细来源，本次跳过另一来源的 1 个用量桶。', 'upload_withheld'],
+  ['cursor: CSV 最新 token 事件停在 2026-11-22T00:00:00.000Z，Billing V2 补回 2 个更新的 token 事件。', 'fallback_used'],
+  ['cursor: Billing V2 本次读取失败，已尝试仪表盘事件接口；下次重试 Billing V2。', 'export_unusable'],
   // Claude Code / Claude Desktop
   [`Claude Code: cannot read directory ${PROJECT_DIR}: EACCES: permission denied, scandir '${PROJECT_DIR}'`, 'dir_unreadable'],
   [`Claude Code: cannot read directory ${HOME}/.claude: not a directory`, 'dir_unreadable'],
@@ -103,6 +106,7 @@ const CASES = [
   [`cursor: ${ENCRYPTED_TOKEN_NOTICE}`, 'cursor_token_encrypted'],
   // The separate Vibe Usage sign-in (cursor-login.js): ended, or renewal not done this run.
   [`cursor: ${LOGIN_EXPIRED_NOTICE}`, 'cursor_login_expired'],
+  ['cursor: Billing V2 跳过 2 条缺少模型名或 token 明细的用量记录。', 'unsupported_format'],
   ['cursor: Cursor 登录续期本次未完成，Cursor 本次未同步，下次重试 (network: fetch failed)', 'network_failed'],
   ['cursor: Cursor 登录续期本次未完成，Cursor 本次未同步，下次重试 (skipped (HTTP 503))', 'remote_http_error'],
   // env-proxy.js: a proxy this process cannot follow (both reasons).

@@ -82,15 +82,16 @@ function networkError(code) {
   });
 }
 
-/** Route the CSV endpoint and the events endpoint independently. */
+/** A legacy dashboard without Billing V2. */
 function mockFetch(t, { csv, events } = {}) {
   return t.mock.method(globalThis, 'fetch', async (url, init) => {
     if (String(url).includes('/api/dashboard/export-usage-events-csv')) {
       return typeof csv === 'function' ? csv(init, String(url)) : csv;
     }
     if (String(url).includes('/api/dashboard/get-filtered-usage-events')) {
-      return typeof events === 'function' ? events(init, String(url)) : events;
+      return typeof events === 'function' ? events(init, String(url)) : events ?? new Response('{}');
     }
+    if (String(url).includes('/v2/query-billing-items')) return new Response(null, { status: 404 });
     throw new Error(`unexpected URL ${url}`);
   });
 }
@@ -180,7 +181,7 @@ test('Cursor fills a stale CSV gap from events without touching older history', 
   });
 
   const result = await cursor.parse({ previousInfo: RECENT_INFO() });
-  assert.equal(fetchMock.mock.callCount(), 2);
+  assert.equal(fetchMock.mock.callCount(), 3);
   assert.equal(eventBody.startDate, String(csvLatest - 60 * 60 * 1000));
   assert.equal(result.buckets.length, 2);
   assert.equal(result.buckets.find(b => b.model === 'csv-model').inputTokens, 3);
@@ -279,10 +280,10 @@ for (const reason of ['socks', 'unsupported']) {
   });
 }
 
-test('Cursor without a token says nothing about the proxy', async (t) => {
+test('Cursor without a token preserves cloud window ownership and says nothing about the proxy', async (t) => {
   await withCursorDb(t, { value: '' });
   const result = await cursor.parse({ envProxyBlock: envProxyBlock('socks') });
-  assert.deepEqual(result, { buckets: [], sessions: [] });
+  assert.deepEqual(result, { buckets: [], sessions: [], skipped: true });
 });
 
 // Issue #144: Cursor 3.27+ stores `cursor-safe-storage:<version>:<base64>`.
@@ -338,7 +339,7 @@ test('Cursor falls back to the events API when the CSV is empty', async (t) => {
   });
 
   const result = await cursor.parse({ previousInfo: RECENT_INFO() });
-  assert.equal(fetchMock.mock.callCount(), 2);
+  assert.equal(fetchMock.mock.callCount(), 3);
   assert.equal(result.buckets.length, 1);
   assert.equal(result.buckets[0].model, 'test-model');
   assert.equal(result.warnings.length, 1);
@@ -656,6 +657,7 @@ test('Cursor events fallback rebuilds whole windows across a DST fall-back', asy
     let startDate;
     globalThis.fetch = async (url, init) => {
       if (String(url).includes('export-usage-events-csv')) return new Response(${JSON.stringify(CSV_HEADER)});
+      if (String(url).includes('query-billing-items')) return new Response(null, { status: 404 });
       startDate = Number(JSON.parse(init.body).startDate);
       const visible = events.filter(([, iso]) => Date.parse(iso) >= startDate);
       return new Response(JSON.stringify({ totalUsageEventsCount: visible.length, usageEventsDisplay: visible.map(([id, iso, n]) => ({

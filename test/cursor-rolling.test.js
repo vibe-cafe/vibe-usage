@@ -54,7 +54,7 @@ function readBody(req) {
 const sumOf = b => b.inputTokens + b.outputTokens + b.cachedInputTokens + b.reasoningOutputTokens;
 
 async function withBackend(run) {
-  const backend = { rows: [], csvRequests: 0, eventsRequests: 0, table: new Map() };
+  const backend = { rows: [], csvRequests: 0, billingRequests: 0, eventsRequests: 0, table: new Map() };
   const server = createServer(async (req, res) => {
     const url = new URL(req.url, 'http://127.0.0.1');
     const body = await readBody(req);
@@ -71,6 +71,11 @@ async function withBackend(run) {
       backend.eventsRequests++;
       res.writeHead(200, { 'content-type': 'application/json' });
       res.end('{}');
+      return;
+    }
+    if (url.pathname === '/api/dashboard/v2/query-billing-items') {
+      backend.billingRequests++;
+      res.writeHead(404).end();
       return;
     }
     if (url.pathname === '/api/usage/settings') {
@@ -152,6 +157,7 @@ test('rolling Cursor syncs keep the server equal to a whole export across first 
       assert.deepEqual(server(), truth(backend.rows));
       assert.equal(state().parserMeta.cursor.backfill, undefined);
       const keysAfterFirst = cursorKeys();
+      assert.equal(backend.billingRequests, 0, 'a legacy CSV history fill only reads CSV, even for empty weeks');
 
       // Run 2: new usage, and a row that reached the export three days late.
       backend.rows.push({ at: now - 30 * 60 * 1000, input: 5, model: 'a' });
@@ -171,6 +177,7 @@ test('rolling Cursor syncs keep the server equal to a whole export across first 
       await sync();
       assert.deepEqual(server(), truth(backend.rows));
       assert.equal(state().parserMeta.cursor.backfill, undefined);
+      assert.equal(backend.billingRequests + backend.eventsRequests, 0);
     });
   } finally {
     rmSync(root, { recursive: true, force: true });
@@ -226,9 +233,9 @@ test('an encrypted Cursor token pauses Cursor, keeps its progress, and the gap f
 
       // Run 2, encrypted token: no request, exit 0, a notice, nothing lost.
       const tableBefore = server();
-      const requestsBefore = backend.csvRequests + backend.eventsRequests;
+      const requestsBefore = backend.csvRequests + backend.eventsRequests + backend.billingRequests;
       const { stderr } = await sync();
-      assert.equal(backend.csvRequests + backend.eventsRequests, requestsBefore, 'no request reaches cursor.com');
+      assert.equal(backend.csvRequests + backend.eventsRequests + backend.billingRequests, requestsBefore, 'no request reaches cursor.com');
       assert.match(stderr, /cursor: 新版 Cursor 已加密保存登录凭证/);
       assert.match(stderr, /vibe-usage login cursor/);
       assert.doesNotMatch(stderr, /sign in again/);

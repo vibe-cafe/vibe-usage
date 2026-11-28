@@ -167,6 +167,62 @@ test('renewal: shouldLogout, 400/401/403 or another account end the sign-in; any
 
 // --- The stored sign-in -----------------------------------------------------------
 
+test('an optional Billing V2 or freshness probe cannot renew or end a working legacy sign-in', async t => {
+  const home = isolateParser(t);
+  const credential = cursorCredential({ accessToken: tokenFor('legacy') });
+  writeStoredCursorLogin(credential);
+  const path = join(home, 'cursor-login.json');
+  const saved = readFileSync(path, 'utf8');
+  const at = new Date(Date.now() - 3 * DAY).toISOString();
+  const previousInfo = { syncedAt: at };
+  const header = 'Date,Model,Output Tokens';
+  let csv = header + '\n' + at + ',auto,11';
+  const requests = [];
+  t.mock.method(globalThis, 'fetch', async url => {
+    const endpoint = new URL(url).pathname.split('/').pop();
+    requests.push(endpoint);
+    if (endpoint === 'export-usage-events-csv') return new Response(csv);
+    if (endpoint === 'query-billing-items') return new Response(null, { status: 403 });
+    if (endpoint === 'get-filtered-usage-events') return new Response(null, { status: 401 });
+    throw new Error('unexpected request');
+  });
+  const stale = await cursor.parse({ previousInfo });
+  assert.deepEqual(stale.buckets.map(b => b.outputTokens), [11]);
+  csv = header;
+  const idle = await cursor.parse({ previousInfo: { ...stale.info, latestTokenAt: new Date(Date.now() - 8 * DAY).toISOString() } });
+  assert.equal(idle.info.billingFailure, 'http_403');
+  assert.deepEqual(idle.warnings, []);
+  assert.ok(!requests.includes('token'));
+  assert.equal(readFileSync(path, 'utf8'), saved);
+});
+
+for (const [label, csv, reason] of [
+  ['network error', () => { throw new Error('fixture disconnect'); }, /network/i],
+  ['HTTP 503', () => new Response(null, { status: 503 }), /503/],
+  ['zero-byte 200', () => new Response(''), /CSV/],
+]) {
+  test('selected V2 rejection with CSV ' + label + ' keeps the stored sign-in for a retry', async t => {
+    const path = join(isolateParser(t), 'cursor-login.json');
+    writeStoredCursorLogin(cursorCredential({ accessToken: tokenFor('legacy'), refreshToken: 'fixture' }));
+    const saved = readFileSync(path, 'utf8');
+    const previousInfo = { account: 'auth0|legacy', billingAccounts: ['auth0|legacy'], syncedAt: new Date().toISOString() };
+    const requests = [];
+    t.mock.method(globalThis, 'fetch', async raw => {
+      const endpoint = new URL(raw).pathname.split('/').pop();
+      requests.push(endpoint);
+      if (endpoint === 'export-usage-events-csv') return csv();
+      return new Response(null, { status: 403 });
+    });
+    const result = await cursor.parse({ previousInfo });
+    assert.deepEqual(requests, ['query-billing-items', 'export-usage-events-csv']);
+    assert.equal(result.skipped, true);
+    assert.equal(result.info, undefined);
+    assert.match(result.warnings.join(' '), reason);
+    assert.doesNotMatch(result.warnings.join(' '), /登录已失效|sign in again/i);
+    assert.equal(readFileSync(path, 'utf8'), saved);
+  });
+}
+
 test('the stored sign-in is 0600, and an ended one keeps no token', t => {
   const env = { VIBE_USAGE_CONFIG_DIR: join(tempDir(t), 'fresh-dir') };
   const credential = cursorCredential({ accessToken: tokenFor('user_a'), refreshToken: 'r', email: 'a@example.com' });

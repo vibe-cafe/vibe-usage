@@ -29,6 +29,22 @@ const BATCH_SIZE = 100;
 const SESSION_BATCH_SIZE = 500;
 const ACTIVITY_BATCH_SIZE = 500;
 
+// Ingest only upserts; replacing a window with another source's model names
+// would leave both sets of rows on the server. Plain hashes (including those
+// written before #220) are treated as CSV. The first acknowledged bucket
+// owns the whole window, even if the process dies before committing parserMeta.
+function cursorBucketsForUpload(buckets, windowSources, uploaded) {
+  const owned = new Map();
+  for (const key of Object.keys(uploaded)) {
+    if (key.startsWith('cursor|')) {
+      const hash = uploaded[key];
+      const separator = typeof hash === 'string' ? hash.indexOf(':') : -1;
+      owned.set(key.slice(key.lastIndexOf('|') + 1), separator < 0 ? 'csv' : hash.slice(0, separator));
+    }
+  }
+  return buckets.filter(b => !owned.has(b.bucketStart) || owned.get(b.bucketStart) === (windowSources.get(b.bucketStart) ?? 'csv'));
+}
+
 /**
  * Model-time upload rows (2026-11-25): the `activity` of every session, added
  * up per tool, project, machine and half-hour. Only sources whose parser
@@ -571,6 +587,7 @@ async function runSyncPasses({
     const parserResults = [];
     const parserProgress = [];
     const parserInfos = [];
+    let cursorWindowSources = new Map();
     // Sources whose parser ran to completion this sync. pruneState() below is
     // scoped to these so a transient parser failure doesn't evict that tool's
     // state and force a full re-upload next run.
@@ -591,7 +608,14 @@ async function runSyncPasses({
         record.noteParser(source, { error: 'invalid_result' });
         continue;
       }
-      const { buckets, sessions, skipped, warnings, indexing, info } = normalized;
+      const { sessions, skipped, warnings, indexing, info } = normalized;
+      let buckets = normalized.buckets;
+      if (source === 'cursor' && buckets.length) {
+        cursorWindowSources = result.windowSources ?? cursorWindowSources;
+        buckets = cursorBucketsForUpload(buckets, cursorWindowSources, state.buckets);
+        const held = normalized.buckets.length - buckets.length;
+        if (held) warnings.push(`cursor: 保留已上传窗口的明细来源，本次跳过另一来源的 ${held} 个用量桶。`);
+      }
       // The history keeps counts and fixed warning codes only; the warning
       // text (paths, exception messages) stays on stderr below.
       record.noteParser(source, {
@@ -778,7 +802,9 @@ async function runSyncPasses({
 
     for (const b of allBuckets) {
       const key = bucketKey(b);
-      const h = bucketHash(b);
+      const hash = bucketHash(b);
+      const origin = b.source === 'cursor' && cursorWindowSources.get(b.bucketStart);
+      const h = origin ? `${origin}:${hash}` : hash;
       liveBucketKeys.add(key);
       if (migration.preserveBuckets.has(key) || state.buckets[key] === h) continue;
       changedBuckets.push(b);
